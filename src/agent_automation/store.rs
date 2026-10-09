@@ -16,6 +16,7 @@ const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_PRIVATE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_GOAL_RESULT_BYTES: usize = 4096;
 const MAX_CHAT_MIRROR_IDS: usize = 1024;
+const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
 const PAIRING_INDEX_DIR: &str = ".pairings";
@@ -50,6 +51,42 @@ pub struct GoalRecord {
 pub enum GoalFinish {
     Completed { summary: Option<String> },
     Blocked { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerGoalCommand {
+    Set { markdown: String },
+    Run,
+    Stop,
+    Clear,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerGoalCommandKind {
+    Set,
+    Run,
+    Stop,
+    Clear,
+    Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OwnerGoalCommandReceipt {
+    pub kind: OwnerGoalCommandKind,
+    pub goal: Option<GoalRecord>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct OwnerGoalRequestRecord {
+    request_digest: String,
+    command_digest: String,
+    receipt: OwnerGoalCommandReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +195,8 @@ pub struct AutomationTaskState {
     pub chat_mirror: ChatMirrorState,
     pub action: AutomationActionState,
     pub goal_wake: GoalWakeState,
+    #[serde(default)]
+    owner_goal_requests: Vec<OwnerGoalRequestRecord>,
 }
 
 impl Default for AutomationTaskState {
@@ -170,6 +209,7 @@ impl Default for AutomationTaskState {
             chat_mirror: ChatMirrorState::default(),
             action: AutomationActionState::default(),
             goal_wake: GoalWakeState::default(),
+            owner_goal_requests: Vec::new(),
         }
     }
 }
@@ -192,14 +232,16 @@ static PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceL
 impl AgentAutomationStore {
     pub fn for_config(config: &AppConfig) -> Result<Self, String> {
         let root = crate::memory::memory_dir(config).join("chats");
-        let pairing_index_root = config
-            .memory
-            .dir
-            .as_ref()
-            .map(PathBuf::from)
-            .map(|base| base.join(PAIRING_INDEX_DIR))
-            .or_else(|| crate::util::home_dir().map(|home| home.join(".codexify/browser/pairings")))
-            .unwrap_or_else(|| root.join(PAIRING_INDEX_DIR));
+        let pairing_index_root = pairing_index_root(config, &root);
+        Self::new_with_pairing_index(root, pairing_index_root)
+    }
+
+    pub fn for_state_root(config: &AppConfig, state_root: &Path) -> Result<Self, String> {
+        if !state_root.is_absolute() {
+            return Err("Agent automation state root must be absolute".into());
+        }
+        let root = state_root.join("chats");
+        let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
     }
 
@@ -292,14 +334,7 @@ impl AgentAutomationStore {
         markdown: &str,
         now_ms: u64,
     ) -> Result<GoalRecord, String> {
-        if markdown.trim().is_empty() {
-            return Err("Agent-chat goal Markdown must not be empty".into());
-        }
-        if markdown.len() > MAX_GOAL_BYTES {
-            return Err(format!(
-                "Agent-chat goal Markdown must not exceed {MAX_GOAL_BYTES} UTF-8 bytes"
-            ));
-        }
+        validate_goal_markdown(markdown)?;
         self.mutate(task, |state| {
             let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
                 goal.revision
@@ -408,6 +443,156 @@ impl AgentAutomationStore {
         })
     }
 
+    pub fn apply_owner_goal_command(
+        &self,
+        task: &ConversationIdentity,
+        request_id: &str,
+        command: OwnerGoalCommand,
+        now_ms: u64,
+    ) -> Result<OwnerGoalCommandReceipt, String> {
+        if !valid_opaque(request_id) {
+            return Err("Agent-chat goal command request ID is invalid".into());
+        }
+        if let OwnerGoalCommand::Set { markdown } = &command {
+            validate_goal_markdown(markdown)?;
+        }
+        if matches!(command, OwnerGoalCommand::Status) {
+            return Ok(OwnerGoalCommandReceipt {
+                kind: OwnerGoalCommandKind::Status,
+                goal: self.load(task)?.goal,
+                replayed: false,
+            });
+        }
+        let request_digest = owner_goal_request_digest(request_id);
+        let command_digest = owner_goal_command_digest(&command)?;
+        self.mutate(task, move |state| {
+            if let Some(record) = state
+                .owner_goal_requests
+                .iter()
+                .find(|record| record.request_digest == request_digest)
+            {
+                if record.command_digest != command_digest {
+                    return Err(
+                        "This goal command request ID already belongs to a different command"
+                            .into(),
+                    );
+                }
+                let mut receipt = record.receipt.clone();
+                receipt.replayed = true;
+                return Ok(receipt);
+            }
+
+            let (kind, goal) = match command {
+                OwnerGoalCommand::Set { markdown } => {
+                    let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
+                        goal.revision
+                            .checked_add(1)
+                            .ok_or("Agent-chat goal revision overflow")
+                    })?;
+                    let goal = GoalRecord {
+                        revision,
+                        markdown,
+                        status: GoalStatus::Configured,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                        finished_at_ms: None,
+                        summary: None,
+                        blocked_reason: None,
+                    };
+                    state.goal = Some(goal.clone());
+                    state.goal_wake = GoalWakeState::default();
+                    if state.action.goal_revision.is_some() {
+                        state.action = AutomationActionState::default();
+                    }
+                    (OwnerGoalCommandKind::Set, Some(goal))
+                }
+                OwnerGoalCommand::Run => {
+                    let revision = state
+                        .goal
+                        .as_ref()
+                        .ok_or("No agent-chat goal is configured")?
+                        .revision;
+                    let goal = exact_goal_mut(state, revision)?;
+                    match goal.status {
+                        GoalStatus::Configured => {
+                            goal.status = GoalStatus::Active;
+                            goal.updated_at_ms = now_ms;
+                            goal.finished_at_ms = None;
+                            goal.summary = None;
+                            goal.blocked_reason = None;
+                        }
+                        GoalStatus::Active => {}
+                        GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error => {
+                            return Err(
+                                "Only a configured agent-chat goal can be started; create a new revision first"
+                                    .into(),
+                            );
+                        }
+                    }
+                    let goal = goal.clone();
+                    state.goal_wake = GoalWakeState::default();
+                    (OwnerGoalCommandKind::Run, Some(goal))
+                }
+                OwnerGoalCommand::Stop => {
+                    let revision = state
+                        .goal
+                        .as_ref()
+                        .ok_or("No agent-chat goal is configured")?
+                        .revision;
+                    let goal = exact_goal_mut(state, revision)?;
+                    match goal.status {
+                        GoalStatus::Active => {
+                            goal.status = GoalStatus::Configured;
+                            goal.updated_at_ms = now_ms;
+                            goal.finished_at_ms = None;
+                            goal.summary = None;
+                            goal.blocked_reason = None;
+                        }
+                        GoalStatus::Configured => {}
+                        GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error => {
+                            return Err("This agent-chat goal is already terminal".into());
+                        }
+                    }
+                    let goal = goal.clone();
+                    state.goal_wake = GoalWakeState::default();
+                    if state.action.goal_revision == Some(revision) {
+                        state.action = AutomationActionState::default();
+                    }
+                    (OwnerGoalCommandKind::Stop, Some(goal))
+                }
+                OwnerGoalCommand::Clear => {
+                    if let Some(goal) = state.goal.as_ref()
+                        && goal.status == GoalStatus::Active
+                    {
+                        return Err("Stop the active agent-chat goal before clearing it".into());
+                    }
+                    let revision = state.goal.as_ref().map(|goal| goal.revision);
+                    state.goal = None;
+                    state.goal_wake = GoalWakeState::default();
+                    if revision.is_some() && state.action.goal_revision == revision {
+                        state.action = AutomationActionState::default();
+                    }
+                    (OwnerGoalCommandKind::Clear, None)
+                }
+                OwnerGoalCommand::Status => unreachable!("status is handled before mutation"),
+            };
+            let receipt = OwnerGoalCommandReceipt {
+                kind,
+                goal,
+                replayed: false,
+            };
+            state.owner_goal_requests.push(OwnerGoalRequestRecord {
+                request_digest,
+                command_digest,
+                receipt: receipt.clone(),
+            });
+            if state.owner_goal_requests.len() > MAX_OWNER_GOAL_REQUESTS {
+                state.owner_goal_requests.remove(0);
+            }
+            Ok(receipt)
+        })
+    }
+
     pub fn finish_goal(
         &self,
         task: &ConversationIdentity,
@@ -509,6 +694,42 @@ impl AgentAutomationStore {
                 generation,
                 expires_at_ms,
             })
+        })
+    }
+
+    pub fn unlink_pairing(
+        &self,
+        task: &ConversationIdentity,
+        now_ms: u64,
+    ) -> Result<PairingState, String> {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            let previous_digest = state
+                .pairing
+                .pending
+                .as_ref()
+                .map(|pending| pending.reference_digest.clone());
+            let generation = state
+                .pairing
+                .generation
+                .checked_add(1)
+                .ok_or("Agent-chat pairing generation overflow")?;
+            state.pairing = PairingState {
+                generation,
+                ..Default::default()
+            };
+            state.action = AutomationActionState {
+                status: AutomationActionStatus::Unpaired,
+                pairing_generation: Some(generation),
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            if let Some(previous_digest) = previous_digest {
+                let _ = self.remove_pairing_index(&previous_digest);
+            }
+            Ok(state.pairing)
         })
     }
 
@@ -805,6 +1026,35 @@ impl AgentAutomationStore {
         })
     }
 
+    pub fn reset_failed_action_for_retry(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(expected_action_id) {
+            return Err("Agent automation retry action ID is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(expected_action_id) {
+                return Err("The browser action changed before it could be retried".into());
+            }
+            if state.action.status != AutomationActionStatus::Failed {
+                return Err("Only a browser action that failed before Send can be retried".into());
+            }
+            if state.action.kind == Some(AutomationActionKind::PairVerify) {
+                return Err(
+                    "Pairing verification cannot be replayed; start a new pairing request".into(),
+                );
+            }
+            state.action = AutomationActionState {
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            Ok(state.action.clone())
+        })
+    }
+
     pub fn record_goal_nudge(
         &self,
         task: &ConversationIdentity,
@@ -1062,6 +1312,17 @@ impl AgentAutomationStore {
             )),
         }
     }
+}
+
+fn pairing_index_root(config: &AppConfig, fallback_root: &Path) -> PathBuf {
+    config
+        .memory
+        .dir
+        .as_ref()
+        .map(PathBuf::from)
+        .map(|base| base.join(PAIRING_INDEX_DIR))
+        .or_else(|| crate::util::home_dir().map(|home| home.join(".codexify/browser/pairings")))
+        .unwrap_or_else(|| fallback_root.join(PAIRING_INDEX_DIR))
 }
 
 enum PairingReferenceOutcome {
@@ -1379,6 +1640,31 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
             return Err("Agent automation goal wake state is invalid".into());
         }
     }
+    if state.owner_goal_requests.len() > MAX_OWNER_GOAL_REQUESTS {
+        return Err("Agent automation owner goal request history is too large".into());
+    }
+    let mut request_digests = std::collections::HashSet::new();
+    for record in &state.owner_goal_requests {
+        if !valid_digest(&record.request_digest)
+            || !request_digests.insert(record.request_digest.as_str())
+            || !valid_digest(&record.command_digest)
+            || record.receipt.replayed
+        {
+            return Err("Agent automation owner goal request history is invalid".into());
+        }
+        match (&record.receipt.kind, &record.receipt.goal) {
+            (
+                OwnerGoalCommandKind::Set | OwnerGoalCommandKind::Run | OwnerGoalCommandKind::Stop,
+                Some(goal),
+            ) => validate_goal(goal)?,
+            (OwnerGoalCommandKind::Clear, None) => {}
+            (OwnerGoalCommandKind::Status, _)
+            | (_, None)
+            | (OwnerGoalCommandKind::Clear, Some(_)) => {
+                return Err("Agent automation owner goal request receipt is invalid".into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1469,6 +1755,18 @@ fn validate_goal(goal: &GoalRecord) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_goal_markdown(markdown: &str) -> Result<(), String> {
+    if markdown.trim().is_empty() {
+        return Err("Agent-chat goal Markdown must not be empty".into());
+    }
+    if markdown.len() > MAX_GOAL_BYTES {
+        return Err(format!(
+            "Agent-chat goal Markdown must not exceed {MAX_GOAL_BYTES} UTF-8 bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_chatgpt_url(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
         return Err("ChatGPT conversation URL is invalid".into());
@@ -1508,6 +1806,22 @@ fn validate_reference(reference: &str) -> Result<(), String> {
 
 fn reference_digest(reference: &str) -> String {
     format!("{:x}", Sha256::digest(reference.as_bytes()))
+}
+
+fn owner_goal_request_digest(request_id: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"codexify-owner-goal-request-v1\0");
+    hash.update(request_id.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn owner_goal_command_digest(command: &OwnerGoalCommand) -> Result<String, String> {
+    let encoded = serde_json::to_vec(command)
+        .map_err(|_| "Could not encode the agent-chat goal command".to_string())?;
+    let mut hash = Sha256::new();
+    hash.update(b"codexify-owner-goal-command-v1\0");
+    hash.update(encoded);
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn valid_digest(value: &str) -> bool {

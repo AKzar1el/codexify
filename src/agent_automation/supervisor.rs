@@ -314,6 +314,99 @@ impl AgentAutomationSupervisor {
         self.queue.lock().await.len()
     }
 
+    pub async fn queue_position(&self, task: &ConversationIdentity) -> Option<(usize, usize)> {
+        let queue = self.queue.lock().await;
+        let total = queue.len();
+        queue
+            .iter()
+            .position(|execution| execution.task_key == task.stable_key())
+            .map(|position| (position + 1, total))
+    }
+
+    pub async fn discard_queued_actions(&self, task: &ConversationIdentity) -> usize {
+        let task_key = task.stable_key();
+        let mut queue = self.queue.lock().await;
+        let before = queue.len();
+        queue.retain(|execution| execution.task_key != task_key);
+        let removed = before.saturating_sub(queue.len());
+        drop(queue);
+        if removed > 0 {
+            self.wake.notify_one();
+        }
+        removed
+    }
+
+    pub async fn cancel_queued_action(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<super::AutomationActionState, String> {
+        let handle = self
+            .tasks
+            .read()
+            .await
+            .get(task.stable_key())
+            .cloned()
+            .ok_or("Browser automation task is not registered")?;
+        let state = handle.store.load(&handle.task)?;
+        if state.action.id.as_deref() != Some(expected_action_id)
+            || state.action.status != AutomationActionStatus::Queued
+        {
+            return Err("Only the exact queued browser action can be cancelled here".into());
+        }
+        let removed = {
+            let mut queue = self.queue.lock().await;
+            let Some(position) = queue.iter().position(|execution| {
+                execution.task_key == handle.task.stable_key()
+                    && execution.request.action_id == expected_action_id
+            }) else {
+                return Err("The browser action already started or left the queue".into());
+            };
+            queue.remove(position);
+            true
+        };
+        debug_assert!(removed);
+        self.live.write().await.remove(handle.task.stable_key());
+        let action = if state.action.kind == Some(AutomationActionKind::PairVerify) {
+            handle.store.unlink_pairing(&handle.task, now_ms)?;
+            handle.store.load(&handle.task)?.action
+        } else {
+            handle.store.update_action_status(
+                &handle.task,
+                expected_action_id,
+                AutomationActionStatus::Failed,
+                Some("Browser action cancelled before Send"),
+                None,
+                now_ms,
+            )?
+        };
+        self.notify();
+        Ok(action)
+    }
+
+    pub async fn retry_failed_action(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<super::AutomationActionState, String> {
+        let handle = self
+            .tasks
+            .read()
+            .await
+            .get(task.stable_key())
+            .cloned()
+            .ok_or("Browser automation task is not registered")?;
+        handle
+            .store
+            .reset_failed_action_for_retry(&handle.task, expected_action_id, now_ms)?;
+        self.live.write().await.remove(handle.task.stable_key());
+        self.scan_once(now_ms).await?;
+        self.notify();
+        Ok(handle.store.load(&handle.task)?.action)
+    }
+
     #[doc(hidden)]
     pub async fn registered_count(&self) -> usize {
         self.tasks.read().await.len()
@@ -809,6 +902,9 @@ impl AgentAutomationSupervisor {
 
         let activity_after = task.chat.offline_activity().await?;
         let no_tool_activity = activity_after.tool_call_count == execution.tool_call_count_at_start;
+        let terminal_status = accumulator
+            .terminal_status
+            .unwrap_or_else(|| companion_status(snapshot.state));
         let status = if pair_verification {
             let pairing = task.store.load(&task.task)?.pairing;
             if pairing.verified_owner_generation == Some(execution.owner_generation) {
@@ -816,16 +912,16 @@ impl AgentAutomationSupervisor {
             } else {
                 AutomationActionStatus::Unverified
             }
+        } else if accumulator.send_accepted && terminal_status == AutomationActionStatus::Failed {
+            AutomationActionStatus::Ambiguous
         } else if accumulator.send_accepted
             && execution_goal_revision(&execution).is_some()
             && no_tool_activity
-            && accumulator.terminal_status == Some(AutomationActionStatus::Idle)
+            && terminal_status == AutomationActionStatus::Idle
         {
             AutomationActionStatus::Stalled
         } else {
-            accumulator
-                .terminal_status
-                .unwrap_or_else(|| companion_status(snapshot.state))
+            terminal_status
         };
         task.store.update_action_status(
             &task.task,

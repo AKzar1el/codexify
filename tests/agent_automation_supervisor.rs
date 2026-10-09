@@ -93,6 +93,8 @@ struct PreSendFailureExecutor {
     calls: AtomicUsize,
 }
 
+struct AcceptedTerminalFailureExecutor;
+
 impl Default for PreSendFailureExecutor {
     fn default() -> Self {
         Self {
@@ -129,6 +131,39 @@ impl AutomationExecutor for PreSendFailureExecutor {
             message: "Selector verification failed before Send".into(),
             send_accepted: false,
         })
+    }
+}
+
+#[async_trait]
+impl AutomationExecutor for AcceptedTerminalFailureExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        events
+            .send(CompanionEvent {
+                sequence: 1,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 1,
+                kind: CompanionEventKind::SendAccepted,
+            })
+            .unwrap();
+        events
+            .send(CompanionEvent {
+                sequence: 2,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 2,
+                kind: CompanionEventKind::Failed {
+                    code: "response_failed".into(),
+                    message: "ChatGPT failed after accepting the message".into(),
+                },
+            })
+            .unwrap();
+        let mut snapshot = snapshot_for(execution);
+        snapshot.state = CompanionActionState::Failed;
+        Ok(snapshot)
     }
 }
 
@@ -1349,6 +1384,157 @@ async fn failed_pre_send_action_is_not_retried_and_chat_remains_usable() {
             .unwrap()
             .text
             .contains("Ordinary chat still works.")
+    );
+}
+
+#[tokio::test]
+async fn explicit_retry_rearms_only_a_pre_send_failed_action() {
+    let fixture = fixture().await;
+    let executor = Arc::new(PreSendFailureExecutor::default());
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        executor.clone(),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "retry-pre-send".into(),
+            "Retry this only after explicit owner action.".into(),
+        )
+        .await
+        .unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    let failed_action = fixture
+        .store
+        .load(&fixture.task)
+        .unwrap()
+        .action
+        .id
+        .unwrap();
+    assert!(
+        supervisor
+            .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+            .await
+            .is_err()
+    );
+
+    let retried = supervisor
+        .retry_failed_action(&fixture.task, &failed_action, 1_000 + OFFLINE_AFTER_MS + 2)
+        .await
+        .unwrap();
+    assert_eq!(retried.status, AutomationActionStatus::Queued);
+    assert_ne!(retried.id.as_deref(), Some(failed_action.as_str()));
+    assert_eq!(supervisor.queued_count().await, 1);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn queued_pair_verification_can_be_cancelled_without_replaying_its_reference() {
+    let fixture = fixture().await;
+    let replacement = fixture
+        .store
+        .issue_pairing(&fixture.task, "https://chatgpt.com/c/replacement", 0, 1_000)
+        .unwrap();
+    fixture
+        .supervisor
+        .queue_pair_verification(
+            &fixture.task,
+            &replacement.reference,
+            replacement.generation,
+            1_001,
+        )
+        .await
+        .unwrap();
+    let action_id = fixture
+        .store
+        .load(&fixture.task)
+        .unwrap()
+        .action
+        .id
+        .unwrap();
+
+    let cancelled = fixture
+        .supervisor
+        .cancel_queued_action(&fixture.task, &action_id, 1_002)
+        .await
+        .unwrap();
+
+    assert_eq!(cancelled.status, AutomationActionStatus::Unpaired);
+    assert_eq!(fixture.supervisor.queued_count().await, 0);
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert!(state.pairing.candidate_url.is_none());
+    assert!(state.pairing.pending.is_none());
+    assert_eq!(fixture.executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn terminal_failure_after_send_acceptance_is_ambiguous_and_never_retryable() {
+    let fixture = fixture().await;
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(AcceptedTerminalFailureExecutor),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "accepted-terminal-failure".into(),
+            "Do not replay this message after an accepted failure.".into(),
+        )
+        .await
+        .unwrap();
+
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Ambiguous);
+    assert_eq!(
+        state.chat_mirror.message_ids,
+        vec!["accepted-terminal-failure"]
+    );
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS + 2)
+        .await
+        .unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert!(
+        fixture
+            .chat
+            .read(false)
+            .await
+            .unwrap()
+            .text
+            .contains("Do not replay this message")
     );
 }
 

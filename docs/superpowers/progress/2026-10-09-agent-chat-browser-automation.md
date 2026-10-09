@@ -252,14 +252,62 @@ Implement the approved agent-chat browser automation architecture completely: re
 - Task 8 has started: add the authenticated standalone owner-chat automation API,
   exact local `/goal` command parsing, and standalone-only controls without exposing
   companion credentials or browser controls to the embedded ChatGPT widget.
+- Task 8's first slice is green:
+  - `/goal set`, `run`, `stop`, `clear`, and `status` are parsed locally and
+    `//goal` escapes to an ordinary chat message;
+  - mutating goal commands use a private bounded request ledger so response-loss
+    retries do not create a second goal revision or repeat a lifecycle transition;
+  - goal commands never enter `CHAT.md`, while literal escaped messages still do;
+  - the authenticated standalone automation-state endpoint exposes pairing,
+    selection, goal, action, live-output, and presence state without descriptor,
+    bearer-token, or companion-endpoint data;
+  - owner-state lookup registers the stable task with the existing supervisor and
+    binds pairing validity to the continuation owner generation.
+- Resumed Task 8 after exhaustively rereading the complete 1,336-line approved
+  architecture and this full progress journal. The saved handoff and checkout agree:
+  the backend owner-management slice is uncommitted, and the next work is the
+  remaining authenticated action controls plus standalone-only browser UI.
+- Task 8's standalone UI red-green slice is now green in Chromium and WebKit:
+  - automation controls are created only by the standalone owner page after its
+    authenticated automation-state endpoint reports `enabled=true`;
+  - the panel exposes companion/login, capability refresh, exact URL pair/replace,
+    unlink/reveal, model/effort filtering, goal set/run/stop/clear/status, queue and
+    presence badges, task-local errors, and live status/commentary/answer output;
+  - every browser operation goes through Codexify's owner API, while local goal
+    commands continue through the existing `/send` endpoint and remain absent from
+    transcript history;
+  - disabled automation leaves the existing standalone chat layout and behavior
+    intact, and the new panel remains usable without horizontal overflow at the
+    mobile test viewport.
+- Completed the standalone action-repair slice:
+  - owner state now exposes the exact one-based queue position and total without
+    exposing queued prompt contents;
+  - the authenticated owner API provides bounded action status, queued-action
+    cancellation, and explicit retry for actions proven to have failed before
+    Send;
+  - cancelling queued pairing verification revokes the one-time reference and
+    returns the task to `unpaired` rather than leaving an unreplayable pending
+    handshake;
+  - ordinary queued cancellation preserves unread chat and active-goal state,
+    records a blocking pre-Send failure, and requires explicit retry;
+  - retry rejects ambiguous/accepted actions and pairing verification, clears only
+    the failed action envelope, revalidates current task state, and rebuilds a new
+    queue entry through the normal supervisor scan;
+  - a terminal browser failure after semantic Send acceptance is now normalized to
+    `ambiguous`, so explicit retry cannot duplicate an accepted message;
+  - standalone controls expose Cancel queued action and Retry failed action, while
+    the embedded ChatGPT widget remains free of clipboard and browser controls.
 
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
-- HEAD: `b1d2daa`
-- Working tree: only this live Task 8 progress update is uncommitted.
-- Next step: write the first failing owner-chat API and `/goal` command tests, then
-  implement only the minimum authenticated Rust surface needed to make them pass.
+- HEAD: `5d9be86`
+- Working tree: the Task 8 backend owner-management slice is uncommitted across
+  owner chat, persistent automation state, continuation-generation lookup, server
+  wiring, and this progress journal.
+- Next step: verify that backend slice, add explicit action status/cancel/retry
+  behavior under TDD, then render companion, URL, model/effort, goal, queue, error,
+  and live-output controls only in the standalone page.
 
 ## Latest verification
 
@@ -341,3 +389,43 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --lib` — 583 passed;
   - `cargo clippy --all-targets -- -D warnings` — passed;
   - `cargo fmt --all` and `git diff --check` — passed.
+- Task 8 first-slice verification:
+  - red: parser and owner API tests failed before local command dispatch, persistent
+    idempotency, owner automation context, and the automation-state route existed;
+  - green: `cargo test --lib owner_chat::tests` — 9 passed, including exact command
+    parsing, lifecycle, replay, transcript isolation, authentication, and state
+    redaction checks.
+- Task 8 standalone UI red phase: the new Chromium/WebKit owner-page test failed
+  waiting for `#automation-panel`, proving no browser controls existed yet.
+- Task 8 standalone UI green phase: `node --test scripts/test-owner-chat.mjs` — 4
+  passed across Chromium and WebKit, covering disabled isolation, authenticated
+  owner API routing, capability filtering, pairing, goals, live output, queue state,
+  secret absence, and mobile layout.
+- Action-repair red phases:
+  - owner queue-state test observed `null` before queue positions were exposed;
+  - store retry test failed because no explicit failed-action reset existed;
+  - supervisor tests failed because queued cancellation and explicit retry were
+    absent;
+  - accepted terminal failure remained `failed` instead of fail-closed `ambiguous`.
+- Action-repair green verification:
+  - targeted store retry test passed;
+  - targeted supervisor retry, pairing-cancel, and accepted-failure tests passed;
+  - targeted authenticated owner action API tests passed, including unread-message
+    preservation;
+  - `node --test scripts/test-owner-chat.mjs` — 4 passed on Chromium and WebKit;
+  - embedded-widget isolation test passed on Chromium and WebKit through the
+    targeted Markdown-chat widget test.
+- Task 8 aggregate verification is green:
+  - `cargo test --lib owner_chat::tests` — 11 passed;
+  - `cargo test --test agent_automation_store` — 9 passed;
+  - `cargo test --test agent_automation_supervisor` — 28 passed;
+  - combined owner-chat and Markdown-chat browser suite — 114 passed across
+    Chromium and WebKit;
+  - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`, and
+    `git diff --check` passed.
+- Preserved the public three-argument `owner_chat::start` integration surface and
+  moved server-only continuation/supervisor injection behind
+  `start_with_automation`; this fixed the restart integration target without
+  weakening the production wiring.
+- `cargo test --test owner_chat_restart` also passed after preserving that public
+  startup surface (1 passed, its subprocess fixture remained intentionally ignored).

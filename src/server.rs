@@ -1782,8 +1782,14 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((bind_host, config.port)).await?;
     let _owner_chat = if config.markdown_chat.enabled {
         Some(
-            crate::owner_chat::start(config.clone(), owner_chat_store, artifact_egress.clone())
-                .await?,
+            crate::owner_chat::start_with_automation(
+                config.clone(),
+                owner_chat_store,
+                artifact_egress.clone(),
+                continuations.clone(),
+                agent_automation.clone(),
+            )
+            .await?,
         )
     } else {
         None

@@ -69,7 +69,7 @@ pub enum CompanionSessionStatus {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CompanionHealth {
     pub protocol_version: u32,
@@ -81,7 +81,7 @@ pub struct CompanionHealth {
     pub active_action_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CapabilityCatalog {
     pub protocol_version: u32,
@@ -91,7 +91,7 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelCapability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelCapability {
     pub id: String,
@@ -99,7 +99,7 @@ pub struct ModelCapability {
     pub efforts: Vec<EffortCapability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EffortCapability {
     pub id: String,

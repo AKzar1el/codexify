@@ -1,7 +1,8 @@
 use std::sync::{Arc, Barrier};
 
 use codexify::agent_automation::{
-    AgentAutomationStore, GoalFinish, GoalStatus, PAIRING_REFERENCE_TTL_MS,
+    AgentAutomationStore, AutomationActionKind, AutomationActionStatus, GoalFinish, GoalStatus,
+    PAIRING_REFERENCE_TTL_MS,
 };
 use codexify::project_bindings::ConversationIdentity;
 
@@ -321,4 +322,78 @@ fn corrupt_or_symlinked_state_fails_closed() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn only_pre_send_failed_non_pair_actions_can_be_reset_for_explicit_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("retry-action");
+    store
+        .set_selection(&task, "gpt-6-sol", "high", "catalog-1", "account-1", 1)
+        .unwrap();
+    let pairing = store
+        .issue_pairing(&task, "https://chatgpt.com/c/retry", 0, 2)
+        .unwrap();
+    store
+        .record_pairing_canonical_url(&task, pairing.generation, "https://chatgpt.com/c/retry", 3)
+        .unwrap();
+    store
+        .verify_pairing(&task, pairing.generation, 0, &pairing.reference, 4)
+        .unwrap();
+    store
+        .queue_action(
+            &task,
+            "failed-action",
+            AutomationActionKind::OfflineChat,
+            pairing.generation,
+            None,
+            5,
+        )
+        .unwrap();
+    store
+        .update_action_status(
+            &task,
+            "failed-action",
+            AutomationActionStatus::Failed,
+            Some("Selector verification failed before Send"),
+            None,
+            6,
+        )
+        .unwrap();
+
+    let reset = store
+        .reset_failed_action_for_retry(&task, "failed-action", 7)
+        .unwrap();
+    assert_eq!(reset.status, AutomationActionStatus::Idle);
+    assert!(reset.id.is_none());
+    assert!(reset.kind.is_none());
+    assert!(reset.last_error.is_none());
+
+    store
+        .queue_action(
+            &task,
+            "ambiguous-action",
+            AutomationActionKind::OfflineChat,
+            pairing.generation,
+            None,
+            8,
+        )
+        .unwrap();
+    store
+        .update_action_status(
+            &task,
+            "ambiguous-action",
+            AutomationActionStatus::Ambiguous,
+            Some("Send may have been accepted"),
+            None,
+            9,
+        )
+        .unwrap();
+    assert!(
+        store
+            .reset_failed_action_for_retry(&task, "ambiguous-action", 10)
+            .unwrap_err()
+            .contains("failed before Send")
+    );
 }

@@ -12,7 +12,8 @@ pub use companion::{
 pub use store::{
     AgentAutomationStore, AutomationActionKind, AutomationActionState, AutomationActionStatus,
     AutomationTaskState, ChatMirrorState, GoalFinish, GoalRecord, GoalStatus, GoalWakeState,
-    MAX_GOAL_BYTES, PAIRING_REFERENCE_TTL_MS, PairingIssue, PairingState, SelectionState,
+    MAX_GOAL_BYTES, OwnerGoalCommand, OwnerGoalCommandKind, OwnerGoalCommandReceipt,
+    PAIRING_REFERENCE_TTL_MS, PairingIssue, PairingState, SelectionState,
 };
 pub use supervisor::{
     AgentAutomationSupervisor, AutomationExecution, AutomationExecutionError, AutomationExecutor,

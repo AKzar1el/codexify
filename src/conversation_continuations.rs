@@ -193,6 +193,23 @@ impl ConversationContinuationStore {
         })
     }
 
+    pub(crate) fn owner_generation_for_task_key(&self, task_key: &str) -> Result<u64, String> {
+        if ConversationIdentity::from_stable_keys(task_key.to_string(), task_key.to_string())
+            .is_none()
+        {
+            return Err("Invalid stable Codexify task identity".into());
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Conversation handoff state is unavailable")?;
+        Ok(runtime
+            .stored
+            .tasks
+            .get(task_key)
+            .map_or(0, |task| task.generation))
+    }
+
     pub(crate) fn begin_model_call(
         self: &Arc<Self>,
         physical: &ConversationIdentity,
