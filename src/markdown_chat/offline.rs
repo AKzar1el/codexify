@@ -115,6 +115,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notification_and_browser_goal_claims_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("chats/conversation/CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.record_agent_call(1000).await.unwrap();
+
+        assert!(chat.claim_offline_notification(1600, 600).await.unwrap());
+        assert!(chat.claim_offline_automation_goal(1600, 600).await.unwrap());
+        assert!(!chat.claim_offline_notification(9999, 600).await.unwrap());
+        assert!(!chat.claim_offline_automation_goal(9999, 600).await.unwrap());
+
+        let reopened = Arc::new(ChatFile::new(path, true));
+        assert!(
+            !reopened
+                .claim_offline_notification(9999, 600)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .claim_offline_automation_goal(9999, 600)
+                .await
+                .unwrap()
+        );
+        reopened.record_agent_call(10_000).await.unwrap();
+        assert!(
+            reopened
+                .claim_offline_notification(10_600, 600)
+                .await
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .claim_offline_automation_goal(10_600, 600)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn monitor_sends_once_when_offline_and_rearms_after_activity() {
         let root = tempfile::tempdir().unwrap();
         let chat = Arc::new(ChatFile::new(root.path().join("chat/CHAT.md"), true));

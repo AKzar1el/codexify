@@ -18,7 +18,7 @@ Implement the approved agent-chat browser automation architecture completely: re
 - Loaded the project instructions and implementation workflow skills.
 - Confirmed the checkout is an existing isolated Git worktree.
 - Created branch `feat/agent-chat-browser-automation` from `v1.7.0` / `f269d56`.
-- The architecture document is currently untracked and will be committed with the implementation documentation.
+- The approved architecture, executable plan, and progress journal are committed.
 - Cloned the exact upstream browser reference into `/tmp/codex-chatgpt-web-v6.1.7` at `f9ad4ae83a579287105ad822dd0c3e0029b04ef6`.
 - Wrote and self-reviewed the detailed TDD plan at `docs/superpowers/plans/2026-10-09-agent-chat-browser-automation.md`.
 - The first baseline build on the external `/Volumes/data` target stalled in uninterruptible filesystem I/O and was cancelled without a test result. The same suite was rerun with a fresh isolated target under `/tmp` and passed completely.
@@ -29,6 +29,7 @@ Implement the approved agent-chat browser automation architecture completely: re
   - advertised `automation_verify_pairing`, `goal_read`, and `goal_finish` whenever agent chat is enabled, independent of the runtime automation toggle;
   - added initial disabled-state tool contracts;
   - increased connector-version marker bounds from 64 to 128 bytes so the explicit feature marker remains lossless.
+- Committed that slice as `9b30eb7` (`feat: configure agent chat browser automation`).
 - Implemented secure task-scoped automation state:
   - versioned private `automation.json` records beside stable task chat state;
   - cross-process file locks plus process-local serialization across store instances;
@@ -37,6 +38,14 @@ Implement the approved agent-chat browser automation architecture completely: re
   - exact-revision completion, mandatory blocked reasons, terminal idempotency, stop/clear semantics, and no pause/resume state;
   - random digest-only one-time pairing references with expiry, canonical URL staging, owner-generation binding, replay rejection, and single use;
   - continuation owner snapshots exposing only stable hashes and generation, now used by server dispatch for active/retired routing.
+- Committed that slice as `8d80f66` (`feat: persist agent chat automation state`).
+- The current uncommitted slice implements the chat primitives required by the future supervisor:
+  - structured non-consuming unread-message snapshots with stable IDs, original Markdown, byte ranges, timestamps, and transcript revisions;
+  - transcript checkpoints and detection of tool-written agent messages after an action starts;
+  - idempotent browser-answer fallback appends tagged by browser action ID;
+  - browser fallback appends do not acknowledge unread messages, advance delivery/read cursors, record agent activity, or alter tool counts;
+  - notification and browser-goal offline claims are independent and persist across restart;
+  - existing chat reads, writes, history, timestamps, notifications, and widget behavior remain intact in focused tests.
 
 ## Required invariants
 
@@ -81,3 +90,16 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --lib conversation_continuations` — 8 passed;
   - `cargo clippy --test agent_automation_store -- -D warnings` — passed;
   - `cargo fmt --all` and `git diff --check` — passed.
+- Chat-primitives red phase: the new focused tests failed because `unread_snapshot`, transcript checkpointing, browser-answer persistence, and independent automation offline claims did not exist.
+- Chat-primitives verification to date:
+  - `cargo test --lib markdown_chat::storage` — 10 passed;
+  - `cargo test --test markdown_chat --test markdown_chat_tools --test markdown_chat_timestamps` — 38 passed, 1 environment-gated Apprise test ignored;
+  - `cargo clippy --lib -- -D warnings` — passed;
+  - `cargo fmt --all` and `git diff --check` — passed.
+
+## Current checkout state
+
+- Branch: `feat/agent-chat-browser-automation`
+- HEAD: `8d80f66`
+- Uncommitted files: `src/markdown_chat/mod.rs`, `src/markdown_chat/offline.rs`, `src/markdown_chat/storage.rs`, and `src/markdown_chat/widget.rs`.
+- Next step: review and commit the chat-primitives slice, then replace the placeholder goal/pairing handlers with the real task-scoped tools and request context wiring.

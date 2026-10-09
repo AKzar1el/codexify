@@ -19,7 +19,8 @@ use crate::project_bindings::ConversationIdentity;
 use crate::types::AppConfig;
 
 pub use storage::{
-    AppendReceipt, ChatFile, ChatSnapshot, NotificationState, OwnerChatSummary, UserSendReceipt,
+    AppendReceipt, BrowserAppendReceipt, ChatFile, ChatSnapshot, NotificationState,
+    OwnerChatSummary, TranscriptCheckpoint, UnreadMessage, UnreadSnapshot, UserSendReceipt,
     WidgetPage,
 };
 pub use wait::WaitOutcome;

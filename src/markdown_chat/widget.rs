@@ -52,6 +52,43 @@ pub struct OwnerChatSummary {
     pub total_tool_calls: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UnreadMessage {
+    pub id: String,
+    pub markdown: String,
+    pub start: u64,
+    pub end: u64,
+    pub created_at_ms: Option<u64>,
+    pub tool_call_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UnreadSnapshot {
+    pub revision: String,
+    pub read_through: u64,
+    pub end: u64,
+    pub messages: Vec<UnreadMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TranscriptCheckpoint {
+    pub revision: String,
+    pub end: u64,
+    anchor: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BrowserAppendReceipt {
+    pub id: String,
+    pub end: u64,
+    pub appended: bool,
+}
+
+#[derive(Clone)]
 struct Span {
     id: String,
     role: &'static str,
@@ -221,6 +258,37 @@ fn widget_message(file: &mut File, span: Span) -> Result<Option<WidgetMessage>, 
         created_at_ms: span.created_at_ms,
         tool_call_count: span.tool_call_count,
     }))
+}
+
+fn transcript_revision(file: &File, cursor: &Cursor) -> Result<String, String> {
+    let metadata = file.metadata().map_err(io_error)?;
+    let modified = metadata
+        .modified()
+        .map_err(io_error)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Ok(format!("{}-{modified}-{}", metadata.len(), cursor.offset))
+}
+
+fn validate_checkpoint(file: &mut File, checkpoint: &TranscriptCheckpoint) -> Result<(), String> {
+    let length = file.metadata().map_err(io_error)?.len();
+    if checkpoint.anchor.len() > ANCHOR_BYTES
+        || checkpoint.anchor.len() as u64 > checkpoint.end
+        || checkpoint.end > length
+        || read_range(
+            file,
+            checkpoint.end - checkpoint.anchor.len() as u64,
+            checkpoint.end,
+            ANCHOR_BYTES,
+        )? != checkpoint.anchor
+    {
+        return Err(
+            "CHAT.md changed before the browser-action transcript checkpoint; no fallback answer was persisted."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 impl ChatFile {
@@ -421,6 +489,175 @@ impl ChatFile {
                     sections.push(section);
                 }
                 Ok(sections.join("\n\n"))
+            })
+        })
+        .await
+    }
+
+    pub async fn unread_snapshot(self: &Arc<Self>) -> Result<UnreadSnapshot, String> {
+        self.run(|chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                let end = file.metadata().map_err(io_error)?.len();
+                let pending = read_range(file, cursor.offset, end, MAX_UNREAD_BYTES)?;
+                std::str::from_utf8(&pending).map_err(|_| {
+                    "CHAT.md contains incomplete UTF-8; finish saving before browser delivery."
+                        .to_string()
+                })?;
+                let mut messages = Vec::new();
+                for span in spans(file)? {
+                    if span.role != "user" || span.end <= cursor.offset {
+                        continue;
+                    }
+                    if span.start < cursor.offset {
+                        return Err(
+                            "The Markdown chat read cursor intersects a user message boundary."
+                                .into(),
+                        );
+                    }
+                    let markdown = String::from_utf8(read_range(
+                        file,
+                        span.body_start,
+                        span.body_end,
+                        MAX_UNREAD_BYTES,
+                    )?)
+                    .map_err(|_| "CHAT.md contains incomplete UTF-8".to_string())?;
+                    if markdown.trim().is_empty() {
+                        continue;
+                    }
+                    let id = if span.id.starts_with("manual-") {
+                        format!("manual-{}-{}", span.body_start, span.body_end)
+                    } else {
+                        span.id
+                    };
+                    messages.push(UnreadMessage {
+                        id,
+                        markdown,
+                        start: span.start,
+                        end: span.end,
+                        created_at_ms: span.created_at_ms,
+                        tool_call_count: span.tool_call_count,
+                    });
+                }
+                Ok(UnreadSnapshot {
+                    revision: transcript_revision(file, cursor)?,
+                    read_through: cursor.offset,
+                    end,
+                    messages,
+                })
+            })
+        })
+        .await
+    }
+
+    pub async fn transcript_checkpoint(self: &Arc<Self>) -> Result<TranscriptCheckpoint, String> {
+        self.run(|chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                let end = file.metadata().map_err(io_error)?.len();
+                let anchor = read_range(
+                    file,
+                    end.saturating_sub(ANCHOR_BYTES as u64),
+                    end,
+                    ANCHOR_BYTES,
+                )?;
+                Ok(TranscriptCheckpoint {
+                    revision: transcript_revision(file, cursor)?,
+                    end,
+                    anchor,
+                })
+            })
+        })
+        .await
+    }
+
+    pub async fn has_agent_message_after(
+        self: &Arc<Self>,
+        checkpoint: &TranscriptCheckpoint,
+    ) -> Result<bool, String> {
+        let checkpoint = checkpoint.clone();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                validate_checkpoint(file, &checkpoint)?;
+                Ok(spans(file)?
+                    .into_iter()
+                    .any(|span| span.role == "agent" && span.start >= checkpoint.end))
+            })
+        })
+        .await
+    }
+
+    pub async fn append_browser_answer(
+        self: &Arc<Self>,
+        action_id: &str,
+        message: &str,
+    ) -> Result<BrowserAppendReceipt, String> {
+        let id = format!("browser-{action_id}");
+        if !valid_id(action_id) || !valid_id(&id) {
+            return Err("Invalid browser action ID.".into());
+        }
+        if message.trim().is_empty() {
+            return Err("Browser answer must not be blank.".into());
+        }
+        if message.len() > MAX_UNREAD_BYTES {
+            return Err(
+                "Browser answer exceeds the 16 MiB safety ceiling; nothing was appended.".into(),
+            );
+        }
+        let message = message.to_string();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                for span in spans(file)? {
+                    if span.id != id {
+                        continue;
+                    }
+                    let existing = read_range(
+                        file,
+                        span.body_start,
+                        span.body_end,
+                        MAX_UNREAD_BYTES,
+                    )?;
+                    if span.role == "agent" && existing == message.as_bytes() {
+                        return Ok(BrowserAppendReceipt {
+                            id,
+                            end: span.end,
+                            appended: false,
+                        });
+                    }
+                    return Err(
+                        "This browser action ID already belongs to different transcript content."
+                            .into(),
+                    );
+                }
+
+                let block = agent_block_with_id(
+                    &id,
+                    &message,
+                    cursor.total_tool_calls,
+                    super::super::now_ms(),
+                );
+                file.write_all(block.as_bytes()).map_err(io_error)?;
+                let end = file.stream_position().map_err(io_error)?;
+                file.sync_all().map_err(io_error)?;
+                let same = same_file::Handle::from_file(file.try_clone().map_err(io_error)?)
+                    .and_then(|handle| {
+                        same_file::Handle::from_path(&chat.path)
+                            .map(|current| current == handle)
+                    })
+                    .map_err(io_error)?;
+                if !same {
+                    return Err(
+                        "CHAT.md changed during browser-answer persistence; reload before retrying with the same action ID."
+                            .into(),
+                    );
+                }
+                Ok(BrowserAppendReceipt {
+                    id,
+                    end,
+                    appended: true,
+                })
             })
         })
         .await
@@ -673,5 +910,102 @@ mod tests {
         chat.ensure().await.unwrap();
 
         assert_eq!(chat.clean_markdown_transcript().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn unread_snapshots_are_structured_stable_and_non_consuming() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chat/CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.ensure().await.unwrap();
+        let read_through = chat.widget_page(None, None).await.unwrap().read_through;
+        chat.append_user("structured-one".into(), "First **message**".into())
+            .await
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"manual follow-up\n")
+            .unwrap();
+
+        let first = chat.unread_snapshot().await.unwrap();
+        let second = chat.unread_snapshot().await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.read_through, read_through);
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(first.messages[0].id, "structured-one");
+        assert_eq!(first.messages[0].markdown, "First **message**");
+        assert!(first.messages[1].id.starts_with("manual-"));
+        assert_eq!(first.messages[1].markdown, "manual follow-up\n");
+        assert_eq!(
+            chat.widget_page(None, None).await.unwrap().read_through,
+            read_through
+        );
+
+        chat.read(true).await.unwrap();
+        assert!(chat.unread_snapshot().await.unwrap().messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_answers_are_idempotent_and_do_not_acknowledge_or_record_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chat/CHAT.md");
+        let chat = Arc::new(ChatFile::new(path, true));
+        chat.ensure().await.unwrap();
+        chat.record_agent_call(1000).await.unwrap();
+        chat.append_user("pending-user".into(), "Please continue".into())
+            .await
+            .unwrap();
+        let before = chat.widget_page(None, None).await.unwrap();
+        let checkpoint = chat.transcript_checkpoint().await.unwrap();
+
+        let appended = chat
+            .append_browser_answer("browser-action-one", "Visible browser answer")
+            .await
+            .unwrap();
+        assert!(appended.appended);
+        let repeated = chat
+            .append_browser_answer("browser-action-one", "Visible browser answer")
+            .await
+            .unwrap();
+        assert!(!repeated.appended);
+        assert!(
+            chat.append_browser_answer("browser-action-one", "Conflicting answer")
+                .await
+                .is_err()
+        );
+
+        let after = chat.widget_page(None, None).await.unwrap();
+        assert_eq!(after.read_through, before.read_through);
+        assert_eq!(after.delivered_through, before.delivered_through);
+        assert_eq!(after.last_agent_call_at_ms, before.last_agent_call_at_ms);
+        assert_eq!(after.total_tool_calls, before.total_tool_calls);
+        assert_eq!(after.messages.last().unwrap().role, "agent");
+        assert_eq!(
+            after.messages.last().unwrap().markdown,
+            "Visible browser answer"
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == appended.id)
+                .count(),
+            1
+        );
+        assert!(chat.has_agent_message_after(&checkpoint).await.unwrap());
+        assert_eq!(chat.read(false).await.unwrap().text, "Please continue\n\n");
+    }
+
+    #[tokio::test]
+    async fn transcript_checkpoints_detect_tool_written_agent_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let chat = Arc::new(ChatFile::new(directory.path().join("chat/CHAT.md"), true));
+        chat.ensure().await.unwrap();
+        let checkpoint = chat.transcript_checkpoint().await.unwrap();
+        assert!(!chat.has_agent_message_after(&checkpoint).await.unwrap());
+        chat.append("Tool-written answer".into()).await.unwrap();
+        assert!(chat.has_agent_message_after(&checkpoint).await.unwrap());
     }
 }
