@@ -26,6 +26,7 @@ fn fixture() -> (
     let context = ToolRequestContext {
         conversation: conversation.clone(),
         task_conversation: conversation,
+        task_owner_generation: Some(0),
         conversation_retired: false,
         connector_schema_version: None,
         conversation_schema_version: None,
@@ -41,6 +42,7 @@ fn fixture() -> (
             root.path().join("artifacts"),
         )),
         markdown_chat: Arc::new(MarkdownChatStore::default()),
+        agent_automation: None,
         cancellation: CancellationToken::new(),
     };
     (root, config, SessionState::new(), context)

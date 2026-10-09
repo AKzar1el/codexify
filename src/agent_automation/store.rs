@@ -18,6 +18,7 @@ const MAX_GOAL_RESULT_BYTES: usize = 4096;
 const MAX_CHAT_MIRROR_IDS: usize = 1024;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
+const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
 pub const PAIRING_REFERENCE_TTL_MS: u64 = 10 * 60 * 1000;
@@ -176,23 +177,57 @@ impl Default for AutomationTaskState {
 #[derive(Debug, Clone)]
 pub struct AgentAutomationStore {
     root: PathBuf,
+    pairing_index_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PairingIndexRecord {
+    task_root: String,
+    task_key: String,
 }
 
 static PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
 impl AgentAutomationStore {
     pub fn for_config(config: &AppConfig) -> Result<Self, String> {
-        Self::new(crate::memory::memory_dir(config).join("chats"))
+        let root = crate::memory::memory_dir(config).join("chats");
+        let pairing_index_root = config
+            .memory
+            .dir
+            .as_ref()
+            .map(PathBuf::from)
+            .map(|base| base.join(PAIRING_INDEX_DIR))
+            .or_else(|| crate::util::home_dir().map(|home| home.join(".codexify/browser/pairings")))
+            .unwrap_or_else(|| root.join(PAIRING_INDEX_DIR));
+        Self::new_with_pairing_index(root, pairing_index_root)
     }
 
     pub fn new(root: PathBuf) -> Result<Self, String> {
+        let pairing_index_root = root.join(PAIRING_INDEX_DIR);
+        Self::new_with_pairing_index(root, pairing_index_root)
+    }
+
+    pub fn new_with_pairing_index(
+        root: PathBuf,
+        pairing_index_root: PathBuf,
+    ) -> Result<Self, String> {
         if !root.is_absolute() {
             return Err("Agent automation state root must be absolute".into());
+        }
+        if !pairing_index_root.is_absolute() {
+            return Err("Agent automation pairing index root must be absolute".into());
         }
         if root.exists() {
             ensure_private_directory(&root, "Agent automation state root")?;
         }
-        Ok(Self { root })
+        if pairing_index_root.exists() {
+            ensure_private_directory(&pairing_index_root, "Agent automation pairing index")?;
+        }
+        Ok(Self {
+            root,
+            pairing_index_root,
+        })
     }
 
     pub fn task_directory(&self, task: &ConversationIdentity) -> Result<PathBuf, String> {
@@ -378,7 +413,14 @@ impl AgentAutomationStore {
         let candidate_url = normalize_chatgpt_url(candidate_url)?;
         let reference = generate_reference()?;
         let digest = reference_digest(&reference);
-        self.mutate(task, |state| {
+        let task_key = task.stable_key().to_string();
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            let previous_digest = state
+                .pairing
+                .pending
+                .as_ref()
+                .map(|pending| pending.reference_digest.clone());
             let generation = state
                 .pairing
                 .generation
@@ -396,7 +438,7 @@ impl AgentAutomationStore {
                 pending: Some(PendingPairing {
                     generation,
                     owner_generation,
-                    reference_digest: digest,
+                    reference_digest: digest.clone(),
                     expires_at_ms,
                 }),
             };
@@ -407,6 +449,14 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(now_ms),
                 ..Default::default()
             };
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            self.publish_pairing_index(&digest, &task_key)?;
+            if let Some(previous_digest) = previous_digest
+                && previous_digest != digest
+            {
+                let _ = self.remove_pairing_index(&previous_digest);
+            }
             Ok(PairingIssue {
                 reference,
                 generation,
@@ -454,7 +504,7 @@ impl AgentAutomationStore {
     ) -> Result<PairingState, String> {
         validate_reference(reference)?;
         let supplied_digest = reference_digest(reference);
-        self.mutate_persisting_errors(task, |state| {
+        let result = self.mutate_persisting_errors(task, |state| {
             let Some(pending) = state.pairing.pending.clone() else {
                 return Err(
                     "The agent-chat pairing reference is invalid, expired, or already used".into(),
@@ -484,7 +534,59 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.pairing.clone())
-        })
+        });
+        let _ = self.remove_pairing_index(&supplied_digest);
+        result
+    }
+
+    pub fn verify_pairing_reference(
+        &self,
+        actual_task: &ConversationIdentity,
+        owner_generation: u64,
+        reference: &str,
+        now_ms: u64,
+    ) -> Result<PairingState, String> {
+        validate_reference(reference)?;
+        let supplied_digest = reference_digest(reference);
+        let index = self.read_pairing_index(&supplied_digest)?;
+        let intended_root = PathBuf::from(&index.task_root);
+        let intended =
+            Self::new_with_pairing_index(intended_root, self.pairing_index_root.clone())?;
+        let actual_matches = actual_task.stable_key() == index.task_key;
+        let outcome = intended.with_locked_task_key(&index.task_key, |path| {
+            let mut state = load_state(path)?;
+            let Some(pending) = state.pairing.pending.clone() else {
+                return Ok(PairingReferenceOutcome::Rejected);
+            };
+            if pending.reference_digest != supplied_digest {
+                return Ok(PairingReferenceOutcome::Rejected);
+            }
+            let valid = now_ms <= pending.expires_at_ms
+                && actual_matches
+                && state.pairing.generation == pending.generation
+                && pending.owner_generation == owner_generation
+                && state.pairing.canonical_url.is_some();
+            if !valid {
+                state.pairing.pending = None;
+                validate_state(&state)?;
+                persist_state(path, &state)?;
+                return Ok(PairingReferenceOutcome::Rejected);
+            }
+            state.pairing.pending = None;
+            state.pairing.candidate_url = None;
+            state.pairing.verified_owner_generation = Some(owner_generation);
+            state.pairing.verified_at_ms = Some(now_ms);
+            state.action.status = AutomationActionStatus::Idle;
+            state.action.updated_at_ms = Some(now_ms);
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            Ok(PairingReferenceOutcome::Verified(state.pairing.clone()))
+        })?;
+        let _ = self.remove_pairing_index(&supplied_digest);
+        match outcome {
+            PairingReferenceOutcome::Verified(pairing) => Ok(pairing),
+            PairingReferenceOutcome::Rejected => Err(invalid_pairing_reference()),
+        }
     }
 
     pub fn invalidate_pairing(
@@ -535,7 +637,16 @@ impl AgentAutomationStore {
         task: &ConversationIdentity,
         action: impl FnOnce(&Path) -> Result<R, String>,
     ) -> Result<R, String> {
-        let directory = self.task_directory(task)?;
+        self.with_locked_task_key(task.stable_key(), action)
+    }
+
+    fn with_locked_task_key<R>(
+        &self,
+        task_key: &str,
+        action: impl FnOnce(&Path) -> Result<R, String>,
+    ) -> Result<R, String> {
+        validate_task_key(task_key)?;
+        let directory = self.root.join(task_key);
         ensure_private_directory(&self.root, "Agent automation state root")?;
         ensure_private_directory(&directory, "Agent automation task directory")?;
 
@@ -549,6 +660,139 @@ impl AgentAutomationStore {
             .map_err(|error| format!("Could not lock agent automation state: {error}"))?;
         action(&directory.join(STATE_FILE))
     }
+
+    fn pairing_index_path(&self, digest: &str) -> Result<PathBuf, String> {
+        if !valid_digest(digest) {
+            return Err(invalid_pairing_reference());
+        }
+        Ok(self.pairing_index_root.join(digest))
+    }
+
+    fn publish_pairing_index(&self, digest: &str, task_key: &str) -> Result<(), String> {
+        validate_task_key(task_key)?;
+        let path = self.pairing_index_path(digest)?;
+        let parent = path
+            .parent()
+            .ok_or("Pairing index has no parent directory")?;
+        ensure_private_directory(parent, "Agent automation pairing index")?;
+        let record = PairingIndexRecord {
+            task_root: self.root.to_string_lossy().into_owned(),
+            task_key: task_key.to_string(),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| format!("Could not encode agent automation pairing index: {error}"))?;
+        if bytes.len() > 8192 {
+            return Err("Agent automation pairing index is too large".into());
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| format!("Could not create agent automation pairing index: {error}"))?;
+        set_private_file_permissions(temporary.path(), "temporary agent automation pairing index")?;
+        temporary
+            .write_all(&bytes)
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|error| format!("Could not write agent automation pairing index: {error}"))?;
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = self.read_pairing_index(digest)?;
+                if existing != record {
+                    return Err("Agent automation pairing reference collision".into());
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not publish agent automation pairing index: {}",
+                    error.error
+                ));
+            }
+        }
+        set_private_file_permissions(&path, "agent automation pairing index")?;
+        Ok(())
+    }
+
+    fn read_pairing_index(&self, digest: &str) -> Result<PairingIndexRecord, String> {
+        let path = self.pairing_index_path(digest)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(invalid_pairing_reference());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect agent automation pairing index: {error}"
+                ));
+            }
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 8192 {
+            return Err("Agent automation pairing index is invalid".into());
+        }
+        validate_private_file(&metadata, "Agent automation pairing index")?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| format!("Could not open agent automation pairing index: {error}"))?;
+        let metadata = file.metadata().map_err(|error| {
+            format!("Could not inspect agent automation pairing index: {error}")
+        })?;
+        if !metadata.is_file() || metadata.len() > 8192 {
+            return Err("Agent automation pairing index is invalid".into());
+        }
+        validate_private_file(&metadata, "Agent automation pairing index")?;
+        let mut bytes = Vec::new();
+        file.take(8193)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("Could not read agent automation pairing index: {error}"))?;
+        if bytes.len() > 8192 {
+            return Err("Agent automation pairing index is too large".into());
+        }
+        let record: PairingIndexRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| "Agent automation pairing index is invalid".to_string())?;
+        if !Path::new(&record.task_root).is_absolute() {
+            return Err("Agent automation pairing index is invalid".into());
+        }
+        validate_task_key(&record.task_key)?;
+        Ok(record)
+    }
+
+    fn remove_pairing_index(&self, digest: &str) -> Result<(), String> {
+        let path = self.pairing_index_path(digest)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err("Agent automation pairing index is invalid".into());
+                }
+                std::fs::remove_file(path).map_err(|error| {
+                    format!("Could not remove agent automation pairing index: {error}")
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Could not inspect agent automation pairing index: {error}"
+            )),
+        }
+    }
+}
+
+enum PairingReferenceOutcome {
+    Verified(PairingState),
+    Rejected,
+}
+
+fn invalid_pairing_reference() -> String {
+    "The agent-chat pairing reference is invalid, expired, or already used".into()
 }
 
 fn exact_goal(state: &AutomationTaskState, expected_revision: u64) -> Result<&GoalRecord, String> {

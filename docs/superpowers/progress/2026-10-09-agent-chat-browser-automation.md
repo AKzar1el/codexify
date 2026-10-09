@@ -47,6 +47,24 @@ Implement the approved agent-chat browser automation architecture completely: re
   - notification and browser-goal offline claims are independent and persist across restart;
   - existing chat reads, writes, history, timestamps, notifications, and widget behavior remain intact in focused tests.
 - Committed that slice as `27a0d9b` (`feat: expose chat browser fallback primitives`).
+- Resumed from `2079c95`, reread the complete revised architecture, this progress
+  journal, and the 13-task implementation plan, and confirmed the working tree was
+  clean before continuing.
+- Task 5 is in progress: replace the placeholder `goal_read`, `goal_finish`, and
+  `automation_verify_pairing` handlers with task-scoped implementations, wire the
+  automation store and continuation owner generation through request context, and
+  add active-goal guidance to `get_agent_brief`.
+- Task 5's first red-green slice is now green:
+  - request context carries the current continuation owner generation and an
+    effective task-rooted automation store;
+  - `goal_read` returns the bounded revisioned goal state;
+  - `goal_finish` enforces exact revisions, completed summaries, and mandatory
+    blocked reasons with idempotent terminal receipts;
+  - `automation_verify_pairing` resolves one-time references through a private
+    digest index shared across project-state roots, consumes
+    mismatched/expired/replayed references, and exposes no URL or task identity;
+  - active goals add browser-specific `goal_read`/`goal_finish` guidance to
+    `get_agent_brief` without embedding the goal text.
 
 ## Required invariants
 
@@ -97,10 +115,38 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --test markdown_chat --test markdown_chat_tools --test markdown_chat_timestamps` — 38 passed, 1 environment-gated Apprise test ignored;
   - `cargo clippy --lib -- -D warnings` — passed;
   - `cargo fmt --all` and `git diff --check` — passed.
+- Task 5 red phase: `cargo test --test agent_automation_tools` failed on the
+  placeholder schemas, missing request-context fields, absent goal results,
+  unconsumed pairing mismatches/expiry, and absent brief guidance.
+- Task 5 targeted green phase:
+  - `cargo test --test agent_automation_tools` — 11 passed;
+  - `cargo test --test agent_automation_store` — 8 passed.
+- Cross-project pairing-index red/green phase: the new mismatch test first failed
+  because pairing references could only resolve within one project-state root;
+  `pairing_mismatch_across_project_state_roots_consumes_the_reference` now passes
+  with the private shared digest index.
+- Server-dispatch verification now proves `automation_verify_pairing` cannot bypass
+  the ordinary per-conversation setup gate, does not consume its reference while
+  unauthorized, and receives owner generation zero from the live request-context
+  path after authorization.
+- Task 5 broad verification:
+  - `cargo clippy --all-targets -- -D warnings` — passed;
+  - `cargo test --lib` — 582 passed;
+  - `cargo test --test agent_automation_store --test agent_automation_tools --test markdown_chat_tools --test tools_core --test meta_suite` — 107 passed, 1 environment-gated Apprise test ignored;
+  - `cargo fmt --all --check` and `git diff --check` — passed.
+- A focused owner-generation test now proves a pairing issued for an older
+  continuation generation is rejected and consumed rather than being silently
+  rebound to the new physical owner.
+- The pairing-reference index now has dedicated privacy and unsafe-path
+  coverage: its directory is private, records are private, filenames are SHA-256
+  digests, raw references are absent, and unsafe roots fail closed.
+- Task 5 now passes the complete library suite and all directly affected
+  integration suites; the aggregate diff was reviewed in the Codexify diff widget.
 
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
 - HEAD: `27a0d9b`
 - Working tree: clean before this progress-only update.
-- Next step: replace the placeholder goal/pairing handlers with the real task-scoped tools and request-context wiring, then add the authenticated companion client and global offline supervisor.
+- Next step: complete Task 5 with red-green tool and dispatch tests, commit it,
+  then add the authenticated companion client and global offline supervisor.

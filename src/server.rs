@@ -645,12 +645,31 @@ impl ServerHandler for CodexHandler {
         let tool = self.tools.iter().find(|t| t.name() == name);
         let model_call = !tool.is_some_and(|tool| app_only_tool(tool.as_ref()));
         let mut task_conversation = conversation.clone();
+        let mut task_owner_generation = None;
         let mut conversation_retired = false;
         let mut _model_call_guard = None;
         if let Some(physical) = conversation.as_ref() {
             if model_call {
                 match self.continuations.begin_model_call(physical) {
                     Ok((task, guard)) => {
+                        let snapshot = match self.continuations.owner_snapshot(physical) {
+                            Ok(snapshot)
+                                if snapshot.active
+                                    && snapshot.task.stable_key() == task.stable_key() =>
+                            {
+                                snapshot
+                            }
+                            Ok(_) => {
+                                return Ok(to_call_tool_result(ToolResult::error(
+                                    "Conversation ownership changed while the tool call was starting.",
+                                ))
+                                .into());
+                            }
+                            Err(error) => {
+                                return Ok(to_call_tool_result(ToolResult::error(error)).into());
+                            }
+                        };
+                        task_owner_generation = Some(snapshot.generation);
                         task_conversation = Some(task);
                         _model_call_guard = Some(guard);
                     }
@@ -661,9 +680,11 @@ impl ServerHandler for CodexHandler {
             } else {
                 match self.continuations.owner_snapshot(physical) {
                     Ok(snapshot) if snapshot.active => {
+                        task_owner_generation = Some(snapshot.generation);
                         task_conversation = Some(snapshot.task);
                     }
                     Ok(snapshot) if tool.is_some_and(|tool| tool.behavior().read_only) => {
+                        task_owner_generation = Some(snapshot.generation);
                         task_conversation = Some(snapshot.task);
                         conversation_retired = true;
                     }
@@ -780,6 +801,7 @@ impl ServerHandler for CodexHandler {
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),
             task_conversation: task_conversation.clone(),
+            task_owner_generation,
             conversation_retired,
             connector_schema_version,
             conversation_schema_version: conversation
@@ -790,6 +812,7 @@ impl ServerHandler for CodexHandler {
             project_bindings: self.project_bindings.clone(),
             diff_checkpoints: self.diff_checkpoints.clone(),
             artifact_egress: self.artifact_egress.clone(),
+            agent_automation: None,
             cancellation: context.ct.clone(),
         };
 
@@ -1066,6 +1089,27 @@ impl ServerHandler for CodexHandler {
                         }
                         Err(error) => ToolResult::error(error),
                         Ok(effective_config) => {
+                            let mut effective_context = tool_context.clone();
+                            if effective_config.markdown_chat.automation.enabled
+                                && matches!(
+                                    name.as_str(),
+                                    "automation_verify_pairing"
+                                        | "goal_read"
+                                        | "goal_finish"
+                                        | "get_agent_brief"
+                                )
+                            {
+                                match crate::agent_automation::AgentAutomationStore::for_config(
+                                    &effective_config,
+                                ) {
+                                    Ok(store) => {
+                                        effective_context.agent_automation = Some(Arc::new(store));
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(%error, "agent automation state is unavailable for this tool call");
+                                    }
+                                }
+                            }
                             let owner = match task_conversation.as_ref() {
                                 Some(identity) => DiffOwner::conversation(identity),
                                 None => DiffOwner::transport(self.session.diff_state()),
@@ -1092,7 +1136,7 @@ impl ServerHandler for CodexHandler {
                                                 args,
                                                 &effective_config,
                                                 session,
-                                                &tool_context,
+                                                &effective_context,
                                             )
                                             .await;
                                         drop(guard);
@@ -1124,7 +1168,7 @@ impl ServerHandler for CodexHandler {
                                     args,
                                     &effective_config,
                                     session,
-                                    &tool_context,
+                                    &effective_context,
                                 )
                                 .await
                             }
@@ -2529,6 +2573,7 @@ mod tests {
     include!("server_markdown_chat_widget_tests.rs");
     include!("server_workspace_tests.rs");
     include!("server_agent_ticket_tests.rs");
+    include!("server_agent_automation_tests.rs");
     include!("server_continuation_tests.rs");
 
     fn handler_with_tools(

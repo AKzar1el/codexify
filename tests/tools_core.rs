@@ -493,6 +493,7 @@ async fn clock_sleep_ends_early_when_the_mcp_request_is_cancelled() {
     let context = ToolRequestContext {
         conversation: None,
         task_conversation: None,
+        task_owner_generation: None,
         conversation_retired: false,
         connector_schema_version: None,
         conversation_schema_version: None,
@@ -506,6 +507,7 @@ async fn clock_sleep_ends_early_when_the_mcp_request_is_cancelled() {
             ArtifactEgressConfig::default(),
             dir.path().join("artifact-state"),
         )),
+        agent_automation: None,
         cancellation: cancellation.clone(),
     };
 

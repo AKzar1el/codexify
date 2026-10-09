@@ -205,6 +205,61 @@ fn pairing_references_are_random_digest_only_expiring_and_single_use() {
 }
 
 #[test]
+fn pairing_reference_index_is_private_and_digest_only() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("pairing-index");
+
+    let issued = store
+        .issue_pairing(&task, "https://chatgpt.com/c/private", 0, 1_000)
+        .unwrap();
+    let index_root = state_root.join(".pairings");
+    let entries = std::fs::read_dir(&index_root)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let index_path = entries[0].path();
+    assert_eq!(index_path.file_name().unwrap().to_string_lossy().len(), 64);
+    let stored = std::fs::read_to_string(&index_path).unwrap();
+    assert!(!stored.contains(&issued.reference));
+    assert!(stored.contains("taskRoot"));
+    assert!(stored.contains("taskKey"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            std::fs::metadata(&index_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(index_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pairing_reference_index_rejects_a_symlinked_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real-index");
+    std::fs::create_dir(&real).unwrap();
+    let link = root.path().join("index-link");
+    symlink(&real, &link).unwrap();
+
+    assert!(
+        AgentAutomationStore::new_with_pairing_index(root.path().join("automation"), link,)
+            .is_err()
+    );
+}
+
+#[test]
 fn independent_store_instances_serialize_mutations() {
     let root = tempfile::tempdir().unwrap();
     let state_root = root.path().join("automation");

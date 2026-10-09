@@ -1070,6 +1070,7 @@ mod tests {
         ToolRequestContext {
             conversation: identity.clone(),
             task_conversation: identity,
+            task_owner_generation: Some(0),
             conversation_retired: false,
             connector_schema_version: None,
             conversation_schema_version: None,
@@ -1083,6 +1084,7 @@ mod tests {
                 crate::types::ArtifactEgressConfig::default(),
                 state_root.join("artifacts"),
             )),
+            agent_automation: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
