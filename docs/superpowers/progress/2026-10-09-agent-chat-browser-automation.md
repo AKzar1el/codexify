@@ -134,6 +134,8 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --lib` — 582 passed;
   - `cargo test --test agent_automation_store --test agent_automation_tools --test markdown_chat_tools --test tools_core --test meta_suite` — 107 passed, 1 environment-gated Apprise test ignored;
   - `cargo fmt --all --check` and `git diff --check` — passed.
+- Task 6 red phase: `cargo test --test agent_automation_companion` failed because no companion protocol types or client existed.
+- Task 6 first green phase: `cargo test --test agent_automation_companion` — 6 passed.
 - A focused owner-generation test now proves a pairing issued for an older
   continuation generation is rejected and consumed rather than being silently
   rebound to the new physical owner.
@@ -142,11 +144,40 @@ Implement the approved agent-chat browser automation architecture completely: re
   digests, raw references are absent, and unsafe roots fail closed.
 - Task 5 now passes the complete library suite and all directly affected
   integration suites; the aggregate diff was reviewed in the Codexify diff widget.
+- Committed the complete Task 5 slice as `2220b1f` (`feat: add agent automation MCP tools`).
+- Resumed the task by rereading the complete 1,336-line revised architecture, this
+  progress journal, and the complete 13-task implementation plan before touching
+  the uncommitted Task 6 slice.
+- Task 6 is complete:
+  - the client loads and validates a private descriptor, live PID, IPv4-loopback
+    endpoint, protocol/build identity, and high-entropy bearer without exposing
+    the bearer, endpoint, prompts, or private response data in Debug/errors;
+  - HTTP uses no proxies or redirects, bounded JSON bodies, cancellation, request
+    deadlines, and a separately bounded event-stream idle deadline;
+  - health, login, capabilities, reveal, execute, cancel, action-state, and NDJSON
+    event APIs are implemented with strict response validation;
+  - execute ambiguity reconciles the exact action ID before any retry and never
+    invents a replacement action after possible Send acceptance;
+  - event streams enforce content type, total/line/delta bounds, action identity,
+    strictly increasing sequence numbers, typed terminal states, and cancellation.
+- Task 6's final red-green addition proved that a companion which emits a
+  nonterminal event and then stalls is terminated by the client-specific idle
+  deadline rather than hanging indefinitely.
 
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
-- HEAD: `27a0d9b`
-- Working tree: clean before this progress-only update.
-- Next step: complete Task 5 with red-green tool and dispatch tests, commit it,
-  then add the authenticated companion client and global offline supervisor.
+- HEAD: `2220b1f`
+- Working tree: Task 6 implementation and this progress update are ready to commit.
+- Next step: implement Task 7's global queue and offline supervisor with a fake
+  companion, deterministic eligibility tests, prompt construction, and fallback
+  output deduplication.
+
+## Latest verification
+
+- Task 6 red phase: the event-idle test failed because the client had no
+  independently configurable event-stream idle timeout.
+- Task 6 green verification:
+  - `cargo test --test agent_automation_companion` — 13 passed;
+  - `cargo clippy --test agent_automation_companion -- -D warnings` — passed;
+  - `cargo fmt --all --check` and `git diff --check` — passed.
