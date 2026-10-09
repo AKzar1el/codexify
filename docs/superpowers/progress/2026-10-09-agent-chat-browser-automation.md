@@ -46,6 +46,7 @@ Implement the approved agent-chat browser automation architecture completely: re
   - browser fallback appends do not acknowledge unread messages, advance delivery/read cursors, record agent activity, or alter tool counts;
   - notification and browser-goal offline claims are independent and persist across restart;
   - existing chat reads, writes, history, timestamps, notifications, and widget behavior remain intact in focused tests.
+- Committed that slice as `27a0d9b` (`feat: expose chat browser fallback primitives`).
 
 ## Required invariants
 
@@ -100,6 +101,6 @@ Implement the approved agent-chat browser automation architecture completely: re
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
-- HEAD: `8d80f66`
-- Uncommitted files: `src/markdown_chat/mod.rs`, `src/markdown_chat/offline.rs`, `src/markdown_chat/storage.rs`, and `src/markdown_chat/widget.rs`.
-- Next step: review and commit the chat-primitives slice, then replace the placeholder goal/pairing handlers with the real task-scoped tools and request context wiring.
+- HEAD: `27a0d9b`
+- Working tree: clean before this progress-only update.
+- Next step: replace the placeholder goal/pairing handlers with the real task-scoped tools and request-context wiring, then add the authenticated companion client and global offline supervisor.
