@@ -75,10 +75,12 @@ pub struct AppendReceipt {
     pub cursor_warning: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct OfflineActivity {
     pub(crate) last_call_at_ms: Option<u64>,
     pub(crate) tool_call_count: u64,
+    pub(crate) activity_epoch: Option<String>,
+    pub(crate) activity_sequence: u64,
     pub(crate) notified_for_tool_call_count: Option<u64>,
 }
 
@@ -226,6 +228,8 @@ impl ChatFile {
                 Ok(OfflineActivity {
                     last_call_at_ms: cursor.last_agent_call_at_ms,
                     tool_call_count: cursor.total_tool_calls,
+                    activity_epoch: cursor.tool_call_epoch.clone(),
+                    activity_sequence: cursor.tool_call_sequence,
                     notified_for_tool_call_count: cursor.offline_notified_for_tool_call_count,
                 })
             })

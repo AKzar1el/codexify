@@ -163,15 +163,100 @@ Implement the approved agent-chat browser automation architecture completely: re
 - Task 6's final red-green addition proved that a companion which emits a
   nonterminal event and then stalls is terminated by the client-specific idle
   deadline rather than hanging indefinitely.
+- Committed Task 6 as `25dcde5` (`feat: add browser companion protocol client`).
+- Task 7 has started with strict TDD. The first red test failed because the global
+  supervisor, task registration, executor abstraction, and selection mutation did
+  not exist. The minimal green slice now registers task handles, reads the existing
+  persisted activity clock, and proves that unread messages remain entirely on the
+  ordinary path while the task is still online; no queue entry, mirror state, or
+  companion call is created.
+- The second Task 7 red/green slice now queues an offline unread-message action
+  without requiring a goal. It snapshots the existing non-consuming unread records,
+  builds a deterministic batch identity plus fresh action/idempotency IDs, persists
+  the queued action state, and leaves the `CHAT.md` read cursor untouched.
+- The third Task 7 slice now executes a goal-only action through the executor
+  abstraction, records the accepted nudge against the persisted activity epoch, and
+  marks the active goal's automation state `stalled` when the accepted browser turn
+  produces no new model-visible Codexify tool activity. The independent persistent
+  offline claim prevents another automatic nudge in the same epoch.
+- The fourth Task 7 slice records accepted unread batches without acknowledging
+  them. Accepted message IDs and the batch/revision receipt are persisted only
+  after semantic Send acceptance, the ordinary chat cursor remains unchanged, and
+  later scans exclude those still-unread IDs so the same owner message is not
+  mirrored automatically twice.
+- The fifth Task 7 slice coalesces additional unread messages into an unsent action
+  for the same task, preserving the original action/idempotency identity while
+  recomputing the bounded batch payload. Queue ordering is now explicit:
+  pair-verification first, unread/combined work next, and goal-only work last.
+- Browser output persistence now has direct supervisor coverage: a stable final
+  answer is appended exactly once when the model did not use `chat_write`, while an
+  agent block written during the browser turn suppresses the fallback transcript
+  append. The browser final remains available only as bounded automation diagnostics
+  in that race.
+- Queued actions now carry immutable URL, owner-generation, account, catalog,
+  model, effort, and goal-revision snapshots. A changed selection invalidates the
+  old unsent action and creates a fresh action/idempotency identity rather than
+  mutating the old one in place. Queue overload leaves all chat input unread and
+  records a bounded task-local failure for the standalone UI.
+- Ambiguous accepted Sends now consume both sides of a combined action's replay
+  budget: unread message IDs are persisted as mirrored and the goal activity epoch
+  is recorded/claimed. The action remains `ambiguous`, the user input remains
+  unread, and neither the chat batch nor a derived goal-only wake is emitted again
+  automatically.
+- Companion events are now consumed concurrently with execution rather than only
+  after the action returns. Bounded transient status, commentary, and answer state
+  is queryable per stable task while generation is still running, but no delta is
+  written to `CHAT.md`; only the settled stable final participates in fallback
+  persistence.
+- A production `BrowserAutomationExecutor` now wraps the authenticated companion
+  client. Immediately before any physical Send it rechecks login/idle state,
+  account fingerprint, catalog revision, exact model, and exact available effort;
+  it streams the bounded event contract, reconciles the exact action after stream
+  failure, and never substitutes a model, account, or action identity.
+- Explicit pair-verification actions are now a first-class queue operation with the
+  highest priority. They revalidate the one-time reference without consuming it,
+  carry no chat/goal content, accept an unverified candidate URL, and record the
+  companion's canonical URL before normal pairing verification can complete. Pair
+  output is operational only and never enters `CHAT.md`.
+- The supervisor now has one long-lived background worker. Registration and explicit
+  queue operations wake it immediately; otherwise it rescans the shared task set at
+  a bounded interval, drains one global action at a time, logs task-local failures,
+  and continues to the next queued task.
+- Resumed again by rereading the complete 1,336-line revised architecture, this
+  progress journal, and the complete 13-task execution plan before reviewing the
+  uncommitted Task 7 implementation.
+- The existing 16 supervisor tests passed, but the review found six uncovered
+  fail-closed requirements. New red tests now prove the current implementation:
+  - retries unchanged pre-Send failures automatically;
+  - replays a persisted in-flight action after supervisor restart;
+  - queues more than the protocol's 128-message limit and accepts one message over
+    the 256 KiB browser-prompt ceiling instead of failing it intact;
+  - lets a stale high-priority action block the next ready action;
+  - accepts a terminal snapshot whose canonical conversation differs from the exact
+    paired URL.
+- The six review regressions are now green:
+  - unchanged pre-Send failures and persisted in-flight actions block automatic
+    replay while ordinary chat remains usable;
+  - unread batches are capped at 128 messages and 256 KiB without truncating a
+    message, with an explicit task-local failure for a single oversized message;
+  - stale queued heads are skipped so later ready work continues in the same drain;
+  - non-pair actions require the companion's terminal canonical URL to equal the
+    exact paired conversation;
+  - goal-only deduplication now uses the persisted activity epoch only after Send
+    acceptance, rather than consuming the epoch merely by entering the queue.
+- Task 7 is now implementation-complete for its planned Rust boundary. The server
+  owns one shared supervisor/worker, registers stable tasks from model-visible
+  activity, serializes one global queue, revalidates immutable execution snapshots
+  immediately before Send, and leaves online/manual agent chat unchanged.
 
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
-- HEAD: `2220b1f`
-- Working tree: Task 6 implementation and this progress update are ready to commit.
-- Next step: implement Task 7's global queue and offline supervisor with a fake
-  companion, deterministic eligibility tests, prompt construction, and fallback
-  output deduplication.
+- HEAD: `25dcde5`
+- Working tree: the reviewed Task 7 implementation, tests, server wiring, and this
+  progress update are ready to commit.
+- Next step after the Task 7 commit: implement Task 8's authenticated standalone
+  owner-chat automation API and local `/goal` command dispatch with strict TDD.
 
 ## Latest verification
 
@@ -181,3 +266,75 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --test agent_automation_companion` — 13 passed;
   - `cargo clippy --test agent_automation_companion -- -D warnings` — passed;
   - `cargo fmt --all --check` and `git diff --check` — passed.
+- Task 7 first red/green slice:
+  - red: `cargo test --test agent_automation_supervisor online_unread_messages_never_enqueue_or_call_the_companion -- --exact` failed on the missing supervisor API;
+  - green: the same test passed after adding the minimal supervisor/task/executor
+    surface and task-scoped selection mutation.
+- Task 7 offline-chat slice:
+  - red: `offline_unread_messages_enqueue_without_a_goal_and_remain_unread` failed
+    with an empty queue;
+  - green: the same test passed with one persisted `offline_chat` action and the
+    original message still unread.
+- Task 7 goal-only slice:
+  - red: `goal_only_action_runs_once_per_activity_epoch_and_stalls_without_tool_activity`
+    failed because the supervisor had no execution path;
+  - green: the action ran exactly once, emitted the fixed `offline_goal` prompt,
+    persisted `stalled`, drained the queue, and did not requeue in the same activity
+    epoch.
+- Task 7 unread-deduplication slice:
+  - red: `accepted_unread_batch_is_not_acknowledged_or_automatically_mirrored_twice`
+    found no persisted mirror receipt;
+  - green: the batch receipt and message ID were persisted after Send acceptance,
+    the message remained unread, and the same epoch did not queue it again.
+- Task 7 coalescing/priority slices:
+  - red: a second message appended before execution was absent from the queued
+    browser prompt;
+  - green: the single queued action contained both stable message IDs;
+  - red: no queue-introspection/priority contract existed;
+  - green: cross-task unread work is ordered ahead of goal-only continuation work.
+- Task 7 output-persistence regression coverage:
+  - stable browser final without `chat_write` is persisted exactly once;
+  - racing `chat_write` output remains authoritative and suppresses the duplicate
+    browser final from `CHAT.md`.
+- Task 7 invalidation/capacity slices:
+  - red: changing effort/catalog reused the queued action ID;
+  - green: the stale action was removed and a fresh identity carried the new
+    selection;
+  - red: queue exhaustion silently skipped the second task;
+  - green: exactly one task is queued at capacity one, the other records a bounded
+    queue-capacity failure, and both transcripts remain unread.
+- Task 7 ambiguous-Send slice:
+  - red: a combined ambiguous Send preserved the chat batch but left the goal epoch
+    re-armable;
+  - green: the same epoch is fully fenced and no follow-up action is queued.
+- Task 7 live-stream slice:
+  - red: no task-scoped live state existed and event consumption waited for the
+    executor to return;
+  - green: status/commentary/answer deltas are visible during the blocked fake turn,
+    remain absent from the transcript, and only the complete answer is persisted at
+    terminal settlement.
+- Task 7 production-executor slice:
+  - red: the production executor did not exist;
+  - green: a local authenticated companion fixture proves an account mismatch stops
+    before capabilities/execute and is classified as pre-Send.
+- Task 7 pair-verification slices:
+  - red: no explicit pair queue operation existed;
+  - green: pair verification outranks pending unread work and persists a queued
+    `pair_verify` action;
+  - red: an unverified pair action failed ordinary offline/verified-URL eligibility;
+  - green: it executes against the exact pending reference, records the canonical
+    URL, remains `unverified` until the MCP proof arrives, and leaves chat empty.
+- Task 7 worker slice:
+  - red: no supervisor lifecycle or wake API existed;
+  - green: a notified, already-offline task is scanned and executed by the single
+    background worker, which is aborted when its server-owned guard is dropped.
+- Task 7 review red phase: `cargo test --test agent_automation_supervisor` ran 22
+  tests; 16 passed and the six new fail-closed regression tests failed for the
+  expected missing behavior listed above.
+- Task 7 review green phase: `cargo test --test agent_automation_supervisor` — 22
+  passed.
+- Final Task 7 verification after the review fixes:
+  - `cargo test --test agent_automation_supervisor --test agent_automation_companion --test agent_automation_store --test agent_automation_tools` — 55 passed;
+  - `cargo test --lib` — 583 passed;
+  - `cargo clippy --all-targets -- -D warnings` — passed;
+  - `cargo fmt --all` and `git diff --check` — passed.

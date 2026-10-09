@@ -23,8 +23,8 @@ const MAX_EVENT_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 128 * 1024;
 const MAX_DELTA_BYTES: usize = 64 * 1024;
 const MAX_FINAL_ANSWER_BYTES: usize = 1024 * 1024;
-const MAX_PROMPT_BYTES: usize = 256 * 1024;
-const MAX_UNREAD_MESSAGES: usize = 128;
+pub(crate) const MAX_PROMPT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_UNREAD_MESSAGES: usize = 128;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 

@@ -239,6 +239,53 @@ impl AgentAutomationStore {
         self.with_locked_task(task, load_state)
     }
 
+    pub fn set_selection(
+        &self,
+        task: &ConversationIdentity,
+        model: &str,
+        effort: &str,
+        catalog_revision: &str,
+        account_fingerprint: &str,
+        now_ms: u64,
+    ) -> Result<SelectionState, String> {
+        for (value, label) in [
+            (model, "model"),
+            (effort, "effort"),
+            (catalog_revision, "catalog revision"),
+            (account_fingerprint, "account fingerprint"),
+        ] {
+            if !valid_opaque(value) {
+                return Err(format!("Agent automation {label} is invalid"));
+            }
+        }
+        self.mutate(task, |state| {
+            let account_changed = state
+                .selection
+                .account_fingerprint
+                .as_deref()
+                .is_some_and(|current| current != account_fingerprint);
+            let selection_changed = state.selection.model.as_deref() != Some(model)
+                || state.selection.effort.as_deref() != Some(effort)
+                || state.selection.catalog_revision.as_deref() != Some(catalog_revision)
+                || account_changed;
+            state.selection = SelectionState {
+                model: Some(model.to_string()),
+                effort: Some(effort.to_string()),
+                catalog_revision: Some(catalog_revision.to_string()),
+                account_fingerprint: Some(account_fingerprint.to_string()),
+            };
+            if account_changed {
+                state.pairing.verified_owner_generation = None;
+                state.pairing.verified_at_ms = None;
+                state.action.status = AutomationActionStatus::Unverified;
+                state.action.updated_at_ms = Some(now_ms);
+            } else if selection_changed && state.action.status == AutomationActionStatus::Queued {
+                state.action = AutomationActionState::default();
+            }
+            Ok(state.selection.clone())
+        })
+    }
+
     pub fn set_goal(
         &self,
         task: &ConversationIdentity,
@@ -494,6 +541,36 @@ impl AgentAutomationStore {
         })
     }
 
+    pub fn validate_pending_pairing(
+        &self,
+        task: &ConversationIdentity,
+        expected_generation: u64,
+        owner_generation: u64,
+        reference: &str,
+        now_ms: u64,
+    ) -> Result<PairingState, String> {
+        validate_reference(reference)?;
+        let digest = reference_digest(reference);
+        self.mutate_persisting_errors(task, |state| {
+            let Some(pending) = state.pairing.pending.as_ref() else {
+                return Err(invalid_pairing_reference());
+            };
+            if now_ms > pending.expires_at_ms {
+                state.pairing.pending = None;
+                return Err(invalid_pairing_reference());
+            }
+            if state.pairing.generation != expected_generation
+                || pending.generation != expected_generation
+                || pending.owner_generation != owner_generation
+                || pending.reference_digest != digest
+                || state.pairing.candidate_url.is_none()
+            {
+                return Err(invalid_pairing_reference());
+            }
+            Ok(state.pairing.clone())
+        })
+    }
+
     pub fn verify_pairing(
         &self,
         task: &ConversationIdentity,
@@ -601,6 +678,207 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Unverified;
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.pairing.clone())
+        })
+    }
+
+    pub fn queue_action(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        kind: AutomationActionKind,
+        pairing_generation: u64,
+        goal_revision: Option<u64>,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(action_id) || pairing_generation == 0 {
+            return Err("Agent automation queued action is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.pairing.generation != pairing_generation {
+                return Err("Agent automation pairing changed before the action was queued".into());
+            }
+            if kind == AutomationActionKind::PairVerify {
+                if state
+                    .pairing
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| pending.generation != pairing_generation)
+                    || state.pairing.candidate_url.is_none()
+                {
+                    return Err("Agent automation pairing request is no longer pending".into());
+                }
+            } else if state.pairing.canonical_url.is_none()
+                || state.pairing.verified_owner_generation.is_none()
+            {
+                return Err("Agent automation pairing changed before the action was queued".into());
+            }
+            match (kind, goal_revision) {
+                (
+                    AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined,
+                    Some(revision),
+                ) => {
+                    let goal = exact_goal(state, revision)?;
+                    if goal.status != GoalStatus::Active {
+                        return Err("Agent automation goal is no longer active".into());
+                    }
+                }
+                (
+                    AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined,
+                    None,
+                )
+                | (AutomationActionKind::PairVerify | AutomationActionKind::OfflineChat, Some(_)) =>
+                {
+                    return Err("Agent automation queued action has inconsistent goal state".into());
+                }
+                (AutomationActionKind::PairVerify | AutomationActionKind::OfflineChat, None) => {}
+            }
+            state.action = AutomationActionState {
+                id: Some(action_id.to_string()),
+                kind: Some(kind),
+                status: AutomationActionStatus::Queued,
+                pairing_generation: Some(pairing_generation),
+                goal_revision,
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            Ok(state.action.clone())
+        })
+    }
+
+    pub fn record_queue_failure(
+        &self,
+        task: &ConversationIdentity,
+        kind: AutomationActionKind,
+        pairing_generation: u64,
+        goal_revision: Option<u64>,
+        message: &str,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if pairing_generation == 0 || !bounded_private(message) || message.trim().is_empty() {
+            return Err("Agent automation queue failure is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.pairing.generation != pairing_generation {
+                return Err(
+                    "Agent automation pairing changed before queue failure reporting".into(),
+                );
+            }
+            state.action = AutomationActionState {
+                kind: Some(kind),
+                status: AutomationActionStatus::Failed,
+                pairing_generation: Some(pairing_generation),
+                goal_revision,
+                last_error: Some(message.to_string()),
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            Ok(state.action.clone())
+        })
+    }
+
+    pub fn update_action_status(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        status: AutomationActionStatus,
+        error: Option<&str>,
+        stable_answer: Option<&str>,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(action_id)
+            || error.is_some_and(|value| !bounded_private(value))
+            || stable_answer.is_some_and(|value| value.len() > MAX_PRIVATE_TEXT_BYTES)
+        {
+            return Err("Agent automation action update is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id) {
+                return Err("Agent automation action changed before its status update".into());
+            }
+            state.action.status = status;
+            state.action.last_error = error.map(str::to_string);
+            if let Some(answer) = stable_answer {
+                state.action.last_stable_answer = Some(answer.to_string());
+            }
+            state.action.updated_at_ms = Some(now_ms);
+            Ok(state.action.clone())
+        })
+    }
+
+    pub fn record_goal_nudge(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        activity_epoch: &str,
+        activity_sequence: u64,
+        now_ms: u64,
+    ) -> Result<GoalWakeState, String> {
+        if !valid_opaque(action_id) || !valid_opaque(activity_epoch) {
+            return Err("Agent automation goal nudge is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id)
+                || !matches!(
+                    state.action.kind,
+                    Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined)
+                )
+            {
+                return Err(
+                    "Agent automation goal nudge no longer matches the current action".into(),
+                );
+            }
+            state.goal_wake.activity_epoch = Some(activity_epoch.to_string());
+            state.goal_wake.activity_sequence = Some(activity_sequence);
+            state.goal_wake.nudged_epoch = Some(activity_epoch.to_string());
+            state.goal_wake.nudged_sequence = Some(activity_sequence);
+            state.goal_wake.last_nudged_at_ms = Some(now_ms);
+            Ok(state.goal_wake.clone())
+        })
+    }
+
+    pub fn record_accepted_batch(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        batch_id: &str,
+        message_ids: &[String],
+        transcript_revision: &str,
+        now_ms: u64,
+    ) -> Result<ChatMirrorState, String> {
+        if !valid_opaque(action_id)
+            || !valid_opaque(batch_id)
+            || message_ids.is_empty()
+            || message_ids.len() > MAX_CHAT_MIRROR_IDS
+            || message_ids.iter().any(|id| !valid_opaque(id))
+            || !bounded_private(transcript_revision)
+        {
+            return Err("Agent automation accepted chat batch is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id)
+                || !matches!(
+                    state.action.kind,
+                    Some(AutomationActionKind::OfflineChat | AutomationActionKind::OfflineCombined)
+                )
+            {
+                return Err(
+                    "Agent automation chat batch no longer matches the current action".into(),
+                );
+            }
+            let mut accepted = state.chat_mirror.message_ids.clone();
+            for id in message_ids {
+                if !accepted.contains(id) {
+                    accepted.push(id.clone());
+                }
+            }
+            if accepted.len() > MAX_CHAT_MIRROR_IDS {
+                return Err("Agent automation accepted chat history is full".into());
+            }
+            state.chat_mirror.last_accepted_batch_id = Some(batch_id.to_string());
+            state.chat_mirror.message_ids = accepted;
+            state.chat_mirror.transcript_revision_at_start = Some(transcript_revision.to_string());
+            state.action.updated_at_ms = Some(now_ms);
+            Ok(state.chat_mirror.clone())
         })
     }
 
