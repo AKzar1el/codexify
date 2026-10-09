@@ -248,15 +248,18 @@ Implement the approved agent-chat browser automation architecture completely: re
   owns one shared supervisor/worker, registers stable tasks from model-visible
   activity, serializes one global queue, revalidates immutable execution snapshots
   immediately before Send, and leaves online/manual agent chat unchanged.
+- Committed Task 7 as `b1d2daa` (`feat: supervise offline browser chat actions`).
+- Task 8 has started: add the authenticated standalone owner-chat automation API,
+  exact local `/goal` command parsing, and standalone-only controls without exposing
+  companion credentials or browser controls to the embedded ChatGPT widget.
 
 ## Current checkout state
 
 - Branch: `feat/agent-chat-browser-automation`
-- HEAD: `25dcde5`
-- Working tree: the reviewed Task 7 implementation, tests, server wiring, and this
-  progress update are ready to commit.
-- Next step after the Task 7 commit: implement Task 8's authenticated standalone
-  owner-chat automation API and local `/goal` command dispatch with strict TDD.
+- HEAD: `b1d2daa`
+- Working tree: only this live Task 8 progress update is uncommitted.
+- Next step: write the first failing owner-chat API and `/goal` command tests, then
+  implement only the minimum authenticated Rust surface needed to make them pass.
 
 ## Latest verification
 
