@@ -22,7 +22,13 @@ Implement the approved agent-chat browser automation architecture completely: re
 - Cloned the exact upstream browser reference into `/tmp/codex-chatgpt-web-v6.1.7` at `f9ad4ae83a579287105ad822dd0c3e0029b04ef6`.
 - Wrote and self-reviewed the detailed TDD plan at `docs/superpowers/plans/2026-10-09-agent-chat-browser-automation.md`.
 - The first baseline build on the external `/Volumes/data` target stalled in uninterruptible filesystem I/O and was cancelled without a test result. The same suite was rerun with a fresh isolated target under `/tmp` and passed completely.
-- No production implementation has been written yet.
+- Committed the approved architecture, executable plan, and initial progress journal as `a00c297` (`docs: plan agent chat browser automation`).
+- Implemented the first configuration/schema slice:
+  - added `agentChat.automation` defaults and validation;
+  - added the stable `+agent-automation-v1` connector marker;
+  - advertised `automation_verify_pairing`, `goal_read`, and `goal_finish` whenever agent chat is enabled, independent of the runtime automation toggle;
+  - added initial disabled-state tool contracts;
+  - increased connector-version marker bounds from 64 to 128 bytes so the explicit feature marker remains lossless.
 
 ## Required invariants
 
@@ -53,3 +59,11 @@ Implement the approved agent-chat browser automation architecture completely: re
 
 - Baseline passed: `CARGO_TARGET_DIR=/tmp/codexify-target-agent-automation-1791553656 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only cargo test --all` (exit 0; 576 library tests plus every integration and doc-test target passed; only explicitly environment-gated tests were ignored).
 - `git diff --check` passed for the implementation plan.
+- Red phase: `cargo test --test markdown_chat agent_chat_automation_defaults_overrides_and_validation -- --exact` failed because `MarkdownChatConfig` had no `automation` field.
+- Green configuration/schema verification:
+  - `cargo test --test markdown_chat` — 15 passed;
+  - `cargo test --test meta_suite` — 39 passed;
+  - `cargo test --lib config::tests::shipped_config_examples_track_the_complete_supported_surface` — passed;
+  - `cargo test --lib tools::setup::tests::feature_toggles_require_reload_then_a_new_conversation` — passed;
+  - connector marker and 128-byte setup marker tests — passed;
+  - `cargo fmt --all` and `git diff --check` — passed.

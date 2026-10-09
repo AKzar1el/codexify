@@ -12,7 +12,14 @@
     "enabled": false,
     "port": 3120,
     "maxWaitMs": 55000,
-    "notifications": null
+    "notifications": null,
+    "automation": {
+      "enabled": false,
+      "descriptorPath": "~/.codexify/browser/descriptor.json",
+      "connectorName": "Codexify",
+      "maxQueuedActions": 64,
+      "autoApproveToolCalls": false
+    }
   },
   "apiKey": null,
   "conversationAuthToken": null,

@@ -779,7 +779,7 @@ impl ServerHandler for CodexHandler {
         let reported_schema = (name == AUTHORIZATION_TOOL_WIRE_NAME)
             .then(|| args.get("connectorVersion").and_then(Value::as_str))
             .flatten()
-            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
             .map(str::to_owned);
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),

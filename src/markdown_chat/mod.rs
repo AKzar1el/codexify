@@ -30,6 +30,57 @@ pub const MAX_UNREAD_BYTES: usize = 16 * 1024 * 1024;
 pub const USER_MESSAGE_FIELD: &str = "new_chat_message_from_user";
 pub const AWAY_AFTER_MS: u64 = 180_000;
 pub const OFFLINE_AFTER_MS: u64 = 300_000;
+pub const DEFAULT_AUTOMATION_DESCRIPTOR_PATH: &str = "~/.codexify/browser/descriptor.json";
+pub const DEFAULT_AUTOMATION_CONNECTOR_NAME: &str = "Codexify";
+pub const DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentAutomationConfig {
+    pub enabled: bool,
+    pub descriptor_path: String,
+    pub connector_name: String,
+    pub max_queued_actions: usize,
+    pub auto_approve_tool_calls: bool,
+}
+
+impl Default for AgentAutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            descriptor_path: DEFAULT_AUTOMATION_DESCRIPTOR_PATH.into(),
+            connector_name: DEFAULT_AUTOMATION_CONNECTOR_NAME.into(),
+            max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
+            auto_approve_tool_calls: false,
+        }
+    }
+}
+
+impl AgentAutomationConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.descriptor_path.trim().is_empty()
+            || self.descriptor_path.len() > 4096
+            || self.descriptor_path.contains('\0')
+        {
+            return Err(
+                "agentChat.automation.descriptorPath must be a nonempty path up to 4096 bytes"
+                    .into(),
+            );
+        }
+        if self.connector_name.trim().is_empty()
+            || self.connector_name.len() > 128
+            || self.connector_name.chars().any(char::is_control)
+        {
+            return Err(
+                "agentChat.automation.connectorName must be 1 to 128 visible characters".into(),
+            );
+        }
+        if !(1..=1024).contains(&self.max_queued_actions) {
+            return Err("agentChat.automation.maxQueuedActions must be between 1 and 1024".into());
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -46,6 +97,7 @@ pub struct MarkdownChatConfig {
     pub port: Option<u16>,
     pub max_wait_ms: u64,
     pub notifications: Option<NotificationsConfig>,
+    pub automation: AgentAutomationConfig,
 }
 
 impl Default for MarkdownChatConfig {
@@ -55,6 +107,7 @@ impl Default for MarkdownChatConfig {
             port: Some(DEFAULT_OWNER_CHAT_PORT),
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
             notifications: None,
+            automation: AgentAutomationConfig::default(),
         }
     }
 }
@@ -123,6 +176,12 @@ impl MarkdownChatConfig {
         if let Some(notifications) = &self.notifications {
             notifications.validate()?;
         }
+        if self.automation.enabled && !self.enabled {
+            return Err(
+                "agentChat.automation.enabled requires agentChat.enabled to be true".into(),
+            );
+        }
+        self.automation.validate()?;
         Ok(())
     }
 }

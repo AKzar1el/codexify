@@ -2329,7 +2329,13 @@ mod tests {
             ("memory", &["dir", "enabled", "maxBytes"]),
             (
                 "agentChat",
-                &["enabled", "maxWaitMs", "notifications", "port"],
+                &[
+                    "automation",
+                    "enabled",
+                    "maxWaitMs",
+                    "notifications",
+                    "port",
+                ],
             ),
             ("skills", &["dirs", "enabled", "includePlugins"]),
             ("codexMcp", &["cliPath", "enabled", "useCli"]),
@@ -2337,6 +2343,17 @@ mod tests {
         ] {
             assert_keys(&example[path], path, keys);
         }
+        assert_keys(
+            &example["agentChat"]["automation"],
+            "agentChat.automation",
+            &[
+                "autoApproveToolCalls",
+                "connectorName",
+                "descriptorPath",
+                "enabled",
+                "maxQueuedActions",
+            ],
+        );
         assert_keys(
             &example["agentChat"]["notifications"],
             "agentChat.notifications",

@@ -94,6 +94,13 @@
     "enabled": false,
     "port": 3120,
     "maxWaitMs": 55000,
+    "automation": {
+      "enabled": false,
+      "descriptorPath": "~/.codexify/browser/descriptor.json",
+      "connectorName": "Codexify",
+      "maxQueuedActions": 64,
+      "autoApproveToolCalls": false
+    },
     "notifications": {
       "urls": ["ntfys://ntfy.example/codexify?image=no"],
       "pythonPath": "python3",
