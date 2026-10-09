@@ -41,9 +41,7 @@ use crate::audit::{
 use crate::auth::{generate_internal_bearer_token, require_auth};
 use crate::bridged_resources::{BRIDGED_RESOURCE_URI_PREFIX, BridgedResourceStore};
 use crate::conversation_auth::{AUTHORIZATION_TOOL_WIRE_NAME, ConversationAuthorizationStore};
-use crate::conversation_continuations::{
-    ConversationContinuationStore, ConversationOwnership, RETIRED_MESSAGE,
-};
+use crate::conversation_continuations::{ConversationContinuationStore, RETIRED_MESSAGE};
 use crate::diff::{DiffAvailability, DiffCheckpointManager, DiffOwner};
 use crate::diff_ui;
 use crate::exec_sessions::{ConversationExecSessionStore, SessionState};
@@ -661,17 +659,15 @@ impl ServerHandler for CodexHandler {
                     }
                 }
             } else {
-                match self.continuations.resolve(physical) {
-                    Ok(ConversationOwnership::Active { task }) => {
-                        task_conversation = Some(task);
+                match self.continuations.owner_snapshot(physical) {
+                    Ok(snapshot) if snapshot.active => {
+                        task_conversation = Some(snapshot.task);
                     }
-                    Ok(ConversationOwnership::Retired { task })
-                        if tool.is_some_and(|tool| tool.behavior().read_only) =>
-                    {
-                        task_conversation = Some(task);
+                    Ok(snapshot) if tool.is_some_and(|tool| tool.behavior().read_only) => {
+                        task_conversation = Some(snapshot.task);
                         conversation_retired = true;
                     }
-                    Ok(ConversationOwnership::Retired { .. }) => {
+                    Ok(_) => {
                         return Ok(to_call_tool_result(ToolResult::error(RETIRED_MESSAGE)).into());
                     }
                     Err(error) => {

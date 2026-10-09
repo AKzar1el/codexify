@@ -29,6 +29,14 @@ Implement the approved agent-chat browser automation architecture completely: re
   - advertised `automation_verify_pairing`, `goal_read`, and `goal_finish` whenever agent chat is enabled, independent of the runtime automation toggle;
   - added initial disabled-state tool contracts;
   - increased connector-version marker bounds from 64 to 128 bytes so the explicit feature marker remains lossless.
+- Implemented secure task-scoped automation state:
+  - versioned private `automation.json` records beside stable task chat state;
+  - cross-process file locks plus process-local serialization across store instances;
+  - atomic bounded JSON persistence, symlink/type/owner/mode checks, and fail-closed corruption handling;
+  - 10 KiB revisioned goal lifecycle with `configured`, `active`, `completed`, `blocked`, and `error` states only;
+  - exact-revision completion, mandatory blocked reasons, terminal idempotency, stop/clear semantics, and no pause/resume state;
+  - random digest-only one-time pairing references with expiry, canonical URL staging, owner-generation binding, replay rejection, and single use;
+  - continuation owner snapshots exposing only stable hashes and generation, now used by server dispatch for active/retired routing.
 
 ## Required invariants
 
@@ -66,4 +74,10 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `cargo test --lib config::tests::shipped_config_examples_track_the_complete_supported_surface` — passed;
   - `cargo test --lib tools::setup::tests::feature_toggles_require_reload_then_a_new_conversation` — passed;
   - connector marker and 128-byte setup marker tests — passed;
+  - `cargo fmt --all` and `git diff --check` — passed.
+- Store red phase: `cargo test --test agent_automation_store` failed because `codexify::agent_automation` did not exist.
+- Store green verification:
+  - `cargo test --test agent_automation_store` — 6 passed;
+  - `cargo test --lib conversation_continuations` — 8 passed;
+  - `cargo clippy --test agent_automation_store -- -D warnings` — passed;
   - `cargo fmt --all` and `git diff --check` — passed.
