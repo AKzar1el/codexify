@@ -809,6 +809,55 @@ Structured primitives — cheaper and safer than shelling out for the same job, 
 | `list_directory` | List files and directories with name, type, and size |
 | `tree` | Print directory tree as ASCII art |
 
+`grep`, `glob`, `tree`, `list_directory` and `read_file` run filesystem work in
+child processes, entered before runtime/config discovery. Worker spawning is
+also off the HTTP threads. Their optional `timeoutMs` defaults to 30,000 ms and
+accepts 1–120,000 ms, including queue, spawn and execution time. Timeout,
+cancellation or an abandoned request terminates the owned worker. Cleanup waits
+at most one extra second; if the OS delays exit, the worker slot stays reserved
+until an asynchronous reaper collects it. No external `grep` or `rg` is required.
+
+The optional `filesystem` configuration controls the shared pool and input-work
+limits independently of output limits:
+
+```json
+{
+  "filesystem": {
+    "maxConcurrentWorkers": 4,
+    "maxPendingRequests": 16,
+    "maxScanBytes": 67108864,
+    "maxScanEntries": 100000,
+    "maxLineBytes": 1048576
+  }
+}
+```
+
+The pool is shared across conversations in one service. A full pending queue
+fails immediately. Byte limits count file contents actually read, entry limits
+bound directory enumeration, and oversized input lines retain only a bounded
+prefix. Incomplete scans are explicitly marked. Grep retains bounded context;
+large `read_file` requests stop after their requested window and lookahead,
+without allocating or decoding the whole file. Small files retain exact total
+line counts for compatibility.
+
+Empty `write_stdin` polls do not acquire the mutation checkpoint lock. Calls
+that send input checkpoint before sending it, release the lock before the
+output wait, and remain cancellable. Output-wait cancellation leaves the resident
+command session available. Reads use a completed-baseline fast path and never
+queue behind an active mutation. The first uncontended baseline initialization
+is bounded; actual mutations still fail closed if checkpoint capture fails.
+`diff.commandTimeoutMs` defaults to 30,000 ms (allowed range 1–120,000), bounding
+checkpoint initialization, lock waits and Git commands. Timed-out Git helpers
+are killed; Unix process groups also terminate their owned filter descendants.
+Checkpoint stdout is bounded at 32 MiB and diagnostics at 64 KiB.
+
+Audit records include `tool_stage` start/finish events and `tool_worker` PIDs,
+linked by call and run IDs. Queue, spawn, filesystem execution/cleanup,
+checkpoint, command-output and upstream waits can be distinguished without
+retaining raw payloads or tickets. `/health` includes filesystem slot/queue
+counts and connected upstream runtime status from memory; it performs no remote
+probe or filesystem scan itself.
+
 When `conversationAuthToken` is configured, one authorization gate tool is added
 ahead of the protected tools:
 
@@ -2498,7 +2547,9 @@ For an upstream imported from Codex, the overlay alone is sufficient; an upstrea
 - `disabledTools: ["dangerous_write", ...]` removes tools after the allow-list.
 - `cwd` selects a stdio child process's working directory.
 - `startupTimeoutSec` bounds initialization plus complete paginated `tools/list`; the default is 20 seconds.
-- `toolTimeoutSec` bounds each forwarded call and sends MCP cancellation when the limit expires.
+- `toolTimeoutSec` bounds the complete forwarded call, including queue and send time; the default is 60 seconds. Timeout/cancellation sends a bounded cancellation notification and reports upstream completion as unconfirmed.
+- `requestLimits` optionally configures one shared admission controller per upstream: `maxConcurrentRequests` (default 4), `maxPendingRequests` (16), `failureThreshold` (3), `recoveryDelayMs` (30000), and `slowCancellationMs` (60000). Full queues fail immediately. Repeated transport/deadline failures or prolonged unconfirmed cancellations pause new calls. After the pause, one newly requested recovery call is allowed; prior calls are never automatically retried.
+- Background protocol liveness probes run every 5 seconds with a 2-second bound. Any protocol response proves liveness, including an error when legacy ping is unsupported. Repeated missing responses mark the connection unresponsive and release active waits with completion-unconfirmed errors. A responding connection clears the pause. This does not kill shared upstream processes or database workers. `mcp_list_sources` and `/health` expose the cached state, active/queued counts, failures and retry delay.
 - `type` is inferred: `command` means `"stdio"`, while `url` means Streamable HTTP. Explicit HTTP aliases `"http"`, `"streamable-http"`, and `"streamable_http"` are accepted.
 - SSE and WebSocket transports are rejected; supported upstream transports are stdio and Streamable HTTP.
 

@@ -4,7 +4,11 @@
 use serde_json::json;
 use tempfile::TempDir;
 
-use codexify::config::default_config;
+fn default_config(root: std::path::PathBuf) -> codexify::types::AppConfig {
+    let mut config = codexify::config::default_config(root);
+    config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
+    config
+}
 use codexify::exec_sessions::{SessionState, ShellType, resolve_shell, shell_type_of};
 use codexify::tool::{Tool, arg_u64};
 use codexify::tools::glob::Glob;
@@ -47,7 +51,7 @@ async fn glob_and_grep_empty_path_falls_back_to_workdir() {
     );
     assert!(g.joined_text().contains("a.ts"));
 
-    let r = Grep
+    let r = Grep::new(env!("CARGO_BIN_EXE_codexify").into())
         .call(json!({ "pattern": "TODO", "path": "" }), &config, &session)
         .await;
     assert!(

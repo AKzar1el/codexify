@@ -143,8 +143,21 @@ fn run_projects_list(cli: &Cli, args: &ProjectsListArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn main() {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(codexify::tools::grep::WORKER_ARGUMENT))
+    {
+        if let Err(error) = codexify::tools::grep::run_worker() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    run_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run_main() {
     // We build reqwest with `rustls-no-provider`, so a rustls crypto provider
     // must be installed process-wide before any HTTP client is built. Every
     // client factory installs it too, but do it once up front so any client

@@ -26,6 +26,7 @@ use tempfile::TempDir;
 
 fn multi_project_config(access_root: &std::path::Path) -> codexify::types::AppConfig {
     let mut config = default_config(access_root.to_path_buf());
+    config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
     config.multi_project = true;
     config.worktrees.mode = WorktreeMode::Never;
     config.skills.enabled = Some(false);

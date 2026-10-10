@@ -64,8 +64,16 @@
     "maxEntries": 500,
     "maxTreeNodes": 1000
   },
+  "filesystem": {
+    "maxConcurrentWorkers": 4,
+    "maxPendingRequests": 16,
+    "maxScanBytes": 67108864,
+    "maxScanEntries": 100000,
+    "maxLineBytes": 1048576
+  },
   "diff": {
-    "maxPatchBytes": 4194304
+    "maxPatchBytes": 4194304,
+    "commandTimeoutMs": 30000
   },
   "toolLogging": {
     "mode": "off",

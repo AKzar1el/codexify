@@ -256,6 +256,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// The tool checkpoints its own short mutation phase, leaving later waits
+    /// outside the workspace lock (for example, writing stdin then polling).
+    fn manages_project_checkpoint(&self) -> bool {
+        false
+    }
+
     /// Run the tool. `args` is the arguments object (or `Value::Null` when the
     /// call named none).
     async fn call(&self, args: Value, config: &AppConfig, session: &SessionState) -> ToolResult;
@@ -473,6 +479,10 @@ impl Tool for ValidatedTool {
 
     fn may_modify_project(&self) -> bool {
         self.inner.may_modify_project()
+    }
+
+    fn manages_project_checkpoint(&self) -> bool {
+        self.inner.manages_project_checkpoint()
     }
 
     async fn call(&self, args: Value, config: &AppConfig, session: &SessionState) -> ToolResult {

@@ -12,7 +12,7 @@ use rmcp::service::Peer;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::forward_tool_call;
+use crate::bridge::{UpstreamCallContext, forward_tool_call};
 use crate::bridged_resources::BridgedResourceStore;
 use crate::exec_sessions::SessionState;
 use crate::tool::{Tool, ToolBehavior, ToolCallIdentity, ToolRequestContext};
@@ -39,6 +39,7 @@ pub(crate) struct CatalogSourceInput {
     pub tools: Vec<McpTool>,
     pub peer: Peer<RoleClient>,
     pub tool_timeout: Option<Duration>,
+    pub control: Arc<crate::upstream_control::UpstreamControl>,
 }
 
 struct CatalogTool {
@@ -57,6 +58,7 @@ struct CatalogSource {
     tool_by_id: HashMap<String, usize>,
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
+    control: Arc<crate::upstream_control::UpstreamControl>,
 }
 
 struct SearchDocument {
@@ -125,6 +127,7 @@ impl Catalog {
                 tool_by_id,
                 peer: input.peer,
                 tool_timeout: input.tool_timeout,
+                control: input.control,
             });
         }
 
@@ -202,6 +205,7 @@ impl Catalog {
         value.insert("transport".into(), Value::String(source.transport.clone()));
         value.insert("exposure".into(), Value::String("catalog".into()));
         value.insert("toolCount".into(), json!(source.tools.len()));
+        value.insert("runtimeStatus".into(), source.control.snapshot());
         if let Some(implementation) = &source.implementation
             && let Ok(serialized) = serde_json::to_value(implementation)
         {
@@ -704,6 +708,7 @@ fn source_summary_schema() -> Value {
             "transport": { "type": "string" },
             "exposure": { "type": "string", "const": "catalog" },
             "toolCount": { "type": "integer", "minimum": 0 },
+            "runtimeStatus": { "type": "object" },
             "implementation": implementation,
             "instructions": { "type": "string" }
         },
@@ -1049,7 +1054,10 @@ impl McpCallToolTool {
             tool.raw.name.as_ref(),
             source.tool_timeout,
             cancellation,
-            &self.resources,
+            UpstreamCallContext {
+                resources: &self.resources,
+                control: &source.control,
+            },
         )
         .await
     }

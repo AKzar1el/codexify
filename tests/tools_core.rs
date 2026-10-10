@@ -14,7 +14,11 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use codexify::artifact_egress::ArtifactEgressStore;
-use codexify::config::default_config;
+fn default_config(root: std::path::PathBuf) -> codexify::types::AppConfig {
+    let mut config = codexify::config::default_config(root);
+    config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
+    config
+}
 use codexify::conversation_auth::ConversationAuthorizationStore;
 use codexify::diff::DiffCheckpointManager;
 use codexify::exec_sessions::SessionState;

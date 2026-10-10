@@ -18,6 +18,8 @@ pub struct ListDirectory;
 struct ListDirectoryArgs {
     /// Project-relative directory. Defaults to the project root.
     path: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
 }
 
 #[async_trait]
@@ -53,7 +55,42 @@ impl Tool for ListDirectory {
     }
 
     async fn call(&self, args: Value, config: &AppConfig, _session: &SessionState) -> ToolResult {
-        let ListDirectoryArgs { path } = match parse_tool_args(args) {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::ListDirectory,
+                args,
+                config,
+                &tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+    }
+    async fn call_with_context(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        _session: &SessionState,
+        context: &crate::tool::ToolRequestContext,
+    ) -> ToolResult {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::ListDirectory,
+                args,
+                config,
+                &context.cancellation,
+                None,
+            )
+            .await
+    }
+}
+impl ListDirectory {
+    pub(crate) fn run_inner(args: Value, config: &AppConfig) -> ToolResult {
+        let ListDirectoryArgs {
+            path,
+            _timeout_ms: _,
+        } = match parse_tool_args(args) {
             Ok(args) => args,
             Err(error) => return *error,
         };
@@ -73,22 +110,23 @@ impl Tool for ListDirectory {
         // otherwise-visible directory.
         let target_ignored = ig.is_ignored(&dir_path, true);
 
-        let mut rd = match tokio::fs::read_dir(&dir_path).await {
+        let mut rd = match std::fs::read_dir(&dir_path) {
             Ok(r) => r,
             Err(e) => return ToolResult::error(e.to_string()),
         };
 
         let mut all: Vec<(String, bool)> = Vec::new();
-        loop {
-            match rd.next_entry().await {
-                Ok(Some(entry)) => {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                    all.push((name, is_dir));
-                }
-                Ok(None) => break,
-                Err(e) => return ToolResult::error(e.to_string()),
+        for entry in rd.by_ref() {
+            if !crate::filesystem::visit_entry() {
+                break;
             }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return ToolResult::error(error.to_string()),
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            all.push((name, is_dir));
         }
 
         all.retain(|(name, is_dir)| {
@@ -105,7 +143,7 @@ impl Tool for ListDirectory {
             if *is_dir {
                 lines.push(format!("dir\t-\t{name}/"));
             } else {
-                let meta = match tokio::fs::metadata(dir_path.join(name)).await {
+                let meta = match std::fs::metadata(dir_path.join(name)) {
                     Ok(m) => m,
                     Err(e) => return ToolResult::error(e.to_string()),
                 };

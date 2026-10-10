@@ -1,11 +1,12 @@
 //! Project-scoped Git diff checkpoints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,7 @@ const LEGACY_CODEX_FREE_PROJECT_SCOPE_HASH_DOMAIN: &[u8] = b"codex-free/review-p
 const SYNTHETIC_IDENTITY_NAME: &str = "Codexify Diff";
 const SYNTHETIC_IDENTITY_EMAIL: &str = "diff@codexify.local";
 const MAX_GIT_ERROR_BYTES: usize = 64 * 1024;
+const MAX_GIT_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 const DIFF_ALGORITHM: &str = "--diff-algorithm=histogram";
 
 static TRANSPORT_DIFF_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -257,6 +259,7 @@ pub struct DiffMutationGuard {
 #[derive(Default)]
 pub struct DiffCheckpointManager {
     locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    initialized: StdMutex<HashSet<String>>,
 }
 
 impl DiffCheckpointManager {
@@ -264,16 +267,65 @@ impl DiffCheckpointManager {
         Self::default()
     }
 
+    /// Completed baselines are a read fast path. Reads never queue behind an
+    /// executing mutation; the first uncontended initialization stays bounded.
+    pub async fn ensure_initialized_for_read(
+        &self,
+        config: &AppConfig,
+        owner: DiffOwner,
+    ) -> Result<DiffAvailability, String> {
+        let root = canonical_project_root(&config.work_dir)?;
+        let key = owner.lock_key(&hash_path(&root));
+        if self.initialized.lock().unwrap().contains(&key) {
+            return Ok(DiffAvailability::Ready);
+        }
+        let Ok(_guard) = self.scope_lock(&key).try_lock_owned() else {
+            return Ok(DiffAvailability::Unavailable(
+                "Diff checkpoint busy; reads remain available.".into(),
+            ));
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(config.diff.command_timeout_ms),
+            Self::ensure_initialized_locked(config, &owner, root),
+        )
+        .await
+        .map_err(|_| {
+            "Diff baseline initialization timed out; reads remain available.".to_string()
+        })??;
+        if matches!(result, DiffAvailability::Ready) {
+            self.initialized.lock().unwrap().insert(key);
+        }
+        Ok(result)
+    }
+
     pub async fn ensure_initialized(
+        &self,
+        config: &AppConfig,
+        owner: DiffOwner,
+    ) -> Result<DiffAvailability, String> {
+        tokio::time::timeout(
+            Duration::from_millis(config.diff.command_timeout_ms),
+            self.ensure_initialized_inner(config, owner),
+        )
+        .await
+        .map_err(|_| "Diff checkpoint initialization timed out.".to_string())?
+    }
+
+    async fn ensure_initialized_inner(
         &self,
         config: &AppConfig,
         owner: DiffOwner,
     ) -> Result<DiffAvailability, String> {
         let project_root = canonical_project_root(&config.work_dir)?;
         let workspace_key = hash_path(&project_root);
-        let lock = self.scope_lock(&owner.lock_key(&workspace_key));
+        let key = owner.lock_key(&workspace_key);
+        let lock = self.scope_lock(&key);
         let _guard = lock.lock().await;
-        Self::ensure_initialized_locked(config, &owner, project_root).await
+        let result = Self::ensure_initialized_locked(config, &owner, project_root).await?;
+        if matches!(result, DiffAvailability::Ready) {
+            self.initialized.lock().unwrap().insert(key);
+        }
+        Ok(result)
     }
 
     pub async fn begin_mutation(
@@ -281,11 +333,30 @@ impl DiffCheckpointManager {
         config: &AppConfig,
         owner: DiffOwner,
     ) -> Result<(DiffAvailability, DiffMutationGuard), String> {
+        tokio::time::timeout(
+            Duration::from_millis(config.diff.command_timeout_ms),
+            self.begin_mutation_inner(config, owner),
+        )
+        .await
+        .map_err(|_| {
+            "Timed out waiting for the diff checkpoint; mutation was not dispatched.".to_string()
+        })?
+    }
+
+    async fn begin_mutation_inner(
+        &self,
+        config: &AppConfig,
+        owner: DiffOwner,
+    ) -> Result<(DiffAvailability, DiffMutationGuard), String> {
         let project_root = canonical_project_root(&config.work_dir)?;
         let workspace_key = hash_path(&project_root);
-        let lock = self.scope_lock(&owner.lock_key(&workspace_key));
+        let key = owner.lock_key(&workspace_key);
+        let lock = self.scope_lock(&key);
         let guard = lock.lock_owned().await;
         let availability = Self::ensure_initialized_locked(config, &owner, project_root).await?;
+        if matches!(availability, DiffAvailability::Ready) {
+            self.initialized.lock().unwrap().insert(key);
+        }
         Ok((availability, DiffMutationGuard { _guard: guard }))
     }
 
@@ -317,6 +388,20 @@ impl DiffCheckpointManager {
     }
 
     pub async fn show_diff(
+        &self,
+        config: &AppConfig,
+        owner: DiffOwner,
+        request: DiffRequest,
+    ) -> Result<DiffResult, String> {
+        tokio::time::timeout(
+            Duration::from_millis(config.diff.command_timeout_ms),
+            self.show_diff_inner(config, owner, request),
+        )
+        .await
+        .map_err(|_| "Diff request timed out.".to_string())?
+    }
+
+    async fn show_diff_inner(
         &self,
         config: &AppConfig,
         owner: DiffOwner,
@@ -1311,6 +1396,9 @@ fn git_command(
         .env("GIT_PAGER", "cat")
         .env("GIT_OPTIONAL_LOCKS", "0");
     command.envs(environment.iter().cloned());
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     command
 }
 
@@ -1320,10 +1408,111 @@ async fn git_output(
     args: &[OsString],
     environment: &[(OsString, OsString)],
 ) -> Result<Output, String> {
-    git_command(config, cwd, args, environment)
-        .output()
-        .await
-        .map_err(|error| format!("failed to run git: {error}"))
+    run_git(
+        git_command(config, cwd, args, environment),
+        None,
+        config.diff.command_timeout_ms,
+    )
+    .await
+}
+
+#[cfg(unix)]
+struct GitProcessGroup(Option<u32>);
+#[cfg(unix)]
+impl Drop for GitProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn run_git(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout_ms: u64,
+) -> Result<Output, String> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    crate::audit::worker_started(child.id());
+    #[cfg(unix)]
+    let mut group = GitProcessGroup(child.id());
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let work = async {
+        let send = async {
+            if let Some(input) = input {
+                stdin.as_mut().unwrap().write_all(input).await?;
+            }
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        };
+        let out = async {
+            let mut data = Vec::new();
+            stdout
+                .take(MAX_GIT_OUTPUT_BYTES + 1)
+                .read_to_end(&mut data)
+                .await?;
+            if data.len() as u64 > MAX_GIT_OUTPUT_BYTES {
+                return Err(std::io::Error::other(
+                    "Git checkpoint output exceeded 32 MiB.",
+                ));
+            }
+            Ok::<_, std::io::Error>(data)
+        };
+        let err = async {
+            let mut data = Vec::new();
+            stderr
+                .take(MAX_GIT_ERROR_BYTES as u64 + 1)
+                .read_to_end(&mut data)
+                .await?;
+            if data.len() > MAX_GIT_ERROR_BYTES {
+                return Err(std::io::Error::other(
+                    "Git checkpoint diagnostics exceeded 64 KiB.",
+                ));
+            }
+            Ok::<_, std::io::Error>(data)
+        };
+        let (_, stdout, stderr, status) = tokio::try_join!(send, out, err, child.wait())?;
+        Ok::<_, std::io::Error>(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), work).await {
+        Ok(result) => {
+            #[cfg(unix)]
+            if result.is_ok() {
+                group.0 = None;
+            }
+            result.map_err(|error| format!("failed to run git: {error}"))
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = group.0 {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            Err(format!(
+                "Git checkpoint command timed out after {timeout_ms} ms."
+            ))
+        }
+    }
 }
 
 async fn git_checked_input(
@@ -1337,21 +1526,12 @@ async fn git_checked_input(
         .first()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "git".to_string());
-    let mut command = git_command(config, cwd, &args, environment);
-    command.stdin(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to run git: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input)
-            .await
-            .map_err(|error| format!("failed to write git input: {error}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| format!("failed to wait for git: {error}"))?;
+    let output = run_git(
+        git_command(config, cwd, &args, environment),
+        Some(input),
+        config.diff.command_timeout_ms,
+    )
+    .await?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
@@ -1399,6 +1579,31 @@ mod tests {
     use std::process::Command as StdCommand;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_deadlines_terminate_the_owned_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let parent_file = root.path().join("parent.pid");
+        let child_file = root.path().join("child.pid");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf %s $$ > \"$TEST_PARENT_PID\"; sleep 60 & printf %s $! > \"$TEST_CHILD_PID\"; wait"])
+            .env("TEST_PARENT_PID", &parent_file).env("TEST_CHILD_PID", &child_file)
+            .process_group(0).kill_on_drop(true);
+        let result = super::run_git(command, None, 1000).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        for file in [parent_file, child_file] {
+            let pid: i32 = std::fs::read_to_string(file).unwrap().parse().unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "owned process {pid} survived timeout"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
 
     fn run_git(dir: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")

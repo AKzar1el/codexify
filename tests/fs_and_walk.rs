@@ -15,7 +15,11 @@ use std::path::Path;
 use serde_json::json;
 use tempfile::TempDir;
 
-use codexify::config::default_config;
+fn default_config(root: std::path::PathBuf) -> codexify::types::AppConfig {
+    let mut config = codexify::config::default_config(root);
+    config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
+    config
+}
 use codexify::exec_sessions::SessionState;
 use codexify::ignore_rules::{DEFAULT_IGNORE, build_ignore, to_rel_posix};
 use codexify::output_budget::approx_token_count;
@@ -45,6 +49,10 @@ fn ignore_config(root: &Path) -> AppConfig {
     let mut config = default_config(root.to_path_buf());
     config.tree.ignore = Vec::new();
     config
+}
+
+fn grep() -> Grep {
+    Grep::new(env!("CARGO_BIN_EXE_codexify").into())
 }
 
 async fn run_result(tool: &dyn Tool, args: serde_json::Value, config: &AppConfig) -> ToolResult {
@@ -207,7 +215,12 @@ async fn grep_skips_node_modules_and_gitignored_files() {
     write(root, "ignored.ts", "needle here");
     write(root, ".gitignore", "ignored.ts\n");
 
-    let out = run_text(&Grep, json!({ "pattern": "needle" }), &ignore_config(root)).await;
+    let out = run_text(
+        &grep(),
+        json!({ "pattern": "needle" }),
+        &ignore_config(root),
+    )
+    .await;
     assert!(out.contains("src/a.ts"), "{out}");
     assert!(!out.contains("node_modules"), "{out}");
     assert!(!out.contains("ignored.ts"), "{out}");
@@ -300,7 +313,7 @@ async fn glob_finds_in_subdirectory() {
 #[tokio::test]
 async fn grep_finds_matching_lines() {
     let (_dir, config) = fs_fixture();
-    let out = run_text(&Grep, json!({ "pattern": "hello" }), &config).await;
+    let out = run_text(&grep(), json!({ "pattern": "hello" }), &config).await;
     assert!(out.contains("index.ts"), "{out}");
     assert!(out.contains("hello"), "{out}");
 }
@@ -308,7 +321,12 @@ async fn grep_finds_matching_lines() {
 #[tokio::test]
 async fn grep_includes_context_lines() {
     let (_dir, config) = fs_fixture();
-    let out = run_text(&Grep, json!({ "pattern": "hello", "context": 1 }), &config).await;
+    let out = run_text(
+        &grep(),
+        json!({ "pattern": "hello", "context": 1 }),
+        &config,
+    )
+    .await;
     assert!(out.contains("console.log"), "{out}");
 }
 
@@ -316,7 +334,7 @@ async fn grep_includes_context_lines() {
 async fn grep_filters_by_include_pattern() {
     let (_dir, config) = fs_fixture();
     let out = run_text(
-        &Grep,
+        &grep(),
         json!({ "pattern": "Hello", "include": "*.md" }),
         &config,
     )
@@ -332,7 +350,7 @@ async fn grep_include_supports_relative_path_globs() {
     write(dir.path(), "tests/lib.rs", "needle\n");
     let config = default_config(dir.path().to_path_buf());
     let out = run_text(
-        &Grep,
+        &grep(),
         json!({ "pattern": "needle", "include": "src/**/*.rs" }),
         &config,
     )
@@ -345,7 +363,7 @@ async fn grep_include_supports_relative_path_globs() {
 async fn grep_include_rejects_an_invalid_glob() {
     let (_dir, config) = fs_fixture();
     let result = run_result(
-        &Grep,
+        &grep(),
         json!({ "pattern": "hello", "include": "[" }),
         &config,
     )
@@ -362,7 +380,7 @@ async fn grep_bounds_a_single_enormous_matching_line() {
     let mut config = default_config(dir.path().to_path_buf());
     config.output.max_tool_output_tokens = Some(200);
 
-    let result = run_result(&Grep, json!({ "pattern": "NEEDLE" }), &config).await;
+    let result = run_result(&grep(), json!({ "pattern": "NEEDLE" }), &config).await;
     let out = result.joined_text();
     assert!(out.contains("NEEDLE"), "{out}");
     assert!(out.contains("long result lines were elided"), "{out}");
@@ -384,7 +402,7 @@ async fn grep_clamps_max_results_to_the_configured_entry_limit() {
     config.output.max_entries = Some(3);
 
     let result = run_result(
-        &Grep,
+        &grep(),
         json!({ "pattern": "needle", "maxResults": 1_000 }),
         &config,
     )
@@ -418,7 +436,7 @@ async fn grep_caps_requested_context_lines() {
     let config = default_config(dir.path().to_path_buf());
 
     let result = run_result(
-        &Grep,
+        &grep(),
         json!({ "pattern": "needle", "context": 10_000 }),
         &config,
     )

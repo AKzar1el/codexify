@@ -255,16 +255,23 @@ pub const DEFAULT_DIFF_MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 pub struct DiffConfig {
     #[serde(default = "default_diff_max_patch_bytes")]
     pub max_patch_bytes: usize,
+    #[serde(default = "default_diff_command_timeout_ms")]
+    pub command_timeout_ms: u64,
 }
 
 fn default_diff_max_patch_bytes() -> usize {
     DEFAULT_DIFF_MAX_PATCH_BYTES
 }
 
+fn default_diff_command_timeout_ms() -> u64 {
+    30_000
+}
+
 impl Default for DiffConfig {
     fn default() -> Self {
         Self {
             max_patch_bytes: DEFAULT_DIFF_MAX_PATCH_BYTES,
+            command_timeout_ms: default_diff_command_timeout_ms(),
         }
     }
 }
@@ -446,6 +453,43 @@ pub struct OutputConfig {
     pub max_tree_nodes: Option<usize>,
 }
 
+/// Input-work limits are independent of the model-visible output ceilings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct FilesystemConfig {
+    pub max_concurrent_workers: usize,
+    pub max_pending_requests: usize,
+    pub max_scan_bytes: u64,
+    pub max_scan_entries: usize,
+    pub max_line_bytes: usize,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_workers: 4,
+            max_pending_requests: 16,
+            max_scan_bytes: 64 * 1024 * 1024,
+            max_scan_entries: 100_000,
+            max_line_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl FilesystemConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=64).contains(&self.max_concurrent_workers)
+            || self.max_pending_requests > 4096
+            || self.max_scan_bytes == 0
+            || self.max_scan_entries == 0
+            || self.max_line_bytes == 0
+        {
+            return Err("filesystem limits must be positive; maxConcurrentWorkers must be 1–64 and maxPendingRequests 0–4096".into());
+        }
+        Ok(())
+    }
+}
+
 impl OutputConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_tool_output_tokens == Some(0) {
@@ -557,6 +601,8 @@ pub struct McpServerSpec {
     /// Timeout for each forwarded tool call, in seconds.
     #[serde(default)]
     pub tool_timeout_sec: Option<f64>,
+    #[serde(default)]
+    pub request_limits: McpRequestLimits,
     /// If set, only these upstream tool names are bridged (an allow-list on the
     /// upstream's own names, e.g. `["exec", "machine_list"]`). Use it to keep the
     /// exposed tool count small — LLM clients work better with fewer tools and
@@ -583,6 +629,40 @@ pub struct McpServerSpec {
     /// Internal origin used only to select the backward-compatible default mode.
     #[serde(skip)]
     pub provenance: McpServerProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpRequestLimits {
+    pub max_concurrent_requests: usize,
+    pub max_pending_requests: usize,
+    pub failure_threshold: u32,
+    pub recovery_delay_ms: u64,
+    pub slow_cancellation_ms: u64,
+}
+impl Default for McpRequestLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: 4,
+            max_pending_requests: 16,
+            failure_threshold: 3,
+            recovery_delay_ms: 30_000,
+            slow_cancellation_ms: 60_000,
+        }
+    }
+}
+impl McpRequestLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=64).contains(&self.max_concurrent_requests)
+            || self.max_pending_requests > 4096
+            || !(1..=32).contains(&self.failure_threshold)
+            || !(1..=600_000).contains(&self.recovery_delay_ms)
+            || !(1..=3_600_000).contains(&self.slow_cancellation_ms)
+        {
+            return Err("invalid MCP requestLimits: concurrency must be 1–64, pending 0–4096, failure threshold 1–32, and delays positive".into());
+        }
+        Ok(())
+    }
 }
 
 impl McpServerSpec {
@@ -817,6 +897,9 @@ pub struct AppConfig {
     pub exec: ExecConfig,
     pub project_doc: ProjectDocConfig,
     pub output: OutputConfig,
+    pub filesystem: FilesystemConfig,
+    /// Shared across effective configs and conversations; never loaded from JSON.
+    pub filesystem_worker: ArcFilesystemWorker,
     pub diff: DiffConfig,
     pub artifact_ingress: ArtifactIngressConfig,
     pub artifact_egress: ArtifactEgressConfig,
@@ -844,7 +927,15 @@ pub struct AppConfig {
     pub generated_skills_dir: Option<std::path::PathBuf>,
 }
 
+pub type ArcFilesystemWorker = std::sync::Arc<crate::filesystem::FilesystemWorker>;
+
 impl AppConfig {
+    pub fn set_filesystem_worker_executable(&mut self, executable: std::path::PathBuf) {
+        self.filesystem_worker = std::sync::Arc::new(crate::filesystem::FilesystemWorker::new(
+            &self.filesystem,
+            Some(executable),
+        ));
+    }
     pub fn configured_openai_tunnels(&self) -> impl Iterator<Item = &OpenAiTunnelConfig> {
         self.openai_tunnel
             .iter()

@@ -1,9 +1,12 @@
 //! Structured tool activity records that deliberately exclude raw arguments and output.
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
@@ -21,6 +24,69 @@ const SCHEMA_VERSION: u64 = 2;
 const HASH_HEX_CHARS: usize = 24;
 const MAX_ARGUMENT_FIELDS: usize = 64;
 const MAX_ARGUMENT_DEPTH: usize = 3;
+
+tokio::task_local! { static ACTIVE_CALL: (Arc<AuditLogger>, u64); }
+
+pub(crate) async fn observe<F: Future>(
+    logger: Option<Arc<AuditLogger>>,
+    call_id: u64,
+    work: F,
+) -> F::Output {
+    match logger {
+        Some(logger) => ACTIVE_CALL.scope((logger, call_id), work).await,
+        None => work.await,
+    }
+}
+
+struct StageGuard {
+    call: Option<(Arc<AuditLogger>, u64)>,
+    name: &'static str,
+    started: Instant,
+    completed: bool,
+}
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if let Some((logger, call_id)) = &self.call {
+            let _ = logger.write_event(&json!({"schema_version": SCHEMA_VERSION, "timestamp":timestamp(),
+                "event":"tool_stage", "run_id":logger.run_id, "call_id":call_id, "stage":self.name,
+                "phase":"finish", "outcome":if self.completed { "completed" } else { "interrupted" },
+                "duration_ms": self.started.elapsed().as_millis() as u64}));
+        }
+    }
+}
+
+pub(crate) async fn stage<F: Future>(name: &'static str, work: F) -> F::Output {
+    let call = ACTIVE_CALL.try_with(Clone::clone).ok();
+    if let Some((logger, call_id)) = &call {
+        let _ = logger.write_event(&json!({"schema_version":SCHEMA_VERSION,"timestamp":timestamp(),
+            "event":"tool_stage", "run_id":logger.run_id, "call_id":call_id,"stage":name,"phase":"start"}));
+    }
+    let mut guard = StageGuard {
+        call,
+        name,
+        started: Instant::now(),
+        completed: false,
+    };
+    let result = work.await;
+    guard.completed = true;
+    result
+}
+
+pub(crate) fn worker_started(pid: Option<u32>) {
+    worker_observer()(pid);
+}
+
+pub(crate) fn worker_observer() -> impl Fn(Option<u32>) + Send + 'static {
+    let call = ACTIVE_CALL.try_with(Clone::clone).ok();
+    move |pid| {
+        if let Some((logger, call_id)) = &call {
+            let _ = logger.write_event(
+                &json!({"schema_version":SCHEMA_VERSION,"timestamp":timestamp(),
+            "event":"tool_worker","run_id":logger.run_id,"call_id":call_id,"process_id":pid}),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuditScope {
@@ -579,6 +645,37 @@ mod tests {
     use super::*;
     use crate::config::default_config;
     use rmcp::model::MetaObject;
+
+    #[tokio::test]
+    async fn stage_events_link_waits_and_workers_without_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = default_config(root.path().into());
+        config.audit.log_file = Some(root.path().join("audit.jsonl"));
+        let logger = Arc::new(AuditLogger::open(&config).unwrap().unwrap());
+        observe(Some(logger), 42, async {
+            stage("filesystem_queue", async {}).await;
+            worker_started(Some(123));
+        })
+        .await;
+        let text = std::fs::read_to_string(config.audit.log_file.unwrap()).unwrap();
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| event["event"] == "tool_stage"
+            && event["call_id"] == 42
+            && event["phase"] == "start"));
+        assert!(events.iter().any(|event| event["event"] == "tool_stage"
+            && event["phase"] == "finish"
+            && event.get("duration_ms").is_some()));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "tool_worker" && event["process_id"] == 123)
+        );
+        assert!(!text.contains("arguments"));
+        assert!(!text.contains("output"));
+    }
 
     #[test]
     fn argument_summary_exposes_shape_but_not_values() {

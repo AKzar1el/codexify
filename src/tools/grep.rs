@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -6,6 +6,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::exec_sessions::SessionState;
 use crate::ignore_rules::{IgnoreMatcher, build_ignore, to_rel_posix};
@@ -16,7 +17,41 @@ use crate::safe_path::resolve_safe_path;
 use crate::tool::{Tool, ToolBehavior, ToolRequestContext, parse_tool_args, text_output_schema};
 use crate::types::{AppConfig, ToolResult};
 
-pub struct Grep;
+#[derive(Default)]
+pub struct Grep {
+    worker_executable: Option<PathBuf>,
+}
+
+pub const WORKER_ARGUMENT: &str = crate::filesystem::WORKER_ARGUMENT;
+
+pub fn run_worker() -> Result<(), String> {
+    crate::filesystem::run_worker()
+}
+
+impl Grep {
+    pub fn new(worker_executable: PathBuf) -> Self {
+        Self {
+            worker_executable: Some(worker_executable),
+        }
+    }
+    async fn run_search(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        cancellation: &CancellationToken,
+    ) -> ToolResult {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::Grep,
+                args,
+                config,
+                cancellation,
+                self.worker_executable.as_deref(),
+            )
+            .await
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,6 +65,8 @@ struct GrepArgs {
     max_results: Option<u64>,
     #[serde(default)]
     files_only: bool,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
 }
 
 const DEFAULT_MAX_RESULTS: usize = 500;
@@ -72,6 +109,9 @@ fn collect_files(
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        if !crate::filesystem::visit_entry() {
+            break;
+        }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = match entry.file_type() {
@@ -168,7 +208,8 @@ impl Tool for Grep {
                 "context": { "type": "integer", "minimum": 0, "description": format!("Number of context lines before and after each match. Values above {MAX_CONTEXT_LINES} are capped.") },
                 "ignoreCase": { "type": "boolean", "description": "Case-insensitive search. Default: false" },
                 "maxResults": { "type": "integer", "minimum": 1, "description": format!("Max number of matching lines to return. Defaults to {DEFAULT_MAX_RESULTS} and cannot exceed the configured output.maxEntries limit.") },
-                "filesOnly": { "type": "boolean", "description": "Only return file paths that contain matches, not the matching lines" }
+                "filesOnly": { "type": "boolean", "description": "Only return file paths that contain matches, not the matching lines" },
+                "timeoutMs": { "type": "integer", "minimum": 1, "maximum": crate::filesystem::MAX_TIMEOUT_MS, "description": format!("Search deadline in milliseconds, including queue time. Default: {}. Timeout terminates the search worker.", crate::filesystem::DEFAULT_TIMEOUT_MS) }
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -188,16 +229,25 @@ impl Tool for Grep {
     ) -> ToolResult {
         match crate::markdown_chat::history_call(&args, config, session, context).await {
             Ok(Some((args, history_config))) => {
-                let mut result = self.call(args, &history_config, session).await;
+                let mut result = self
+                    .run_search(args, &history_config, &context.cancellation)
+                    .await;
                 result.audit.sensitive_output = true;
                 result
             }
-            Ok(None) => self.call(args, config, session).await,
+            Ok(None) => self.run_search(args, config, &context.cancellation).await,
             Err(error) => ToolResult::error(error),
         }
     }
 
     async fn call(&self, args: Value, config: &AppConfig, _session: &SessionState) -> ToolResult {
+        self.run_search(args, config, &CancellationToken::new())
+            .await
+    }
+}
+
+impl Grep {
+    pub(crate) fn search(args: Value, config: &AppConfig) -> ToolResult {
         let GrepArgs {
             pattern,
             path,
@@ -206,6 +256,7 @@ impl Tool for Grep {
             ignore_case,
             max_results,
             files_only,
+            _timeout_ms: _,
         } = match parse_tool_args(args) {
             Ok(args) => args,
             Err(error) => return *error,
@@ -273,85 +324,96 @@ impl Tool for Grep {
         let mut line_content_truncated = false;
 
         'files: for file_path in &files {
-            let bytes = match std::fs::read(file_path) {
-                Ok(b) => b,
+            let mut reader = match crate::filesystem::Lines::open(file_path) {
+                Ok(reader) => reader,
                 Err(_) => continue,
             };
-            let content = String::from_utf8_lossy(&bytes);
-            let lines: Vec<&str> = content.split('\n').collect();
             let rel_path = to_rel_posix(file_path, &config.work_dir)
                 .unwrap_or_else(|| file_path.to_string_lossy().replace('\\', "/"));
-
-            if files_only {
-                for line in &lines {
-                    if regex.is_match(line) {
-                        match_count += 1;
-                        if match_count > max_results {
-                            match_limit_reached = true;
-                            break 'files;
-                        }
+            let mut before: VecDeque<(usize, String, bool)> = VecDeque::new();
+            let mut following = 0usize;
+            let mut last_printed: Option<usize> = None;
+            let mut index = 0usize;
+            while let Ok(Some(line)) = reader.next() {
+                let matched = regex.is_match(&line);
+                if matched {
+                    match_count += 1;
+                    if match_count > max_results {
+                        match_limit_reached = true;
+                        break 'files;
+                    }
+                    if files_only {
                         if !results.push_line(&rel_path) {
                             output_limit_reached = true;
                             break 'files;
                         }
-                        break;
+                        continue 'files;
                     }
                 }
-                continue;
-            }
-
-            let mut match_indices: BTreeSet<usize> = BTreeSet::new();
-            let last = lines.len().saturating_sub(1);
-
-            for (i, line) in lines.iter().enumerate() {
-                if regex.is_match(line) {
-                    match_count += 1;
-                    if match_count > max_results {
-                        match_limit_reached = true;
-                        break;
+                if matched {
+                    for (prior, text, cut) in &before {
+                        if last_printed.is_some_and(|last| *prior <= last) {
+                            continue;
+                        }
+                        if context_lines > 0
+                            && last_printed.is_some_and(|last| *prior > last + 1)
+                            && !results.push_line("--")
+                        {
+                            output_limit_reached = true;
+                            break 'files;
+                        }
+                        let (text, cut_again) = render_result_line(
+                            &rel_path,
+                            prior + 1,
+                            "-",
+                            text,
+                            None,
+                            results.remaining_line_bytes().min(MAX_RENDERED_LINE_BYTES),
+                        );
+                        if !results.push_line(&text) {
+                            output_limit_reached = true;
+                            break 'files;
+                        }
+                        last_printed = Some(*prior);
+                        line_content_truncated |= *cut || cut_again;
                     }
-                    let start = i.saturating_sub(context_lines);
-                    let end = i.saturating_add(context_lines).min(last);
-                    for j in start..=end {
-                        match_indices.insert(j);
+                }
+                if matched || following > 0 {
+                    if context_lines > 0
+                        && last_printed.is_some_and(|last| index > last + 1)
+                        && !results.push_line("--")
+                    {
+                        output_limit_reached = true;
+                        break 'files;
+                    }
+                    let (rendered, truncated) = render_result_line(
+                        &rel_path,
+                        index + 1,
+                        if matched { ":" } else { "-" },
+                        &line,
+                        matched.then(|| regex.find(&line)).flatten(),
+                        results.remaining_line_bytes().min(MAX_RENDERED_LINE_BYTES),
+                    );
+                    if !results.push_line(&rendered) {
+                        output_limit_reached = true;
+                        break 'files;
+                    }
+                    last_printed = Some(index);
+                    line_content_truncated |= truncated;
+                }
+                following = if matched {
+                    context_lines
+                } else {
+                    following.saturating_sub(1)
+                };
+                if context_lines > 0 {
+                    let (text, cut) = bounded_line(&line, None, MAX_RENDERED_LINE_BYTES);
+                    before.push_back((index, text, cut));
+                    if before.len() > context_lines {
+                        before.pop_front();
                     }
                 }
-            }
-
-            if match_indices.is_empty() {
-                continue;
-            }
-
-            let mut prev_idx: i64 = -2;
-            for idx in &match_indices {
-                let idx = *idx;
-                if context_lines > 0
-                    && (idx as i64) - prev_idx > 1
-                    && prev_idx >= 0
-                    && !results.push_line("--")
-                {
-                    output_limit_reached = true;
-                    break 'files;
-                }
-                let matched = regex.is_match(lines[idx]);
-                let marker = if matched { ":" } else { "-" };
-                let (rendered, line_truncated) = render_result_line(
-                    &rel_path,
-                    idx + 1,
-                    marker,
-                    lines[idx],
-                    matched.then(|| regex.find(lines[idx])).flatten(),
-                    results.remaining_line_bytes().min(MAX_RENDERED_LINE_BYTES),
-                );
-                line_content_truncated |= line_truncated;
-                if !results.push_line(&rendered) {
-                    output_limit_reached = true;
-                    break 'files;
-                }
-                prev_idx = idx as i64;
-            }
-            if match_limit_reached {
-                break 'files;
+                index += 1;
             }
         }
 
@@ -426,9 +488,8 @@ impl OutputCollector {
     }
 
     fn remaining_line_bytes(&self) -> usize {
-        let separator = usize::from(!self.text.is_empty());
         self.max_bytes
-            .saturating_sub(self.text.len().saturating_add(separator))
+            .saturating_sub(self.text.len() + usize::from(!self.text.is_empty()))
     }
 
     fn is_empty(&self) -> bool {

@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::diff::DiffOwner;
 use crate::exec_sessions::{
     DEFAULT_MAX_OUTPUT_TOKENS, EXEC_MAX_YIELD_MS, STDIN_POLL_DEFAULT_YIELD_MS,
     STDIN_POLL_MAX_YIELD_MS, STDIN_WRITE_DEFAULT_YIELD_MS, SessionState, UnifiedExecOutput, clamp,
     generate_chunk_id, truncate_output,
 };
 use crate::output_budget::resolve_requested_output_tokens;
-use crate::tool::{Tool, ToolBehavior, parse_tool_args};
+use crate::tool::{Tool, ToolBehavior, ToolRequestContext, parse_tool_args};
 use crate::tools::exec_command::{render_unified_exec_output, unified_exec_output_schema};
 use crate::types::{AppConfig, ToolAuditMetadata, ToolContent, ToolResult};
 
@@ -78,7 +79,33 @@ impl Tool for WriteStdin {
         true
     }
 
+    fn manages_project_checkpoint(&self) -> bool {
+        true
+    }
+
     async fn call(&self, args: Value, config: &AppConfig, session: &SessionState) -> ToolResult {
+        self.run(args, config, session, None).await
+    }
+
+    async fn call_with_context(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        session: &SessionState,
+        context: &ToolRequestContext,
+    ) -> ToolResult {
+        self.run(args, config, session, Some(context)).await
+    }
+}
+
+impl WriteStdin {
+    async fn run(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        session: &SessionState,
+        context: Option<&ToolRequestContext>,
+    ) -> ToolResult {
         let WriteStdinArgs {
             session_id,
             chars,
@@ -121,6 +148,7 @@ impl Tool for WriteStdin {
         let max_output_tokens = resolve_requested_output_tokens(config, max_output_tokens);
 
         let started = std::time::Instant::now();
+        let cancellation = context.map(|c| c.cancellation.clone()).unwrap_or_default();
 
         // A lone ETX (Ctrl-C) is an interrupt request, matching Codex's unified
         // exec: rather than writing the raw 0x03 byte into the pipe, signal the
@@ -133,15 +161,53 @@ impl Tool for WriteStdin {
                     "Session {session_id} has already exited with code {code}; cannot write to stdin."
                 ));
             }
+            let _guard = if let Some(context) = context {
+                let owner = context
+                    .task_conversation
+                    .as_ref()
+                    .or(context.conversation.as_ref())
+                    .map(DiffOwner::conversation)
+                    .unwrap_or_else(|| DiffOwner::transport(session.diff_state()));
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return ToolResult::error("Call cancelled before input was sent."),
+                    result = crate::audit::stage("checkpoint_wait", context.diff_checkpoints.begin_mutation(config, owner)) => result,
+                };
+                match result {
+                    Ok((_, guard)) => Some(guard),
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "Refusing to send input because the diff checkpoint could not be captured: {error}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            if cancellation.is_cancelled() {
+                return ToolResult::error("Call cancelled before input was sent.");
+            }
             if is_interrupt {
                 exec_session.interrupt();
-            } else if let Err(e) = exec_session.write_stdin(&chars).await {
-                return ToolResult::error(e.to_string());
+            } else {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return ToolResult::error("Input operation cancelled; some bytes may have been sent."),
+                    result = crate::audit::stage("command_input", tokio::time::timeout(std::time::Duration::from_millis(config.diff.command_timeout_ms), exec_session.write_stdin(&chars))) =>
+                        result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"Input write timed out; some bytes may have been sent."))),
+                };
+                if let Err(error) = result {
+                    return ToolResult::error(error.to_string());
+                }
             }
+            // Checkpoint the input action, not the following wait for output.
         }
 
-        let (output, exited, buffer_truncated) =
-            exec_session.yield_output_with_metadata(yield_ms).await;
+        let (output, exited, buffer_truncated) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return ToolResult::error("Output wait cancelled; the command session remains available."),
+            output = crate::audit::stage("command_output_wait", exec_session.yield_output_with_metadata(yield_ms)) => output,
+        };
         let (text, original_token_count, truncated) = truncate_output(&output, max_output_tokens);
 
         let mut result = UnifiedExecOutput {

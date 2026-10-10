@@ -103,7 +103,7 @@ fn load_tools_with_options(
         Box::new(tools::git_commit::GitCommit),
         Box::new(tools::git_log::GitLog),
         Box::new(tools::glob::Glob),
-        Box::new(tools::grep::Grep),
+        Box::new(tools::grep::Grep::default()),
         Box::new(tools::list_directory::ListDirectory),
         Box::new(tools::tree::Tree),
         // Ported from Codex (codex-rs/core/src/tools). Names use underscores

@@ -22,11 +22,11 @@ use crate::openai_tunnel::validate_tunnel_id;
 use crate::project_catalog::{ProjectCatalog, discover_project_catalog_at};
 use crate::types::{
     AppConfig, ArtifactEgressConfig, ArtifactIngressConfig, AuditConfig, CodexProjectCatalogConfig,
-    CommandConfig, ConversationAuthToken, DiffConfig, ExecConfig, ExperimentalConfig, IgnoreConfig,
-    McpServerSpec, McpToolExposure, MemoryConfig, OpenAiTunnelConfig, OutputConfig,
-    ProjectCatalogConfig, ProjectCatalogEntryConfig, ProjectDocConfig, SkillsConfig, ToolLogLevel,
-    ToolLogMode, ToolLoggingConfig, TreeConfig, WorktreeConfig, WorktreeMode,
-    WorktreeUpstreamRefreshMode,
+    CommandConfig, ConversationAuthToken, DiffConfig, ExecConfig, ExperimentalConfig,
+    FilesystemConfig, IgnoreConfig, McpServerSpec, McpToolExposure, MemoryConfig,
+    OpenAiTunnelConfig, OutputConfig, ProjectCatalogConfig, ProjectCatalogEntryConfig,
+    ProjectDocConfig, SkillsConfig, ToolLogLevel, ToolLogMode, ToolLoggingConfig, TreeConfig,
+    WorktreeConfig, WorktreeMode, WorktreeUpstreamRefreshMode,
 };
 use crate::util::home_dir;
 
@@ -469,6 +469,7 @@ struct PartialMcpServerSpec {
     env_http_headers: Option<HashMap<String, String>>,
     startup_timeout_sec: Option<f64>,
     tool_timeout_sec: Option<f64>,
+    request_limits: Option<crate::types::McpRequestLimits>,
     tools: Option<Vec<String>>,
     disabled_tools: Option<Vec<String>>,
     mode: Option<McpToolExposure>,
@@ -489,6 +490,7 @@ impl PartialMcpServerSpec {
             env_http_headers,
             startup_timeout_sec,
             tool_timeout_sec,
+            request_limits,
             tools,
             disabled_tools,
             mode,
@@ -538,6 +540,9 @@ impl PartialMcpServerSpec {
         }
         if let Some(tool_timeout_sec) = tool_timeout_sec {
             base.tool_timeout_sec = Some(tool_timeout_sec);
+        }
+        if let Some(limits) = request_limits {
+            base.request_limits = limits;
         }
         if let Some(tools) = tools {
             base.tools = Some(tools);
@@ -614,6 +619,7 @@ struct FileConfig {
     exec: Option<PartialExec>,
     project_doc: Option<ProjectDocConfig>,
     output: Option<OutputConfig>,
+    filesystem: Option<FilesystemConfig>,
     #[serde(alias = "review")]
     diff: Option<DiffConfig>,
     artifact_ingress: Option<ArtifactIngressConfig>,
@@ -852,6 +858,11 @@ pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
         exec: default_exec(),
         project_doc: ProjectDocConfig::default(),
         output: OutputConfig::default(),
+        filesystem: FilesystemConfig::default(),
+        filesystem_worker: std::sync::Arc::new(crate::filesystem::FilesystemWorker::new(
+            &FilesystemConfig::default(),
+            None,
+        )),
         diff: DiffConfig::default(),
         artifact_ingress: ArtifactIngressConfig::default(),
         artifact_egress: ArtifactEgressConfig::default(),
@@ -1621,6 +1632,11 @@ fn load_config_with_announcements(
 
     let project_catalog = resolve_project_catalog(&mut file);
     let mcp_servers = resolve_mcp_servers(&mut file, cli, announce)?;
+    for (name, spec) in &mcp_servers {
+        spec.request_limits
+            .validate()
+            .map_err(|error| format!("mcpServers.{name}.requestLimits: {error}"))?;
+    }
     let (openai_tunnel, additional_openai_tunnels) =
         resolve_openai_tunnels(file.openai_tunnel, file.openai_tunnels, cli)?;
     let tool_logging = resolve_tool_logging(file.tool_logging, cli)?;
@@ -1640,6 +1656,10 @@ fn load_config_with_announcements(
     artifact_egress.validate()?;
     let output = file.output.unwrap_or_default();
     output.validate()?;
+    let filesystem = file.filesystem.unwrap_or_default();
+    filesystem.validate()?;
+    let filesystem_worker =
+        std::sync::Arc::new(crate::filesystem::FilesystemWorker::new(&filesystem, None));
     if file.removed_markdown_chat.is_some() {
         return Err(
             "markdownChat was renamed to agentChat; update the configuration key before starting Codexify"
@@ -1656,6 +1676,10 @@ fn load_config_with_announcements(
     }
 
     let experimental = file.experimental.unwrap_or_default();
+    let diff = file.diff.unwrap_or_default();
+    if !(1..=120_000).contains(&diff.command_timeout_ms) {
+        return Err("diff.commandTimeoutMs must be between 1 and 120000".into());
+    }
     let config = AppConfig {
         work_dir,
         debug: file.debug.unwrap_or(false),
@@ -1680,7 +1704,9 @@ fn load_config_with_announcements(
         exec,
         project_doc: file.project_doc.unwrap_or_default(),
         output,
-        diff: file.diff.unwrap_or_default(),
+        filesystem,
+        filesystem_worker,
+        diff,
         artifact_ingress,
         artifact_egress,
         memory: file.memory.unwrap_or_default(),
@@ -1764,6 +1790,7 @@ mod tests {
             disabled_tools: Some(vec!["write".to_string()]),
             mode: None,
             provenance: crate::types::McpServerProvenance::CodexConfig,
+            request_limits: crate::types::McpRequestLimits::default(),
         }
     }
 
@@ -2216,6 +2243,7 @@ mod tests {
             "diff",
             "exec",
             "experimental",
+            "filesystem",
             "ignore",
             "agentChat",
             "mcpServers",
@@ -2282,7 +2310,17 @@ mod tests {
                     "maxTreeNodes",
                 ],
             ),
-            ("diff", &["maxPatchBytes"]),
+            ("diff", &["maxPatchBytes", "commandTimeoutMs"]),
+            (
+                "filesystem",
+                &[
+                    "maxConcurrentWorkers",
+                    "maxPendingRequests",
+                    "maxScanBytes",
+                    "maxScanEntries",
+                    "maxLineBytes",
+                ],
+            ),
             (
                 "toolLogging",
                 &[
@@ -2378,6 +2416,7 @@ mod tests {
             "mode",
             "startupTimeoutSec",
             "toolTimeoutSec",
+            "requestLimits",
             "tools",
             "type",
             "url",
@@ -2808,6 +2847,7 @@ mod tests {
 
         let imported_cli = McpServerSpec {
             provenance: crate::types::McpServerProvenance::CodexCli,
+            request_limits: crate::types::McpRequestLimits::default(),
             ..Default::default()
         };
         assert_eq!(imported_cli.exposure(), McpToolExposure::Catalog);

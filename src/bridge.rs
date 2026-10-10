@@ -51,6 +51,51 @@ pub struct Bridge {
     /// One human-readable line per configured server (connected or failed),
     /// printed in the startup banner so a bad path or handshake is never silent.
     pub report: Vec<String>,
+    pub(crate) upstreams: Arc<HashMap<String, Arc<crate::upstream_control::UpstreamControl>>>,
+    pub(crate) monitors: Vec<UpstreamMonitor>,
+}
+
+pub(crate) struct UpstreamMonitor(tokio::task::JoinHandle<()>);
+impl Drop for UpstreamMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn monitor_upstream(
+    peer: Peer<RoleClient>,
+    control: Arc<crate::upstream_control::UpstreamControl>,
+) -> UpstreamMonitor {
+    monitor_upstream_with_limits(
+        peer,
+        control,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+    )
+}
+
+fn monitor_upstream_with_limits(
+    peer: Peer<RoleClient>,
+    control: Arc<crate::upstream_control::UpstreamControl>,
+    interval: Duration,
+    timeout: Duration,
+) -> UpstreamMonitor {
+    UpstreamMonitor(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let healthy = matches!(
+                tokio::time::timeout(
+                    timeout,
+                    peer.send_request(ClientRequest::PingRequest(Default::default()))
+                )
+                .await,
+                // Newer MCP versions may reject legacy ping. An RPC error is
+                // still a response: the connection is processing requests.
+                Ok(Ok(_) | Err(ServiceError::McpError(_)))
+            );
+            control.health_result(healthy);
+        }
+    }))
 }
 
 /// One bridged tool: a thin proxy that forwards `call` to an upstream peer.
@@ -71,6 +116,7 @@ struct BridgedTool {
     meta: Option<MetaObject>,
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
+    control: Arc<crate::upstream_control::UpstreamControl>,
     resources: Arc<BridgedResourceStore>,
 }
 
@@ -90,7 +136,10 @@ impl BridgedTool {
             &self.original_name,
             self.tool_timeout,
             cancellation,
-            &self.resources,
+            UpstreamCallContext {
+                resources: &self.resources,
+                control: &self.control,
+            },
         )
         .await
     }
@@ -208,6 +257,11 @@ impl Tool for BridgedTool {
     }
 }
 
+pub(crate) struct UpstreamCallContext<'a> {
+    pub(crate) resources: &'a BridgedResourceStore,
+    pub(crate) control: &'a crate::upstream_control::UpstreamControl,
+}
+
 pub(crate) async fn forward_tool_call(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
@@ -215,9 +269,40 @@ pub(crate) async fn forward_tool_call(
     tool: &str,
     tool_timeout: Option<Duration>,
     cancellation: Option<&CancellationToken>,
-    resources: &BridgedResourceStore,
+    context: UpstreamCallContext<'_>,
 ) -> ToolResult {
-    let result = call_upstream_tool(peer, params, tool_timeout, cancellation).await;
+    let UpstreamCallContext { resources, control } = context;
+    let timeout = tool_timeout.unwrap_or(Duration::from_secs(60));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let token = cancellation.cloned().unwrap_or_default();
+    let mut admission = match control.admit(deadline, &token).await {
+        Ok(admission) => admission,
+        Err(error) => return ToolResult::error(format!("Upstream MCP server '{server}': {error}")),
+    };
+    let result = crate::audit::stage(
+        "upstream_response",
+        call_upstream_tool(
+            peer,
+            params,
+            Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            Some(&token),
+            if admission.is_probe() {
+                None
+            } else {
+                Some(control)
+            },
+        ),
+    )
+    .await;
+    admission.complete(match &result {
+        Ok(_) => "response_received",
+        Err(UpstreamError::Timeout(_)) => "deadline_exceeded",
+        Err(UpstreamError::Cancelled) => "cancellation_requested",
+        Err(UpstreamError::Unresponsive) => "upstream_unresponsive",
+        Err(UpstreamError::Interactive) => "response_received",
+        Err(UpstreamError::Remote(_)) => "response_received",
+        Err(UpstreamError::Transport(_)) => "transport_failed",
+    });
 
     match result {
         Ok(result) => map_call_result(result, peer, server, tool_timeout, resources),
@@ -227,73 +312,113 @@ pub(crate) async fn forward_tool_call(
     }
 }
 
+enum UpstreamError {
+    Timeout(Duration),
+    Cancelled,
+    Unresponsive,
+    Transport(String),
+    Remote(String),
+    Interactive,
+}
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(timeout) => write!(
+                f,
+                "timed out after {}s; upstream completion is unconfirmed",
+                timeout.as_secs_f64()
+            ),
+            Self::Unresponsive => write!(
+                f,
+                "upstream became unresponsive; cancellation requested, completion is unconfirmed"
+            ),
+            Self::Cancelled => write!(
+                f,
+                "cancelled by downstream client; upstream completion is unconfirmed"
+            ),
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Remote(error) => write!(f, "{error}"),
+            Self::Interactive => write!(
+                f,
+                "requested additional interactive input, which Codexify cannot provide"
+            ),
+        }
+    }
+}
+
+async fn send_cancellation(peer: &Peer<RoleClient>, notification: CancelledNotification) {
+    let _ = crate::audit::stage(
+        "upstream_cancellation",
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            peer.send_notification(notification.into()),
+        ),
+    )
+    .await;
+}
+
+async fn wait_unavailable(control: Option<&crate::upstream_control::UpstreamControl>) {
+    match control {
+        Some(control) => control.wait_unavailable().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn call_upstream_tool(
     peer: &Peer<RoleClient>,
     params: CallToolRequestParams,
     timeout: Option<Duration>,
     cancellation: Option<&CancellationToken>,
-) -> Result<CallToolResult, String> {
+    control: Option<&crate::upstream_control::UpstreamControl>,
+) -> Result<CallToolResult, UpstreamError> {
+    let timeout = timeout.unwrap_or(Duration::from_secs(60));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let token = cancellation.cloned().unwrap_or_default();
     let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
-    let options = timeout
-        .map(PeerRequestOptions::with_timeout)
-        .unwrap_or_else(PeerRequestOptions::no_options);
-    let handle = peer
-        .send_cancellable_request(request, options)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        let _ = handle
-            .cancel(Some("downstream request cancelled".to_string()))
-            .await;
-        return Err("cancelled by downstream client".to_string());
-    }
-
-    let response = if let Some(cancellation) = cancellation {
-        let request_id = handle.id.clone();
-        let cancel_peer = peer.clone();
-        let response = handle.await_response();
-        tokio::pin!(response);
+    let handle = crate::audit::stage("upstream_send", async {
         tokio::select! {
-            response = &mut response => response,
-            _ = cancellation.cancelled() => {
-                let notification = CancelledNotification::new(CancelledNotificationParam::new(
-                    Some(request_id),
-                    Some("downstream request cancelled".to_string()),
-                ));
-                if let Err(error) = cancel_peer.send_notification(notification.into()).await {
-                    tracing::debug!("could not forward upstream MCP cancellation: {error}");
-                }
-                return Err("cancelled by downstream client".to_string());
-            }
+            biased;
+            _ = token.cancelled() => Err(UpstreamError::Cancelled),
+            _ = wait_unavailable(control) => Err(UpstreamError::Unresponsive),
+            _ = tokio::time::sleep_until(deadline) => Err(UpstreamError::Timeout(timeout)),
+            result = peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(timeout)) =>
+                result.map_err(|error| UpstreamError::Transport(error.to_string())),
         }
-    } else {
-        handle.await_response().await
+    }).await?;
+    let request_id = handle.id.clone();
+    let response = tokio::select! {
+        biased;
+        _ = token.cancelled() => Err(UpstreamError::Cancelled),
+        result = handle.await_response() => result.map_err(|error| match error {
+            ServiceError::Timeout { timeout } => UpstreamError::Timeout(timeout),
+            ServiceError::McpError(error) => UpstreamError::Remote(error.to_string()),
+            error => UpstreamError::Transport(error.to_string()),
+        }),
+        _ = wait_unavailable(control) => Err(UpstreamError::Unresponsive),
+        _ = tokio::time::sleep_until(deadline) => Err(UpstreamError::Timeout(timeout)),
     };
-
-    let response = match response {
-        Ok(response) => response,
-        Err(ServiceError::Timeout { timeout }) => {
-            return Err(format!("timed out after {}s", timeout.as_secs_f64()));
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    match response {
+    if matches!(
+        response,
+        Err(UpstreamError::Timeout(_) | UpstreamError::Cancelled | UpstreamError::Unresponsive)
+    ) {
+        send_cancellation(
+            peer,
+            CancelledNotification::new(CancelledNotificationParam::new(
+                Some(request_id),
+                Some("request deadline or downstream cancellation".into()),
+            )),
+        )
+        .await;
+    }
+    match response? {
         ServerResult::CallToolResult(result) => Ok(result),
-        ServerResult::InputRequiredResult(_) => {
-            Err("requested additional interactive input, which Codexify cannot provide".into())
-        }
-        ServerResult::CreateTaskResult(_) => {
-            Err("returned an asynchronous MCP task, which Codexify does not poll".into())
-        }
-        _ => Err("returned an unexpected response type".into()),
+        ServerResult::InputRequiredResult(_) => Err(UpstreamError::Interactive),
+        _ => Err(UpstreamError::Transport(
+            "unexpected upstream response type".into(),
+        )),
     }
 }
 
-/// Translate an upstream `CallToolResult` into this server's [`ToolResult`],
-/// preserving text, images, error state, structured content, and result metadata.
-/// Content blocks this server has no native representation for are rendered as
-/// JSON text so nothing is silently dropped.
 fn map_call_result(
     result: CallToolResult,
     peer: &Peer<RoleClient>,
@@ -393,6 +518,8 @@ fn unique_name(base: String, used: &std::collections::HashSet<String>) -> String
 pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut services: Vec<RunningService<RoleClient, ()>> = Vec::new();
+    let mut upstreams = HashMap::new();
+    let mut monitors = Vec::new();
     let mut report: Vec<String> = Vec::new();
     let mut catalog_sources = Vec::new();
     let resources = Arc::new(BridgedResourceStore::new(config.artifact_egress.clone()));
@@ -413,6 +540,11 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
         match connect_one(server_name, spec, config).await {
             Ok((service, upstream_tools, tool_timeout)) => {
                 let peer = service.peer().clone();
+                let control = Arc::new(crate::upstream_control::UpstreamControl::new(
+                    spec.request_limits.clone(),
+                ));
+                upstreams.insert(server_name.clone(), control.clone());
+                monitors.push(monitor_upstream(peer.clone(), control.clone()));
                 let count = upstream_tools.len();
 
                 match exposure {
@@ -440,6 +572,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                             function_names: functions.iter().map(|f| f.name.clone()).collect(),
                             peer: peer.clone(),
                             tool_timeout,
+                            control: control.clone(),
                             resources: resources.clone(),
                         }));
                         report.push(format!(
@@ -484,6 +617,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                                 meta: tool.meta,
                                 peer: peer.clone(),
                                 tool_timeout,
+                                control: control.clone(),
                                 resources: resources.clone(),
                             }));
                         }
@@ -503,6 +637,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                             tools: upstream_tools,
                             peer: peer.clone(),
                             tool_timeout,
+                            control: control.clone(),
                         });
                         tracing::info!(
                             "indexed MCP server '{server_name}' privately: {count} tool(s)"
@@ -527,6 +662,8 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
         resources,
         services,
         report,
+        upstreams: Arc::new(upstreams),
+        monitors,
     }
 }
 
@@ -626,6 +763,7 @@ struct GatewayTool {
     function_names: Vec<String>,
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
+    control: Arc<crate::upstream_control::UpstreamControl>,
     resources: Arc<BridgedResourceStore>,
 }
 
@@ -663,7 +801,10 @@ impl GatewayTool {
             function,
             self.tool_timeout,
             cancellation,
-            &self.resources,
+            UpstreamCallContext {
+                resources: &self.resources,
+                control: &self.control,
+            },
         )
         .await
     }
@@ -978,6 +1119,7 @@ async fn connect_one_with_env(
     ),
     String,
 > {
+    spec.request_limits.validate()?;
     let startup_timeout = configured_timeout(
         spec.startup_timeout_sec,
         "startupTimeoutSec",
@@ -2521,7 +2663,10 @@ mod tests {
             "echo",
             tool_timeout,
             None,
-            &resources,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &crate::upstream_control::UpstreamControl::default(),
+            },
         )
         .await;
         assert!(!echo.is_error);
@@ -2535,7 +2680,10 @@ mod tests {
             "slow",
             tool_timeout,
             None,
-            &resources,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &crate::upstream_control::UpstreamControl::default(),
+            },
         )
         .await;
         assert!(slow.is_error);
@@ -2558,7 +2706,10 @@ mod tests {
             "slow",
             Some(Duration::from_secs(5)),
             Some(&cancellation),
-            &resources,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &crate::upstream_control::UpstreamControl::default(),
+            },
         )
         .await;
         cancel_task.await.unwrap();
@@ -2573,6 +2724,89 @@ mod tests {
         drop(service);
         server_task.abort();
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn health_probes_recover_a_connection_that_rejects_legacy_ping() {
+        let (server, transport) = tokio::io::duplex(128 * 1024);
+        let task = tokio::spawn(async {
+            TestHttpMcp
+                .serve(server)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let client = ().serve(transport).await.unwrap();
+        let control = Arc::new(crate::upstream_control::UpstreamControl::new(
+            crate::types::McpRequestLimits {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        ));
+        control.health_result(false);
+        let monitor = monitor_upstream_with_limits(
+            client.peer().clone(),
+            control.clone(),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.snapshot()["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(monitor);
+        drop(client);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unresponsive_upstream_releases_inflight_calls_without_retrying_them() {
+        let (server, transport) = tokio::io::duplex(128 * 1024);
+        let task = tokio::spawn(async {
+            TestHttpMcp
+                .serve(server)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let client = ().serve(transport).await.unwrap();
+        let control =
+            crate::upstream_control::UpstreamControl::new(crate::types::McpRequestLimits {
+                failure_threshold: 1,
+                ..Default::default()
+            });
+        let resources = BridgedResourceStore::new(crate::types::ArtifactEgressConfig::default());
+        let params = CallToolRequestParams::new("slow")
+            .with_arguments(json!({"text":"late"}).as_object().unwrap().clone());
+        let work = forward_tool_call(
+            client.peer(),
+            params,
+            "test",
+            "slow",
+            Some(Duration::from_secs(30)),
+            None,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &control,
+            },
+        );
+        let fail = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            control.health_result(false);
+        };
+        let (result, ()) = tokio::join!(work, fail);
+        assert!(result.is_error);
+        assert!(result.joined_text().contains("completion is unconfirmed"));
+        assert_eq!(control.snapshot()["state"], "unresponsive");
+        drop(client);
+        task.abort();
     }
 
     #[tokio::test]

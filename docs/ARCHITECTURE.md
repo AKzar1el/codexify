@@ -1494,7 +1494,21 @@ Audit command previews: disabled
 Faithful to the TypeScript original; unavoidable differences, each documented in
 the README:
 
-- `grep` uses the Rust `regex` crate (no lookaround / backreferences).
+- `grep` uses the Rust `regex` crate (no lookaround/backreferences). Filesystem
+  reads/walks run in shared, bounded, killable workers; spawning is off the HTTP
+  runtime. Arguments and non-secret search settings cross stdin. Queue/spawn/
+  execution share a deadline; admission permits remain held through reaping.
+  Streaming input and entry limits bound work independently of output limits.
+- Polling does not hold diff mutation guards. Stdin input is checkpointed before
+  sending, and its guard ends before the output wait. Read-only calls do not
+  queue behind active mutations; real mutations retain fail-closed checkpoints.
+  Git lock/command waits have deadlines and owned subprocess cleanup.
+- Each upstream has independent admission and failure state, bounded sends,
+  cancellation notification attempts, cached health and background probes.
+  Unresponsive connections release waiting callers with completion-unconfirmed
+  errors, without replaying calls or killing shared database workers.
+- Audit stage/PID events identify queue, checkpoint, execution and upstream waits
+  while retaining the existing payload/ticket privacy boundary.
 - Filename sort uses byte/Unicode ordering, not JS `localeCompare`.
 - `write_file`'s byte count is UTF-8 bytes.
 - `exec_command` runs with plain pipes, not a PTY.

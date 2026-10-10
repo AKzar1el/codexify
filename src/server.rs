@@ -8,6 +8,7 @@
 //! state and diff checkpoints that survive transport replacement. The embedded
 //! UI resources remain presentation-only.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -881,33 +882,33 @@ impl ServerHandler for CodexHandler {
         }
 
         let started = Instant::now();
-        let mut result = if let Some(error) =
-            self.conversation_auth_error(&name, conversation.as_ref())
-        {
-            error
-        } else if ticketed && context.ct.is_cancelled() {
-            ToolResult::error("Call cancelled before dispatch.")
-        } else if let Some(error) = ticket_argument_error {
-            ToolResult::error(format!("Invalid arguments for `{name}`: {error}"))
-        } else if let Some(error) = tool.and_then(|tool| tool.validate_arguments(&args).err()) {
-            ToolResult::error(format!("Invalid arguments for `{name}`: {error}"))
-        } else {
-            // A ChatGPT conversation gets its own exec-session view (#12); generic MCP
-            // clients fall back to the transport-owned session.
-            let conversation_exec_session = if tool.is_some_and(|t| t.uses_exec_session_state()) {
-                task_conversation.as_ref().map(|identity| {
-                    self.conversation_exec_sessions
-                        .session_for(identity, &self.session)
-                })
+        let execution = async {
+            if let Some(error) = self.conversation_auth_error(&name, conversation.as_ref()) {
+                error
+            } else if ticketed && context.ct.is_cancelled() {
+                ToolResult::error("Call cancelled before dispatch.")
+            } else if let Some(error) = ticket_argument_error {
+                ToolResult::error(format!("Invalid arguments for `{name}`: {error}"))
+            } else if let Some(error) = tool.and_then(|tool| tool.validate_arguments(&args).err()) {
+                ToolResult::error(format!("Invalid arguments for `{name}`: {error}"))
             } else {
-                None
-            };
-            let session = conversation_exec_session.as_ref().unwrap_or(&self.session);
+                // A ChatGPT conversation gets its own exec-session view (#12); generic MCP
+                // clients fall back to the transport-owned session.
+                let conversation_exec_session = if tool.is_some_and(|t| t.uses_exec_session_state())
+                {
+                    task_conversation.as_ref().map(|identity| {
+                        self.conversation_exec_sessions
+                            .session_for(identity, &self.session)
+                    })
+                } else {
+                    None
+                };
+                let session = conversation_exec_session.as_ref().unwrap_or(&self.session);
 
-            match tool {
-                None => ToolResult::error(format!("Unknown tool: {name}")),
-                Some(_) if name == PrepareContinuation::NAME => {
-                    let prepared = conversation
+                match tool {
+                    None => ToolResult::error(format!("Unknown tool: {name}")),
+                    Some(_) if name == PrepareContinuation::NAME => {
+                        let prepared = conversation
                         .as_ref()
                         .zip(task_conversation.as_ref())
                         .ok_or_else(|| {
@@ -929,43 +930,43 @@ impl ServerHandler for CodexHandler {
                             let token = self.continuations.issue_token(physical, task, &root)?;
                             Ok((token, root))
                         });
-                    match prepared {
-                        Ok((token, root)) => {
-                            PrepareContinuation::result(&token, &root.to_string_lossy())
+                        match prepared {
+                            Ok((token, root)) => {
+                                PrepareContinuation::result(&token, &root.to_string_lossy())
+                            }
+                            Err(error) => ToolResult::error(error),
                         }
-                        Err(error) => ToolResult::error(error),
                     }
-                }
-                Some(_) if name == ContinueTask::NAME => {
-                    let continued = (|| -> Result<_, String> {
-                        let physical = conversation.as_ref().ok_or(
-                            "Task continuation requires stable ChatGPT conversation metadata.",
-                        )?;
-                        let token = ContinueTask::token(&args)?;
-                        if task_conversation
-                            .as_ref()
-                            .is_some_and(|task| task.stable_key() != physical.stable_key())
-                        {
-                            return self
+                    Some(_) if name == ContinueTask::NAME => {
+                        let continued = (|| -> Result<_, String> {
+                            let physical = conversation.as_ref().ok_or(
+                                "Task continuation requires stable ChatGPT conversation metadata.",
+                            )?;
+                            let token = ContinueTask::token(&args)?;
+                            if task_conversation
+                                .as_ref()
+                                .is_some_and(|task| task.stable_key() != physical.stable_key())
+                            {
+                                return self
                                 .continuations
                                 .repeated_claim(physical, &token)?
                                 .ok_or_else(|| {
                                     "This ChatGPT conversation is already attached to a different Codexify task."
                                         .to_string()
                                 });
-                        }
-                        if self.config.multi_project
-                            && self
-                                .project_bindings
-                                .selected_project_root(&self.config, physical)?
-                                .is_some()
-                        {
-                            return Err(
+                            }
+                            if self.config.multi_project
+                                && self
+                                    .project_bindings
+                                    .selected_project_root(&self.config, physical)?
+                                    .is_some()
+                            {
+                                return Err(
                                 "This ChatGPT conversation already has a workspace. Continue the task in a new conversation before selecting anything."
                                     .into(),
                             );
-                        }
-                        self.continuations.claim(physical, &token, |source_task, saved| {
+                            }
+                            self.continuations.claim(physical, &token, |source_task, saved| {
                             let current = if self.config.multi_project {
                                 self.project_bindings
                                     .selected_project_root(&self.config, source_task)?
@@ -990,65 +991,66 @@ impl ServerHandler for CodexHandler {
                             }
                             Ok(())
                         })
-                    })();
-                    match continued {
-                        Ok(claimed) => {
-                            task_conversation = Some(claimed.task);
-                            ContinueTask::result(&claimed.workspace.to_string_lossy())
-                        }
-                        Err(error) => ToolResult::error(error),
-                    }
-                }
-                Some(tool)
-                    if matches!(
-                        name.as_str(),
-                        SetProjectRoot::NAME | crate::tools::setup_ui_action::SELECT_NAME
-                    ) =>
-                {
-                    if let Some(identity) = task_conversation.as_ref() {
-                        select_and_render(&args, |request| async move {
-                            match request {
-                                ProjectSelectionRequest::Resume(path) => {
-                                    self.project_bindings
-                                        .resume_workspace(&self.config, identity, &path)
-                                        .await
-                                }
-                                ProjectSelectionRequest::Project {
-                                    path,
-                                    create_worktree,
-                                } => {
-                                    let selected = crate::tools::set_project_root::selection_config(
-                                        &self.config,
-                                        create_worktree,
-                                    );
-                                    self.project_bindings
-                                        .select_project_root(&selected, identity, &path)
-                                        .await
-                                        .map(ProjectSelection::Project)
-                                }
-                                ProjectSelectionRequest::WithoutProject => self
-                                    .project_bindings
-                                    .select_without_project(&self.config, identity)
-                                    .await
-                                    .map(ProjectSelection::WithoutProject),
+                        })();
+                        match continued {
+                            Ok(claimed) => {
+                                task_conversation = Some(claimed.task);
+                                ContinueTask::result(&claimed.workspace.to_string_lossy())
                             }
-                        })
-                        .await
-                    } else {
-                        tool.call_with_context(args, &self.config, session, &tool_context)
-                            .await
-                    }
-                }
-                Some(tool) if tool.requires_project_root() => {
-                    let resolved = if !model_call {
-                        match task_conversation.as_ref() {
-                            Some(identity) => self
-                                .project_bindings
-                                .effective_config(&self.config, identity),
-                            None => session.effective_config(&self.config),
+                            Err(error) => ToolResult::error(error),
                         }
-                    } else {
-                        workspace_at_start.as_ref().map_err(Clone::clone).and_then(|(root, change)| {
+                    }
+                    Some(tool)
+                        if matches!(
+                            name.as_str(),
+                            SetProjectRoot::NAME | crate::tools::setup_ui_action::SELECT_NAME
+                        ) =>
+                    {
+                        if let Some(identity) = task_conversation.as_ref() {
+                            select_and_render(&args, |request| async move {
+                                match request {
+                                    ProjectSelectionRequest::Resume(path) => {
+                                        self.project_bindings
+                                            .resume_workspace(&self.config, identity, &path)
+                                            .await
+                                    }
+                                    ProjectSelectionRequest::Project {
+                                        path,
+                                        create_worktree,
+                                    } => {
+                                        let selected =
+                                            crate::tools::set_project_root::selection_config(
+                                                &self.config,
+                                                create_worktree,
+                                            );
+                                        self.project_bindings
+                                            .select_project_root(&selected, identity, &path)
+                                            .await
+                                            .map(ProjectSelection::Project)
+                                    }
+                                    ProjectSelectionRequest::WithoutProject => self
+                                        .project_bindings
+                                        .select_without_project(&self.config, identity)
+                                        .await
+                                        .map(ProjectSelection::WithoutProject),
+                                }
+                            })
+                            .await
+                        } else {
+                            tool.call_with_context(args, &self.config, session, &tool_context)
+                                .await
+                        }
+                    }
+                    Some(tool) if tool.requires_project_root() => {
+                        let resolved = if !model_call {
+                            match task_conversation.as_ref() {
+                                Some(identity) => self
+                                    .project_bindings
+                                    .effective_config(&self.config, identity),
+                                None => session.effective_config(&self.config),
+                            }
+                        } else {
+                            workspace_at_start.as_ref().map_err(Clone::clone).and_then(|(root, change)| {
                         if let Some(change) = change
                             && name != "get_agent_brief" {
                             return Err(change.notice(root.as_deref()));
@@ -1058,89 +1060,109 @@ impl ServerHandler for CodexHandler {
                         effective.work_dir = root.clone();
                         Ok(effective)
                     })
-                    };
-                    match resolved {
-                        Err(_)
-                            if name == "get_agent_brief"
-                                && matches!(&workspace_at_start, Ok((None, _))) =>
-                        {
-                            let mut config = self.config.as_ref().clone();
-                            config.conversation_auth_token = None;
-                            ToolResult::text(build_initial_instructions(&config))
-                        }
-                        Err(error) => ToolResult::error(error),
-                        Ok(effective_config) => {
-                            let owner = match task_conversation.as_ref() {
-                                Some(identity) => DiffOwner::conversation(identity),
-                                None => DiffOwner::transport(self.session.diff_state()),
-                            };
-                            if tool.may_modify_project() {
-                                // Fail closed: refuse a mutating tool when the diff
-                                // checkpoint cannot be captured. The refusal is returned
-                                // as a value (not an early return) so the audit
-                                // finish_tool below still pairs with begin_tool.
-                                match self
-                                    .diff_checkpoints
-                                    .begin_mutation(&effective_config, owner)
+                        };
+                        match resolved {
+                            Err(_)
+                                if name == "get_agent_brief"
+                                    && matches!(&workspace_at_start, Ok((None, _))) =>
+                            {
+                                let mut config = self.config.as_ref().clone();
+                                config.conversation_auth_token = None;
+                                ToolResult::text(build_initial_instructions(&config))
+                            }
+                            Err(error) => ToolResult::error(error),
+                            Ok(effective_config) => {
+                                let owner = match task_conversation.as_ref() {
+                                    Some(identity) => DiffOwner::conversation(identity),
+                                    None => DiffOwner::transport(self.session.diff_state()),
+                                };
+                                if tool.manages_project_checkpoint() {
+                                    tool.call_with_context(
+                                        args,
+                                        &effective_config,
+                                        session,
+                                        &tool_context,
+                                    )
                                     .await
-                                {
-                                    Ok((availability, guard)) => {
-                                        if let DiffAvailability::Unavailable(reason) = &availability
-                                        {
+                                } else if tool.may_modify_project() {
+                                    // Fail closed: refuse a mutating tool when the diff
+                                    // checkpoint cannot be captured. The refusal is returned
+                                    // as a value (not an early return) so the audit
+                                    // finish_tool below still pairs with begin_tool.
+                                    match crate::audit::stage(
+                                        "checkpoint_wait",
+                                        async {
+                                            tokio::select! {
+                                                biased;
+                                                _ = tool_context.cancellation.cancelled() => Err("Checkpoint wait cancelled; mutation was not dispatched.".to_string()),
+                                                result = self.diff_checkpoints.begin_mutation(&effective_config, owner) => result,
+                                            }
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok((availability, guard)) => {
+                                            if let DiffAvailability::Unavailable(reason) =
+                                                &availability
+                                            {
+                                                tracing::debug!(
+                                                    "diff checkpoints unavailable for {name}: {reason}"
+                                                );
+                                            }
+                                            let result = if tool_context.cancellation.is_cancelled() {
+                                                ToolResult::error("Call cancelled before mutation dispatch.")
+                                            } else { tool
+                                                .call_with_context(
+                                                    args,
+                                                    &effective_config,
+                                                    session,
+                                                    &tool_context,
+                                                )
+                                                .await };
+                                            drop(guard);
+                                            result
+                                        }
+                                        Err(error) => ToolResult::error(format!(
+                                            "Refusing to run mutating tool `{name}` because the project diff checkpoint could not be captured: {error}"
+                                        )),
+                                    }
+                                } else {
+                                    match self
+                                        .diff_checkpoints
+                                        .ensure_initialized_for_read(&effective_config, owner)
+                                        .await
+                                    {
+                                        Ok(DiffAvailability::Ready) => {}
+                                        Ok(DiffAvailability::Unavailable(reason)) => {
                                             tracing::debug!(
                                                 "diff checkpoints unavailable for {name}: {reason}"
                                             );
                                         }
-                                        let result = tool
-                                            .call_with_context(
-                                                args,
-                                                &effective_config,
-                                                session,
-                                                &tool_context,
-                                            )
-                                            .await;
-                                        drop(guard);
-                                        result
+                                        Err(error) => {
+                                            tracing::debug!(
+                                                "diff checkpoint initialization skipped for {name}: {error}"
+                                            );
+                                        }
                                     }
-                                    Err(error) => ToolResult::error(format!(
-                                        "Refusing to run mutating tool `{name}` because the project diff checkpoint could not be captured: {error}"
-                                    )),
-                                }
-                            } else {
-                                match self
-                                    .diff_checkpoints
-                                    .ensure_initialized(&effective_config, owner)
+                                    tool.call_with_context(
+                                        args,
+                                        &effective_config,
+                                        session,
+                                        &tool_context,
+                                    )
                                     .await
-                                {
-                                    Ok(DiffAvailability::Ready) => {}
-                                    Ok(DiffAvailability::Unavailable(reason)) => {
-                                        tracing::debug!(
-                                            "diff checkpoints unavailable for {name}: {reason}"
-                                        );
-                                    }
-                                    Err(error) => {
-                                        tracing::debug!(
-                                            "diff checkpoint initialization skipped for {name}: {error}"
-                                        );
-                                    }
                                 }
-                                tool.call_with_context(
-                                    args,
-                                    &effective_config,
-                                    session,
-                                    &tool_context,
-                                )
-                                .await
                             }
                         }
                     }
-                }
-                Some(tool) => {
-                    tool.call_with_context(args, &self.config, session, &tool_context)
-                        .await
+                    Some(tool) => {
+                        tool.call_with_context(args, &self.config, session, &tool_context)
+                            .await
+                    }
                 }
             }
         };
+        let mut result = crate::audit::observe(self.audit.clone(), call_id, execution).await;
 
         if agent_call
             && !result.is_error
@@ -1420,6 +1442,8 @@ struct HealthState {
     tool_count: usize,
     ready: Arc<AtomicBool>,
     multi_tunnel: Option<(Arc<TunnelAvailability>, usize)>,
+    upstreams: Arc<HashMap<String, Arc<crate::upstream_control::UpstreamControl>>>,
+    filesystem: Option<Arc<crate::filesystem::FilesystemWorker>>,
 }
 
 async fn health(State(state): State<HealthState>) -> (StatusCode, Json<Value>) {
@@ -1443,6 +1467,18 @@ async fn health(State(state): State<HealthState>) -> (StatusCode, Json<Value>) {
         "status": if is_ready { "ok" } else { "starting" },
         "tools": state.tool_count,
     });
+    if !state.upstreams.is_empty() {
+        payload["upstreams"] = Value::Object(
+            state
+                .upstreams
+                .iter()
+                .map(|(name, state)| (name.clone(), state.snapshot()))
+                .collect(),
+        );
+    }
+    if let Some(filesystem) = &state.filesystem {
+        payload["filesystem"] = filesystem.snapshot();
+    }
     if let Some((active, configured)) = tunnel_counts {
         payload["tunnelsReady"] = json!(active);
         payload["tunnelsConfigured"] = json!(configured);
@@ -1515,6 +1551,8 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     let bridge_report = bridge.report;
     let bridged_resources = bridge.resources;
     let _bridge_services = bridge.services;
+    let _bridge_monitors = bridge.monitors;
+    let upstreams = bridge.upstreams;
 
     let mut all_tools = validate_and_wrap_tools(load_tools_for_config(&config))
         .map_err(|error| anyhow::anyhow!("invalid native tool contract: {error}"))?;
@@ -1630,6 +1668,8 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         .route("/health", get(health))
         .with_state(HealthState {
             tool_count,
+            upstreams: upstreams.clone(),
+            filesystem: Some(config.filesystem_worker.clone()),
             ready: ready.clone(),
             multi_tunnel: multi_availability.as_ref().map(|availability| {
                 (
@@ -2532,6 +2572,7 @@ mod tests {
     include!("server_markdown_chat_tests.rs");
     include!("server_markdown_chat_widget_tests.rs");
     include!("server_workspace_tests.rs");
+    include!("server_starvation_tests.rs");
     include!("server_agent_ticket_tests.rs");
     include!("server_continuation_tests.rs");
 
@@ -3515,7 +3556,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
         config.output.max_tool_output_tokens = Some(20);
-        let tool = crate::tools::grep::Grep;
+        let tool = crate::tools::grep::Grep::default();
         let mut result = ToolResult::text("\"\\\n".repeat(1_000));
 
         finalize_model_visible_result(Some(&tool), &mut result, &config);
@@ -3537,7 +3578,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
         config.output.max_tool_output_tokens = Some(20);
-        let tool = crate::tools::grep::Grep;
+        let tool = crate::tools::grep::Grep::default();
         let mut result = ToolResult::text("fallback").with_structured(json!({
             "payload": "x".repeat(10_000)
         }));
@@ -3758,6 +3799,8 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(false));
         let state = HealthState {
             tool_count: 38,
+            upstreams: Arc::new(HashMap::new()),
+            filesystem: None,
             ready: ready.clone(),
             multi_tunnel: None,
         };
@@ -3781,6 +3824,8 @@ mod tests {
         });
         let state = HealthState {
             tool_count: 38,
+            upstreams: Arc::new(HashMap::new()),
+            filesystem: None,
             ready,
             multi_tunnel: Some((availability.clone(), 2)),
         };

@@ -19,6 +19,8 @@ pub struct Tree;
 struct TreeArgs {
     /// Project-relative directory. Defaults to the project root.
     path: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
     /// Maximum traversal depth. Defaults to the configured tree depth.
     depth: Option<usize>,
 }
@@ -56,7 +58,43 @@ impl Tool for Tree {
     }
 
     async fn call(&self, args: Value, config: &AppConfig, _session: &SessionState) -> ToolResult {
-        let TreeArgs { path, depth } = match parse_tool_args(args) {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::Tree,
+                args,
+                config,
+                &tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+    }
+    async fn call_with_context(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        _session: &SessionState,
+        context: &crate::tool::ToolRequestContext,
+    ) -> ToolResult {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::Tree,
+                args,
+                config,
+                &context.cancellation,
+                None,
+            )
+            .await
+    }
+}
+impl Tree {
+    pub(crate) fn run_inner(args: Value, config: &AppConfig) -> ToolResult {
+        let TreeArgs {
+            path,
+            depth,
+            _timeout_ms: _,
+        } = match parse_tool_args(args) {
             Ok(args) => args,
             Err(error) => return *error,
         };
@@ -121,6 +159,10 @@ fn build_tree(
     let rd = std::fs::read_dir(dir_path).map_err(|e| e.to_string())?;
     let mut filtered: Vec<Entry> = Vec::new();
     for entry in rd {
+        if !crate::filesystem::visit_entry() {
+            state.stopped = true;
+            break;
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);

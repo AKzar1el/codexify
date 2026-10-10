@@ -2,7 +2,11 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codexify::config::default_config;
+fn default_config(root: std::path::PathBuf) -> codexify::types::AppConfig {
+    let mut config = codexify::config::default_config(root);
+    config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
+    config
+}
 use codexify::exec_sessions::SessionState;
 use codexify::markdown_chat::{MarkdownChatStore, NotificationState, WaitOutcome};
 use codexify::project_bindings::ConversationIdentity;
@@ -902,7 +906,11 @@ async fn history_tools_read_only_the_current_conversation_without_acknowledging(
         .unwrap();
     other.ensure().await.unwrap();
     append(other.path(), "Unrelated private text\n");
-    let tools = load_tools_for_config(&config);
+    let mut tools = load_tools_for_config(&config);
+    // This test runs in a Cargo harness; workers must enter the real CLI binary.
+    *tools.iter_mut().find(|tool| tool.name() == "grep").unwrap() = Box::new(
+        codexify::tools::grep::Grep::new(env!("CARGO_BIN_EXE_codexify").into()),
+    );
     for name in ["read_file", "grep"] {
         let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
         let args = if name == "grep" {

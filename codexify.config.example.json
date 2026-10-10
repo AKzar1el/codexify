@@ -51,8 +51,16 @@
     "maxEntries": 500,
     "maxTreeNodes": 1000
   },
+  "filesystem": {
+    "maxConcurrentWorkers": 4,
+    "maxPendingRequests": 16,
+    "maxScanBytes": 67108864,
+    "maxScanEntries": 100000,
+    "maxLineBytes": 1048576
+  },
   "diff": {
-    "maxPatchBytes": 4194304
+    "maxPatchBytes": 4194304,
+    "commandTimeoutMs": 30000
   },
   "toolLogging": {
     "mode": "off",
@@ -155,6 +163,13 @@
       "envHttpHeaders": {},
       "startupTimeoutSec": 20,
       "toolTimeoutSec": 60,
+      "requestLimits": {
+        "maxConcurrentRequests": 4,
+        "maxPendingRequests": 16,
+        "failureThreshold": 3,
+        "recoveryDelayMs": 30000,
+        "slowCancellationMs": 60000
+      },
       "tools": ["example_tool"],
       "disabledTools": [],
       "mode": "direct"
@@ -176,6 +191,13 @@
       },
       "startupTimeoutSec": 20,
       "toolTimeoutSec": 60,
+      "requestLimits": {
+        "maxConcurrentRequests": 4,
+        "maxPendingRequests": 16,
+        "failureThreshold": 3,
+        "recoveryDelayMs": 30000,
+        "slowCancellationMs": 60000
+      },
       "tools": null,
       "disabledTools": [],
       "mode": "catalog"

@@ -23,6 +23,8 @@ struct GlobArgs {
     pattern: String,
     /// Project-relative subdirectory. Defaults to the project root.
     path: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
 }
 
 /// Whether the pattern opts into matching dot-prefixed path segments. fast-glob
@@ -47,6 +49,9 @@ fn collect_files(base: &Path, matcher: &IgnoreMatcher, out: &mut Vec<PathBuf>) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        if !crate::filesystem::visit_entry() {
+            break;
+        }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_dir = match entry.file_type() {
@@ -96,7 +101,43 @@ impl Tool for Glob {
     }
 
     async fn call(&self, args: Value, config: &AppConfig, _session: &SessionState) -> ToolResult {
-        let GlobArgs { pattern, path } = match parse_tool_args(args) {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::Glob,
+                args,
+                config,
+                &tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+    }
+    async fn call_with_context(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        _session: &SessionState,
+        context: &crate::tool::ToolRequestContext,
+    ) -> ToolResult {
+        config
+            .filesystem_worker
+            .run(
+                crate::filesystem::Operation::Glob,
+                args,
+                config,
+                &context.cancellation,
+                None,
+            )
+            .await
+    }
+}
+impl Glob {
+    pub(crate) fn run_inner(args: Value, config: &AppConfig) -> ToolResult {
+        let GlobArgs {
+            pattern,
+            path,
+            _timeout_ms: _,
+        } = match parse_tool_args(args) {
             Ok(args) => args,
             Err(error) => return *error,
         };

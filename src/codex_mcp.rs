@@ -342,6 +342,7 @@ fn codex_cli_server_to_spec(
             disabled_tools: server.disabled_tools,
             mode: None,
             provenance: McpServerProvenance::CodexCli,
+            request_limits: crate::types::McpRequestLimits::default(),
         });
     }
     if matches!(kind.as_str(), "sse" | "websocket" | "ws") {
@@ -408,6 +409,7 @@ fn codex_cli_server_to_spec(
         disabled_tools: server.disabled_tools,
         mode: None,
         provenance: McpServerProvenance::CodexCli,
+        request_limits: crate::types::McpRequestLimits::default(),
     })
 }
 
@@ -607,6 +609,7 @@ fn parse_server(
                 disabled_tools,
                 mode: None,
                 provenance: McpServerProvenance::CodexConfig,
+                request_limits: crate::types::McpRequestLimits::default(),
             }),
             ignored_fields,
         });
@@ -655,6 +658,7 @@ fn parse_server(
             disabled_tools,
             mode: None,
             provenance: McpServerProvenance::CodexConfig,
+            request_limits: crate::types::McpRequestLimits::default(),
         }),
         ignored_fields,
     })
