@@ -1,0 +1,27 @@
+{
+  "name": "@codexify/browser-companion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "description": "Single-window ChatGPT browser companion for Codexify agent chat",
+  "scripts": {
+    "build": "bun build src/main.ts --target=node --packages=external --outdir=dist",
+    "typecheck": "bun x --no-install --bun tsc --noEmit",
+    "test": "bun test ./tests",
+    "start": "bun run build && electron ."
+  },
+  "dependencies": {
+    "@mixmark-io/domino": "2.2.0",
+    "playwright-core": "^1.62.0",
+    "turndown": "7.2.0",
+    "turndown-plugin-gfm": "1.0.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "@types/turndown": "5.0.5",
+    "electron": "41.10.7",
+    "typescript": "5.9.3"
+  }
+}

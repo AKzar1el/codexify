@@ -429,3 +429,78 @@ Implement the approved agent-chat browser automation architecture completely: re
   weakening the production wiring.
 - `cargo test --test owner_chat_restart` also passed after preserving that public
   startup surface (1 passed, its subprocess fixture remained intentionally ignored).
+- Committed the complete Task 8 owner API/UI and action-repair slice as `c013069`
+  (`feat: add standalone chat browser automation controls`). The working tree was
+  clean at the Task 9 boundary.
+- Task 9 is now active: extract the approved narrow browser/session layer from
+  upstream `f9ad4ae` into a one-window TypeScript/Electron companion, retain MIT
+  attribution and update tooling, and exclude every Responses/Codex/multi-tab
+  subsystem named as a non-goal.
+- Task 9 scaffold is in place:
+  - added an independently typechecked/tested Bun package under
+    `browser-companion/` with the exact upstream browser dependencies plus
+    Electron for the persistent user-session process;
+  - copied the upstream MIT license, added the third-party notice and an explicit
+    source-boundary document naming tag `v6.1.7` / commit `f9ad4ae`;
+  - copied the upstream session/model-selector and stable Markdown modules as the
+    structural starting point rather than rewriting their selector and streaming
+    logic from memory;
+  - installed the pinned package graph and generated `browser-companion/bun.lock`.
+- Task 9 initial red phase: `bun test` ran the copied session and Markdown tests
+  successfully (8 passed) and failed exactly because the new fixed protocol,
+  model-catalog, and composer modules did not yet exist (3 missing-module errors).
+- Task 9's first companion-core slice is green:
+  - implemented strict protocol-v1 request, response, event, descriptor, URL, size,
+    and opaque-ID contracts matching the existing Rust client;
+  - implemented fixed pair/unread/goal prompt rendering with unread Markdown escaped
+    as data and no arbitrary browser-code surface;
+  - implemented stable Luna, GPT-5.6 Sol, and GPT-6 Sol capability IDs plus live
+    effort availability and deterministic privacy-preserving catalog revisions;
+  - extracted upstream exact-composer insertion, session selectors, model-family
+    verification, and stable incremental Markdown conversion with source comments;
+  - `bun test` for protocol, models, composer, session, and response streaming now
+    passes 21 tests with 73 assertions.
+- Added the task-independent single-window orchestration core:
+  - exact stable turn identities and semantic Send evidence are adapted from the
+    upstream grouped/legacy DOM model rather than display-index heuristics;
+  - the companion accepts one active action globally, rejects navigation for a
+    second task while generation is active, and makes execute/cancel idempotency
+    explicit;
+  - action history is exposed as bounded ordered NDJSON-ready events, with
+    accepted cancellation normalized to `ambiguous_send` and no automatic replay;
+  - `bun test` for turn binding and single-window coordination passes 7 additional
+    tests, and the complete companion package typechecks cleanly.
+- Completed the first runnable companion implementation:
+  - added privacy-preserving ChatGPT account projection/fingerprinting, exact
+    connector selection and cleanup, Luna/Sol family plus effort verification,
+    semantic Send acceptance, stable assistant-turn reconciliation, visible
+    status/commentary/answer streaming, and fail-closed approval/auth/rate-limit/
+    interference handling;
+  - added one persistent Electron `BrowserWindow` with a private profile, loopback
+    CDP attachment, HTTPS-only navigation, hide-on-close behavior, and explicit
+    reveal/action ownership;
+  - added the authenticated loopback protocol server, strict bounded JSON and
+    NDJSON event endpoints, high-entropy bearer token, private atomic descriptor,
+    symlink/type/mode rejection, and owned descriptor cleanup;
+  - companion preflight now refuses queue ownership before navigation when the
+    shared ChatGPT window is already generating, waiting for approval, holding a
+    user draft, logged out, or otherwise unavailable;
+  - control-server shutdown aborts an active action before waiting for its NDJSON
+    client, preventing a service-stop deadlock while preserving accepted actions as
+    ambiguous rather than replayable;
+  - added a single-instance Electron entry point and reproducible Bun bundle.
+- Added `upstream-manifest.json` plus
+  `scripts/update-browser-companion-upstream.mjs`: it verifies the exact upstream
+  commit, produces whole-file adaptation diffs and derived-symbol anchors, and
+  prevents copied modules from silently losing their provenance.
+- Added a source-boundary regression test proving that the package has exactly one
+  browser window and imports no upstream Responses, Codex-provider, tunnel,
+  subagent, retained-conversation, or multi-tab pool subsystem.
+- Task 9 aggregate verification:
+  - `bun test` — 40 passed, 0 failed, 166 assertions across 12 companion test files;
+  - `bun run typecheck` — passed under strict TypeScript settings;
+  - `bun run build` — bundled the Electron entry (145.98 KiB, external Electron and
+    Playwright dependencies);
+  - `node --test scripts/test-browser-companion-boundary.mjs` — 4 passed;
+  - `node scripts/update-browser-companion-upstream.mjs --source
+    /tmp/codex-chatgpt-web-v6.1.7 --check` — passed at exact commit `f9ad4ae`.
