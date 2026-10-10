@@ -6,6 +6,7 @@ export const PROTOCOL_SCHEMA_HASH = "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
+export const MAX_EVENT_STREAM_BYTES = 16 * 1024 * 1024;
 export const MAX_EVENT_LINE_BYTES = 128 * 1024;
 export const MAX_DELTA_BYTES = 64 * 1024;
 export const MAX_FINAL_ANSWER_BYTES = 1024 * 1024;
@@ -22,16 +23,21 @@ export function utf8Length(value: string): number {
 }
 
 function noControl(value: string): boolean {
-  return !/[\u0000-\u001f\u007f]/u.test(value);
+  return !/\p{Cc}/u.test(value);
 }
 
 export const opaqueIdSchema = z.string().regex(opaquePattern);
-export const companionTokenSchema = z.string().regex(tokenPattern);
+export const companionTokenSchema = z.string().refine(value => {
+  if (!tokenPattern.test(value)) return false;
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length === 32 && decoded.toString("base64url") === value;
+}, "value must be canonical 32-byte base64url");
 export const boundedVisibleSchema = (max: number) => z.string()
   .min(1)
   .max(max)
   .refine(value => value.trim().length > 0, "text must not be blank")
-  .refine(noControl, "control characters are not allowed");
+  .refine(noControl, "control characters are not allowed")
+  .refine(value => utf8Length(value) <= max, "text exceeds its UTF-8 byte limit");
 export const boundedTextSchema = (max: number) => z.string().min(1).refine(value => !value.includes("\0") && utf8Length(value) <= max, "text is oversized or contains NUL");
 
 export function validateChatGptConversationUrl(value: string): string {

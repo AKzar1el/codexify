@@ -1,17 +1,20 @@
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use axum::Router;
+use axum::body::Body;
+use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use codexify::agent_automation::{
-    ActionPrompt, AgentAutomationStore, AgentAutomationSupervisor, AutomationActionStatus,
-    AutomationExecution, AutomationExecutionError, AutomationExecutor, AutomationTaskHandle,
-    BrowserAutomationExecutor, CompanionActionSnapshot, CompanionActionState, CompanionEvent,
-    CompanionEventKind,
+    AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AgentAutomationSupervisor,
+    AutomationActionStatus, AutomationExecution, AutomationExecutionError, AutomationExecutor,
+    AutomationTaskHandle, BrowserAutomationExecutor, CompanionActionSnapshot, CompanionActionState,
+    CompanionEvent, CompanionEventKind, PairingCommit,
 };
 use codexify::config::default_config;
 use codexify::exec_sessions::SessionState;
@@ -23,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -87,6 +90,20 @@ struct ChatWritingExecutor {
     chat: Arc<codexify::markdown_chat::ChatFile>,
 }
 
+struct PairVerifyingExecutor {
+    store: Arc<AgentAutomationStore>,
+    task: ConversationIdentity,
+    generation: u64,
+    reference: String,
+}
+
+struct PairVerifyingFailureExecutor {
+    store: Arc<AgentAutomationStore>,
+    task: ConversationIdentity,
+    generation: u64,
+    reference: String,
+}
+
 struct AmbiguousExecutor;
 
 struct PreSendFailureExecutor {
@@ -94,6 +111,8 @@ struct PreSendFailureExecutor {
 }
 
 struct AcceptedTerminalFailureExecutor;
+
+struct AcceptedEventThenTransportErrorExecutor;
 
 impl Default for PreSendFailureExecutor {
     fn default() -> Self {
@@ -167,10 +186,37 @@ impl AutomationExecutor for AcceptedTerminalFailureExecutor {
     }
 }
 
+#[async_trait]
+impl AutomationExecutor for AcceptedEventThenTransportErrorExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        events
+            .send(CompanionEvent {
+                sequence: 1,
+                action_id: execution.request.action_id,
+                at_ms: 1,
+                kind: CompanionEventKind::SendAccepted,
+            })
+            .unwrap();
+        Err(AutomationExecutionError {
+            message: "Browser companion status reconciliation failed".into(),
+            send_accepted: false,
+        })
+    }
+}
+
 struct StreamingExecutor {
     started: Arc<Notify>,
     release: Arc<Notify>,
 }
+
+struct LargeTransientExecutor;
+
+struct LargeFinalAnswerExecutor;
 
 struct SerialExecutor {
     calls: AtomicUsize,
@@ -251,6 +297,97 @@ impl AutomationExecutor for StreamingExecutor {
 }
 
 #[async_trait]
+impl AutomationExecutor for LargeTransientExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        events
+            .send(CompanionEvent {
+                sequence: 1,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 1,
+                kind: CompanionEventKind::SendAccepted,
+            })
+            .unwrap();
+        for index in 0..17_u64 {
+            events
+                .send(CompanionEvent {
+                    sequence: index + 2,
+                    action_id: execution.request.action_id.clone(),
+                    at_ms: index + 2,
+                    kind: CompanionEventKind::StatusDelta {
+                        text: "x".repeat(64 * 1024),
+                        continuation: index != 0,
+                    },
+                })
+                .unwrap();
+        }
+        events
+            .send(CompanionEvent {
+                sequence: 19,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 19,
+                kind: CompanionEventKind::GenerationComplete {
+                    final_markdown: Some("Complete after long transient output.".into()),
+                    canonical_url: Some(execution.request.expected_url.clone()),
+                },
+            })
+            .unwrap();
+        Ok(snapshot_for(execution))
+    }
+}
+
+#[async_trait]
+impl AutomationExecutor for LargeFinalAnswerExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        events
+            .send(CompanionEvent {
+                sequence: 1,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 1,
+                kind: CompanionEventKind::SendAccepted,
+            })
+            .unwrap();
+        for (index, markdown) in ["a".repeat(40 * 1024), "b".repeat(40 * 1024)]
+            .into_iter()
+            .enumerate()
+        {
+            events
+                .send(CompanionEvent {
+                    sequence: index as u64 + 2,
+                    action_id: execution.request.action_id.clone(),
+                    at_ms: index as u64 + 2,
+                    kind: CompanionEventKind::AnswerDelta {
+                        markdown,
+                        continuation: index != 0,
+                    },
+                })
+                .unwrap();
+        }
+        events
+            .send(CompanionEvent {
+                sequence: 4,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 4,
+                kind: CompanionEventKind::GenerationComplete {
+                    final_markdown: None,
+                    canonical_url: Some(execution.request.expected_url.clone()),
+                },
+            })
+            .unwrap();
+        Ok(snapshot_for(execution))
+    }
+}
+
+#[async_trait]
 impl AutomationExecutor for ChatWritingExecutor {
     async fn execute(
         &self,
@@ -282,6 +419,78 @@ impl AutomationExecutor for ChatWritingExecutor {
             })
             .unwrap();
         Ok(snapshot_for(execution))
+    }
+}
+
+#[async_trait]
+impl AutomationExecutor for PairVerifyingExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.store
+            .record_pairing_canonical_url(
+                &self.task,
+                self.generation,
+                &execution.request.expected_url,
+                102,
+            )
+            .unwrap();
+        self.store
+            .verify_pairing(
+                &self.task,
+                self.generation,
+                execution.owner_generation,
+                &self.reference,
+                103,
+            )
+            .unwrap();
+        events
+            .send(CompanionEvent {
+                sequence: 1,
+                action_id: execution.request.action_id.clone(),
+                at_ms: 1,
+                kind: CompanionEventKind::GenerationComplete {
+                    final_markdown: None,
+                    canonical_url: Some(execution.request.expected_url.clone()),
+                },
+            })
+            .unwrap();
+        Ok(snapshot_for(execution))
+    }
+}
+
+#[async_trait]
+impl AutomationExecutor for PairVerifyingFailureExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        _events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.store
+            .record_pairing_canonical_url(
+                &self.task,
+                self.generation,
+                &execution.request.expected_url,
+                102,
+            )
+            .unwrap();
+        self.store
+            .verify_pairing(
+                &self.task,
+                self.generation,
+                execution.owner_generation,
+                &self.reference,
+                103,
+            )
+            .unwrap();
+        Err(AutomationExecutionError {
+            message: "Browser companion returned a different conversation URL".into(),
+            send_accepted: true,
+        })
     }
 }
 
@@ -610,6 +819,279 @@ async fn accepted_unread_batch_is_not_acknowledged_or_automatically_mirrored_twi
 }
 
 #[tokio::test]
+async fn accepted_unread_batch_is_rearmed_for_a_new_physical_owner_generation() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "owner-generation-message".into(),
+            "Mirror me again after the physical owner changes.".into(),
+        )
+        .await
+        .unwrap();
+    fixture.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::GenerationComplete {
+            final_markdown: None,
+            canonical_url: Some("https://chatgpt.com/c/example".into()),
+        },
+    ]);
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.supervisor.queued_count().await, 0);
+
+    fixture
+        .supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            1,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    let replacement = fixture
+        .store
+        .issue_pairing(
+            &fixture.task,
+            "https://chatgpt.com/c/replacement-owner",
+            1,
+            2_000,
+        )
+        .unwrap();
+    fixture
+        .store
+        .record_pairing_canonical_url(
+            &fixture.task,
+            replacement.generation,
+            "https://chatgpt.com/c/replacement-owner",
+            2_001,
+        )
+        .unwrap();
+    fixture
+        .store
+        .verify_pairing(
+            &fixture.task,
+            replacement.generation,
+            1,
+            &replacement.reference,
+            2_002,
+        )
+        .unwrap();
+
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS + 2_000)
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.supervisor.queued_count().await, 1);
+}
+
+#[tokio::test]
+async fn consumed_accepted_message_ids_are_pruned_before_the_history_limit_blocks_delivery() {
+    let fixture = fixture().await;
+    let pairing_generation = fixture
+        .store
+        .load(&fixture.task)
+        .unwrap()
+        .pairing
+        .generation;
+    let stale_ids = (0..1024)
+        .map(|index| format!("consumed-{index:04}"))
+        .collect::<Vec<_>>();
+    fixture
+        .store
+        .queue_action(
+            &fixture.task,
+            "consumed-history-action",
+            codexify::agent_automation::AutomationActionKind::OfflineChat,
+            pairing_generation,
+            None,
+            900,
+        )
+        .unwrap();
+    fixture
+        .store
+        .record_accepted_batch(
+            &fixture.task,
+            "consumed-history-action",
+            AcceptedChatBatch {
+                owner_generation: 0,
+                batch_id: "consumed-history-batch",
+                message_ids: &stale_ids,
+                transcript_revision: "consumed-history-revision",
+            },
+            901,
+        )
+        .unwrap();
+    fixture
+        .store
+        .update_action_status(
+            &fixture.task,
+            "consumed-history-action",
+            AutomationActionStatus::Idle,
+            None,
+            None,
+            902,
+        )
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "new-after-consumed-history".into(),
+            "This unread message must still reach the replacement browser turn.".into(),
+        )
+        .await
+        .unwrap();
+    fixture.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::GenerationComplete {
+            final_markdown: None,
+            canonical_url: Some("https://chatgpt.com/c/example".into()),
+        },
+    ]);
+
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .load(&fixture.task)
+            .unwrap()
+            .chat_mirror
+            .message_ids,
+        vec!["new-after-consumed-history"]
+    );
+}
+
+#[tokio::test]
+async fn full_unread_accepted_history_blocks_a_new_send_before_browser_execution() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    let accepted_ids = (0..1024)
+        .map(|index| format!("retained-{index:04}"))
+        .collect::<Vec<_>>();
+    let mut blocks = String::new();
+    for (index, id) in accepted_ids.iter().enumerate() {
+        blocks.push_str(&format!(
+            "\n\n<!-- codexify-user-message:v1:start id=\"{id}\" created_at_ms=\"{}\" tool_call_count=\"0\" -->\n\n## User\n\nPending accepted message {index}.\n\n<!-- codexify-user-message:v1:end id=\"{id}\" -->\n",
+            1_001 + index as u64,
+        ));
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.chat.path())
+        .unwrap()
+        .write_all(blocks.as_bytes())
+        .unwrap();
+    assert_eq!(
+        fixture.chat.unread_snapshot().await.unwrap().messages.len(),
+        1024
+    );
+
+    let pairing_generation = fixture
+        .store
+        .load(&fixture.task)
+        .unwrap()
+        .pairing
+        .generation;
+    fixture
+        .store
+        .queue_action(
+            &fixture.task,
+            "full-history-action",
+            codexify::agent_automation::AutomationActionKind::OfflineChat,
+            pairing_generation,
+            None,
+            2_100,
+        )
+        .unwrap();
+    fixture
+        .store
+        .record_accepted_batch(
+            &fixture.task,
+            "full-history-action",
+            AcceptedChatBatch {
+                owner_generation: 0,
+                batch_id: "full-history-batch",
+                message_ids: &accepted_ids,
+                transcript_revision: "full-history-revision",
+            },
+            2_101,
+        )
+        .unwrap();
+    fixture
+        .store
+        .update_action_status(
+            &fixture.task,
+            "full-history-action",
+            AutomationActionStatus::Idle,
+            None,
+            None,
+            2_102,
+        )
+        .unwrap();
+    fixture
+        .chat
+        .append_user(
+            "new-after-full-history".into(),
+            "This message must remain unread until a mirror receipt can be persisted.".into(),
+        )
+        .await
+        .unwrap();
+
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.supervisor.queued_count().await, 0);
+    assert_eq!(fixture.executor.calls.load(Ordering::SeqCst), 0);
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Failed);
+    assert!(
+        state
+            .action
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("accepted chat history"))
+    );
+    assert!(
+        fixture
+            .chat
+            .unread_snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.id == "new-after-full-history")
+    );
+}
+
+#[tokio::test]
 async fn queued_unread_action_coalesces_messages_arriving_before_execution() {
     let fixture = fixture().await;
     fixture.chat.record_agent_call(1_000).await.unwrap();
@@ -659,6 +1141,155 @@ async fn queued_unread_action_coalesces_messages_arriving_before_execution() {
             .map(|message| message.id.as_str())
             .collect::<Vec<_>>(),
         vec!["first-message", "second-message"]
+    );
+}
+
+#[tokio::test]
+async fn queued_unread_action_is_rebuilt_when_message_markdown_changes() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "edited-before-send".into(),
+            "Original pending message.".into(),
+        )
+        .await
+        .unwrap();
+    let offline_at = 1_000 + OFFLINE_AFTER_MS;
+    fixture.supervisor.scan_once(offline_at).await.unwrap();
+    assert_eq!(fixture.supervisor.queued_count().await, 1);
+
+    let path = fixture.chat.path().to_path_buf();
+    let transcript = std::fs::read_to_string(&path).unwrap();
+    assert!(transcript.contains("Original pending message."));
+    std::fs::write(
+        &path,
+        transcript.replace("Original pending message.", "Revised pending message."),
+    )
+    .unwrap();
+
+    assert!(
+        fixture
+            .supervisor
+            .run_next(offline_at + 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.executor.calls.load(Ordering::SeqCst), 0);
+
+    fixture.supervisor.scan_once(offline_at + 2).await.unwrap();
+    fixture.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::GenerationComplete {
+            final_markdown: None,
+            canonical_url: Some("https://chatgpt.com/c/example".into()),
+        },
+    ]);
+    fixture
+        .supervisor
+        .run_next(offline_at + 3)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let executions = fixture.executor.executions.lock().unwrap();
+    assert_eq!(executions.len(), 1);
+    let ActionPrompt::OfflineChat { messages, .. } = &executions[0].request.prompt else {
+        panic!("expected an offline chat action");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "edited-before-send");
+    assert_eq!(messages[0].markdown, "Revised pending message.");
+}
+
+#[tokio::test]
+async fn queued_unread_action_is_rebuilt_when_message_order_changes() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user("reordered-first".into(), "First pending message.".into())
+        .await
+        .unwrap();
+    fixture
+        .chat
+        .append_user("reordered-second".into(), "Second pending message.".into())
+        .await
+        .unwrap();
+    let offline_at = 1_000 + OFFLINE_AFTER_MS;
+    fixture.supervisor.scan_once(offline_at).await.unwrap();
+    assert_eq!(fixture.supervisor.queued_count().await, 1);
+
+    let path = fixture.chat.path().to_path_buf();
+    let transcript = std::fs::read_to_string(&path).unwrap();
+    let first_marker = "<!-- codexify-user-message:v1:start id=\"reordered-first\"";
+    let second_marker = "<!-- codexify-user-message:v1:start id=\"reordered-second\"";
+    let second_end_marker = "<!-- codexify-user-message:v1:end id=\"reordered-second\" -->\n";
+    let first_start = transcript.find(first_marker).unwrap();
+    let second_start = transcript.find(second_marker).unwrap();
+    let second_end = transcript[second_start..]
+        .find(second_end_marker)
+        .map(|offset| second_start + offset + second_end_marker.len())
+        .unwrap();
+    let reordered = format!(
+        "{}{}{}{}",
+        &transcript[..first_start],
+        &transcript[second_start..second_end],
+        &transcript[first_start..second_start],
+        &transcript[second_end..]
+    );
+    std::fs::write(&path, reordered).unwrap();
+    assert_eq!(
+        fixture
+            .chat
+            .unread_snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reordered-second", "reordered-first"]
+    );
+
+    assert!(
+        fixture
+            .supervisor
+            .run_next(offline_at + 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.executor.calls.load(Ordering::SeqCst), 0);
+
+    fixture.supervisor.scan_once(offline_at + 2).await.unwrap();
+    fixture.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::GenerationComplete {
+            final_markdown: None,
+            canonical_url: Some("https://chatgpt.com/c/example".into()),
+        },
+    ]);
+    fixture
+        .supervisor
+        .run_next(offline_at + 3)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let executions = fixture.executor.executions.lock().unwrap();
+    assert_eq!(executions.len(), 1);
+    let ActionPrompt::OfflineChat { messages, .. } = &executions[0].request.prompt else {
+        panic!("expected an offline chat action");
+    };
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reordered-second", "reordered-first"]
     );
 }
 
@@ -831,6 +1462,170 @@ async fn stable_browser_final_is_persisted_once_when_chat_write_produces_no_outp
             .last_stable_answer
             .as_deref(),
         Some("Stable browser fallback answer.")
+    );
+}
+
+#[tokio::test]
+async fn oversized_transient_browser_status_is_bounded_without_orphaning_the_action() {
+    let fixture = fixture().await;
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(LargeTransientExecutor),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "large-transient-message".into(),
+            "Complete despite verbose transient browser status.".into(),
+        )
+        .await
+        .unwrap();
+
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let live = supervisor.live_state(&fixture.task).await.unwrap();
+    assert!(
+        live.status
+            .as_ref()
+            .is_some_and(|value| value.len() <= 1024 * 1024)
+    );
+    assert_eq!(live.phase, AutomationActionStatus::Idle);
+    assert!(
+        fixture
+            .chat
+            .clean_markdown_transcript()
+            .await
+            .unwrap()
+            .contains("Complete after long transient output.")
+    );
+}
+
+#[tokio::test]
+async fn streamed_answer_deltas_reconstruct_a_final_omitted_from_the_terminal_event() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "streamed-fallback-message".into(),
+            "Produce a browser answer whose terminal event omits the full body.".into(),
+        )
+        .await
+        .unwrap();
+    fixture.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::AnswerDelta {
+            markdown: "Stable streamed browser ".into(),
+            continuation: false,
+        },
+        CompanionEventKind::AnswerDelta {
+            markdown: "fallback answer.".into(),
+            continuation: true,
+        },
+        CompanionEventKind::GenerationComplete {
+            final_markdown: None,
+            canonical_url: Some("https://chatgpt.com/c/example".into()),
+        },
+    ]);
+
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let expected = "Stable streamed browser fallback answer.";
+    let transcript = fixture.chat.clean_markdown_transcript().await.unwrap();
+    assert_eq!(transcript.matches(expected).count(), 1);
+    assert_eq!(
+        fixture
+            .store
+            .load(&fixture.task)
+            .unwrap()
+            .action
+            .last_stable_answer
+            .as_deref(),
+        Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn large_stable_browser_final_does_not_orphan_the_persisted_action() {
+    let fixture = fixture().await;
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(LargeFinalAnswerExecutor),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "large-stable-final".into(),
+            "Persist a stable browser answer larger than its diagnostic preview.".into(),
+        )
+        .await
+        .unwrap();
+
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let expected = format!("{}{}", "a".repeat(40 * 1024), "b".repeat(40 * 1024));
+    assert!(
+        fixture
+            .chat
+            .clean_markdown_transcript()
+            .await
+            .unwrap()
+            .contains(&expected)
+    );
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(
+        state
+            .action
+            .last_stable_answer
+            .as_ref()
+            .is_none_or(|answer| answer.len() <= 64 * 1024)
     );
 }
 
@@ -1044,6 +1839,12 @@ async fn queue_capacity_leaves_messages_unread_and_records_one_bounded_failure()
         .iter()
         .find(|state| state.action.status == AutomationActionStatus::Failed)
         .unwrap();
+    let failed_action_id = failure
+        .action
+        .id
+        .as_deref()
+        .expect("queue-local failures need an explicit retry identity")
+        .to_string();
     assert!(
         failure
             .action
@@ -1054,6 +1855,30 @@ async fn queue_capacity_leaves_messages_unread_and_records_one_bounded_failure()
     );
     assert!(!fixture.chat.read(false).await.unwrap().text.is_empty());
     assert!(!other_chat.read(false).await.unwrap().text.is_empty());
+
+    fixture
+        .supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let failed_task = if states[0].action.status == AutomationActionStatus::Failed {
+        fixture.task.clone()
+    } else {
+        other_task
+    };
+    let retried = fixture
+        .supervisor
+        .retry_failed_action(
+            &failed_task,
+            &failed_action_id,
+            1_000 + OFFLINE_AFTER_MS + 2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.status, AutomationActionStatus::Queued);
+    assert_ne!(retried.id.as_deref(), Some(failed_action_id.as_str()));
+    assert_eq!(fixture.supervisor.queued_count().await, 1);
 }
 
 #[tokio::test]
@@ -1226,6 +2051,284 @@ async fn browser_deltas_are_visible_live_but_not_persisted_before_completion() {
 }
 
 #[tokio::test]
+async fn replacing_a_goal_during_generation_does_not_apply_the_old_terminal_receipt() {
+    let fixture = fixture().await;
+    let goal = fixture
+        .store
+        .set_goal(&fixture.task, "Original browser goal.", 100)
+        .unwrap();
+    fixture
+        .store
+        .run_goal(&fixture.task, goal.revision, 101)
+        .unwrap();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(StreamingExecutor {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    let runner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.run_next(1_000 + OFFLINE_AFTER_MS + 1).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+
+    let replacement = fixture
+        .store
+        .set_goal(&fixture.task, "Replacement browser goal.", 2_000)
+        .unwrap();
+    release.notify_one();
+
+    assert!(runner.await.unwrap().unwrap().is_some());
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.goal.as_ref().unwrap().revision, replacement.revision);
+    assert_eq!(
+        state.goal.as_ref().unwrap().markdown,
+        "Replacement browser goal."
+    );
+    assert!(state.action.id.is_none());
+    assert!(
+        !fixture
+            .chat
+            .clean_markdown_transcript()
+            .await
+            .unwrap()
+            .contains("Complete answer")
+    );
+}
+
+#[tokio::test]
+async fn owner_generation_change_during_generation_discards_old_browser_output() {
+    let fixture = fixture().await;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(StreamingExecutor {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "owner-changed-during-generation".into(),
+            "Do not persist output from the previous physical owner.".into(),
+        )
+        .await
+        .unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    let runner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.run_next(1_000 + OFFLINE_AFTER_MS + 1).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            1,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    release.notify_one();
+
+    assert!(runner.await.unwrap().unwrap().is_some());
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert!(state.pairing.verified_owner_generation.is_none());
+    assert_eq!(state.action.status, AutomationActionStatus::Unverified);
+    assert!(
+        !fixture
+            .chat
+            .clean_markdown_transcript()
+            .await
+            .unwrap()
+            .contains("Complete answer")
+    );
+    assert!(
+        fixture
+            .chat
+            .unread_snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.id == "owner-changed-during-generation")
+    );
+}
+
+#[tokio::test]
+async fn account_change_during_generation_discards_old_browser_output() {
+    let fixture = fixture().await;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(StreamingExecutor {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "account-changed-during-generation".into(),
+            "Do not persist output from the previous ChatGPT account.".into(),
+        )
+        .await
+        .unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    let runner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.run_next(1_000 + OFFLINE_AFTER_MS + 1).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+
+    fixture
+        .store
+        .set_selection(
+            &fixture.task,
+            "gpt-6-sol",
+            "high",
+            "catalog-2",
+            "account-2",
+            2_000,
+        )
+        .unwrap();
+    release.notify_one();
+
+    assert!(runner.await.unwrap().unwrap().is_some());
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert!(state.pairing.verified_owner_generation.is_none());
+    assert_eq!(state.action.status, AutomationActionStatus::Unverified);
+    assert!(
+        !fixture
+            .chat
+            .clean_markdown_transcript()
+            .await
+            .unwrap()
+            .contains("Complete answer")
+    );
+}
+
+#[tokio::test]
+async fn superseded_combined_action_still_fences_its_accepted_unread_batch() {
+    let fixture = fixture().await;
+    let goal = fixture
+        .store
+        .set_goal(&fixture.task, "Original combined goal.", 100)
+        .unwrap();
+    fixture
+        .store
+        .run_goal(&fixture.task, goal.revision, 101)
+        .unwrap();
+    fixture
+        .chat
+        .append_user(
+            "superseded-combined-message".into(),
+            "Do not mirror this accepted message twice.".into(),
+        )
+        .await
+        .unwrap();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(StreamingExecutor {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    let runner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        async move { supervisor.run_next(1_000 + OFFLINE_AFTER_MS + 1).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+
+    fixture
+        .store
+        .set_goal(&fixture.task, "Replacement combined goal.", 2_000)
+        .unwrap();
+    release.notify_one();
+
+    assert!(runner.await.unwrap().unwrap().is_some());
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(
+        state.chat_mirror.message_ids,
+        vec!["superseded-combined-message"]
+    );
+    assert!(state.action.id.is_none());
+    assert!(!fixture.chat.read(false).await.unwrap().text.is_empty());
+}
+
+#[tokio::test]
 async fn real_executor_rejects_account_mismatch_before_execute() {
     let execute_calls = Arc::new(AtomicUsize::new(0));
     let execute_counter = execute_calls.clone();
@@ -1299,7 +2402,7 @@ async fn real_executor_rejects_account_mismatch_before_execute() {
             auto_approve_tool_calls: false,
         },
     };
-    let (events, _) = mpsc::unbounded_channel();
+    let (events, _events_rx) = mpsc::unbounded_channel();
 
     let error = executor
         .execute(execution, events, CancellationToken::new())
@@ -1310,6 +2413,1207 @@ async fn real_executor_rejects_account_mismatch_before_execute() {
     assert!(!error.send_accepted);
     assert!(error.message.contains("account"));
     assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn real_executor_marks_an_unreconciled_execute_receipt_as_ambiguous() {
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{
+                            "id":"high",
+                            "label":"High",
+                            "available":true,
+                            "reason":null
+                        }]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/v1/actions/{action_id}",
+            get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let config = codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    };
+    let executor = BrowserAutomationExecutor::new(config);
+    let execution = AutomationExecution {
+        task_key: "f".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["ambiguous-execute-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "ambiguous-execute-action".into(),
+            idempotency_key: "ambiguous-execute-idempotency".into(),
+            url: "https://chatgpt.com/c/ambiguous-execute".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "ambiguous-execute-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "ambiguous-execute-message".into(),
+                    markdown: "Do not replay an action whose execute receipt was lost.".into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/ambiguous-execute".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events, _events_rx) = mpsc::unbounded_channel();
+
+    let error = match executor
+        .execute(execution, events, CancellationToken::new())
+        .await
+    {
+        Ok(_) => panic!("an unreconciled execute receipt must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.send_accepted);
+    server.abort();
+}
+
+#[tokio::test]
+async fn successful_execute_receipt_stays_ambiguous_when_status_returns_not_found() {
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{
+                            "id":"high",
+                            "label":"High",
+                            "available":true,
+                            "reason":null
+                        }]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/v1/actions/{action_id}",
+            get(|| async { StatusCode::NOT_FOUND }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let config = codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    };
+    let executor = BrowserAutomationExecutor::new(config);
+    let execution = AutomationExecution {
+        task_key: "e".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["ambiguous-not-found-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "ambiguous-not-found-action".into(),
+            idempotency_key: "ambiguous-not-found-idempotency".into(),
+            url: "https://chatgpt.com/c/ambiguous-not-found".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "ambiguous-not-found-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "ambiguous-not-found-message".into(),
+                    markdown: "Do not trust a racy status 404 after a successful execute receipt."
+                        .into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/ambiguous-not-found".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events, _events_rx) = mpsc::unbounded_channel();
+
+    let error = match executor
+        .execute(execution, events, CancellationToken::new())
+        .await
+    {
+        Ok(_) => panic!("a malformed successful execute receipt remains ambiguous"),
+        Err(error) => error,
+    };
+
+    assert!(error.send_accepted);
+    server.abort();
+}
+
+#[tokio::test]
+async fn terminal_idle_receipt_without_send_proof_is_ambiguous() {
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{
+                            "id":"high",
+                            "label":"High",
+                            "available":true,
+                            "reason":null
+                        }]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"idle-without-send-action",
+                    "state":"idle",
+                    "sendAccepted":false,
+                    "canonicalUrl":null,
+                    "selected":null,
+                    "lastEventSequence":0,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let config = codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    };
+    let executor = BrowserAutomationExecutor::new(config);
+    let execution = AutomationExecution {
+        task_key: "d".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["idle-without-send-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "idle-without-send-action".into(),
+            idempotency_key: "idle-without-send-idempotency".into(),
+            url: "https://chatgpt.com/c/idle-without-send".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "idle-without-send-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "idle-without-send-message".into(),
+                    markdown: "Do not accept a successful terminal receipt without Send proof."
+                        .into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/idle-without-send".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events, _events_rx) = mpsc::unbounded_channel();
+
+    let error = match executor
+        .execute(execution, events, CancellationToken::new())
+        .await
+    {
+        Ok(_) => panic!("idle without Send proof must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.send_accepted);
+    assert!(error.message.contains("Send acceptance"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn accepted_execute_with_unreconciled_event_stream_is_ambiguous() {
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{
+                            "id":"high",
+                            "label":"High",
+                            "available":true,
+                            "reason":null
+                        }]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"unreconciled-stream-action",
+                    "state":"queued",
+                    "sendAccepted":false,
+                    "canonicalUrl":null,
+                    "selected":null,
+                    "lastEventSequence":0,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/{action_id}/events",
+            get(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/v1/actions/{action_id}",
+            get(|| async { StatusCode::NOT_FOUND }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let config = codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    };
+    let executor = BrowserAutomationExecutor::new(config);
+    let execution = AutomationExecution {
+        task_key: "c".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["unreconciled-stream-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "unreconciled-stream-action".into(),
+            idempotency_key: "unreconciled-stream-idempotency".into(),
+            url: "https://chatgpt.com/c/unreconciled-stream".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "unreconciled-stream-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "unreconciled-stream-message".into(),
+                    markdown: "Do not retry after losing observation of an accepted action.".into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/unreconciled-stream".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events, _events_rx) = mpsc::unbounded_channel();
+
+    let error = match executor
+        .execute(execution, events, CancellationToken::new())
+        .await
+    {
+        Ok(_) => panic!("an unreconciled accepted action must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.send_accepted);
+    server.abort();
+}
+
+#[tokio::test]
+async fn real_pair_executor_records_the_candidate_before_the_async_send_receipt() {
+    let expected_url = "https://chatgpt.com/c/pair-production";
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{"id":"high","label":"High","available":true,"reason":null}]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"pair-production-action",
+                    "state":"queued",
+                    "sendAccepted":false,
+                    "canonicalUrl":null,
+                    "selected":null,
+                    "lastEventSequence":0,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/pair-production-action/events",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let events = [
+                    serde_json::json!({
+                        "sequence":1,"actionId":"pair-production-action","atMs":1,
+                        "type":"navigating"
+                    }),
+                    serde_json::json!({
+                        "sequence":2,"actionId":"pair-production-action","atMs":2,
+                        "type":"model_verified","model":"gpt-6-sol","effort":"high"
+                    }),
+                    serde_json::json!({
+                        "sequence":3,"actionId":"pair-production-action","atMs":3,
+                        "type":"connector_verified"
+                    }),
+                    serde_json::json!({
+                        "sequence":4,"actionId":"pair-production-action","atMs":4,
+                        "type":"send_accepted"
+                    }),
+                    serde_json::json!({
+                        "sequence":5,"actionId":"pair-production-action","atMs":5,
+                        "type":"generation_complete","finalMarkdown":null,
+                        "canonicalUrl":"https://chatgpt.com/c/pair-production"
+                    }),
+                ];
+                let body = events
+                    .into_iter()
+                    .map(|event| format!("{event}\n"))
+                    .collect::<String>();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/v1/actions/pair-production-action",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"pair-production-action",
+                    "state":"idle",
+                    "sendAccepted":true,
+                    "canonicalUrl":"https://chatgpt.com/c/pair-production",
+                    "selected":{"model":"gpt-6-sol","effort":"high"},
+                    "lastEventSequence":5,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut app_config = default_config(project);
+    app_config.memory.dir = Some(root.path().join("state").display().to_string());
+    app_config.markdown_chat.enabled = true;
+    app_config.markdown_chat.automation.enabled = true;
+    app_config.markdown_chat.automation.descriptor_path =
+        write_companion_descriptor(root.path(), &endpoint)
+            .display()
+            .to_string();
+    let task = ConversationIdentity::from_openai_session("pair-production-task").unwrap();
+    let store = Arc::new(AgentAutomationStore::for_config(&app_config).unwrap());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .set_selection(&task, "gpt-6-sol", "high", "catalog-1", "account-1", now_ms)
+        .unwrap();
+    let pairing = store.issue_pairing(&task, expected_url, 0, now_ms).unwrap();
+    let executor = BrowserAutomationExecutor::new(app_config.markdown_chat.automation.clone());
+    let execution = AutomationExecution {
+        task_key: "c".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "pair-verification".into(),
+        activity_sequence: pairing.generation,
+        tool_call_count_at_start: 0,
+        unread_message_ids: Vec::new(),
+        transcript_revision: String::new(),
+        pairing_commit: Some(PairingCommit::new(
+            task.clone(),
+            store.clone(),
+            pairing.generation,
+        )),
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "pair-production-action".into(),
+            idempotency_key: "pair-production-execute".into(),
+            url: expected_url.into(),
+            pairing_generation: pairing.generation,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::PairVerify {
+                reference: pairing.reference,
+            },
+            expected_url: expected_url.into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events, mut events_rx) = mpsc::unbounded_channel();
+
+    let snapshot = executor
+        .execute(execution, events, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.state, CompanionActionState::Idle);
+    while events_rx.try_recv().is_ok() {}
+    assert_eq!(
+        store.load(&task).unwrap().pairing.canonical_url.as_deref(),
+        Some(expected_url)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn real_executor_reconnects_a_dropped_stream_before_accepting_terminal_state() {
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let event_counter = stream_calls.clone();
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let status_counter = status_calls.clone();
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{"id":"high","label":"High","available":true,"reason":null}]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"stream-reconnect-action",
+                    "state":"queued",
+                    "sendAccepted":false,
+                    "canonicalUrl":null,
+                    "selected":null,
+                    "lastEventSequence":0,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/stream-reconnect-action/events",
+            get(move |headers: HeaderMap| {
+                let event_counter = event_counter.clone();
+                async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let call = event_counter.fetch_add(1, Ordering::SeqCst);
+                    let body = if call == 0 {
+                        concat!(
+                            "{\"sequence\":1,\"actionId\":\"stream-reconnect-action\",\"atMs\":1,\"type\":\"send_accepted\"}\n",
+                            "{\"sequence\":2,\"actionId\":\"stream-reconnect-action\",\"atMs\":2,\"type\":\"answer_delta\",\"markdown\":\"Recovered answer\",\"continuation\":false}\n",
+                            "{\"sequence\":3"
+                        )
+                        .to_string()
+                    } else {
+                        concat!(
+                            "{\"sequence\":3,\"actionId\":\"stream-reconnect-action\",\"atMs\":3,",
+                            "\"type\":\"generation_complete\",\"finalMarkdown\":\"Recovered answer\",",
+                            "\"canonicalUrl\":\"https://chatgpt.com/c/stream-reconnect\"}\n"
+                        )
+                        .to_string()
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/v1/actions/stream-reconnect-action",
+            get(move |headers: HeaderMap| {
+                let status_counter = status_counter.clone();
+                async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let generating = status_counter.fetch_add(1, Ordering::SeqCst) == 0;
+                    axum::Json(serde_json::json!({
+                        "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                        "build":COMPANION_BUILD,
+                        "actionId":"stream-reconnect-action",
+                        "state":if generating { "generating" } else { "idle" },
+                        "sendAccepted":true,
+                        "canonicalUrl":"https://chatgpt.com/c/stream-reconnect",
+                        "selected":{"model":"gpt-6-sol","effort":"high"},
+                        "lastEventSequence":if generating { 2 } else { 3 },
+                        "attention":null
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let executor = BrowserAutomationExecutor::new(codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    });
+    let execution = AutomationExecution {
+        task_key: "d".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["stream-reconnect-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "stream-reconnect-action".into(),
+            idempotency_key: "stream-reconnect-idempotency".into(),
+            url: "https://chatgpt.com/c/stream-reconnect".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "stream-reconnect-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "stream-reconnect-message".into(),
+                    markdown: "Recover the retained browser stream.".into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/stream-reconnect".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+    let snapshot = executor
+        .execute(execution, events_tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut kinds = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        kinds.push(event.kind);
+    }
+
+    assert_eq!(snapshot.state, CompanionActionState::Idle);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(status_calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        kinds.last(),
+        Some(CompanionEventKind::GenerationComplete {
+            final_markdown: Some(markdown),
+            ..
+        }) if markdown == "Recovered answer"
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn real_executor_replays_retained_prefix_from_an_idempotent_generating_receipt() {
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{"id":"high","label":"High","available":true,"reason":null}]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"generating-replay-action",
+                    "state":"generating",
+                    "sendAccepted":true,
+                    "canonicalUrl":"https://chatgpt.com/c/generating-replay",
+                    "selected":{"model":"gpt-6-sol","effort":"high"},
+                    "lastEventSequence":2,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/generating-replay-action/events",
+            get(
+                |headers: HeaderMap,
+                 Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let body = if query.get("after").map(String::as_str) == Some("0") {
+                        concat!(
+                            "{\"sequence\":1,\"actionId\":\"generating-replay-action\",\"atMs\":1,\"type\":\"send_accepted\"}\n",
+                            "{\"sequence\":2,\"actionId\":\"generating-replay-action\",\"atMs\":2,\"type\":\"answer_delta\",\"markdown\":\"Retained prefix\",\"continuation\":false}\n",
+                            "{\"sequence\":3,\"actionId\":\"generating-replay-action\",\"atMs\":3,\"type\":\"answer_delta\",\"markdown\":\" and suffix\",\"continuation\":true}\n",
+                            "{\"sequence\":4,\"actionId\":\"generating-replay-action\",\"atMs\":4,\"type\":\"generation_complete\",\"finalMarkdown\":null,\"canonicalUrl\":\"https://chatgpt.com/c/generating-replay\"}\n"
+                        )
+                    } else {
+                        concat!(
+                            "{\"sequence\":3,\"actionId\":\"generating-replay-action\",\"atMs\":3,\"type\":\"answer_delta\",\"markdown\":\" and suffix\",\"continuation\":true}\n",
+                            "{\"sequence\":4,\"actionId\":\"generating-replay-action\",\"atMs\":4,\"type\":\"generation_complete\",\"finalMarkdown\":null,\"canonicalUrl\":\"https://chatgpt.com/c/generating-replay\"}\n"
+                        )
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(body))
+                        .unwrap()
+                },
+            ),
+        )
+        .route(
+            "/v1/actions/generating-replay-action",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"generating-replay-action",
+                    "state":"idle",
+                    "sendAccepted":true,
+                    "canonicalUrl":"https://chatgpt.com/c/generating-replay",
+                    "selected":{"model":"gpt-6-sol","effort":"high"},
+                    "lastEventSequence":4,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let executor = BrowserAutomationExecutor::new(codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    });
+    let execution = AutomationExecution {
+        task_key: "f".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["generating-replay-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "generating-replay-action".into(),
+            idempotency_key: "generating-replay-idempotency".into(),
+            url: "https://chatgpt.com/c/generating-replay".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "generating-replay-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "generating-replay-message".into(),
+                    markdown: "Recover an in-progress retained browser stream.".into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/generating-replay".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+    let snapshot = executor
+        .execute(execution, events_tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut answer = String::new();
+    while let Ok(event) = events_rx.try_recv() {
+        if let CompanionEventKind::AnswerDelta { markdown, .. } = event.kind {
+            answer.push_str(&markdown);
+        }
+    }
+
+    assert_eq!(snapshot.state, CompanionActionState::Idle);
+    assert_eq!(answer, "Retained prefix and suffix");
+    server.abort();
+}
+
+#[tokio::test]
+async fn real_executor_reconnects_retained_events_from_an_idempotent_terminal_receipt() {
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let event_counter = stream_calls.clone();
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "kind":"codexify-browser-companion",
+                    "build":COMPANION_BUILD,
+                    "status":"idle",
+                    "authenticated":true,
+                    "accountFingerprint":"account-1",
+                    "activeActionId":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/session/capabilities",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "accountFingerprint":"account-1",
+                    "catalogRevision":"catalog-1",
+                    "models":[{
+                        "id":"gpt-6-sol",
+                        "label":"GPT-6 Sol",
+                        "efforts":[{"id":"high","label":"High","available":true,"reason":null}]
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/execute",
+            post(|headers: HeaderMap| async move {
+                if !authorized(&headers) {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD,
+                    "actionId":"terminal-replay-action",
+                    "state":"idle",
+                    "sendAccepted":true,
+                    "canonicalUrl":"https://chatgpt.com/c/terminal-replay",
+                    "selected":{"model":"gpt-6-sol","effort":"high"},
+                    "lastEventSequence":3,
+                    "attention":null
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/v1/actions/terminal-replay-action/events",
+            get(move |headers: HeaderMap| {
+                let event_counter = event_counter.clone();
+                async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let call = event_counter.fetch_add(1, Ordering::SeqCst);
+                    let body = if call == 0 {
+                        concat!(
+                            "{\"sequence\":1,\"actionId\":\"terminal-replay-action\",\"atMs\":1,\"type\":\"send_accepted\"}\n",
+                            "{\"sequence\":2,\"actionId\":\"terminal-replay-action\",\"atMs\":2,\"type\":\"answer_delta\",\"markdown\":\"Terminal replay answer\",\"continuation\":false}\n",
+                            "{\"sequence\":3"
+                        )
+                    } else {
+                        concat!(
+                            "{\"sequence\":3,\"actionId\":\"terminal-replay-action\",\"atMs\":3,",
+                            "\"type\":\"generation_complete\",\"finalMarkdown\":\"Terminal replay answer\",",
+                            "\"canonicalUrl\":\"https://chatgpt.com/c/terminal-replay\"}\n"
+                        )
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/x-ndjson")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let descriptor = write_companion_descriptor(root.path(), &endpoint);
+    let executor = BrowserAutomationExecutor::new(codexify::markdown_chat::AgentAutomationConfig {
+        enabled: true,
+        descriptor_path: descriptor.display().to_string(),
+        ..Default::default()
+    });
+    let execution = AutomationExecution {
+        task_key: "e".repeat(64),
+        owner_generation: 0,
+        account_fingerprint: "account-1".into(),
+        catalog_revision: "catalog-1".into(),
+        activity_epoch: "epoch-1".into(),
+        activity_sequence: 1,
+        tool_call_count_at_start: 1,
+        unread_message_ids: vec!["terminal-replay-message".into()],
+        transcript_revision: "revision-1".into(),
+        pairing_commit: None,
+        request: codexify::agent_automation::ExecuteActionRequest {
+            action_id: "terminal-replay-action".into(),
+            idempotency_key: "terminal-replay-idempotency".into(),
+            url: "https://chatgpt.com/c/terminal-replay".into(),
+            pairing_generation: 1,
+            connector_name: "Codexify".into(),
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+            prompt: ActionPrompt::OfflineChat {
+                batch_id: "terminal-replay-batch".into(),
+                messages: vec![codexify::agent_automation::CompanionUnreadMessage {
+                    id: "terminal-replay-message".into(),
+                    markdown: "Recover an already completed action.".into(),
+                }],
+            },
+            expected_url: "https://chatgpt.com/c/terminal-replay".into(),
+            auto_approve_tool_calls: false,
+        },
+    };
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+    let snapshot = executor
+        .execute(execution, events_tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut kinds = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        kinds.push(event.kind);
+    }
+
+    assert_eq!(snapshot.state, CompanionActionState::Idle);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        kinds.last(),
+        Some(CompanionEventKind::GenerationComplete {
+            final_markdown: Some(markdown),
+            ..
+        }) if markdown == "Terminal replay answer"
+    ));
     server.abort();
 }
 
@@ -1539,6 +3843,51 @@ async fn terminal_failure_after_send_acceptance_is_ambiguous_and_never_retryable
 }
 
 #[tokio::test]
+async fn delivered_send_acceptance_outweighs_a_stale_pre_send_error_flag() {
+    let fixture = fixture().await;
+    let supervisor = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(AcceptedEventThenTransportErrorExecutor),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "accepted-event-before-error".into(),
+            "Do not replay after the event stream proves Send acceptance.".into(),
+        )
+        .await
+        .unwrap();
+    supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+
+    assert!(
+        supervisor
+            .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+            .await
+            .is_err()
+    );
+
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Ambiguous);
+    assert_eq!(
+        state.chat_mirror.message_ids,
+        vec!["accepted-event-before-error"]
+    );
+}
+
+#[tokio::test]
 async fn persisted_in_flight_action_is_not_replayed_after_supervisor_restart() {
     let fixture = fixture().await;
     fixture.chat.record_agent_call(1_000).await.unwrap();
@@ -1602,6 +3951,100 @@ async fn persisted_in_flight_action_is_not_replayed_after_supervisor_restart() {
 }
 
 #[tokio::test]
+async fn persisted_queued_pairing_is_revoked_after_supervisor_restart() {
+    let fixture = fixture().await;
+    let pairing = fixture
+        .store
+        .issue_pairing(
+            &fixture.task,
+            "https://chatgpt.com/c/restart-pairing",
+            0,
+            1_000,
+        )
+        .unwrap();
+    fixture
+        .store
+        .queue_action(
+            &fixture.task,
+            "restart-pairing-action",
+            codexify::agent_automation::AutomationActionKind::PairVerify,
+            pairing.generation,
+            None,
+            1_001,
+        )
+        .unwrap();
+
+    let restarted = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(FakeExecutor::default()),
+    );
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert!(state.pairing.pending.is_none());
+    assert_eq!(state.action.status, AutomationActionStatus::Unverified);
+    assert_eq!(restarted.queued_count().await, 0);
+    assert!(
+        fixture
+            .store
+            .verify_pairing_reference(&fixture.task, 0, &pairing.reference, 1_002)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn persisted_queued_chat_without_remaining_work_is_cleared_after_restart() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    fixture
+        .chat
+        .append_user(
+            "restart-consumed-message".into(),
+            "Consume me before the queued action can run.".into(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(fixture.supervisor.queued_count().await, 1);
+    fixture.chat.read(true).await.unwrap();
+
+    let restarted = AgentAutomationSupervisor::new(
+        fixture.config.markdown_chat.automation.clone(),
+        Arc::new(FakeExecutor::default()),
+    );
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            fixture.task.clone(),
+            0,
+            fixture.store.clone(),
+            fixture.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    restarted
+        .scan_once(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap();
+
+    let state = fixture.store.load(&fixture.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(state.action.id.is_none());
+    assert_eq!(restarted.queued_count().await, 0);
+}
+
+#[tokio::test]
 async fn unread_batches_are_split_without_truncating_messages() {
     let fixture = fixture().await;
     fixture.chat.record_agent_call(1_000).await.unwrap();
@@ -1661,6 +4104,40 @@ async fn unread_batches_are_split_without_truncating_messages() {
         .await
         .unwrap();
     assert_eq!(fixture.supervisor.queued_count().await, 1);
+}
+
+#[tokio::test]
+async fn unread_batches_account_for_xml_escaping_before_queueing() {
+    let fixture = fixture().await;
+    fixture.chat.record_agent_call(1_000).await.unwrap();
+    let escaped_heavy = "<".repeat(40 * 1024);
+    for id in ["escaped-first", "escaped-second"] {
+        fixture
+            .chat
+            .append_user(id.into(), escaped_heavy.clone())
+            .await
+            .unwrap();
+    }
+
+    fixture
+        .supervisor
+        .scan_once(1_000 + OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    fixture
+        .supervisor
+        .run_next(1_000 + OFFLINE_AFTER_MS + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let executions = fixture.executor.executions.lock().unwrap();
+    let ActionPrompt::OfflineChat { messages, .. } = &executions[0].request.prompt else {
+        panic!("expected an offline chat action");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "escaped-first");
+    assert_eq!(messages[0].markdown, escaped_heavy);
 }
 
 #[tokio::test]
@@ -1780,7 +4257,7 @@ async fn stale_priority_action_is_skipped_without_blocking_the_next_ready_action
 }
 
 #[tokio::test]
-async fn real_executor_rejects_a_different_canonical_conversation_after_send() {
+async fn real_executor_rejects_a_different_canonical_conversation_for_every_prompt_kind() {
     let app = Router::new()
         .route(
             "/v1/health",
@@ -1849,46 +4326,59 @@ async fn real_executor_rejects_a_different_canonical_conversation_after_send() {
         ..Default::default()
     };
     let executor = BrowserAutomationExecutor::new(config);
-    let execution = AutomationExecution {
-        task_key: "b".repeat(64),
-        owner_generation: 0,
-        account_fingerprint: "account-1".into(),
-        catalog_revision: "catalog-1".into(),
-        activity_epoch: "epoch-1".into(),
-        activity_sequence: 1,
-        tool_call_count_at_start: 1,
-        unread_message_ids: vec!["canonical-message".into()],
-        transcript_revision: "revision-1".into(),
-        pairing_commit: None,
-        request: codexify::agent_automation::ExecuteActionRequest {
-            action_id: "canonical-check".into(),
-            idempotency_key: "canonical-idempotency".into(),
-            url: "https://chatgpt.com/c/expected-conversation".into(),
-            pairing_generation: 1,
-            connector_name: "Codexify".into(),
-            model: "gpt-6-sol".into(),
-            effort: "high".into(),
-            prompt: ActionPrompt::OfflineChat {
+    for (prompt, unread_message_ids) in [
+        (
+            ActionPrompt::OfflineChat {
                 batch_id: "canonical-batch".into(),
                 messages: vec![codexify::agent_automation::CompanionUnreadMessage {
                     id: "canonical-message".into(),
                     markdown: "Check the canonical URL.".into(),
                 }],
             },
-            expected_url: "https://chatgpt.com/c/expected-conversation".into(),
-            auto_approve_tool_calls: false,
-        },
-    };
-    let (events, _) = mpsc::unbounded_channel();
+            vec!["canonical-message".into()],
+        ),
+        (
+            ActionPrompt::PairVerify {
+                reference: "A".repeat(43),
+            },
+            Vec::new(),
+        ),
+    ] {
+        let execution = AutomationExecution {
+            task_key: "b".repeat(64),
+            owner_generation: 0,
+            account_fingerprint: "account-1".into(),
+            catalog_revision: "catalog-1".into(),
+            activity_epoch: "epoch-1".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 1,
+            unread_message_ids,
+            transcript_revision: "revision-1".into(),
+            pairing_commit: None,
+            request: codexify::agent_automation::ExecuteActionRequest {
+                action_id: "canonical-check".into(),
+                idempotency_key: "canonical-idempotency".into(),
+                url: "https://chatgpt.com/c/expected-conversation".into(),
+                pairing_generation: 1,
+                connector_name: "Codexify".into(),
+                model: "gpt-6-sol".into(),
+                effort: "high".into(),
+                prompt,
+                expected_url: "https://chatgpt.com/c/expected-conversation".into(),
+                auto_approve_tool_calls: false,
+            },
+        };
+        let (events, _) = mpsc::unbounded_channel();
 
-    let error = executor
-        .execute(execution, events, CancellationToken::new())
-        .await
-        .err()
-        .unwrap();
+        let error = executor
+            .execute(execution, events, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
 
-    assert!(error.send_accepted);
-    assert!(error.message.contains("conversation"));
+        assert!(error.send_accepted);
+        assert!(error.message.contains("conversation"));
+    }
     server.abort();
 }
 
@@ -2024,6 +4514,116 @@ async fn pair_verification_records_canonical_url_without_polluting_chat() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn pair_verification_may_finish_before_the_browser_response_settles() {
+    let fixture = fixture().await;
+    let pair_task = ConversationIdentity::from_openai_session("pair-tool-race-task").unwrap();
+    let pair_chat = MarkdownChatStore::default()
+        .chat(&fixture.config, Some(&pair_task), &SessionState::new())
+        .unwrap();
+    pair_chat.ensure().await.unwrap();
+    fixture
+        .store
+        .set_selection(
+            &pair_task,
+            "gpt-6-sol",
+            "high",
+            "catalog-1",
+            "account-1",
+            100,
+        )
+        .unwrap();
+    let pairing = fixture
+        .store
+        .issue_pairing(&pair_task, "https://chatgpt.com/c/pair-tool-race", 0, 100)
+        .unwrap();
+    let executor = Arc::new(PairVerifyingExecutor {
+        store: fixture.store.clone(),
+        task: pair_task.clone(),
+        generation: pairing.generation,
+        reference: pairing.reference.clone(),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(fixture.config.markdown_chat.automation.clone(), executor);
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            pair_task.clone(),
+            0,
+            fixture.store.clone(),
+            pair_chat,
+        ))
+        .await
+        .unwrap();
+    supervisor
+        .queue_pair_verification(&pair_task, &pairing.reference, pairing.generation, 101)
+        .await
+        .unwrap();
+
+    supervisor.run_next(104).await.unwrap().unwrap();
+
+    let state = fixture.store.load(&pair_task).unwrap();
+    assert_eq!(state.pairing.verified_owner_generation, Some(0));
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+}
+
+#[tokio::test]
+async fn failed_pair_turn_revokes_a_pairing_verified_before_terminal_reconciliation() {
+    let fixture = fixture().await;
+    let pair_task = ConversationIdentity::from_openai_session("pair-failed-after-tool").unwrap();
+    let pair_chat = MarkdownChatStore::default()
+        .chat(&fixture.config, Some(&pair_task), &SessionState::new())
+        .unwrap();
+    pair_chat.ensure().await.unwrap();
+    fixture
+        .store
+        .set_selection(
+            &pair_task,
+            "gpt-6-sol",
+            "high",
+            "catalog-1",
+            "account-1",
+            100,
+        )
+        .unwrap();
+    let pairing = fixture
+        .store
+        .issue_pairing(
+            &pair_task,
+            "https://chatgpt.com/c/pair-failed-after-tool",
+            0,
+            100,
+        )
+        .unwrap();
+    let executor = Arc::new(PairVerifyingFailureExecutor {
+        store: fixture.store.clone(),
+        task: pair_task.clone(),
+        generation: pairing.generation,
+        reference: pairing.reference.clone(),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(fixture.config.markdown_chat.automation.clone(), executor);
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            pair_task.clone(),
+            0,
+            fixture.store.clone(),
+            pair_chat,
+        ))
+        .await
+        .unwrap();
+    supervisor
+        .queue_pair_verification(&pair_task, &pairing.reference, pairing.generation, 101)
+        .await
+        .unwrap();
+
+    assert!(supervisor.run_next(104).await.is_err());
+
+    let state = fixture.store.load(&pair_task).unwrap();
+    assert!(state.pairing.pending.is_none());
+    assert!(state.pairing.verified_owner_generation.is_none());
+    assert!(state.pairing.verified_at_ms.is_none());
 }
 
 #[tokio::test]

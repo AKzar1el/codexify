@@ -13,6 +13,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+const FIXTURE_START_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct FixtureProcess {
     child: Child,
     descriptor: PathBuf,
@@ -50,7 +52,7 @@ fn start_fixture_mode(root: &Path, mode: &str) -> FixtureProcess {
         .spawn()
         .expect("start TypeScript browser companion fixture");
     let mut fixture = FixtureProcess { child, descriptor };
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + FIXTURE_START_TIMEOUT;
     loop {
         if fixture.descriptor.is_file() {
             break;

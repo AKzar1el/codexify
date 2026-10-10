@@ -50,6 +50,24 @@ export function responseCompletionReady(input: {
     && input.completionActionVisible;
 }
 
+export function assertCapabilityAccount(
+  cache: { accountFingerprint:string } | undefined,
+  currentFingerprint: string,
+): asserts cache is { accountFingerprint:string } {
+  if (!cache) {
+    throw new BrowserCompanionError(
+      "Refresh browser capabilities before starting an automated action",
+      "model_unavailable",
+    );
+  }
+  if (cache.accountFingerprint !== currentFingerprint) {
+    throw new BrowserCompanionError(
+      "ChatGPT account changed; refresh capabilities and verify the pairing again",
+      "external_interference",
+    );
+  }
+}
+
 async function generationRunning(page: Page): Promise<boolean> {
   return page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true }).count()
     .then(count => count > 0)
@@ -105,7 +123,15 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   }> {
     try {
       const page = await this.surface.page();
-      await assertAuthenticatedChatGptPage(page);
+      try {
+        await assertAuthenticatedChatGptPage(page);
+      } catch (error) {
+        throw new BrowserCompanionError(
+          "ChatGPT authentication could not be verified in the shared browser window",
+          "authentication_required",
+          { cause:error },
+        );
+      }
       const account = await readChatGptAccount(page);
       try {
         await throwIfSessionAttention(page);
@@ -165,11 +191,13 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         detail:null,
       };
     } catch (error) {
+      const failure = asCompanionError(error);
+      const authenticationRequired = failure.code === "authentication_required";
       return {
         authenticated:false,
         accountFingerprint:null,
-        status:"authentication_required",
-        detail:asCompanionError(error).message,
+        status:authenticationRequired ? "authentication_required" : "unavailable",
+        detail:failure.message,
       };
     }
   }
@@ -221,16 +249,8 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         execution.signal,
       );
       const account = await readChatGptAccount(page);
-      let cache = this.capabilitiesCache;
-      if (!cache || cache.accountFingerprint !== account.fingerprint) {
-        const capabilities = await detectChatGptAccountCapabilities(page);
-        cache = {
-          accountFingerprint:account.fingerprint,
-          capabilities,
-          catalog:buildCapabilityCatalog(capabilities, account.fingerprint, this.build),
-        };
-        this.capabilitiesCache = cache;
-      }
+      const cache = this.capabilitiesCache;
+      assertCapabilityAccount(cache, account.fingerprint);
       const composer = await activeComposer(page, 30_000, execution.signal);
       if ((await composerText(composer)).trim()) {
         throw new BrowserCompanionError("ChatGPT composer contains a user draft", "external_interference");

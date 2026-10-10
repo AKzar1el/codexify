@@ -39,6 +39,8 @@ class ImmediateDriver implements BrowserDriver {
 
 class BlockingDriver extends ImmediateDriver {
   override async execute(execution: DriverExecution) {
+    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     await new Promise<void>((_resolve, reject) => {
       execution.signal.addEventListener(

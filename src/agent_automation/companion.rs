@@ -305,7 +305,18 @@ enum ExecuteAttempt {
     Failed {
         message: String,
         retryable_if_absent: bool,
+        ambiguous_if_unreconciled: bool,
     },
+}
+
+pub(crate) struct CompanionExecuteError {
+    pub message: String,
+    pub send_accepted: bool,
+}
+
+struct RequestFailure {
+    message: String,
+    may_have_reached_companion: bool,
 }
 
 impl CompanionEventKind {
@@ -458,31 +469,69 @@ impl BrowserCompanionClient {
         request: &ExecuteActionRequest,
         cancellation: &CancellationToken,
     ) -> Result<CompanionActionSnapshot, String> {
-        validate_execute_request(request)?;
+        self.execute_with_acceptance(request, cancellation)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    pub(crate) async fn execute_with_acceptance(
+        &self,
+        request: &ExecuteActionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CompanionActionSnapshot, CompanionExecuteError> {
+        validate_execute_request(request).map_err(|message| CompanionExecuteError {
+            message,
+            send_accepted: false,
+        })?;
         let first = self.execute_attempt(request, cancellation).await;
         match first {
             ExecuteAttempt::Complete(snapshot) => Ok(snapshot),
             ExecuteAttempt::Failed {
                 message,
                 retryable_if_absent,
+                ambiguous_if_unreconciled,
             } => {
+                let first_ambiguous = ambiguous_if_unreconciled;
                 if cancellation.is_cancelled() {
-                    return Err(message);
+                    return Err(CompanionExecuteError {
+                        message,
+                        send_accepted: first_ambiguous,
+                    });
                 }
                 match self.action_optional(&request.action_id, cancellation).await {
                     Ok(Some(snapshot)) => Ok(snapshot),
                     Ok(None) if retryable_if_absent => {
                         match self.execute_attempt(request, cancellation).await {
                             ExecuteAttempt::Complete(snapshot) => Ok(snapshot),
-                            ExecuteAttempt::Failed { message, .. } => {
+                            ExecuteAttempt::Failed {
+                                message,
+                                ambiguous_if_unreconciled,
+                                ..
+                            } => {
+                                let ambiguous_if_unreconciled =
+                                    first_ambiguous || ambiguous_if_unreconciled;
                                 match self.action_optional(&request.action_id, cancellation).await {
                                     Ok(Some(snapshot)) => Ok(snapshot),
-                                    Ok(None) | Err(_) => Err(message),
+                                    Ok(None) => Err(CompanionExecuteError {
+                                        message,
+                                        send_accepted: ambiguous_if_unreconciled,
+                                    }),
+                                    Err(_) => Err(CompanionExecuteError {
+                                        message,
+                                        send_accepted: ambiguous_if_unreconciled,
+                                    }),
                                 }
                             }
                         }
                     }
-                    Ok(None) | Err(_) => Err(message),
+                    Ok(None) => Err(CompanionExecuteError {
+                        message,
+                        send_accepted: first_ambiguous,
+                    }),
+                    Err(_) => Err(CompanionExecuteError {
+                        message,
+                        send_accepted: first_ambiguous,
+                    }),
                 }
             }
         }
@@ -563,11 +612,12 @@ impl BrowserCompanionClient {
         let mut total = 0usize;
         let mut buffer = Vec::new();
         let mut last_sequence = after_sequence;
+        let mut semantic_deadline = tokio::time::Instant::now() + self.event_idle_timeout;
         loop {
             let chunk = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(cancelled_error()),
-                chunk = tokio::time::timeout(self.event_idle_timeout, response.chunk()) => chunk
+                chunk = tokio::time::timeout_at(semantic_deadline, response.chunk()) => chunk
                     .map_err(|_| "Browser companion event stream stalled".to_string())?
                     .map_err(|_| "Browser companion event stream failed".to_string())?,
             };
@@ -581,6 +631,7 @@ impl BrowserCompanionClient {
                 return Err("Browser companion event stream is too large".into());
             }
             buffer.extend_from_slice(&chunk);
+            let mut received_event = false;
             while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line = buffer.drain(..=newline).collect::<Vec<_>>();
                 let line = &line[..line.len() - 1];
@@ -594,6 +645,7 @@ impl BrowserCompanionClient {
                     .map_err(|_| "Browser companion event is invalid".to_string())?;
                 validate_event(&event, action_id, last_sequence)?;
                 last_sequence = event.sequence;
+                received_event = true;
                 let terminal = event.kind.is_terminal();
                 receive(event)?;
                 if terminal {
@@ -602,6 +654,9 @@ impl BrowserCompanionClient {
             }
             if buffer.len() > MAX_EVENT_LINE_BYTES {
                 return Err("Browser companion event is too large".into());
+            }
+            if received_event {
+                semantic_deadline = tokio::time::Instant::now() + self.event_idle_timeout;
             }
         }
         if !buffer.is_empty() {
@@ -616,11 +671,12 @@ impl BrowserCompanionClient {
         cancellation: &CancellationToken,
     ) -> ExecuteAttempt {
         let response = self
-            .send_json(
+            .send_json_with_timeout_detailed(
                 Method::POST,
                 "/v1/actions/execute",
                 Some(request),
                 cancellation,
+                Some(self.request_timeout),
             )
             .await;
         match response {
@@ -635,12 +691,14 @@ impl BrowserCompanionClient {
                             Err(message) => ExecuteAttempt::Failed {
                                 message,
                                 retryable_if_absent: false,
+                                ambiguous_if_unreconciled: true,
                             },
                         }
                     }
                     Err(message) => ExecuteAttempt::Failed {
                         message,
                         retryable_if_absent: false,
+                        ambiguous_if_unreconciled: true,
                     },
                 }
             }
@@ -652,10 +710,12 @@ impl BrowserCompanionClient {
                         | StatusCode::SERVICE_UNAVAILABLE
                         | StatusCode::GATEWAY_TIMEOUT
                 ),
+                ambiguous_if_unreconciled: false,
             },
-            Err(message) => ExecuteAttempt::Failed {
-                message,
+            Err(error) => ExecuteAttempt::Failed {
+                message: error.message,
                 retryable_if_absent: !cancellation.is_cancelled(),
+                ambiguous_if_unreconciled: error.may_have_reached_companion,
             },
         }
     }
@@ -781,10 +841,32 @@ impl BrowserCompanionClient {
     where
         B: Serialize + ?Sized,
     {
+        self.send_json_with_timeout_detailed(method, path, body, cancellation, timeout)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    async fn send_json_with_timeout_detailed<B>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, RequestFailure>
+    where
+        B: Serialize + ?Sized,
+    {
         if cancellation.is_cancelled() {
-            return Err(cancelled_error());
+            return Err(RequestFailure {
+                message: cancelled_error(),
+                may_have_reached_companion: false,
+            });
         }
-        let url = self.request_url(path)?;
+        let url = self.request_url(path).map_err(|message| RequestFailure {
+            message,
+            may_have_reached_companion: false,
+        })?;
         let mut request = self
             .http
             .request(method, url)
@@ -794,10 +876,15 @@ impl BrowserCompanionClient {
             request = request.timeout(timeout);
         }
         if let Some(body) = body {
-            let encoded = serde_json::to_vec(body)
-                .map_err(|_| "Could not encode browser companion request".to_string())?;
+            let encoded = serde_json::to_vec(body).map_err(|_| RequestFailure {
+                message: "Could not encode browser companion request".to_string(),
+                may_have_reached_companion: false,
+            })?;
             if encoded.len() > MAX_JSON_BYTES {
-                return Err("Browser companion request is too large".into());
+                return Err(RequestFailure {
+                    message: "Browser companion request is too large".into(),
+                    may_have_reached_companion: false,
+                });
             }
             request = request
                 .header(header::CONTENT_TYPE, "application/json")
@@ -805,9 +892,14 @@ impl BrowserCompanionClient {
         }
         tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(cancelled_error()),
-            response = request.send() => response
-                .map_err(|_| "Browser companion request failed before a verified response".to_string()),
+            _ = cancellation.cancelled() => Err(RequestFailure {
+                message: cancelled_error(),
+                may_have_reached_companion: true,
+            }),
+            response = request.send() => response.map_err(|error| RequestFailure {
+                message: "Browser companion request failed before a verified response".to_string(),
+                may_have_reached_companion: !error.is_connect() && !error.is_builder(),
+            }),
         }
     }
 
@@ -1100,10 +1192,14 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
             }
         }
     }
-    if render_action_prompt(prompt).len() > MAX_PROMPT_BYTES {
+    if rendered_action_prompt_bytes(prompt) > MAX_PROMPT_BYTES {
         return Err("Browser automation prompt exceeds the safety limit".into());
     }
     Ok(())
+}
+
+pub(crate) fn rendered_action_prompt_bytes(prompt: &ActionPrompt) -> usize {
+    render_action_prompt(prompt).len()
 }
 
 fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result<(), String> {
@@ -1195,8 +1291,11 @@ fn validate_event(
     expected_action_id: &str,
     last_sequence: u64,
 ) -> Result<(), String> {
-    if event.sequence <= last_sequence {
-        return Err("Browser companion event sequence is not strictly increasing".into());
+    let expected_sequence = last_sequence
+        .checked_add(1)
+        .ok_or("Browser companion event sequence overflow")?;
+    if event.sequence != expected_sequence {
+        return Err("Browser companion event sequence is not contiguous".into());
     }
     if event.action_id != expected_action_id {
         return Err("Browser companion event belongs to the wrong action".into());
@@ -1230,11 +1329,15 @@ fn validate_event(
         | CompanionEventKind::RateLimited { message }
         | CompanionEventKind::ExternalInterference { message }
         | CompanionEventKind::AmbiguousSend { message } => {
-            validate_optional_text(message.as_deref(), 4096, "browser attention message")?;
+            validate_optional_text(
+                message.as_deref(),
+                MAX_DELTA_BYTES,
+                "browser attention message",
+            )?;
         }
         CompanionEventKind::Failed { code, message } => {
             validate_opaque(code, "browser failure code")?;
-            validate_text(message, 4096, "browser failure message")?;
+            validate_text(message, MAX_DELTA_BYTES, "browser failure message")?;
         }
         CompanionEventKind::Queued
         | CompanionEventKind::Navigating
@@ -1278,7 +1381,7 @@ fn validate_opaque(value: &str, label: &str) -> Result<(), String> {
 
 fn validate_visible(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.trim().is_empty()
-        || value.encode_utf16().count() > max
+        || value.len() > max
         || value.chars().any(|character| character.is_control())
     {
         return Err(format!("{label} is invalid"));

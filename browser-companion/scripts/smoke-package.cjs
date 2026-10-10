@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
 const repositoryRoot = path.resolve(root, "..");
+const PACKAGE_EXTRACTION_TIMEOUT_MS = 10 * 60_000;
 
 function cargoVersion() {
   const contents = fs.readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8");
@@ -53,7 +54,7 @@ try {
   fs.mkdirSync(extract);
   run("tar", process.platform === "win32"
     ? ["-xf", artifact, "-C", extract]
-    : ["-xzf", artifact, "-C", extract]);
+    : ["-xzf", artifact, "-C", extract], { timeout:PACKAGE_EXTRACTION_TIMEOUT_MS });
   const packageRoot = path.join(extract, packageRootName);
   const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "manifest.json"), "utf8"));
   const protocolSchemaHash = createHash("sha256")

@@ -103,6 +103,46 @@ async fn spawn_stalled_event_server() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{address}"), task)
 }
 
+async fn spawn_heartbeat_stalled_event_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let event = concat!(
+            "{\"sequence\":3,\"actionId\":\"action_1\",\"atMs\":3,",
+            "\"type\":\"queued\"}\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n",
+            event.len(),
+            event
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if stream.write_all(b"1\r\n\n\r\n").await.is_err() {
+                return;
+            }
+            if stream.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    (format!("http://{address}"), task)
+}
+
 fn authorized(headers: &HeaderMap) -> bool {
     headers
         .get(header::AUTHORIZATION)
@@ -288,6 +328,20 @@ async fn out_of_order_events(headers: HeaderMap) -> Response {
         .into_response()
 }
 
+async fn gapped_events(headers: HeaderMap) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        concat!(
+            "{\"sequence\":3,\"actionId\":\"action_1\",\"atMs\":3,\"type\":\"queued\"}\n",
+            "{\"sequence\":5,\"actionId\":\"action_1\",\"atMs\":5,\"type\":\"generation_complete\",\"finalMarkdown\":\"x\",\"canonicalUrl\":null}\n"
+        ),
+    )
+        .into_response()
+}
+
 async fn unknown_events(headers: HeaderMap) -> Response {
     if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -321,6 +375,25 @@ async fn oversized_events(headers: HeaderMap) -> Response {
         "type":"answer_delta",
         "markdown":"private-event-payload".repeat(10_000),
         "continuation":false
+    });
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        format!("{}\n", serde_json::to_string(&value).unwrap()),
+    )
+        .into_response()
+}
+
+async fn protocol_bounded_failure_event(headers: HeaderMap) -> Response {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let value = json!({
+        "sequence":3,
+        "actionId":"action_1",
+        "atMs":3,
+        "type":"failed",
+        "code":"selector_drift",
+        "message":"x".repeat(8 * 1024)
     });
     (
         [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -882,6 +955,9 @@ async fn invalid_action_data_is_rejected_before_network_access() {
     request.model = "bad model".into();
     invalid.push(request);
     let mut request = action_request();
+    request.connector_name = "😀".repeat(40);
+    invalid.push(request);
+    let mut request = action_request();
     request.prompt = ActionPrompt::OfflineGoal { goal_revision: 0 };
     invalid.push(request);
     let mut request = action_request();
@@ -971,6 +1047,11 @@ async fn event_stream_is_bounded_strictly_ordered_and_typed() {
         false,
     )
     .await;
+    exercise_event_stream(
+        Router::new().route("/v1/actions/action_1/events", get(gapped_events)),
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -996,6 +1077,32 @@ async fn event_stream_rejects_unknown_wrong_action_and_oversized_events_without_
 }
 
 #[tokio::test]
+async fn event_stream_accepts_protocol_bounded_terminal_messages() {
+    let app = Router::new().route(
+        "/v1/actions/action_1/events",
+        get(protocol_bounded_failure_event),
+    );
+    let (endpoint, task) = spawn_fake(app).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+    let mut message_bytes = None;
+
+    client
+        .stream_action_events("action_1", 2, &CancellationToken::new(), |event| {
+            if let CompanionEventKind::Failed { message, .. } = event.kind {
+                message_bytes = Some(message.len());
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(message_bytes, Some(8 * 1024));
+    task.abort();
+}
+
+#[tokio::test]
 async fn event_stream_idle_timeout_is_bounded_per_client() {
     let (endpoint, task) = spawn_stalled_event_server().await;
     let root = tempfile::tempdir().unwrap();
@@ -1015,5 +1122,30 @@ async fn event_stream_idle_timeout_is_bounded_per_client() {
 
     assert!(error.contains("stalled"));
     assert!(started.elapsed() < Duration::from_secs(1));
+    task.abort();
+}
+
+#[tokio::test]
+async fn event_stream_heartbeats_do_not_mask_semantic_idle_timeout() {
+    let (endpoint, task) = spawn_heartbeat_stalled_event_server().await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path_with_timeouts(
+        &path,
+        Duration::from_secs(5),
+        Duration::from_millis(60),
+    )
+    .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.stream_action_events("action_1", 2, &CancellationToken::new(), |_| Ok(())),
+    )
+    .await;
+
+    let error = result
+        .expect("heartbeats must not keep a semantically idle event stream alive")
+        .unwrap_err();
+    assert!(error.contains("stalled"), "{error}");
     task.abort();
 }

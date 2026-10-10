@@ -16,10 +16,10 @@ pub use install::{
     BrowserLifecycleState, BrowserReleaseAsset, BrowserRuntimeLayout, BrowserRuntimeManifest,
 };
 pub use store::{
-    AgentAutomationStore, AutomationActionKind, AutomationActionState, AutomationActionStatus,
-    AutomationTaskState, ChatMirrorState, GoalFinish, GoalRecord, GoalStatus, GoalWakeState,
-    MAX_GOAL_BYTES, OwnerGoalCommand, OwnerGoalCommandKind, OwnerGoalCommandReceipt,
-    PAIRING_REFERENCE_TTL_MS, PairingIssue, PairingState, SelectionState,
+    AcceptedChatBatch, AgentAutomationStore, AutomationActionKind, AutomationActionState,
+    AutomationActionStatus, AutomationTaskState, ChatMirrorState, GoalFinish, GoalRecord,
+    GoalStatus, GoalWakeState, MAX_GOAL_BYTES, OwnerGoalCommand, OwnerGoalCommandKind,
+    OwnerGoalCommandReceipt, PAIRING_REFERENCE_TTL_MS, PairingIssue, PairingState, SelectionState,
 };
 pub use supervisor::{
     AgentAutomationSupervisor, AutomationExecution, AutomationExecutionError, AutomationExecutor,

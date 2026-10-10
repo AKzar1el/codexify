@@ -206,6 +206,53 @@ fn pairing_references_are_random_digest_only_expiring_and_single_use() {
 }
 
 #[test]
+fn pairing_urls_discard_noncanonical_query_data_before_persistence() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("pairing-query");
+
+    let pairing = store
+        .issue_pairing(
+            &task,
+            "https://chatgpt.com/c/query-example?temporary-chat=false&source=sidebar",
+            0,
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load(&task).unwrap().pairing.candidate_url.as_deref(),
+        Some("https://chatgpt.com/c/query-example")
+    );
+
+    let recorded = store
+        .record_pairing_canonical_url(
+            &task,
+            pairing.generation,
+            "https://chatgpt.com/c/query-example?source=browser",
+            1_001,
+        )
+        .unwrap();
+    assert_eq!(
+        recorded.canonical_url.as_deref(),
+        Some("https://chatgpt.com/c/query-example")
+    );
+}
+
+#[test]
+fn pairing_rejects_the_chatgpt_homepage_without_a_conversation_path() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("pairing-root");
+
+    let error = store
+        .issue_pairing(&task, "https://chatgpt.com/", 0, 1_000)
+        .unwrap_err();
+
+    assert!(error.contains("conversation URL"), "{error}");
+    assert!(store.load(&task).unwrap().pairing.candidate_url.is_none());
+}
+
+#[test]
 fn pairing_reference_index_is_private_and_digest_only() {
     let root = tempfile::tempdir().unwrap();
     let state_root = root.path().join("automation");
@@ -241,6 +288,106 @@ fn pairing_reference_index_is_private_and_digest_only() {
             0o600
         );
     }
+}
+
+#[test]
+fn invalidating_pairing_revokes_its_pending_reference_index() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("pairing-invalidate");
+
+    let issued = store
+        .issue_pairing(&task, "https://chatgpt.com/c/pairing-invalidate", 0, 1_000)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(state_root.join(".pairings"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let pairing = store.invalidate_pairing(&task, 1_001).unwrap();
+
+    assert!(pairing.pending.is_none());
+    assert_eq!(
+        std::fs::read_dir(state_root.join(".pairings"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        store
+            .verify_pairing_reference(&task, 0, &issued.reference, 1_002)
+            .is_err()
+    );
+}
+
+#[test]
+fn account_change_revokes_a_pending_pairing_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("pairing-account-change");
+    store
+        .set_selection(
+            &task,
+            "gpt-6-sol",
+            "high",
+            "catalog-one",
+            "account-one",
+            1_000,
+        )
+        .unwrap();
+    let issued = store
+        .issue_pairing(
+            &task,
+            "https://chatgpt.com/c/pairing-account-change",
+            0,
+            1_001,
+        )
+        .unwrap();
+    store
+        .record_pairing_canonical_url(
+            &task,
+            issued.generation,
+            "https://chatgpt.com/c/pairing-account-change",
+            1_002,
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(state_root.join(".pairings"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    store
+        .set_selection(
+            &task,
+            "gpt-6-sol",
+            "high",
+            "catalog-two",
+            "account-two",
+            1_003,
+        )
+        .unwrap();
+
+    let state = store.load(&task).unwrap();
+    assert!(state.pairing.pending.is_none());
+    assert!(state.pairing.verified_owner_generation.is_none());
+    assert_eq!(state.action.status, AutomationActionStatus::Unverified);
+    assert_eq!(
+        std::fs::read_dir(state_root.join(".pairings"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(
+        store
+            .verify_pairing_reference(&task, 0, &issued.reference, 1_004)
+            .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -322,6 +469,176 @@ fn corrupt_or_symlinked_state_fails_closed() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn logically_inconsistent_persisted_state_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+
+    let partial_selection = task("partial-selection-state");
+    store
+        .set_selection(
+            &partial_selection,
+            "gpt-6-sol",
+            "high",
+            "catalog-one",
+            "account-one",
+            1,
+        )
+        .unwrap();
+    let partial_path = store
+        .task_directory(&partial_selection)
+        .unwrap()
+        .join("automation.json");
+    let mut partial: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&partial_path).unwrap()).unwrap();
+    partial["selection"]["effort"] = serde_json::Value::Null;
+    std::fs::write(&partial_path, serde_json::to_vec(&partial).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(state_root.clone())
+            .unwrap()
+            .load(&partial_selection)
+            .is_err()
+    );
+
+    let duplicate_mirror = task("duplicate-mirror-state");
+    store
+        .set_goal(&duplicate_mirror, "Create state", 1)
+        .unwrap();
+    let mirror_path = store
+        .task_directory(&duplicate_mirror)
+        .unwrap()
+        .join("automation.json");
+    let mut mirror: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&mirror_path).unwrap()).unwrap();
+    mirror["chatMirror"] = serde_json::json!({
+        "ownerGeneration": 0,
+        "lastAcceptedBatchId": "duplicate-batch",
+        "messageIds": ["duplicate-message", "duplicate-message"],
+        "transcriptRevisionAtStart": "duplicate-revision"
+    });
+    std::fs::write(&mirror_path, serde_json::to_vec(&mirror).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(state_root.clone())
+            .unwrap()
+            .load(&duplicate_mirror)
+            .is_err()
+    );
+
+    let pending_and_verified = task("pending-and-verified-state");
+    store
+        .set_selection(
+            &pending_and_verified,
+            "gpt-6-sol",
+            "high",
+            "catalog-two",
+            "account-two",
+            1,
+        )
+        .unwrap();
+    let issue = store
+        .issue_pairing(
+            &pending_and_verified,
+            "https://chatgpt.com/c/pending-and-verified",
+            7,
+            2,
+        )
+        .unwrap();
+    let pairing_path = store
+        .task_directory(&pending_and_verified)
+        .unwrap()
+        .join("automation.json");
+    let mut pairing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pairing_path).unwrap()).unwrap();
+    pairing["pairing"]["canonicalUrl"] =
+        serde_json::Value::String("https://chatgpt.com/c/pending-and-verified".into());
+    pairing["pairing"]["verifiedOwnerGeneration"] = serde_json::json!(7);
+    pairing["pairing"]["verifiedAtMs"] = serde_json::json!(3);
+    assert_eq!(pairing["pairing"]["generation"], issue.generation);
+    std::fs::write(&pairing_path, serde_json::to_vec(&pairing).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(state_root)
+            .unwrap()
+            .load(&pending_and_verified)
+            .is_err()
+    );
+
+    let incomplete_action = task("incomplete-action-state");
+    store
+        .set_goal(&incomplete_action, "Create action state", 1)
+        .unwrap();
+    let action_path = store
+        .task_directory(&incomplete_action)
+        .unwrap()
+        .join("automation.json");
+    let mut action: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&action_path).unwrap()).unwrap();
+    action["action"] = serde_json::json!({
+        "id": null,
+        "kind": "offline_chat",
+        "status": "queued",
+        "pairingGeneration": 1,
+        "goalRevision": null,
+        "lastError": null,
+        "lastStableAnswer": null,
+        "updatedAtMs": 1
+    });
+    std::fs::write(&action_path, serde_json::to_vec(&action).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(root.path().join("automation"))
+            .unwrap()
+            .load(&incomplete_action)
+            .is_err()
+    );
+
+    let failed_without_id = task("failed-action-without-id");
+    store
+        .set_goal(&failed_without_id, "Create failed action state", 1)
+        .unwrap();
+    let failed_path = store
+        .task_directory(&failed_without_id)
+        .unwrap()
+        .join("automation.json");
+    let mut failed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&failed_path).unwrap()).unwrap();
+    failed["action"] = serde_json::json!({
+        "id": null,
+        "kind": "offline_chat",
+        "status": "failed",
+        "pairingGeneration": 1,
+        "goalRevision": null,
+        "lastError": "Retryable queue failure",
+        "lastStableAnswer": null,
+        "updatedAtMs": 1
+    });
+    std::fs::write(&failed_path, serde_json::to_vec(&failed).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(root.path().join("automation"))
+            .unwrap()
+            .load(&failed_without_id)
+            .is_err()
+    );
+
+    let incomplete_wake = task("incomplete-goal-wake-state");
+    store
+        .set_goal(&incomplete_wake, "Create wake state", 1)
+        .unwrap();
+    let wake_path = store
+        .task_directory(&incomplete_wake)
+        .unwrap()
+        .join("automation.json");
+    let mut wake: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&wake_path).unwrap()).unwrap();
+    wake["goalWake"]["nudgedEpoch"] = serde_json::json!("epoch-one");
+    std::fs::write(&wake_path, serde_json::to_vec(&wake).unwrap()).unwrap();
+    assert!(
+        AgentAutomationStore::new(root.path().join("automation"))
+            .unwrap()
+            .load(&incomplete_wake)
+            .is_err()
+    );
 }
 
 #[test]

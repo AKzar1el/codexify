@@ -31,5 +31,7 @@ test("package smoke launches only the packaged readiness path", () => {
   expect(smoke).toContain("CODEXIFY_BROWSER_SMOKE_FILE");
   expect(smoke).toContain("packaged");
   expect(smoke).toContain("manifest.json");
+  expect(smoke).toContain("PACKAGE_EXTRACTION_TIMEOUT_MS = 10 * 60_000");
+  expect(smoke).toContain("{ timeout:PACKAGE_EXTRACTION_TIMEOUT_MS }");
   expect(smoke).not.toContain("chatgpt.com");
 });

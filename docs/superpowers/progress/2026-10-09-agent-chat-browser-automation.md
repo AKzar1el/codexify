@@ -800,3 +800,698 @@ Implement the approved agent-chat browser automation architecture completely: re
   another schema change; upgrading from a pre-automation release still requires the
   ordinary connector Refresh and a new conversation. The focused cross-document
   contract and `git diff --check` remain green.
+- Committed the complete Task 12 documentation/security/redaction slice as
+  `7483fda` (`docs: document agent chat browser automation`). Task 13 is now active:
+  run the full fresh verification matrix, review every architecture invariant
+  against the aggregate branch diff, resolve all findings, and complete the branch.
+- Resumed Task 13 after exhaustively rereading the complete 1,336-line revised
+  architecture and this complete progress journal. The branch is clean apart from
+  this journal entry at `7483fda`; the active work is fresh aggregate verification,
+  architecture-invariant review, corrective fixes, and branch completion.
+- Task 13 fresh verification is underway:
+  - the setup-widget suite passes all 30 tests;
+  - the complete browser-companion suite passes 52 tests with 231 assertions;
+  - strict companion TypeScript typechecking, fixture regeneration, bundle build,
+    all four source-boundary tests, and the exact upstream `f9ad4ae` extraction
+    check pass;
+  - the release/notarization orchestration suite passes all 30 tests;
+  - a fresh native darwin-arm64 companion package builds and its packaged readiness
+    smoke returns `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64`;
+  - fresh `cargo clippy --all-targets -- -D warnings` passes from an empty target.
+- The first combined Chromium/WebKit owner/widget run reported three individual
+  eight-second locator timeouts while the machine was simultaneously compiling the
+  complete Rust graph and packaging Electron. The other 143 tests passed. These
+  timeouts are being rerun in isolation before classifying them as product defects;
+  no code change has been made from this symptom alone.
+- Aggregate invariant review found a real one-window ownership bug independent of
+  those timeouts: `SingleWindowCoordinator.login()` did not reject an active browser
+  action, so an authenticated owner login request could navigate the shared window
+  away from a generating response. A focused test failed first because login
+  resolved and reached the driver; the coordinator now rejects while an action is
+  active. The targeted browser-window suite passes 5 tests after the fix.
+- The same one-window review found that login and capability refresh could mutate a
+  manually busy shared window, while Reveal could navigate it. Focused tests failed
+  first; login/capability refresh now reject busy state and Reveal exposes the
+  current window without navigation. Driver-emitted events are now schema-validated
+  before entering the retained stream, and one action is capped at the protocol's
+  16 MiB event budget with terminal capacity reserved. The focused coordinator
+  suite passes 11 tests.
+- Protocol review found that a valid final answer may be up to 1 MiB while one NDJSON
+  event line is limited to 128 KiB. Previously the companion emitted the complete
+  final body in `generation_complete`, making long answers impossible to transport.
+  A failing TypeScript test reproduced the oversized terminal line and a failing
+  Rust supervisor test reproduced loss of a terminal body omitted by the helper.
+  The companion now nulls only an oversized terminal copy after delivering bounded
+  append-only answer deltas, and Rust reconstructs the stable final from those
+  deltas. Both focused regressions pass.
+- Pairing review found that the production executor expected the initial asynchronous
+  execute receipt to contain a canonical URL even though the companion necessarily
+  returns a queued snapshot with `canonicalUrl=null`. That made real pair verification
+  fail before the browser prompt. The executor now records the already-normalized
+  explicit candidate after account/catalog preflight and before the send request;
+  the browser still proves the exact URL before Send and the MCP tool remains the
+  authority that verifies task ownership. A real loopback-companion regression passes.
+- A second pairing race existed after that fix: when `automation_verify_pairing`
+  consumed the reference during generation, the supervisor tried to write the
+  canonical URL again after completion and failed with `No agent-chat pairing request
+  is pending`. A red executor test reproduced the tool-before-response ordering; the
+  completion path now updates the canonical URL only while the pending handshake still
+  exists. The exact race test passes.
+- Fresh verification also exposed a stale production-executor fixture build ID left
+  behind by the protocol hash change. Its focused test failed before reaching the
+  intended account-mismatch assertion; the fixture now carries the current schema-bound
+  build and the original behavioral test passes again.
+- URL/canonicalization review found that Rust persisted owner-supplied query data even
+  though the companion strips it when identifying the stable conversation. A store
+  regression failed with the raw query still present; candidate and canonical pairing
+  URLs now discard query data before persistence, matching the approved architecture
+  and the browser protocol.
+- Terminal snapshot validation also exempted pair-verification prompts from the exact
+  conversation check. A production-executor test now runs both ordinary-chat and pair
+  prompts against a mismatched canonical URL; the pair case failed first, and accepted
+  snapshots now require the exact expected conversation for every prompt kind.
+- Accepted-action stream recovery was incomplete. On a dropped NDJSON connection the
+  executor reconciled terminal status but did not replay retained events, losing the
+  stable browser answer; an idempotent execute receipt that was already terminal had
+  the same omission. Two real loopback-companion tests failed with no recovered
+  `generation_complete` event. The executor now tracks the last delivered sequence,
+  resumes retained events after terminal reconciliation, and replays the ledger from
+  zero for an already-terminal idempotent receipt. Both recovery paths pass without
+  replaying the physical Send.
+- The Rust client previously accepted monotonically increasing event sequences with
+  gaps. A focused fixture proved that sequence 3 followed by terminal sequence 5 was
+  treated as complete, which can silently lose an answer delta during reconciliation.
+  Event delivery now requires the exact next sequence after the requested cursor; the
+  existing ordered stream and new gapped-stream regression both pass.
+- Resumed Task 13 again after exhaustively rereading all 1,336 lines of the revised
+  architecture and this complete journal. The branch remains at `7483fda`; the
+  working tree contains only the recorded Task 13 fail-closed fixes and their tests
+  across the single-window coordinator, pairing/canonicalization store, companion
+  stream validation, production executor recovery, and this journal. The next step
+  is fresh aggregate verification before reviewing the full branch against every
+  architecture invariant.
+- The fresh Task 13 formatting gate initially failed on rustfmt-only layout changes
+  in `src/agent_automation/supervisor.rs` and
+  `tests/agent_automation_supervisor.rs`; no semantic defect was reported. The
+  formatter will be applied before the remaining matrix is run.
+- Fresh aggregate verification after applying rustfmt is green for the non-UI
+  matrix completed so far:
+  - `cargo fmt --all --check`, the explicit standalone rustfmt check, and
+    `git diff --check` pass;
+  - a fresh-target `cargo clippy --all-targets -- -D warnings` passes;
+  - a fresh-target `cargo test --all` passes, including 594 library tests and every
+    ordinary integration/doc-test target (only explicitly environment-gated tests
+    remain ignored);
+  - the browser companion passes 59 tests with 247 assertions, strict TypeScript
+    typechecking, bundle build, fixture regeneration, all four source-boundary
+    checks, and the exact upstream `f9ad4ae` extraction check;
+  - setup-widget and release/notarization suites each pass 30 tests;
+  - POSIX installer syntax and the full installer fixture pass;
+  - a fresh native darwin-arm64 package builds and returns
+    `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64`.
+- The combined 148-test Chromium/WebKit owner/widget run completed with 141 passes
+  and seven eight-second locator timeouts while sharing the host with two clean Rust
+  builds and native Electron packaging. The reported failures are confined to four
+  test bodies (setup-picker activation, two download-feedback cases, and local
+  midnight refresh); they will be rerun in isolation now that the heavy jobs have
+  ended before any product defect is inferred.
+- The three opt-in Rust↔real-Bun protocol process tests pass on the fresh Task 13
+  target: round-trip/event replay, accepted-action cancellation without replay, and
+  companion restart descriptor reconciliation.
+- An isolated rerun of the full Markdown-chat widget file cleared the setup-picker,
+  rendered-file, midnight, and all WebKit failures. It still exposed one intermittent
+  Chromium timeout in the unsupported-download feedback test; the same test passed
+  under WebKit and had passed in the earlier combined run on Chromium, so it remains
+  under targeted race analysis rather than being waived.
+- PowerShell is not installed on this macOS host, so the Windows installer fixture
+  remains covered by its workflow contract and CI rather than a local `pwsh` run.
+- Architecture review found that task-state URL normalization accepted the bare
+  `https://chatgpt.com/` homepage even though both protocol implementations require
+  a conversation path. A focused store test failed by successfully issuing a
+  pairing for the homepage; `normalize_chatgpt_url` now rejects the root path and
+  the regression passes.
+- Pairing review found a tool/terminal race: the model could consume the one-time
+  pairing reference before terminal browser reconciliation, after which an accepted
+  pair turn could fail (for example on a canonical-URL mismatch) while leaving the
+  task verified. A focused supervisor test reproduced that state. Pair-action
+  execution errors now invalidate the pairing, and invalidation also removes the
+  pending digest index immediately; both regressions pass.
+- Live-stream review found that cumulative, individually valid status/commentary
+  deltas could exceed the owner-page buffer and make `run_next` return early without
+  settling the persisted action. A focused executor reproduced the orphaning error.
+  Transient fields are now UTF-8-safely bounded in place instead of aborting browser
+  observation; answer truncation is tracked separately so a bounded prefix can never
+  be mistaken for an authoritative final answer. The action now reaches its terminal
+  state and persists the real final output in the regression.
+- The remaining Chromium unsupported-download timeout passed in a focused 25-test
+  rerun of its complete parent suite (all 25 passed). No source change or relaxed
+  assertion was needed; the diagnostic-only test instrumentation was removed. The
+  original aggregate timeouts are therefore recorded as host-contention flakes, not
+  product failures.
+- Single-window review found a real asynchronous preflight race: two concurrent
+  `execute` calls could both observe no active action, await browser health in
+  parallel, and each acquire the same physical window. The new red test accepted
+  both actions. All browser-mutating maintenance and execute preflights now share a
+  promise-serialized window operation gate, while idempotent replays are rechecked
+  after acquiring it. The focused companion suite now admits exactly one concurrent
+  action (12 tests passing).
+- Resumed from the Task 13 review handoff after exhaustively rereading all 1,336
+  architecture lines and this complete progress journal. The branch remains at
+  `7483fda`; the working tree contains the accumulated fail-closed review fixes and
+  tests across the one-window coordinator, protocol validation, task-state URL
+  normalization, pairing invalidation, event recovery, bounded live output, and
+  this journal. The next step is to review the aggregate diff against every
+  remaining architecture invariant, add red tests for any uncovered defect, then
+  rerun the complete verification matrix before committing.
+- Owner-generation review found that accepted unread-message IDs were persisted as
+  one task-global set even though the architecture scopes automatic mirror
+  deduplication to the same physical-owner generation. A red supervisor test showed
+  that a still-unread message accepted by owner generation 0 was never offered to a
+  newly paired owner generation 1. Chat-mirror receipts now record their owner
+  generation, scans ignore receipts from another generation, and the merge path
+  resets the accepted-ID set when ownership changes. The focused regression passes.
+- Prompt-boundary review found that queue batching counted raw Markdown bytes but
+  ignored XML escaping and the fixed wake-up clauses. Two individually valid
+  `<`-heavy messages were therefore combined into a browser prompt above the
+  256 KiB protocol ceiling instead of being split. A red supervisor test reproduced
+  the two-message batch. The queue now measures each candidate prefix with the same
+  Rust prompt renderer used by protocol validation, includes the active-goal clause
+  when applicable, preserves message boundaries, and queues only the largest exact
+  prefix that fits. The focused regression passes.
+- Send-ambiguity review found that the executor error flag could remain `false`
+  after the supervisor had already consumed a `send_accepted` event. A later status
+  or transport failure would then be persisted as safely retryable `failed`, despite
+  direct evidence that ChatGPT accepted the message. A red regression reproduced
+  that state. Supervisor settlement now treats either the terminal error flag or the
+  retained event ledger as acceptance evidence, records the mirrored batch, and
+  persists `ambiguous`; the focused test passes.
+- Long-lived companion review found that every completed request, full prompt, and
+  up-to-16-MiB event ledger remained resident for the lifetime of the GUI process.
+  A red companion test showed the oldest completed action still retained its full
+  stream after more than the intended history window. The coordinator now keeps at
+  most eight full action ledgers, compacts older terminal actions to bounded
+  idempotency tombstones with no event payload, retains safe execute/status replay
+  without rerunning the browser, and bounds retired-action and cancel-key caches.
+  The focused 13-test companion suite and strict TypeScript check pass.
+- Persistent chat-mirror review found that accepted message IDs were never removed
+  after `chat_read` consumed those messages. The bounded 1,024-ID history could
+  therefore fill permanently and make a later accepted browser Send fail during
+  settlement. A red test prefilled consumed IDs and reproduced the failure on the
+  next unread message. Each scan now intersects accepted receipts with the current
+  unread snapshot, clears stale metadata, and persists only still-relevant IDs; the
+  focused regression passes.
+- Execute-receipt review found another acceptance ambiguity before event streaming:
+  a 2xx execute response with a lost or malformed body, followed by an unavailable
+  action-status probe, was surfaced as a pre-Send failure. The owner could then
+  explicitly retry with a fresh action even though the companion may already have
+  started the original one. A red production-executor fixture reproduced the false
+  `send_accepted=false` result. The companion client now carries typed uncertainty
+  through execute/reconciliation attempts, distinguishes connection failures from
+  requests that may have reached the companion, and the production executor maps an
+  unreconciled accepted receipt to `ambiguous`. The focused regression passes.
+- Companion event-order review found that a buggy driver could emit answer deltas or
+  `generation_complete` without ever proving semantic Send acceptance. The
+  coordinator would retain and expose that output as a successful idle action. A
+  red driver fixture reproduced the premature final answer. Driver events now must
+  prove the exact requested model/effort, then connector selection, then Send
+  acceptance before response output; completion must also report the exact expected
+  conversation. Invalid order fails before entering the stream, or becomes
+  `ambiguous` after acceptance. The focused 14-test coordinator suite and strict
+  TypeScript check pass.
+- Stable-answer persistence review found a protocol/store size mismatch: the
+  browser stream may reconstruct up to 1 MiB of final Markdown, while private action
+  diagnostics intentionally retain at most 64 KiB. The supervisor appended the full
+  valid answer to `CHAT.md` and then failed its final state write, leaving the action
+  orphaned. A red 80 KiB final-answer regression reproduced the failure. Full stable
+  output remains authoritative in the transcript and live state; oversized answers
+  are now omitted only from the bounded persisted diagnostic field, allowing the
+  action to settle `idle`. The focused regression passes.
+- Single-window teardown review found a narrow terminal race: the coordinator
+  released `activeActionId` as soon as the driver emitted its terminal event, before
+  the driver's async cleanup and Electron `endAction()` had returned. A concurrent
+  execute could therefore acquire the same physical window during that gap. A red
+  lingering-driver test accepted the second action. Window ownership now remains
+  active until the entire driver promise unwinds; terminal events still unblock
+  neither stream readers nor maintenance prematurely: retained terminal events are
+  delivered only after the driver promise settles, cancellation and shutdown wait
+  for the same boundary, and the next action stays excluded throughout cleanup. The
+  strengthened focused race regression and strict TypeScript check pass.
+- Error-terminal review found that an upstream selector or browser failure message
+  above the protocol's 64 KiB delta limit made the coordinator's own terminal-event
+  validation throw. The action then lost window ownership without ever becoming
+  terminal, leaving status/event clients orphaned. A red oversized-error driver
+  reproduced the invalid Zod event; a second red fixture proved an embedded NUL had
+  the same effect. Browser-originated terminal messages now replace NUL and truncate
+  on a UTF-8 boundary before event construction; the action reaches a bounded
+  `failed` or `ambiguous_send` terminal state. Both focused regressions and strict
+  TypeScript checking pass.
+- Resumed the Task 13 aggregate review after exhaustively rereading all 1,336 lines
+  of the revised architecture and all 1,048 existing progress-journal lines. The
+  checkout still matches the saved handoff: `HEAD` is `7483fda`, and the only
+  working-tree changes are the accumulated fail-closed review fixes plus their
+  focused tests and this journal. The active step remains invariant-by-invariant
+  review before the final clean verification and commit.
+- The resumed companion review immediately exercised the pending post-Send attention
+  regression. The focused browser-window suite failed as intended: an
+  `approval_required` terminal action had proven semantic Send acceptance but its
+  snapshot still exposed `canonicalUrl=null`, so Rust would downgrade the exact
+  approval state into a conversation-proof failure. The next fix binds the already
+  verified expected conversation to the snapshot at `send_accepted`, before any
+  post-Send terminal state can settle.
+- The post-Send canonical-URL regression is green: the focused browser-window suite
+  passes 18 tests, and approval/attention snapshots now retain the exact verified
+  conversation as soon as semantic Send acceptance is recorded.
+- Event-resume review found a cleanup-boundary race not covered by the existing
+  terminal-stream test. A client reconnecting with `after` already equal to the
+  terminal sequence returned immediately while the driver still owned the Electron
+  window, allowing Rust to schedule the next action into a cleanup gap. The new
+  focused test fails with `settled` instead of waiting for driver teardown.
+- The terminal-cursor cleanup regression is green: event resumption now waits for
+  the driver promise to unwind even when the caller's cursor is already at the
+  terminal event, preserving exclusive window ownership through teardown.
+- Error-line review found that the existing 64 KiB terminal-message clamp bounded
+  UTF-8 input but not JSON expansion. A failure made of backslashes and control
+  characters passed the text schema, expanded beyond the 128 KiB NDJSON line limit,
+  and caused the coordinator's own fallback event to throw, orphaning the action.
+  The focused regression fails at the protocol line-limit assertion before the
+  sanitizing/bounding fix.
+- The JSON-expanding terminal-error regression is green together with the complete
+  browser-window suite (20 tests, 65 assertions). Control characters are normalized
+  and the retained public message is conservatively bounded so its serialized NDJSON
+  terminal event cannot exceed the line limit.
+- Execute-reconciliation review found another unsafe downgrade: a malformed body on
+  a successful HTTP 2xx execute response correctly carried acceptance uncertainty,
+  but an immediate action-status 404 reset that evidence to `send_accepted=false`.
+  The focused production-executor regression now fails on that exact false result;
+  a racy or faulty status lookup must not make an already-reached execute request
+  safely retryable.
+- The successful-receipt/status-404 ambiguity regression is green. Execute
+  reconciliation now preserves acceptance uncertainty through both the initial and
+  same-idempotency retry attempts, including an absent status result, so a request
+  known to have reached companion protocol handling can never be surfaced as a
+  safely retryable pre-Send failure.
+- Persistent mirror-capacity review found that 1,024 still-unread accepted message
+  IDs filled the bounded receipt history, but the supervisor still queued a 1,025th
+  message. Its physical Send would succeed before settlement failed to persist the
+  deduplication receipt, creating a replay hazard. The focused regression currently
+  observes one queued action instead of the required pre-Send task-local failure.
+- The full accepted-history regression is green. Scan-time eligibility now refuses
+  new unread browser work before queueing when every bounded mirror-receipt slot is
+  still needed by unread accepted messages, records a task-local failed state, and
+  leaves the new message unread with zero companion executions. Consumed receipts
+  continue to be pruned and free capacity normally.
+- Terminal-receipt review found that Rust accepted a successful `idle` action
+  snapshot with `sendAccepted=false`, no selected model, and no canonical URL. That
+  contradictory response could be persisted as a clean idle action and automatically
+  requeued, even though the execute request had reached the companion. The focused
+  real-executor regression currently returns success instead of a fail-closed
+  ambiguous receipt.
+- The terminal-idle receipt regression is green. Rust now treats post-Send terminal
+  states (`idle`, approval, ambiguous, and stalled) without semantic acceptance proof
+  as protocol uncertainty, and terminal snapshot validation preserves ambiguity for
+  wrong-action, model/effort, and conversation mismatches rather than exposing an
+  explicit retry path.
+- Delta-line review found the same JSON-expansion problem on valid response content:
+  a 64 KiB answer made entirely of backslashes satisfies the Markdown delta bound but
+  serializes above the 128 KiB NDJSON line ceiling. The coordinator converted the
+  otherwise valid response into `ambiguous_send`, and the focused regression sees
+  zero answer deltas instead of a lossless bounded split.
+- The JSON-expanding answer regression is green. Valid status/commentary/answer
+  deltas whose serialized form exceeds one NDJSON line are now split losslessly on
+  UTF-8 boundaries with exact continuation semantics; the complete Markdown and
+  terminal completion survive and every emitted line remains protocol-bounded.
+- Stream-reconciliation review found that a well-formed queued execute receipt,
+  followed by an unavailable event stream and action-status endpoint, was classified
+  as `send_accepted=false`. The companion had already accepted ownership of the
+  action and could continue toward Send asynchronously, so the focused regression
+  fails on the unsafe retryable classification.
+- The unreconciled-stream regression is green. Once the companion has returned a
+  valid nonterminal execute receipt, loss of both event observation and terminal
+  status is always treated as acceptance uncertainty unless a reconciled terminal
+  pre-Send state proves otherwise; the owner cannot explicitly replay that action.
+- The complete companion suite is green after the review fixes: 69 tests and 283
+  assertions pass, including control-server shutdown, one-window ownership,
+  JSON-expanding deltas, terminal cleanup, protocol fixtures, and packaging
+  contracts; strict TypeScript checking also passes. The shutdown fixture was
+  corrected to perform the same model/connector verification sequence required of a
+  real accepted Send before testing ambiguous cancellation.
+- The directly affected Rust suites are green after the new uncertainty and receipt
+  bounds: 17 companion tests, 12 store tests, and 47 supervisor tests pass. This
+  includes the real HTTP executor, full unread-receipt capacity, stream recovery,
+  owner-generation invalidation, pairing races, and transcript fallback behavior.
+- Terminal-receipt replay review found an asymmetry in recovery: a dropped retained
+  event stream was resumed for a newly queued action after status reconciliation,
+  but not when the idempotent execute call immediately returned an already-terminal
+  action. The strengthened existing test now drops after sequences 1–2 and fails
+  with an incomplete-event error instead of reconnecting from sequence 2.
+- The already-terminal replay regression is green. The executor tracks only events
+  actually delivered to the supervisor and retries the retained ledger once from the
+  last contiguous sequence, so a response-loss retry still recovers status,
+  commentary, answer, and completion without replaying the browser action.
+- Account-binding review found that changing the live ChatGPT account invalidated a
+  verified pairing but left an in-progress pairing reference and its private digest
+  index usable. The focused store regression changes the account after canonical URL
+  capture and currently finds the old pending reference intact, contrary to the
+  account-fingerprint invalidation rule.
+- The account-change pairing regression is green. Updating to a different
+  privacy-preserving account fingerprint now atomically revokes the pending reference,
+  removes its digest index, clears verification, and leaves the task explicitly
+  unverified while retaining only non-authoritative URL history for user repair.
+- Window-lifecycle review found that `cancel` and `close` stopped sending the abort
+  signal as soon as a terminal event existed, even though the browser driver could
+  still be unwinding and retained exclusive window ownership. The focused shutdown
+  regression emits completion and then waits for abort; it currently remains blocked
+  until the test manually releases the driver.
+- The post-terminal cleanup shutdown regression is green. Cancellation and process
+  shutdown now abort every still-retained driver controller before awaiting teardown;
+  aborting an already-settled controller is harmless, while a terminal-but-unwinding
+  browser action can no longer deadlock companion shutdown or window reuse.
+- Restart review found that a persisted queued pair-verification action cannot be
+  reconstructed because the raw one-time reference is deliberately never persisted.
+  A fresh supervisor nevertheless left the digest, pending state, and `queued`
+  action intact with no in-memory queue entry. The focused restart regression finds
+  that unrecoverable pairing transaction still pending instead of revoked.
+- The queued-pair restart regression is green. On the first registration in a fresh
+  supervisor, a persisted queued pair-verification action with no recoverable raw
+  capability is revoked, its digest index is removed, and the task returns to an
+  explicit unverified state; repeated registration in the same live supervisor does
+  not disturb a real in-memory pairing action.
+- Restart review then found the analogous stale-state problem for ordinary queued
+  work: if its unread message was consumed before restart, the fresh supervisor had
+  no queue entry and no work to reconstruct, but the persisted action remained
+  `queued` indefinitely. The focused regression observes that stale queued state
+  instead of a clean idle action.
+- The stale ordinary-queue restart regression is green. A fresh supervisor now
+  clears only reconstructable non-pair queued envelopes before rescanning
+  authoritative chat/goal state; pending work is rebuilt with a fresh action identity,
+  while already-consumed work leaves a clean idle record and no phantom queue row.
+- Persistent-state review found that syntactically valid but logically impossible
+  records did not fail closed. A selection could retain model/catalog/account while
+  losing only its effort, accepted-message history could contain duplicate IDs, and
+  one pairing could be both pending and verified. The focused corruption regression
+  currently loads the partial selection successfully instead of rejecting the state.
+- The logical-state corruption regression is green. Persisted selections are now
+  either wholly absent or contain model, effort, catalog revision, and account
+  fingerprint together; accepted-message IDs are unique and carry complete receipt
+  metadata; and a pairing cannot be both pending/candidate and verified. Corrupt
+  records are preserved and rejected rather than normalized silently.
+- Extending the same corruption test found two remaining incomplete-state shapes:
+  a `queued` action can omit its action ID, and a goal wake can record a nudge epoch
+  without its sequence/timestamp. The focused test currently loads the ID-less
+  queued action successfully instead of rejecting the record.
+- Resumed from that exact Task 13 handoff after exhaustively rereading all 1,336
+  architecture lines and the complete 1,202-line progress journal. The checkout is
+  still on `feat/agent-chat-browser-automation` at `7483fda`, with only the recorded
+  aggregate-review fixes and tests in the working tree.
+- The persisted-state incomplete-shape regression is now green. `validate_action`
+  rejects every in-flight/attention/stalled state without an action identity, and
+  `validate_goal_wake` requires each epoch to carry its sequence plus every recorded
+  nudge to carry a timestamp and match the current activity epoch. The exact
+  `logically_inconsistent_persisted_state_fails_closed` test passes.
+- Event-stream liveness review found that the real companion emits blank NDJSON
+  heartbeats every 30 seconds, while the Rust idle timeout was applied independently
+  to each raw HTTP chunk. Heartbeats therefore reset the deadline forever even when
+  no semantic browser event arrives. A focused raw-loopback regression sends one
+  nonterminal event followed only by frequent heartbeat chunks; it currently times
+  out at the test harness instead of returning `Browser companion event stream
+  stalled`, reproducing the unbounded stall.
+- The heartbeat-masked idle regression is green. Rust now keeps one deadline for the
+  next complete semantic event and advances it only after a valid nonblank event is
+  parsed; transport heartbeats and partial lines no longer keep a stalled action
+  alive indefinitely. All four event-stream ordering, bounds, ordinary-idle, and
+  heartbeat-idle tests pass.
+- Queued-message revalidation review found that execution checked only whether each
+  unread message ID still existed. A user or editor could change the Markdown under
+  the same explicit message ID after queueing, and the browser would send the stale
+  snapshot. A focused test edits the queued message body in `CHAT.md`; it currently
+  executes the old prompt instead of discarding and rebuilding the stale action.
+- The stale queued-message regression is green. Immediate pre-Send validation now
+  requires the queued IDs, ordering, and exact Markdown to match the current unread
+  snapshot. Edited content invalidates the old action before the companion is called;
+  the next scan rebuilds it with the revised text. Both coalescing and edited-message
+  focused tests pass.
+- Owner-generation review found a post-Send race: registering a new physical owner
+  invalidated the pairing but retained the running action ID. When the old browser
+  response settled, the supervisor still treated that action as current, persisted
+  its final answer, and overwrote `unverified` with `idle`. A focused generation-race
+  test reproduces the incorrect terminal `idle` state and old-owner output.
+- The owner-generation race is green. Registration of a changed owner now atomically
+  invalidates pairing and supersedes the persisted action identity while retaining
+  the private URL only as unverified history. The old accepted browser turn may
+  settle, but its final text and terminal receipt cannot mutate the new owner state;
+  both queued and in-generation owner-change tests pass.
+- Cross-language bound review found that protocol v1 permits terminal attention and
+  failure messages up to 64 KiB, and the TypeScript companion emits within that
+  bound, but Rust still rejected anything above 4 KiB. A focused 8 KiB terminal
+  failure event is valid on the wire yet currently fails with `browser failure
+  message is invalid`.
+- The terminal-message bound mismatch is green. Rust event validation now uses the
+  protocol's 64 KiB attention-message limit consistently with TypeScript and action
+  snapshots; the 8 KiB cross-language event is accepted while the existing line and
+  stream ceilings remain authoritative.
+- Protocol text-bound review found that the manifest specifies UTF-8 byte limits,
+  but TypeScript's visible-text helper used JavaScript string length. Forty emoji
+  therefore passed the 128-byte connector-name schema at 160 UTF-8 bytes even though
+  Rust rejects the same request. The focused contract test fails by accepting it.
+- The visible-text byte-bound regression is green. TypeScript now enforces UTF-8
+  bytes in addition to nonblank/control-free text, so connector names, labels,
+  reasons, and all other manifest-bound visible strings agree with Rust. The focused
+  protocol contract test and strict TypeScript check pass.
+- The same visible-text review found a Unicode-category mismatch: TypeScript rejected
+  only ASCII C0/DEL controls, while Rust rejects every Unicode control character.
+  A connector name containing U+0085 is therefore accepted by TypeScript and rejected
+  by Rust; the focused contract assertion is red.
+- The Unicode-control mismatch is green. TypeScript visible-text validation now uses
+  the Unicode `Cc` category, matching Rust's control-character rejection. The focused
+  contract test and strict typecheck pass.
+- Account-binding review found the same terminal race as physical-owner replacement:
+  changing the live account invalidated pairing but retained the active action ID.
+  The old account's browser response then settled as `idle` and could persist its
+  final output. A focused in-generation account-change test reproduces the incorrect
+  terminal state.
+- The in-generation account-change race is green. Account replacement now revokes
+  the pending/verified pairing and supersedes the persisted action identity in the
+  same locked write, so output from the old ChatGPT account cannot settle into the
+  task. The existing pending-reference revocation test and the new active-generation
+  regression both pass.
+- The directly affected aggregate suites remain green after the resumed review:
+  19 companion-client tests, 14 persistent-store tests, and 52 supervisor tests pass.
+  The complete browser companion passes 70 tests with 287 assertions plus strict
+  TypeScript checking, including the new UTF-8/control contract cases.
+- Pairing-reference review found one more Rust/TypeScript mismatch. TypeScript
+  accepted any 43 URL-safe characters, including non-canonical trailing base64 bits,
+  while Rust's decoder requires an exact canonical 32-byte base64url value. The
+  focused contract test accepts `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB`
+  instead of rejecting it.
+- The canonical base64url regression is green. The shared token/reference schema now
+  round-trips through a 32-byte decode before accepting a value, so descriptor bearer
+  secrets and pairing references obey the same exact contract as Rust. The focused
+  protocol test and strict TypeScript check pass.
+- The resumed invariant review is complete for the current aggregate diff. Its new
+  red-green fixes cover persisted-state completeness, semantic event-stream liveness,
+  exact queued-message content, physical-owner and account replacement during a
+  browser turn, terminal-message bounds, UTF-8/control validation, and canonical
+  base64url credentials. No further high-confidence architecture violation remained
+  in this pass; Task 13 has moved to fresh full-matrix verification.
+- Resumed the final Task 13 verification pass after exhaustively rereading all 1,336
+  lines of the revised architecture and all 1,296 existing journal lines. The
+  checkout is still on `feat/agent-chat-browser-automation` at `7483fda`, with the
+  accumulated fail-closed review fixes in 12 modified files. The next operation is
+  the complete fresh formatting, Rust, companion, installer, packaging, workflow,
+  and Chromium/WebKit verification matrix before aggregate diff review and commit.
+- The final formatting gate is green: `cargo fmt --all --check`, the explicit
+  standalone `rustfmt --edition 2024 --check` invocation, and `git diff --check`
+  all passed. The host currently has 131 GiB free, so the remaining fresh builds can
+  use isolated `/tmp` targets without repeating the earlier low-space failure.
+- The first fresh-target Clippy run exposed one real static-analysis regression:
+  `AgentAutomationStore::record_accepted_batch` now has eight parameters after the
+  owner-generation deduplication fix, exceeding the repository's seven-argument
+  limit. No warning is being waived; the call surface will be reduced under focused
+  tests before restarting the full matrix.
+- The Clippy regression is fixed without an allow attribute. Accepted mirror data is
+  now carried by one typed `AcceptedChatBatch` value shared by current and superseded
+  settlement paths, reducing the store method surface while preserving all receipt
+  invariants. The complete 52-test supervisor suite passes, and the resumed
+  fresh-target `cargo clippy --all-targets -- -D warnings` run is green.
+- The full fresh Rust matrix is green on the same isolated target:
+  `cargo test --all` passed all 594 library tests and every ordinary integration and
+  doc-test target. Only the explicitly environment-gated real-Bun, Apprise, and
+  subprocess fixtures remain ignored by the ordinary aggregate command; their
+  browser-companion process cases are run separately below.
+- Fresh companion verification is green: strict TypeScript checking passed; all 70
+  Bun tests passed with 288 assertions; the bundle built at 155.50 KiB; regenerating
+  protocol fixtures produced the checked-in hash
+  `edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2`
+  with no diff; all four source-boundary tests passed; and the exact upstream
+  extraction check still matches `miuuyy/codex-chatgpt-web` commit `f9ad4ae`.
+- Fresh native packaging produced the expected darwin-arm64 archive, but the packaged
+  smoke failed before launching Electron because its helper imposed the same 60-second
+  timeout on `tar -xzf`; extraction hit `ETIMEDOUT`. This is being treated as a
+  reproducible smoke-harness defect, not waived as host load: archive size and actual
+  extraction time are being measured before changing the timeout contract.
+- The package-smoke timeout defect is green under TDD. The 109 MiB archive contains
+  607 entries and took 184.107 seconds to extract on this host, proving the generic
+  60-second command limit was inappropriate for extraction rather than for the
+  packaged app launch. The smoke harness now gives only archive extraction a bounded
+  ten-minute budget while retaining the one-minute runtime readiness deadline. The
+  focused packaging contract passes 2 tests with 25 assertions, and the same native
+  artifact now returns `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64`.
+- The first explicit real Rust↔Bun contract run failed uniformly before HTTP: all
+  three tests reached their 15-second descriptor-publication assertion. Because the
+  fixture hides child stdout/stderr, this is being debugged at the process boundary
+  by launching the exact Bun fixture directly and timing descriptor publication;
+  no protocol behavior is being changed from the timeout symptom alone.
+- Direct fixture evidence showed one Bun server publishes its descriptor in 11.340
+  seconds, leaving too little margin when all three ignored process tests cold-start
+  concurrently. The bounded test-fixture publication deadline is now 60 seconds.
+  The next run then exposed a stale blocking driver that emitted `send_accepted`
+  before model and connector verification, which the hardened coordinator correctly
+  rejected. Updating that fixture to the real event order made all three explicit
+  Rust↔Bun process contracts pass: round-trip/retained events, accepted cancellation
+  without replay, and restart descriptor reconciliation.
+- Installer and release orchestration are green on the available host: all 30
+  release/notarization tests passed, both POSIX scripts pass syntax validation, and
+  the complete POSIX installer fixture passed including the browser opt-in path.
+  PowerShell remains unavailable locally and is still exercised by its dedicated
+  Windows workflow and checked workflow contract.
+- The unloaded Chromium/WebKit matrix is fully green: all 30 setup-widget tests and
+  all 148 sequential Markdown-chat, owner-chat, workspace-switch, workspace-widget,
+  and workspace-picker tests passed with zero retries, timeouts, or relaxed
+  assertions. This clears the earlier host-contention failures and verifies the
+  standalone-only automation UI plus embedded-widget isolation on both engines.
+- Final protocol review found one remaining Rust/TypeScript bound mismatch. The
+  checked-in protocol defines connector/model/effort visible-text limits in UTF-8
+  bytes and TypeScript now enforces that contract, but Rust still counted UTF-16
+  code units. A focused request with forty emoji reached the fake companion instead
+  of being rejected locally; `invalid_action_data_is_rejected_before_network_access`
+  failed with one unexpected network POST, providing the red phase for the fix.
+- The UTF-8 visible-text regression is green. Rust now applies the manifest's byte
+  limits directly, so the same forty-emoji connector name is rejected before any
+  network access; the exact focused companion-client test passes.
+- Queued-message order review found that immediate pre-Send validation compared the
+  stored IDs and Markdown but searched each ID independently in the current unread
+  snapshot. Reordering two still-unread message blocks under the same IDs therefore
+  sent the stale queued order. A focused supervisor test rewrites the transcript as
+  second-then-first and fails because `run_next` executes the old first-then-second
+  prompt instead of discarding it.
+- The queued-order regression is green. Pre-Send validation now derives the current
+  ordered, unaccepted unread prefix for the same owner generation and compares IDs
+  plus exact Markdown positionally. Reordered or inserted content invalidates the
+  stale action; the next scan rebuilds the prompt in authoritative transcript order.
+- Queue-local failure review found that capacity, prompt-size, and receipt-history
+  failures persisted `status=failed` without an action ID. Automatic rescans then
+  stayed blocked, while the standalone Retry control is intentionally disabled when
+  no exact action ID exists. A strengthened capacity test fails at the missing retry
+  identity before the queue can be drained and explicitly retried.
+- Queue-local failures are now explicitly repairable. Each pre-Send queue failure
+  receives a fresh opaque action identity, so the owner can drain or repair the
+  underlying condition and invoke the existing exact-ID Retry path. The capacity
+  regression now drains the earlier action, retries the failed task, obtains a new
+  queued action identity, and leaves both original messages unread throughout.
+- Idempotent execute-receipt review found that a recovered nonterminal companion
+  snapshot started event observation after the snapshot's current sequence. If the
+  first execute response was lost after answer deltas had already been retained,
+  Rust skipped that prefix and could reconstruct only the later suffix when the
+  terminal event intentionally omitted its large final Markdown. A real loopback
+  test fails with `" and suffix"` instead of `"Retained prefix and suffix"`.
+- Nonterminal idempotent recovery now replays the retained event ledger from
+  sequence zero before following new events. The real loopback regression receives
+  both the retained prefix and later suffix, while the companion's action identity
+  and idempotency key still prevent a second physical Send.
+- Stream-disconnect review found that Rust only reconnected when the first status
+  reconciliation already reported a terminal action. If the companion correctly
+  reported that the same accepted action was still generating, the executor stopped
+  with ambiguity instead of resuming its retained event ledger. The strengthened
+  loopback regression now returns `generating` on the first status check and fails
+  before the second event-stream connection is attempted.
+- Nonterminal stream recovery is green. After one dropped retained stream, Rust now
+  reconciles the exact action, reconnects once from the last contiguous sequence
+  while it is still generating, and only falls back to ambiguity if observation is
+  lost again. The loopback test sees two stream connections, generating-then-idle
+  status reconciliation, and the complete recovered answer without another Send.
+- Companion terminal-error review found that the error sanitizer returned an empty
+  string unchanged. An internal `BrowserCompanionError("")` therefore made the
+  terminal `failed` event violate its own nonempty protocol schema and left the
+  action without a consumable terminal event. The focused Bun regression fails with
+  the expected Zod `too_small` error.
+- Empty companion failures are now normalized to the same bounded generic message
+  used for unknown failures, so every action receives a valid terminal event. The
+  focused Bun regression passes and observes `Browser companion operation failed`.
+- Browser-health review found that every outer driver failure was reported as
+  `authentication_required`, including a destroyed shared Electron window. That
+  misdirects the owner toward sign-in instead of repairing unavailable browser
+  infrastructure. A focused surface fixture fails because the destroyed-window
+  error returns `authentication_required` rather than `unavailable`.
+- Browser health now distinguishes failed authentication proof from unavailable
+  browser infrastructure. The driver wraps only composer authentication failure as
+  `authentication_required`; a destroyed or otherwise unusable shared window remains
+  `unavailable` with its bounded repair diagnostic. The focused Bun test passes.
+- Persistent-state follow-up found that `failed` was the one repairable action state
+  still allowed without an action ID. Although all live queue failures now receive
+  one, a syntactically valid corrupt record could silently recreate the disabled
+  Retry state. The strengthened logical-consistency test fails because a failed
+  offline-chat action with `id=null` still loads successfully.
+- Failed action persistence now requires an exact opaque identity just like every
+  other repairable non-idle state. The logical-consistency regression passes, so a
+  corrupt no-ID failure disables automation fail-closed instead of creating an
+  unrecoverable owner UI state.
+- Account-binding review found a narrow race after Rust's health/capability
+  preflight: `ChatGptBrowserDriver.execute` refreshed its local capability cache when
+  the page account differed, then continued toward Send. A browser account switch
+  between preflight and execution could therefore bypass the persisted account
+  fingerprint. The focused policy test is red because the driver has no fail-closed
+  capability-account assertion yet.
+- Browser execution now requires the exact account fingerprint established by the
+  immediately preceding capability refresh. A missing cache asks for an explicit
+  refresh; a changed account fails as external interference before composer or Send
+  mutation. The focused Bun policy regression passes.
+- The directly affected aggregate suites are green after the final review fixes:
+  - Rust companion client — 19 passed;
+  - secure automation store — 14 passed;
+  - offline/global supervisor — 54 passed;
+  - browser companion — 73 passed with 296 assertions across 16 files;
+  - strict TypeScript typechecking passed;
+  - `cargo fmt --all` and `git diff --check` passed before these suite runs.
+- The fresh full-matrix Clippy run found one API-shape regression introduced by the
+  explicit queue-failure identity fix: `record_queue_failure` now has eight total
+  parameters. The warning remains fatal under `-D warnings`; it will be reduced with
+  a typed failure envelope rather than suppressed.
+- The typed queue-failure envelope removed the argument-count warning, and Clippy
+  then exposed its intended crate-private boundary: the store method remained
+  publicly reachable while its envelope is `pub(crate)`. Only the supervisor calls
+  this mutation, so the method is being narrowed rather than widening an internal
+  protocol type.
+- The queue-failure API is now one crate-private typed envelope and Clippy is green
+  across all targets under `-D warnings`; no lint exception was added.
+- Fresh verification from the final edited tree is green so far:
+  - formatting: `cargo fmt --all --check`, explicit standalone `rustfmt`, and
+    `git diff --check` passed;
+  - static analysis: `cargo clippy --all-targets -- -D warnings` passed;
+  - Rust: `cargo test --all` passed all 594 library tests plus every ordinary
+    integration and doc-test target; only explicitly environment-gated fixtures were
+    skipped by that aggregate command;
+  - companion: strict TypeScript checking, 73 Bun tests with 296 assertions, the
+    156.0 KiB bundle, all four extraction-boundary tests, exact upstream commit
+    verification, and generated protocol-fixture identity all passed;
+  - release/UI: 30 release/notarization tests, 7 webhook-relay tests, 30 setup-widget
+    tests, and 148 sequential Chromium/WebKit owner/chat/workspace tests passed;
+  - POSIX installer syntax and the complete installer fixture passed; PowerShell is
+    unavailable on this macOS host and remains covered by the Windows workflow.
+- The environment-gated and packaged-runtime checks are also green:
+  - all five Rust↔real-Bun protocol tests passed, including retained events,
+    accepted cancellation without replay, and companion restart reconciliation;
+  - the versioned darwin-arm64 Electron archive built successfully and its packaged
+    readiness smoke returned `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64`;
+  - the isolated Apprise dependency environment passed all eight Python adapter
+    tests; the Rust notification subprocess fixtures are running separately below.
+- The environment-gated notification integration is green as well: all six
+  `markdown_chat_notifications` tests and all 22 `markdown_chat_tools` tests passed
+  with the real Apprise runtime and local HTTP receiver enabled.
+- Final Task 13 verification is complete from the post-review tree. Formatting and
+  diff checks, all-target Clippy, the complete Rust suite, strict TypeScript,
+  companion unit/contract/boundary/upstream checks, native packaging and packaged
+  smoke, real Rust↔Bun process contracts, release/notarization and webhook tests,
+  POSIX installer fixtures, real Apprise integration, and the full unloaded
+  Chromium/WebKit matrix are green. The only host limitation is the absence of
+  PowerShell on macOS; Windows syntax, installer behavior, and release packaging
+  remain enforced by checked workflow contracts and the Windows CI job.

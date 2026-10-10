@@ -7,12 +7,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::companion::{MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES};
+use super::companion::{MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES, rendered_action_prompt_bytes};
+use super::store::{MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure};
 use super::{
-    ActionPrompt, AgentAutomationStore, AutomationActionKind, AutomationActionStatus,
-    BrowserCompanionClient, CapabilityCatalog, CompanionActionSnapshot, CompanionActionState,
-    CompanionEvent, CompanionEventKind, CompanionSessionStatus, CompanionUnreadMessage,
-    ExecuteActionRequest, GoalStatus,
+    AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AutomationActionKind,
+    AutomationActionStatus, BrowserCompanionClient, CapabilityCatalog, CompanionActionSnapshot,
+    CompanionActionState, CompanionEvent, CompanionEventKind, CompanionSessionStatus,
+    CompanionUnreadMessage, ExecuteActionRequest, GoalStatus,
 };
 use crate::markdown_chat::{AgentAutomationConfig, ChatFile, OFFLINE_AFTER_MS};
 use crate::project_bindings::ConversationIdentity;
@@ -37,6 +38,21 @@ pub struct PairingCommit {
     task: ConversationIdentity,
     store: Arc<AgentAutomationStore>,
     generation: u64,
+}
+
+impl PairingCommit {
+    #[doc(hidden)]
+    pub fn new(
+        task: ConversationIdentity,
+        store: Arc<AgentAutomationStore>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            task,
+            store,
+            generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,62 +133,127 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         validate_execution_catalog(&execution, &catalog)
             .map_err(|message| execution_error(message, false))?;
 
-        let initial = client
-            .execute(&execution.request, &cancellation)
-            .await
-            .map_err(|message| execution_error(message, false))?;
         if let Some(commit) = &execution.pairing_commit {
-            let canonical_url = initial.canonical_url.as_deref().ok_or_else(|| {
-                execution_error(
-                    "Browser companion did not return the canonical pairing URL".into(),
-                    initial.send_accepted,
-                )
-            })?;
             commit
                 .store
                 .record_pairing_canonical_url(
                     &commit.task,
                     commit.generation,
-                    canonical_url,
+                    &execution.request.expected_url,
                     crate::markdown_chat::now_ms(),
                 )
-                .map_err(|message| execution_error(message, initial.send_accepted))?;
+                .map_err(|message| execution_error(message, false))?;
         }
+
+        let initial = client
+            .execute_with_acceptance(&execution.request, &cancellation)
+            .await
+            .map_err(|error| execution_error(error.message, error.send_accepted))?;
         if action_is_terminal(initial.state) {
-            validate_terminal_snapshot(&execution, &initial)
-                .map_err(|message| execution_error(message, initial.send_accepted))?;
+            if initial.last_event_sequence > 0 {
+                let mut last_event_sequence = 0;
+                let first = client
+                    .stream_action_events(&execution.request.action_id, 0, &cancellation, |event| {
+                        let sequence = event.sequence;
+                        events.send(event).map_err(|_| {
+                            "Browser automation event receiver is unavailable".to_string()
+                        })?;
+                        last_event_sequence = sequence;
+                        Ok(())
+                    })
+                    .await;
+                if let Err(message) = first {
+                    client
+                        .stream_action_events(
+                            &execution.request.action_id,
+                            last_event_sequence,
+                            &cancellation,
+                            |event| {
+                                let sequence = event.sequence;
+                                events.send(event).map_err(|_| {
+                                    "Browser automation event receiver is unavailable".to_string()
+                                })?;
+                                last_event_sequence = sequence;
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .map_err(|retry| {
+                            execution_error(
+                                format!(
+                                    "{message}; retained browser event reconciliation failed: {retry}"
+                                ),
+                                initial.send_accepted,
+                            )
+                        })?;
+                }
+            }
+            validate_terminal_snapshot(&execution, &initial)?;
             return Ok(initial);
         }
 
-        let stream = client
-            .stream_action_events(
-                &execution.request.action_id,
-                initial.last_event_sequence,
-                &cancellation,
-                |event| {
-                    events
-                        .send(event)
-                        .map_err(|_| "Browser automation event receiver is unavailable".to_string())
+        let mut last_event_sequence = 0;
+        let mut previous_stream_error: Option<String> = None;
+        loop {
+            let stream = client
+                .stream_action_events(
+                    &execution.request.action_id,
+                    last_event_sequence,
+                    &cancellation,
+                    |event| {
+                        last_event_sequence = event.sequence;
+                        events.send(event).map_err(|_| {
+                            "Browser automation event receiver is unavailable".to_string()
+                        })
+                    },
+                )
+                .await;
+            let Err(stream_error) = stream else {
+                break;
+            };
+            let message = previous_stream_error.as_ref().map_or_else(
+                || stream_error.clone(),
+                |previous| {
+                    format!("{previous}; retained browser event reconnect failed: {stream_error}")
                 },
-            )
-            .await;
-        if let Err(message) = stream {
+            );
             let reconciled = client
                 .action(&execution.request.action_id, &cancellation)
                 .await;
             if let Ok(ref snapshot) = reconciled
                 && action_is_terminal(snapshot.state)
             {
-                validate_terminal_snapshot(&execution, snapshot)
-                    .map_err(|error| execution_error(error, snapshot.send_accepted))?;
+                if last_event_sequence < snapshot.last_event_sequence {
+                    client
+                        .stream_action_events(
+                            &execution.request.action_id,
+                            last_event_sequence,
+                            &cancellation,
+                            |event| {
+                                last_event_sequence = event.sequence;
+                                events.send(event).map_err(|_| {
+                                    "Browser automation event receiver is unavailable".to_string()
+                                })
+                            },
+                        )
+                        .await
+                        .map_err(|retry| {
+                            execution_error(
+                                format!(
+                                    "{message}; retained browser event reconciliation failed: {retry}"
+                                ),
+                                snapshot.send_accepted,
+                            )
+                        })?;
+                }
+                validate_terminal_snapshot(&execution, snapshot)?;
                 return Ok(snapshot.clone());
             }
-            let send_accepted = reconciled
-                .as_ref()
-                .ok()
-                .is_some_and(|snapshot| snapshot.send_accepted)
-                || initial.send_accepted;
-            return Err(execution_error(message, send_accepted));
+            if previous_stream_error.is_none() {
+                previous_stream_error = Some(stream_error);
+                continue;
+            }
+            return Err(execution_error(message, true));
         }
         let terminal = client
             .action(&execution.request.action_id, &cancellation)
@@ -184,8 +265,7 @@ impl AutomationExecutor for BrowserAutomationExecutor {
                 terminal.send_accepted || initial.send_accepted,
             ));
         }
-        validate_terminal_snapshot(&execution, &terminal)
-            .map_err(|message| execution_error(message, terminal.send_accepted))?;
+        validate_terminal_snapshot(&execution, &terminal)?;
         Ok(terminal)
     }
 }
@@ -282,6 +362,7 @@ impl AgentAutomationSupervisor {
         if !self.config.enabled {
             return Err("Agent-chat browser automation is disabled".into());
         }
+        let first_registration = !self.tasks.read().await.contains_key(task.task.stable_key());
         let state = task.store.load(&task.task)?;
         let owner_changed = state
             .pairing
@@ -292,9 +373,30 @@ impl AgentAutomationSupervisor {
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.owner_generation != task.owner_generation);
-        if owner_changed {
-            task.store
-                .invalidate_pairing(&task.task, crate::markdown_chat::now_ms())?;
+        let orphaned_pairing = first_registration
+            && state.action.status == AutomationActionStatus::Queued
+            && state.action.kind == Some(AutomationActionKind::PairVerify);
+        let orphaned_action = (first_registration
+            && state.action.status == AutomationActionStatus::Queued
+            && state.action.kind != Some(AutomationActionKind::PairVerify))
+        .then(|| state.action.id.clone())
+        .flatten();
+        if owner_changed || orphaned_pairing {
+            task.store.invalidate_pairing_and_supersede_action(
+                &task.task,
+                crate::markdown_chat::now_ms(),
+            )?;
+            self.queue
+                .lock()
+                .await
+                .retain(|queued| queued.task_key != task.task.stable_key());
+            self.live.write().await.remove(task.task.stable_key());
+        } else if let Some(action_id) = orphaned_action {
+            task.store.clear_persisted_queued_action(
+                &task.task,
+                &action_id,
+                crate::markdown_chat::now_ms(),
+            )?;
             self.queue
                 .lock()
                 .await
@@ -474,11 +576,11 @@ impl AgentAutomationSupervisor {
             tool_call_count_at_start: 0,
             unread_message_ids: Vec::new(),
             transcript_revision: String::new(),
-            pairing_commit: Some(PairingCommit {
-                task: handle.task.clone(),
-                store: handle.store.clone(),
+            pairing_commit: Some(PairingCommit::new(
+                handle.task.clone(),
+                handle.store.clone(),
                 generation,
-            }),
+            )),
             request: ExecuteActionRequest {
                 action_id,
                 idempotency_key: random_id("execute")?,
@@ -546,9 +648,33 @@ impl AgentAutomationSupervisor {
                 continue;
             };
             let unread = task.chat.unread_snapshot().await?;
-            let accepted = state
-                .chat_mirror
-                .message_ids
+            let unread_ids = unread
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let retained_accepted =
+                if state.chat_mirror.owner_generation == Some(task.owner_generation) {
+                    state
+                        .chat_mirror
+                        .message_ids
+                        .iter()
+                        .filter(|id| unread_ids.contains(id.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+            if state.chat_mirror.owner_generation != Some(task.owner_generation)
+                || retained_accepted.len() != state.chat_mirror.message_ids.len()
+            {
+                task.store.retain_accepted_messages(
+                    &task.task,
+                    task.owner_generation,
+                    &retained_accepted,
+                )?;
+            }
+            let accepted = retained_accepted
                 .iter()
                 .collect::<std::collections::HashSet<_>>();
             let all_pending_messages = unread
@@ -562,7 +688,28 @@ impl AgentAutomationSupervisor {
                 .as_ref()
                 .filter(|goal| goal.status == GoalStatus::Active)
                 .map(|goal| goal.revision);
-            let pending_messages = match bounded_unread_batch(&all_pending_messages) {
+            if !all_pending_messages.is_empty() && retained_accepted.len() >= MAX_CHAT_MIRROR_IDS {
+                let kind = if goal_revision.is_some() {
+                    AutomationActionKind::OfflineCombined
+                } else {
+                    AutomationActionKind::OfflineChat
+                };
+                let action_id = random_id("action")?;
+                task.store.record_queue_failure(
+                    &task.task,
+                    QueueFailure {
+                        action_id: &action_id,
+                        kind,
+                        pairing_generation: state.pairing.generation,
+                        goal_revision,
+                        message: "Browser automation accepted chat history is full; consume pending messages before retrying",
+                        now_ms,
+                    },
+                )?;
+                continue;
+            }
+            let pending_messages = match bounded_unread_batch(&all_pending_messages, goal_revision)
+            {
                 Ok(messages) => messages,
                 Err(error) => {
                     let kind = if goal_revision.is_some() {
@@ -570,13 +717,17 @@ impl AgentAutomationSupervisor {
                     } else {
                         AutomationActionKind::OfflineChat
                     };
+                    let action_id = random_id("action")?;
                     task.store.record_queue_failure(
                         &task.task,
-                        kind,
-                        state.pairing.generation,
-                        goal_revision,
-                        &error,
-                        now_ms,
+                        QueueFailure {
+                            action_id: &action_id,
+                            kind,
+                            pairing_generation: state.pairing.generation,
+                            goal_revision,
+                            message: &error,
+                            now_ms,
+                        },
                     )?;
                     continue;
                 }
@@ -679,13 +830,17 @@ impl AgentAutomationSupervisor {
                 queue.remove(position);
             }
             if queue.len() >= self.config.max_queued_actions {
+                let action_id = random_id("action")?;
                 task.store.record_queue_failure(
                     &task.task,
-                    kind,
-                    state.pairing.generation,
-                    goal_revision,
-                    "Browser automation queue capacity is exhausted; pending chat and goal work were preserved",
-                    now_ms,
+                    QueueFailure {
+                        action_id: &action_id,
+                        kind,
+                        pairing_generation: state.pairing.generation,
+                        goal_revision,
+                        message: "Browser automation queue capacity is exhausted; pending chat and goal work were preserved",
+                        now_ms,
+                    },
                 )?;
                 continue;
             }
@@ -803,18 +958,39 @@ impl AgentAutomationSupervisor {
                 snapshot
             }
             Err(error) => {
-                if error.send_accepted {
+                let action_current = current_action_matches(&task, &execution)?;
+                let send_accepted = error.send_accepted || accumulator.send_accepted;
+                if pair_verification && action_current {
+                    task.store.invalidate_pairing(&task.task, now_ms)?;
+                }
+                if send_accepted {
                     if let Some(batch_id) = execution_batch_id(&execution) {
-                        task.store.record_accepted_batch(
-                            &task.task,
-                            &execution.request.action_id,
-                            batch_id,
-                            &execution.unread_message_ids,
-                            &execution.transcript_revision,
-                            now_ms,
-                        )?;
+                        if action_current {
+                            task.store.record_accepted_batch(
+                                &task.task,
+                                &execution.request.action_id,
+                                AcceptedChatBatch {
+                                    owner_generation: execution.owner_generation,
+                                    batch_id,
+                                    message_ids: &execution.unread_message_ids,
+                                    transcript_revision: &execution.transcript_revision,
+                                },
+                                now_ms,
+                            )?;
+                        } else {
+                            task.store.record_superseded_accepted_batch(
+                                &task.task,
+                                &execution.request.action_id,
+                                AcceptedChatBatch {
+                                    owner_generation: execution.owner_generation,
+                                    batch_id,
+                                    message_ids: &execution.unread_message_ids,
+                                    transcript_revision: &execution.transcript_revision,
+                                },
+                            )?;
+                        }
                     }
-                    if execution_goal_revision(&execution).is_some() {
+                    if action_current && execution_goal_revision(&execution).is_some() {
                         task.store.record_goal_nudge(
                             &task.task,
                             &execution.request.action_id,
@@ -828,7 +1004,11 @@ impl AgentAutomationSupervisor {
                             .await?;
                     }
                 }
-                let status = if error.send_accepted {
+                if !action_current {
+                    self.clear_live_if_action(&execution).await;
+                    return Err(error.message);
+                }
+                let status = if send_accepted {
                     AutomationActionStatus::Ambiguous
                 } else {
                     AutomationActionStatus::Failed
@@ -847,17 +1027,39 @@ impl AgentAutomationSupervisor {
             }
         };
 
+        if !current_action_matches(&task, &execution)? {
+            if accumulator.send_accepted
+                && let Some(batch_id) = execution_batch_id(&execution)
+            {
+                task.store.record_superseded_accepted_batch(
+                    &task.task,
+                    &execution.request.action_id,
+                    AcceptedChatBatch {
+                        owner_generation: execution.owner_generation,
+                        batch_id,
+                        message_ids: &execution.unread_message_ids,
+                        transcript_revision: &execution.transcript_revision,
+                    },
+                )?;
+            }
+            self.clear_live_if_action(&execution).await;
+            return Ok(Some(snapshot));
+        }
+
         if let Some(commit) = &execution.pairing_commit {
-            let canonical_url = snapshot
-                .canonical_url
-                .as_deref()
-                .ok_or("Browser companion did not return the canonical pairing URL")?;
-            commit.store.record_pairing_canonical_url(
-                &commit.task,
-                commit.generation,
-                canonical_url,
-                now_ms,
-            )?;
+            let pairing = commit.store.load(&commit.task)?.pairing;
+            if pairing.pending.is_some() {
+                let canonical_url = snapshot
+                    .canonical_url
+                    .as_deref()
+                    .ok_or("Browser companion did not return the canonical pairing URL")?;
+                commit.store.record_pairing_canonical_url(
+                    &commit.task,
+                    commit.generation,
+                    canonical_url,
+                    now_ms,
+                )?;
+            }
         }
 
         if accumulator.send_accepted
@@ -866,9 +1068,12 @@ impl AgentAutomationSupervisor {
             task.store.record_accepted_batch(
                 &task.task,
                 &execution.request.action_id,
-                batch_id,
-                &execution.unread_message_ids,
-                &execution.transcript_revision,
+                AcceptedChatBatch {
+                    owner_generation: execution.owner_generation,
+                    batch_id,
+                    message_ids: &execution.unread_message_ids,
+                    transcript_revision: &execution.transcript_revision,
+                },
                 now_ms,
             )?;
         }
@@ -930,7 +1135,8 @@ impl AgentAutomationSupervisor {
             None,
             (!pair_verification)
                 .then_some(accumulator.final_markdown.as_deref())
-                .flatten(),
+                .flatten()
+                .filter(|answer| answer.len() <= MAX_PRIVATE_TEXT_BYTES),
             now_ms,
         )?;
         self.update_live_terminal(&execution, status, None, now_ms)
@@ -963,24 +1169,31 @@ impl AgentAutomationSupervisor {
                 state.phase = AutomationActionStatus::Sending;
             }
             CompanionEventKind::StatusDelta { text, continuation } => {
-                apply_live_delta(&mut state.status, &text, continuation)?;
+                apply_live_delta(&mut state.status, &text, continuation);
                 state.phase = AutomationActionStatus::Generating;
             }
             CompanionEventKind::CommentaryDelta {
                 markdown,
                 continuation,
             } => {
-                apply_live_delta(&mut state.commentary, &markdown, continuation)?;
+                apply_live_delta(&mut state.commentary, &markdown, continuation);
                 state.phase = AutomationActionStatus::Generating;
             }
             CompanionEventKind::AnswerDelta {
                 markdown,
                 continuation,
             } => {
-                apply_live_delta(&mut state.answer, &markdown, continuation)?;
+                apply_live_delta(&mut state.answer, &markdown, continuation);
+                accumulator.answer_truncated |=
+                    apply_live_delta(&mut accumulator.answer_markdown, &markdown, continuation);
                 state.phase = AutomationActionStatus::Generating;
             }
             CompanionEventKind::GenerationComplete { final_markdown, .. } => {
+                let final_markdown = final_markdown.or_else(|| {
+                    (!accumulator.answer_truncated)
+                        .then(|| accumulator.answer_markdown.take())
+                        .flatten()
+                });
                 if let Some(answer) = final_markdown.as_ref() {
                     state.answer = Some(answer.clone());
                 }
@@ -1040,39 +1253,57 @@ impl AgentAutomationSupervisor {
         }
         state.updated_at_ms = now_ms;
     }
+
+    async fn clear_live_if_action(&self, execution: &AutomationExecution) {
+        let mut live = self.live.write().await;
+        if live
+            .get(&execution.task_key)
+            .and_then(|state| state.action_id.as_deref())
+            == Some(execution.request.action_id.as_str())
+        {
+            live.remove(&execution.task_key);
+        }
+    }
 }
 
 #[derive(Default)]
 struct EventAccumulator {
     send_accepted: bool,
+    answer_markdown: Option<String>,
+    answer_truncated: bool,
     final_markdown: Option<String>,
     terminal_status: Option<AutomationActionStatus>,
 }
 
+fn current_action_matches(
+    task: &AutomationTaskHandle,
+    execution: &AutomationExecution,
+) -> Result<bool, String> {
+    Ok(task.store.load(&task.task)?.action.id.as_deref()
+        == Some(execution.request.action_id.as_str()))
+}
+
 const MAX_LIVE_TEXT_BYTES: usize = 1024 * 1024;
 
-fn apply_live_delta(
-    destination: &mut Option<String>,
-    value: &str,
-    continuation: bool,
-) -> Result<(), String> {
-    let next_length = if continuation {
-        destination
-            .as_ref()
-            .map_or(0, String::len)
-            .saturating_add(value.len())
-    } else {
-        value.len()
-    };
-    if next_length > MAX_LIVE_TEXT_BYTES {
-        return Err("Browser automation live output is too large".into());
+fn apply_live_delta(destination: &mut Option<String>, value: &str, continuation: bool) -> bool {
+    if !continuation {
+        let end = utf8_prefix_end(value, MAX_LIVE_TEXT_BYTES);
+        *destination = Some(value[..end].to_string());
+        return end < value.len();
     }
-    if continuation {
-        destination.get_or_insert_with(String::new).push_str(value);
-    } else {
-        *destination = Some(value.to_string());
+    let destination = destination.get_or_insert_with(String::new);
+    let remaining = MAX_LIVE_TEXT_BYTES.saturating_sub(destination.len());
+    let end = utf8_prefix_end(value, remaining);
+    destination.push_str(&value[..end]);
+    end < value.len()
+}
+
+fn utf8_prefix_end(value: &str, maximum: usize) -> usize {
+    let mut end = value.len().min(maximum);
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-    Ok(())
+    end
 }
 
 fn execution_error(message: String, send_accepted: bool) -> AutomationExecutionError {
@@ -1114,24 +1345,46 @@ fn validate_execution_catalog(
 fn validate_terminal_snapshot(
     execution: &AutomationExecution,
     snapshot: &CompanionActionSnapshot,
-) -> Result<(), String> {
+) -> Result<(), AutomationExecutionError> {
     if snapshot.action_id != execution.request.action_id {
-        return Err("Browser companion returned the wrong action".into());
+        return Err(execution_error(
+            "Browser companion returned the wrong action".into(),
+            true,
+        ));
     }
-    if snapshot.send_accepted {
-        let selected = snapshot
-            .selected
-            .as_ref()
-            .ok_or("Browser companion did not prove the selected model and effort")?;
-        if selected.model != execution.request.model || selected.effort != execution.request.effort
-        {
-            return Err("Browser companion selected a different model or effort".into());
+    if !snapshot.send_accepted {
+        if matches!(
+            snapshot.state,
+            CompanionActionState::Idle
+                | CompanionActionState::ApprovalRequired
+                | CompanionActionState::Ambiguous
+                | CompanionActionState::Stalled
+        ) {
+            return Err(execution_error(
+                "Browser companion reached a post-Send terminal state without proving Send acceptance"
+                    .into(),
+                true,
+            ));
         }
-        if !matches!(execution.request.prompt, ActionPrompt::PairVerify { .. })
-            && snapshot.canonical_url.as_deref() != Some(execution.request.expected_url.as_str())
-        {
-            return Err("Browser companion returned a different conversation URL".into());
-        }
+        return Ok(());
+    }
+    let selected = snapshot.selected.as_ref().ok_or_else(|| {
+        execution_error(
+            "Browser companion did not prove the selected model and effort".into(),
+            true,
+        )
+    })?;
+    if selected.model != execution.request.model || selected.effort != execution.request.effort {
+        return Err(execution_error(
+            "Browser companion selected a different model or effort".into(),
+            true,
+        ));
+    }
+    if snapshot.canonical_url.as_deref() != Some(execution.request.expected_url.as_str()) {
+        return Err(execution_error(
+            "Browser companion returned a different conversation URL".into(),
+            true,
+        ));
     }
     Ok(())
 }
@@ -1153,11 +1406,34 @@ fn blocks_automatic_requeue(status: AutomationActionStatus) -> bool {
 
 fn bounded_unread_batch(
     messages: &[crate::markdown_chat::UnreadMessage],
+    goal_revision: Option<u64>,
 ) -> Result<Vec<crate::markdown_chat::UnreadMessage>, String> {
     let mut selected = Vec::new();
-    let mut bytes = 0usize;
     for message in messages {
-        if message.markdown.len() > MAX_PROMPT_BYTES {
+        if selected.len() >= MAX_UNREAD_MESSAGES {
+            break;
+        }
+        let candidate_messages = selected
+            .iter()
+            .chain(std::iter::once(message))
+            .map(|message| CompanionUnreadMessage {
+                id: message.id.clone(),
+                markdown: message.markdown.clone(),
+            })
+            .collect::<Vec<_>>();
+        let prompt = if let Some(goal_revision) = goal_revision {
+            ActionPrompt::OfflineCombined {
+                batch_id: "0".repeat(64),
+                messages: candidate_messages,
+                goal_revision,
+            }
+        } else {
+            ActionPrompt::OfflineChat {
+                batch_id: "0".repeat(64),
+                messages: candidate_messages,
+            }
+        };
+        if rendered_action_prompt_bytes(&prompt) > MAX_PROMPT_BYTES {
             if selected.is_empty() {
                 return Err(
                     "Browser automation unread message is too large; it was preserved without truncation"
@@ -1166,12 +1442,6 @@ fn bounded_unread_batch(
             }
             break;
         }
-        if selected.len() >= MAX_UNREAD_MESSAGES
-            || bytes.saturating_add(message.markdown.len()) > MAX_PROMPT_BYTES
-        {
-            break;
-        }
-        bytes += message.markdown.len();
         selected.push(message.clone());
     }
     Ok(selected)
@@ -1257,10 +1527,34 @@ async fn execution_matches(
     }
     if !execution.unread_message_ids.is_empty() {
         let unread = task.chat.unread_snapshot().await?;
-        if execution
-            .unread_message_ids
+        let queued_messages = execution_unread_messages(execution);
+        let accepted = if state.chat_mirror.owner_generation == Some(execution.owner_generation) {
+            state
+                .chat_mirror
+                .message_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let current_messages = unread
+            .messages
             .iter()
-            .any(|id| !unread.messages.iter().any(|message| &message.id == id))
+            .filter(|message| !accepted.contains(&message.id))
+            .take(queued_messages.len())
+            .collect::<Vec<_>>();
+        if queued_messages.len() != execution.unread_message_ids.len()
+            || current_messages.len() != queued_messages.len()
+            || queued_messages
+                .iter()
+                .zip(&execution.unread_message_ids)
+                .any(|(message, id)| &message.id != id)
+            || queued_messages
+                .iter()
+                .zip(current_messages)
+                .any(|(queued, current)| {
+                    current.id != queued.id || current.markdown != queued.markdown
+                })
         {
             return Ok(false);
         }
@@ -1298,6 +1592,14 @@ fn execution_batch_id(execution: &AutomationExecution) -> Option<&str> {
         ActionPrompt::OfflineChat { batch_id, .. }
         | ActionPrompt::OfflineCombined { batch_id, .. } => Some(batch_id),
         ActionPrompt::PairVerify { .. } | ActionPrompt::OfflineGoal { .. } => None,
+    }
+}
+
+fn execution_unread_messages(execution: &AutomationExecution) -> &[CompanionUnreadMessage] {
+    match &execution.request.prompt {
+        ActionPrompt::OfflineChat { messages, .. }
+        | ActionPrompt::OfflineCombined { messages, .. } => messages,
+        ActionPrompt::PairVerify { .. } | ActionPrompt::OfflineGoal { .. } => &[],
     }
 }
 

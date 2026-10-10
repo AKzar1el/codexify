@@ -78,6 +78,10 @@ test("pair verification requires one exact 32-byte base64url reference", () => {
     ...request,
     prompt:{ kind:"pair_verify", reference:"A".repeat(42) },
   })).toThrow();
+  expect(() => executeActionRequestSchema.parse({
+    ...request,
+    prompt:{ kind:"pair_verify", reference:`${"A".repeat(42)}B` },
+  })).toThrow();
 });
 
 test("connector names use the configured 128-byte visible-text contract", () => {
@@ -85,6 +89,8 @@ test("connector names use the configured 128-byte visible-text contract", () => 
   expect(executeActionRequestSchema.parse({ ...request, connectorName:"x".repeat(128) }).connectorName)
     .toHaveLength(128);
   expect(() => executeActionRequestSchema.parse({ ...request, connectorName:"x".repeat(129) })).toThrow();
+  expect(() => executeActionRequestSchema.parse({ ...request, connectorName:"😀".repeat(40) })).toThrow();
+  expect(() => executeActionRequestSchema.parse({ ...request, connectorName:"Codexify\u0085hidden" })).toThrow();
   expect(() => executeActionRequestSchema.parse({ ...request, connectorName:"   " })).toThrow();
 });
 

@@ -13,9 +13,9 @@ use crate::types::AppConfig;
 
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
-const MAX_PRIVATE_TEXT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PRIVATE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_GOAL_RESULT_BYTES: usize = 4096;
-const MAX_CHAT_MIRROR_IDS: usize = 1024;
+pub(crate) const MAX_CHAT_MIRROR_IDS: usize = 1024;
 const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
@@ -170,9 +170,28 @@ pub struct AutomationActionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatMirrorState {
+    pub owner_generation: Option<u64>,
     pub last_accepted_batch_id: Option<String>,
     pub message_ids: Vec<String>,
     pub transcript_revision_at_start: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedChatBatch<'a> {
+    pub owner_generation: u64,
+    pub batch_id: &'a str,
+    pub message_ids: &'a [String],
+    pub transcript_revision: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueFailure<'a> {
+    pub action_id: &'a str,
+    pub kind: AutomationActionKind,
+    pub pairing_generation: u64,
+    pub goal_revision: Option<u64>,
+    pub message: &'a str,
+    pub now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -300,7 +319,8 @@ impl AgentAutomationStore {
                 return Err(format!("Agent automation {label} is invalid"));
             }
         }
-        self.mutate(task, |state| {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
             let account_changed = state
                 .selection
                 .account_fingerprint
@@ -310,6 +330,15 @@ impl AgentAutomationStore {
                 || state.selection.effort.as_deref() != Some(effort)
                 || state.selection.catalog_revision.as_deref() != Some(catalog_revision)
                 || account_changed;
+            let previous_digest = account_changed
+                .then(|| {
+                    state
+                        .pairing
+                        .pending
+                        .as_ref()
+                        .map(|pending| pending.reference_digest.clone())
+                })
+                .flatten();
             state.selection = SelectionState {
                 model: Some(model.to_string()),
                 effort: Some(effort.to_string()),
@@ -317,14 +346,25 @@ impl AgentAutomationStore {
                 account_fingerprint: Some(account_fingerprint.to_string()),
             };
             if account_changed {
+                state.pairing.pending = None;
                 state.pairing.verified_owner_generation = None;
                 state.pairing.verified_at_ms = None;
-                state.action.status = AutomationActionStatus::Unverified;
-                state.action.updated_at_ms = Some(now_ms);
+                state.action = AutomationActionState {
+                    status: AutomationActionStatus::Unverified,
+                    pairing_generation: (state.pairing.generation > 0)
+                        .then_some(state.pairing.generation),
+                    updated_at_ms: Some(now_ms),
+                    ..Default::default()
+                };
             } else if selection_changed && state.action.status == AutomationActionStatus::Queued {
                 state.action = AutomationActionState::default();
             }
-            Ok(state.selection.clone())
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            if let Some(previous_digest) = previous_digest {
+                let _ = self.remove_pairing_index(&previous_digest);
+            }
+            Ok(state.selection)
         })
     }
 
@@ -892,13 +932,55 @@ impl AgentAutomationStore {
         task: &ConversationIdentity,
         now_ms: u64,
     ) -> Result<PairingState, String> {
-        self.mutate(task, |state| {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            let previous_digest = state
+                .pairing
+                .pending
+                .as_ref()
+                .map(|pending| pending.reference_digest.clone());
             state.pairing.pending = None;
             state.pairing.verified_owner_generation = None;
             state.pairing.verified_at_ms = None;
             state.action.status = AutomationActionStatus::Unverified;
             state.action.updated_at_ms = Some(now_ms);
-            Ok(state.pairing.clone())
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            if let Some(previous_digest) = previous_digest {
+                let _ = self.remove_pairing_index(&previous_digest);
+            }
+            Ok(state.pairing)
+        })
+    }
+
+    pub(crate) fn invalidate_pairing_and_supersede_action(
+        &self,
+        task: &ConversationIdentity,
+        now_ms: u64,
+    ) -> Result<PairingState, String> {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            let previous_digest = state
+                .pairing
+                .pending
+                .as_ref()
+                .map(|pending| pending.reference_digest.clone());
+            state.pairing.pending = None;
+            state.pairing.verified_owner_generation = None;
+            state.pairing.verified_at_ms = None;
+            state.action = AutomationActionState {
+                status: AutomationActionStatus::Unverified,
+                pairing_generation: (state.pairing.generation > 0)
+                    .then_some(state.pairing.generation),
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            validate_state(&state)?;
+            persist_state(path, &state)?;
+            if let Some(previous_digest) = previous_digest {
+                let _ = self.remove_pairing_index(&previous_digest);
+            }
+            Ok(state.pairing)
         })
     }
 
@@ -966,31 +1048,32 @@ impl AgentAutomationStore {
         })
     }
 
-    pub fn record_queue_failure(
+    pub(crate) fn record_queue_failure(
         &self,
         task: &ConversationIdentity,
-        kind: AutomationActionKind,
-        pairing_generation: u64,
-        goal_revision: Option<u64>,
-        message: &str,
-        now_ms: u64,
+        failure: QueueFailure<'_>,
     ) -> Result<AutomationActionState, String> {
-        if pairing_generation == 0 || !bounded_private(message) || message.trim().is_empty() {
+        if !valid_opaque(failure.action_id)
+            || failure.pairing_generation == 0
+            || !bounded_private(failure.message)
+            || failure.message.trim().is_empty()
+        {
             return Err("Agent automation queue failure is invalid".into());
         }
         self.mutate(task, |state| {
-            if state.pairing.generation != pairing_generation {
+            if state.pairing.generation != failure.pairing_generation {
                 return Err(
                     "Agent automation pairing changed before queue failure reporting".into(),
                 );
             }
             state.action = AutomationActionState {
-                kind: Some(kind),
+                id: Some(failure.action_id.to_string()),
+                kind: Some(failure.kind),
                 status: AutomationActionStatus::Failed,
-                pairing_generation: Some(pairing_generation),
-                goal_revision,
-                last_error: Some(message.to_string()),
-                updated_at_ms: Some(now_ms),
+                pairing_generation: Some(failure.pairing_generation),
+                goal_revision: failure.goal_revision,
+                last_error: Some(failure.message.to_string()),
+                updated_at_ms: Some(failure.now_ms),
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -1055,6 +1138,30 @@ impl AgentAutomationStore {
         })
     }
 
+    pub(crate) fn clear_persisted_queued_action(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(expected_action_id) {
+            return Err("Persisted automation action ID is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(expected_action_id)
+                || state.action.status != AutomationActionStatus::Queued
+                || state.action.kind == Some(AutomationActionKind::PairVerify)
+            {
+                return Err("Persisted automation action state is inconsistent".into());
+            }
+            state.action = AutomationActionState {
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            Ok(state.action.clone())
+        })
+    }
+
     pub fn record_goal_nudge(
         &self,
         task: &ConversationIdentity,
@@ -1090,20 +1197,15 @@ impl AgentAutomationStore {
         &self,
         task: &ConversationIdentity,
         action_id: &str,
-        batch_id: &str,
-        message_ids: &[String],
-        transcript_revision: &str,
+        batch: AcceptedChatBatch<'_>,
         now_ms: u64,
     ) -> Result<ChatMirrorState, String> {
-        if !valid_opaque(action_id)
-            || !valid_opaque(batch_id)
-            || message_ids.is_empty()
-            || message_ids.len() > MAX_CHAT_MIRROR_IDS
-            || message_ids.iter().any(|id| !valid_opaque(id))
-            || !bounded_private(transcript_revision)
-        {
-            return Err("Agent automation accepted chat batch is invalid".into());
-        }
+        validate_accepted_batch(
+            action_id,
+            batch.batch_id,
+            batch.message_ids,
+            batch.transcript_revision,
+        )?;
         self.mutate(task, |state| {
             if state.action.id.as_deref() != Some(action_id)
                 || !matches!(
@@ -1115,19 +1217,59 @@ impl AgentAutomationStore {
                     "Agent automation chat batch no longer matches the current action".into(),
                 );
             }
-            let mut accepted = state.chat_mirror.message_ids.clone();
-            for id in message_ids {
-                if !accepted.contains(id) {
-                    accepted.push(id.clone());
-                }
-            }
-            if accepted.len() > MAX_CHAT_MIRROR_IDS {
-                return Err("Agent automation accepted chat history is full".into());
-            }
-            state.chat_mirror.last_accepted_batch_id = Some(batch_id.to_string());
-            state.chat_mirror.message_ids = accepted;
-            state.chat_mirror.transcript_revision_at_start = Some(transcript_revision.to_string());
+            merge_accepted_batch(
+                &mut state.chat_mirror,
+                batch.owner_generation,
+                batch.batch_id,
+                batch.message_ids,
+                batch.transcript_revision,
+            )?;
             state.action.updated_at_ms = Some(now_ms);
+            Ok(state.chat_mirror.clone())
+        })
+    }
+
+    pub(crate) fn record_superseded_accepted_batch(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        batch: AcceptedChatBatch<'_>,
+    ) -> Result<ChatMirrorState, String> {
+        validate_accepted_batch(
+            action_id,
+            batch.batch_id,
+            batch.message_ids,
+            batch.transcript_revision,
+        )?;
+        self.mutate(task, |state| {
+            merge_accepted_batch(
+                &mut state.chat_mirror,
+                batch.owner_generation,
+                batch.batch_id,
+                batch.message_ids,
+                batch.transcript_revision,
+            )?;
+            Ok(state.chat_mirror.clone())
+        })
+    }
+
+    pub(crate) fn retain_accepted_messages(
+        &self,
+        task: &ConversationIdentity,
+        owner_generation: u64,
+        message_ids: &[String],
+    ) -> Result<ChatMirrorState, String> {
+        if message_ids.len() > MAX_CHAT_MIRROR_IDS || message_ids.iter().any(|id| !valid_opaque(id))
+        {
+            return Err("Agent automation accepted chat history is invalid".into());
+        }
+        self.mutate(task, |state| {
+            state.chat_mirror.owner_generation = Some(owner_generation);
+            state.chat_mirror.message_ids = message_ids.to_vec();
+            if message_ids.is_empty() {
+                state.chat_mirror.last_accepted_batch_id = None;
+                state.chat_mirror.transcript_revision_at_start = None;
+            }
             Ok(state.chat_mirror.clone())
         })
     }
@@ -1592,7 +1734,22 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     if let Some(goal) = &state.goal {
         validate_goal(goal)?;
     }
+    let unique_mirror_ids = state
+        .chat_mirror
+        .message_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mirror_metadata_complete = state.chat_mirror.message_ids.is_empty()
+        || (state.chat_mirror.owner_generation.is_some()
+            && state.chat_mirror.last_accepted_batch_id.is_some()
+            && state.chat_mirror.transcript_revision_at_start.is_some());
+    let empty_mirror_metadata_clean = !state.chat_mirror.message_ids.is_empty()
+        || (state.chat_mirror.last_accepted_batch_id.is_none()
+            && state.chat_mirror.transcript_revision_at_start.is_none());
     if state.chat_mirror.message_ids.len() > MAX_CHAT_MIRROR_IDS
+        || unique_mirror_ids.len() != state.chat_mirror.message_ids.len()
+        || !mirror_metadata_complete
+        || !empty_mirror_metadata_clean
         || state
             .chat_mirror
             .message_ids
@@ -1611,35 +1768,8 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     {
         return Err("Agent automation chat mirror state is invalid".into());
     }
-    if state
-        .action
-        .id
-        .as_deref()
-        .is_some_and(|value| !valid_opaque(value))
-        || state
-            .action
-            .last_error
-            .as_deref()
-            .is_some_and(|value| !bounded_private(value))
-        || state
-            .action
-            .last_stable_answer
-            .as_deref()
-            .is_some_and(|value| value.len() > MAX_PRIVATE_TEXT_BYTES)
-    {
-        return Err("Agent automation action state is invalid".into());
-    }
-    for value in [
-        state.goal_wake.activity_epoch.as_deref(),
-        state.goal_wake.nudged_epoch.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !valid_opaque(value) {
-            return Err("Agent automation goal wake state is invalid".into());
-        }
-    }
+    validate_action(&state.action)?;
+    validate_goal_wake(&state.goal_wake)?;
     if state.owner_goal_requests.len() > MAX_OWNER_GOAL_REQUESTS {
         return Err("Agent automation owner goal request history is too large".into());
     }
@@ -1668,6 +1798,86 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_action(action: &AutomationActionState) -> Result<(), String> {
+    if action
+        .id
+        .as_deref()
+        .is_some_and(|value| !valid_opaque(value))
+        || action
+            .last_error
+            .as_deref()
+            .is_some_and(|value| !bounded_private(value))
+        || action
+            .last_stable_answer
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_PRIVATE_TEXT_BYTES)
+    {
+        return Err("Agent automation action state is invalid".into());
+    }
+    let requires_id = matches!(
+        action.status,
+        AutomationActionStatus::Queued
+            | AutomationActionStatus::Navigating
+            | AutomationActionStatus::Sending
+            | AutomationActionStatus::Generating
+            | AutomationActionStatus::ApprovalRequired
+            | AutomationActionStatus::AuthenticationRequired
+            | AutomationActionStatus::RateLimited
+            | AutomationActionStatus::Interference
+            | AutomationActionStatus::Ambiguous
+            | AutomationActionStatus::Stalled
+            | AutomationActionStatus::Failed
+    );
+    if requires_id && action.id.is_none() {
+        return Err("Agent automation in-flight action has no identity".into());
+    }
+    if action.id.is_some() && action.kind.is_none() {
+        return Err("Agent automation action identity has no kind".into());
+    }
+    if action.kind.is_some() && action.pairing_generation.is_none() {
+        return Err("Agent automation action has no pairing generation".into());
+    }
+    if action.pairing_generation == Some(0) {
+        return Err("Agent automation action pairing generation is invalid".into());
+    }
+    match (action.kind, action.goal_revision) {
+        (
+            Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined),
+            Some(revision),
+        ) if revision > 0 => {}
+        (Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined), _)
+        | (Some(AutomationActionKind::PairVerify | AutomationActionKind::OfflineChat), Some(_)) => {
+            return Err("Agent automation action has inconsistent goal state".into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_goal_wake(wake: &GoalWakeState) -> Result<(), String> {
+    for value in [wake.activity_epoch.as_deref(), wake.nudged_epoch.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !valid_opaque(value) {
+            return Err("Agent automation goal wake state is invalid".into());
+        }
+    }
+    if wake.activity_epoch.is_some() != wake.activity_sequence.is_some()
+        || wake.nudged_epoch.is_some() != wake.nudged_sequence.is_some()
+        || wake.nudged_epoch.is_some() != wake.last_nudged_at_ms.is_some()
+    {
+        return Err("Agent automation goal wake state is incomplete".into());
+    }
+    if wake.nudged_epoch.is_some()
+        && (wake.nudged_epoch != wake.activity_epoch
+            || wake.nudged_sequence != wake.activity_sequence)
+    {
+        return Err("Agent automation goal wake state is inconsistent".into());
+    }
+    Ok(())
+}
+
 fn validate_pairing(pairing: &PairingState) -> Result<(), String> {
     for url in [
         pairing.candidate_url.as_deref(),
@@ -1684,6 +1894,11 @@ fn validate_pairing(pairing: &PairingState) -> Result<(), String> {
     if pairing.verified_owner_generation.is_some() && pairing.canonical_url.is_none() {
         return Err("Agent automation pairing is verified without a canonical URL".into());
     }
+    if pairing.verified_owner_generation.is_some()
+        && (pairing.pending.is_some() || pairing.candidate_url.is_some())
+    {
+        return Err("Agent automation pairing cannot be pending and verified together".into());
+    }
     if let Some(pending) = &pairing.pending
         && (pending.generation == 0
             || pending.generation != pairing.generation
@@ -1697,15 +1912,17 @@ fn validate_pairing(pairing: &PairingState) -> Result<(), String> {
 }
 
 fn validate_selection(selection: &SelectionState) -> Result<(), String> {
-    for value in [
+    let values = [
         selection.model.as_deref(),
         selection.effort.as_deref(),
         selection.catalog_revision.as_deref(),
         selection.account_fingerprint.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    let populated = values.iter().filter(|value| value.is_some()).count();
+    if populated != 0 && populated != values.len() {
+        return Err("Agent automation selection state is incomplete".into());
+    }
+    for value in values.into_iter().flatten() {
         if !valid_opaque(value) {
             return Err("Agent automation selection state is invalid".into());
         }
@@ -1767,6 +1984,51 @@ fn validate_goal_markdown(markdown: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_accepted_batch(
+    action_id: &str,
+    batch_id: &str,
+    message_ids: &[String],
+    transcript_revision: &str,
+) -> Result<(), String> {
+    if !valid_opaque(action_id)
+        || !valid_opaque(batch_id)
+        || message_ids.is_empty()
+        || message_ids.len() > MAX_CHAT_MIRROR_IDS
+        || message_ids.iter().any(|id| !valid_opaque(id))
+        || !bounded_private(transcript_revision)
+    {
+        return Err("Agent automation accepted chat batch is invalid".into());
+    }
+    Ok(())
+}
+
+fn merge_accepted_batch(
+    mirror: &mut ChatMirrorState,
+    owner_generation: u64,
+    batch_id: &str,
+    message_ids: &[String],
+    transcript_revision: &str,
+) -> Result<(), String> {
+    let mut accepted = if mirror.owner_generation == Some(owner_generation) {
+        mirror.message_ids.clone()
+    } else {
+        Vec::new()
+    };
+    for id in message_ids {
+        if !accepted.contains(id) {
+            accepted.push(id.clone());
+        }
+    }
+    if accepted.len() > MAX_CHAT_MIRROR_IDS {
+        return Err("Agent automation accepted chat history is full".into());
+    }
+    mirror.owner_generation = Some(owner_generation);
+    mirror.last_accepted_batch_id = Some(batch_id.to_string());
+    mirror.message_ids = accepted;
+    mirror.transcript_revision_at_start = Some(transcript_revision.to_string());
+    Ok(())
+}
+
 fn normalize_chatgpt_url(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
         return Err("ChatGPT conversation URL is invalid".into());
@@ -1778,9 +2040,11 @@ fn normalize_chatgpt_url(value: &str) -> Result<String, String> {
         || url.password().is_some()
         || url.port().is_some()
         || url.fragment().is_some()
+        || url.path() == "/"
     {
         return Err("ChatGPT conversation URL must use the https://chatgpt.com origin".into());
     }
+    url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string())
 }
