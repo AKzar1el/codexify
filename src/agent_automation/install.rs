@@ -856,6 +856,15 @@ fn extract_tar_archive(bytes: &[u8], destination: &Path, package_root: &str) -> 
             create_private_directory(&target)?;
             continue;
         }
+        if entry_type.is_symlink() {
+            let link_target = entry
+                .link_name()
+                .context("read browser companion tar symlink target")?
+                .context("Browser companion tar symlink target is missing")?;
+            validate_archive_symlink_target(&relative, &link_target, package_root)?;
+            write_archive_symlink(&target, &link_target)?;
+            continue;
+        }
         if !entry_type.is_file() {
             bail!("Browser companion archive contains an unsupported entry type");
         }
@@ -939,6 +948,72 @@ fn safe_archive_path(path: &Path, package_root: &str) -> anyhow::Result<PathBuf>
         bail!("Browser companion archive has an unexpected package root");
     }
     Ok(output)
+}
+
+fn validate_archive_symlink_target(
+    link_path: &Path,
+    target: &Path,
+    package_root: &str,
+) -> anyhow::Result<()> {
+    let text = target
+        .to_str()
+        .context("Browser companion archive symlink target is not UTF-8")?;
+    if text.is_empty() || text.len() > 4096 || target.is_absolute() {
+        bail!("Browser companion archive symlink target is invalid");
+    }
+    let mut resolved = link_path
+        .parent()
+        .context("Browser companion archive symlink has no parent")?
+        .to_path_buf();
+    for component in target.components() {
+        match component {
+            Component::Normal(value) => resolved.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved.components().count() <= 1 {
+                    bail!("Browser companion archive symlink escapes the package root");
+                }
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("Browser companion archive symlink target is invalid")
+            }
+        }
+    }
+    if resolved
+        .components()
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        != Some(package_root)
+    {
+        bail!("Browser companion archive symlink escapes the package root");
+    }
+    Ok(())
+}
+
+fn write_archive_symlink(path: &Path, target: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .context("Browser companion archive symlink has no parent")?;
+    ensure_private_directory(parent)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, path).with_context(|| {
+            format!(
+                "create browser companion archive symlink {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        bail!("Browser companion tar symlinks are unsupported on this platform")
+    }
 }
 
 fn write_archive_file(

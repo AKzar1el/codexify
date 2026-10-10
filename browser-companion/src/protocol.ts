@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac" as const;
+export const PROTOCOL_SCHEMA_HASH = "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -27,7 +27,11 @@ function noControl(value: string): boolean {
 
 export const opaqueIdSchema = z.string().regex(opaquePattern);
 export const companionTokenSchema = z.string().regex(tokenPattern);
-export const boundedVisibleSchema = (max: number) => z.string().min(1).max(max).refine(noControl, "control characters are not allowed");
+export const boundedVisibleSchema = (max: number) => z.string()
+  .min(1)
+  .max(max)
+  .refine(value => value.trim().length > 0, "text must not be blank")
+  .refine(noControl, "control characters are not allowed");
 export const boundedTextSchema = (max: number) => z.string().min(1).refine(value => !value.includes("\0") && utf8Length(value) <= max, "text is oversized or contains NUL");
 
 export function validateChatGptConversationUrl(value: string): string {
@@ -91,13 +95,13 @@ export const protocolBuildSchema = boundedVisibleSchema(128).superRefine((value,
 
 export const unreadMessageSchema = z.strictObject({
   id: opaqueIdSchema,
-  markdown: boundedTextSchema(MAX_PROMPT_BYTES),
+  markdown: boundedTextSchema(MAX_PROMPT_BYTES).refine(value => value.trim().length > 0, "Markdown must not be blank"),
 });
 
 export const actionPromptSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("pair_verify"),
-    reference: opaqueIdSchema,
+    reference: companionTokenSchema,
   }),
   z.strictObject({
     kind: z.literal("offline_chat"),
@@ -177,7 +181,7 @@ export const executeActionRequestSchema = z.strictObject({
   idempotencyKey: opaqueIdSchema,
   url: chatGptUrlSchema,
   pairingGeneration: z.number().int().positive(),
-  connectorName: boundedVisibleSchema(256),
+  connectorName: boundedVisibleSchema(128),
   model: opaqueIdSchema,
   effort: opaqueIdSchema,
   prompt: actionPromptSchema,

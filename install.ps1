@@ -17,6 +17,7 @@ else {
 }
 $ReleaseRoot = if ($env:CODEXIFY_RELEASE_ROOT) { $env:CODEXIFY_RELEASE_ROOT.TrimEnd('/') } else { "https://github.com/$Repository/releases/download" }
 $Version = $env:CODEXIFY_VERSION
+$InstallBrowser = if ($env:CODEXIFY_INSTALL_BROWSER) { $env:CODEXIFY_INSTALL_BROWSER } else { '0' }
 $Headers = @{ 'User-Agent' = 'codexify-installer'; 'Accept' = 'application/vnd.github+json' }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -31,6 +32,9 @@ if (-not $Version) {
 
 if ($Version -notmatch '^[A-Za-z0-9._-]+$') {
     throw "Invalid release tag: $Version"
+}
+if ($InstallBrowser -notin @('0', '1')) {
+    throw 'CODEXIFY_INSTALL_BROWSER must be 0 or 1.'
 }
 
 $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
@@ -167,6 +171,35 @@ try {
         else {
             Write-Host "Background service setup deferred until quickstart creates the selected config: $ConfigPath"
         }
+    }
+
+    if ($InstallBrowser -eq '1') {
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+            throw "The optional browser companion requires an existing config: $ConfigPath"
+        }
+        & $Target --config $ConfigPath config validate *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The optional browser companion requires a valid config: $ConfigPath"
+        }
+        $PreviousBrowserReleaseRoot = $env:CODEXIFY_BROWSER_RELEASE_ROOT
+        try {
+            if (-not $PreviousBrowserReleaseRoot) {
+                $env:CODEXIFY_BROWSER_RELEASE_ROOT = $ReleaseRoot
+            }
+            & $Target --config $ConfigPath browser install
+            if ($LASTEXITCODE -ne 0) {
+                throw 'The Codexify executable was installed, but the optional browser companion could not be installed.'
+            }
+        }
+        finally {
+            if ($PreviousBrowserReleaseRoot) {
+                $env:CODEXIFY_BROWSER_RELEASE_ROOT = $PreviousBrowserReleaseRoot
+            }
+            else {
+                Remove-Item Env:CODEXIFY_BROWSER_RELEASE_ROOT -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Host 'Installed the optional browser companion.'
     }
 
     Write-Host "Installed Codexify $Version to $Target"

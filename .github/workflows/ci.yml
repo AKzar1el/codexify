@@ -46,6 +46,16 @@ jobs:
           cd ..
           node --test scripts/test-browser-companion-boundary.mjs
 
+      - name: Package and smoke browser companion
+        run: |
+          sudo rm -f \
+            /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/google-chrome.sources
+          cd browser-companion
+          bun x --no-install playwright-core install-deps chromium
+          bun run package
+          bun run smoke:package
+
       - name: Validate POSIX installer
         run: |
           sh -n install.sh

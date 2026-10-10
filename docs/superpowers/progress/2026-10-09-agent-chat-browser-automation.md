@@ -628,3 +628,110 @@ Implement the approved agent-chat browser automation architecture completely: re
   - doctor-focused library suite — 17 passed;
   - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and
     `git diff --check` passed.
+- Task 11 packaging contract red-green slice:
+  - red: the companion had no package builder, artifact manifest, packaged smoke
+    path, or package smoke launcher;
+  - green: the package now pins electron-builder 26.15.3, emits one native
+    versioned `codexify-browser-v<version>-<platform>` archive with the protocol
+    hash/build manifest expected by the Rust installer, dereferences packaged app
+    symlinks for the fail-closed extractor, and provides an Electron readiness-only
+    smoke path that never opens ChatGPT or starts the control server;
+  - the focused packaging contract passes 2 tests with 17 assertions.
+- Packaged-runtime smoke red-green slice:
+  - red: the first macOS archive converted framework links into absolute build-path
+    symlinks, so the extracted application could not load Electron Framework;
+  - green: packaging preserves original relative app links, while the Rust tar
+    extractor now accepts only bounded relative symlinks whose lexical target stays
+    inside the versioned package root and continues to reject absolute/escaping
+    links;
+  - the native darwin-arm64 artifact now launches its packaged Electron readiness
+    path successfully, reports the exact protocol-bound build, exits without
+    opening ChatGPT or publishing a descriptor, and passes
+    `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64`.
+- Installer opt-in red-green slice:
+  - red: the release installers never invoked the new browser lifecycle even when
+    explicitly requested;
+  - green: `CODEXIFY_INSTALL_BROWSER=1` now requires an existing valid config and
+    delegates the verified optional artifact install to
+    `codexify --config <path> browser install`; the default remains zero browser
+    downloads/processes and unsupported values fail before installation;
+  - the POSIX installer syntax and full replacement/checksum/PATH/service/browser
+    integration test pass. The equivalent Windows fixture now records and requires
+    exactly one opt-in browser install for its platform CI run.
+- Release publication red-green slice:
+  - red: release orchestration expected only the five Codexify server archives and
+    therefore omitted every browser companion artifact from checksums/publication;
+  - green: release staging now requires and checksums the five server archives plus
+    five version-matched browser companion archives, publishes the exact combined
+    set, and keeps notarization/signature checks scoped to the existing Codexify
+    macOS executable submissions;
+  - release CI now builds all five browser platforms, smoke-runs native
+    linux-x64/darwin-arm64/windows-x64 packages, uploads exact artifact names, and
+    gates release staging on the browser matrix;
+  - the complete release-notarization suite passes 30 tests and the focused CI
+    workflow contract passes.
+- Release cache/contract hardening is green:
+  - release validation now runs the real ignored Rust↔TypeScript companion process
+    contract with the pinned Bun executable before any artifact can publish;
+  - the default-branch cache warmer saves Bun, Electron, and electron-builder
+    download caches for all five browser package targets, while release-tag jobs use
+    restore-only cache access;
+  - all 9 workflow contract tests pass and all three edited workflow files parse as
+    valid YAML.
+- Resumed from the Task 11 packaging handoff after exhaustively rereading the full
+  1,336-line revised architecture, this complete progress journal, and the complete
+  execution plan. The worktree contains the uncommitted package/build, installer,
+  release, and cache integration slice described above; the next step is a fresh
+  focused verification and aggregate review before committing it.
+- Fresh companion packaging/protocol verification is green:
+  - `git diff --check` passed;
+  - targeted Bun packaging and protocol suites passed 16 tests with 74 assertions;
+  - strict TypeScript typechecking passed.
+- Focused Rust verification found one stale golden-test constructor: the generated
+  protocol fixture now uses a valid 43-character pairing reference, while the Rust
+  comparison still serialized the old placeholder. The failing exact test reproduced
+  the mismatch; updating that test datum to the canonical fixture value made
+  `rust_shapes_match_every_golden_protocol_fixture` pass.
+- The refreshed Task 11 Rust/CI/doctor matrix is green:
+  - companion protocol integration — 17 passed;
+  - browser lifecycle CLI — 3 passed;
+  - checked-in protocol fixtures — 2 passed, with 3 real-Bun tests explicitly gated;
+  - browser install/lifecycle integration — 8 passed, including safe relative tar
+    symlinks and the detached user-process fixture;
+  - workflow contracts — 9 passed;
+  - doctor-focused library tests — 17 passed.
+- Fresh native package verification is green on macOS arm64: electron-builder
+  produced `codexify-browser-v1.7.0-darwin-arm64.tar.gz`, and the extracted packaged
+  readiness path returned `PACKAGED_BROWSER_COMPANION_SMOKE_OK darwin/arm64` without
+  opening ChatGPT or publishing a companion descriptor.
+- Installer and release orchestration verification is green on the available host:
+  - POSIX installer syntax and the full fake-release integration suite passed,
+    including the explicit browser opt-in path;
+  - the release/notarization orchestration suite passed all 30 tests with the exact
+    combined server-plus-browser asset set;
+  - PowerShell was unavailable on this macOS host, so the Windows installer fixture
+    remains covered by its dedicated Windows CI job rather than a local execution.
+- Package-attribution review found that the first native artifact contained the app
+  and runtime manifest but omitted Codexify's license, the third-party notice, and
+  the vendored upstream MIT text. A focused packaging-contract test failed first;
+  the packager now includes `LICENSE`, `THIRD_PARTY_NOTICES.md`, and
+  `LICENSES/codex-chatgpt-web-MIT.txt`, and the packaged smoke path verifies all
+  three. The focused test is green with 2 tests and 23 assertions.
+- The complete companion suite remains green after the attribution fix: 49 tests,
+  216 assertions, and strict TypeScript typechecking passed. A fresh native
+  darwin-arm64 package also smoke-tested successfully, and direct archive inspection
+  confirmed all three notice files are present at the package root/license path.
+- Installer mirror propagation review found that an opt-in install using
+  `CODEXIFY_RELEASE_ROOT` downloaded the Codexify binary from that mirror but let the
+  delegated browser installer fall back to GitHub. The POSIX fixture failed first;
+  both installers now pass the selected release root through
+  `CODEXIFY_BROWSER_RELEASE_ROOT` unless the user explicitly supplied a browser-only
+  override. POSIX syntax and the complete installer fixture are green again; the
+  Windows fake executable enforces the same contract in its platform CI run.
+- Task 11 formatting and static analysis are green after applying the one rustfmt
+  layout change reported by the initial check: `cargo fmt --all` completed and
+  `cargo clippy --all-targets -- -D warnings` passed.
+- The protocol fixture regenerated to the checked-in hash
+  `edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2`,
+  `git diff --check` remains clean, all four browser-companion source-boundary tests
+  pass, and the upstream extraction check still matches exact commit `f9ad4ae`.

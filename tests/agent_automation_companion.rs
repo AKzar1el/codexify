@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
+    "test-build-v1+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -941,7 +941,6 @@ async fn protocol_valid_prompt_can_use_the_full_json_transport_bound() {
     let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
     let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
     let mut request = action_request();
-    request.connector_name = "C".repeat(200);
     request.prompt = ActionPrompt::OfflineChat {
         batch_id: "batch_1".into(),
         messages: vec![CompanionUnreadMessage {

@@ -70,7 +70,10 @@ test("pair verification requires one exact 32-byte base64url reference", () => {
     ...request,
     prompt:{ kind:"pair_verify", reference:valid },
   }).prompt).toEqual({ kind:"pair_verify", reference:valid });
-  expect(() => executeActionRequestSchema.parse(request)).toThrow();
+  expect(executeActionRequestSchema.parse(request).prompt).toEqual({
+    kind:"pair_verify",
+    reference:valid,
+  });
   expect(() => executeActionRequestSchema.parse({
     ...request,
     prompt:{ kind:"pair_verify", reference:"A".repeat(42) },

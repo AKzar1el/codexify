@@ -35,10 +35,21 @@ case "${1:-}" in
     --help) exit 0 ;;
     --config)
         [ "$#" -eq 4 ] || exit 2
-        [ "$3" = config ] || exit 2
-        [ "$4" = validate ] || exit 2
-        grep -F '"workDir"' "$2" >/dev/null 2>&1 || exit 1
-        exit 0
+        case "$3:$4" in
+            config:validate)
+                grep -F '"workDir"' "$2" >/dev/null 2>&1 || exit 1
+                exit 0
+                ;;
+            browser:install)
+                grep -F '"automation"' "$2" >/dev/null 2>&1 || exit 1
+                [ "${CODEXIFY_BROWSER_RELEASE_ROOT:-}" = "${CODEXIFY_RELEASE_ROOT:-}" ] || exit 1
+                count=0
+                [ ! -f "$HOME/browser-installs" ] || count=$(cat "$HOME/browser-installs")
+                printf '%s\n' "$((count + 1))" > "$HOME/browser-installs"
+                exit 0
+                ;;
+            *) exit 2 ;;
+        esac
         ;;
     migrate-legacy-install)
         if [ "${2:-}" = --help ]; then
@@ -152,9 +163,21 @@ CODEXIFY_SKIP_SERVICE=1 \
 CLICOLOR_FORCE=1 \
     sh ./install.sh > "$root/run-skip-service.log"
 
+printf '{"workDir":"%s","agentChat":{"enabled":true,"automation":{"enabled":true}}}\n' "$project" > "$custom_config"
+HOME=$home \
+SHELL=/bin/zsh \
+CODEXIFY_CONFIG=$custom_config \
+CODEXIFY_VERSION=$tag \
+CODEXIFY_RELEASE_ROOT=http://127.0.0.1:$port \
+CODEXIFY_SKIP_SERVICE=1 \
+CODEXIFY_INSTALL_BROWSER=1 \
+    sh ./install.sh > "$root/run-with-browser.log"
+
 [ "$("$home/.codexify/bin/codexify")" = fake-codexify ]
 [ "$(cat "$home/service-installs")" = 1 ]
-[ "$(cat "$home/legacy-migrations")" = 4 ]
+[ "$(cat "$home/legacy-migrations")" = 5 ]
+[ "$(cat "$home/browser-installs")" = 1 ]
+grep -F 'Installed the optional browser companion.' "$root/run-with-browser.log" >/dev/null
 grep -F 'Background service setup deferred until quickstart creates the selected config:' "$root/run-no-config.log" >/dev/null
 grep -F 'Background service setup deferred because the selected config is not valid for startup:' "$root/run-invalid-config.log" >/dev/null
 test ! -e "$missing_config"

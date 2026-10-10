@@ -57,9 +57,10 @@ describe("protocol identity and URL boundaries", () => {
 
 describe("fixed prompt contract", () => {
   test("pair verification contains no task content", () => {
-    const prompt = renderActionPrompt({ kind: "pair_verify", reference: "reference-1" });
+    const reference = "A".repeat(43);
+    const prompt = renderActionPrompt({ kind: "pair_verify", reference });
     expect(prompt).toContain("automation_verify_pairing");
-    expect(prompt).toContain("reference-1");
+    expect(prompt).toContain(reference);
     expect(prompt).not.toContain("goal_read");
     expect(prompt).not.toContain("chat_read");
   });

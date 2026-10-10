@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
+    "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
+    "+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -1057,7 +1057,7 @@ fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String
     if request.pairing_generation == 0 {
         return Err("Browser action pairing generation must be positive".into());
     }
-    validate_visible(&request.connector_name, 256, "browser connector name")?;
+    validate_visible(&request.connector_name, 128, "browser connector name")?;
     validate_opaque(&request.model, "browser model ID")?;
     validate_opaque(&request.effort, "browser effort ID")?;
     validate_prompt(&request.prompt)?;
@@ -1116,7 +1116,7 @@ fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result
     for message in messages {
         validate_opaque(&message.id, "browser unread message ID")?;
         if !ids.insert(&message.id)
-            || message.markdown.is_empty()
+            || message.markdown.trim().is_empty()
             || message.markdown.contains('\0')
         {
             return Err("Browser unread batch is invalid".into());

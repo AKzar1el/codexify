@@ -42,6 +42,15 @@
     "offline_goal": ["goalRevision"],
     "offline_combined": ["batchId", "messages", "goalRevision"]
   },
+  "fieldLimits": {
+    "opaqueIdBytes": 256,
+    "pairingReferenceBytes": 43,
+    "connectorNameBytes": 128,
+    "modelLabelBytes": 256,
+    "effortLabelBytes": 256,
+    "effortReasonBytes": 1024,
+    "attentionMessageBytes": 65536
+  },
   "eventTypes": [
     "queued",
     "navigating",

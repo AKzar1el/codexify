@@ -66,7 +66,7 @@ const fixture = {
     activeActionId:null,
   },
   executeRequests:[
-    { ...baseAction, actionId:"fixture-pair", idempotencyKey:"fixture-pair-execute", prompt:{ kind:"pair_verify", reference:"fixture-reference" } },
+    { ...baseAction, actionId:"fixture-pair", idempotencyKey:"fixture-pair-execute", prompt:{ kind:"pair_verify", reference:"A".repeat(43) } },
     { ...baseAction, actionId:"fixture-chat", idempotencyKey:"fixture-chat-execute", prompt:{ kind:"offline_chat", batchId:"fixture-batch", messages:[{ id:"fixture-message", markdown:"Preserve <data> & Markdown." }] } },
     { ...baseAction, actionId:"fixture-goal", idempotencyKey:"fixture-goal-execute", prompt:{ kind:"offline_goal", goalRevision:3 } },
     { ...baseAction, prompt:{ kind:"offline_combined", batchId:"fixture-batch", messages:[{ id:"fixture-message", markdown:"Preserve <data> & Markdown." }], goalRevision:3 } },

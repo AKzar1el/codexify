@@ -34,6 +34,18 @@ fn append_tar_file(builder: &mut Builder<GzEncoder<Vec<u8>>>, path: &str, bytes:
     builder.append_data(&mut header, path, bytes).unwrap();
 }
 
+fn append_tar_symlink(builder: &mut Builder<GzEncoder<Vec<u8>>>, path: &str, target: &str) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_mode(0o777);
+    header.set_link_name(target).unwrap();
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, std::io::empty())
+        .unwrap();
+}
+
 fn tar_package(platform: &str, version: &str, build: &str, entrypoint: &str) -> Vec<u8> {
     tar_package_with_entrypoint(platform, version, build, entrypoint, b"#!/bin/sh\nexit 0\n")
 }
@@ -348,6 +360,83 @@ fn install_rejects_disabled_automation_bad_checksums_and_incompatible_manifests(
             .contains("build")
     );
     assert!(!manager.layout().runtime_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn tar_install_preserves_only_relative_links_that_stay_inside_the_package() {
+    let root = tempfile::tempdir().unwrap();
+    let browser_root = root.path().join("browser");
+    let manager = BrowserCompanionManager::for_test(
+        browser_root,
+        enabled_config(&root.path().join("browser/descriptor.json")),
+        "1.7.0",
+        "macos",
+        "aarch64",
+        "https://example.invalid/releases/download",
+    )
+    .unwrap();
+    let package_root = format!(
+        "codexify-browser-v{}-{}",
+        manager.release_asset().version,
+        manager.release_asset().platform
+    );
+    let manifest = serde_json::to_vec(&json!({
+        "version": 1,
+        "codexifyVersion": manager.release_asset().version,
+        "protocolVersion": PROTOCOL_VERSION,
+        "protocolSchemaHash": PROTOCOL_SCHEMA_HASH,
+        "build": manager.expected_build(),
+        "platform": manager.release_asset().platform,
+        "entrypoint": "app/companion"
+    }))
+    .unwrap();
+
+    let build_archive = |target: &str| {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        append_tar_file(
+            &mut builder,
+            &format!("{package_root}/manifest.json"),
+            &manifest,
+            0o600,
+        );
+        append_tar_file(
+            &mut builder,
+            &format!("{package_root}/app/companion"),
+            b"#!/bin/sh\nexit 0\n",
+            0o700,
+        );
+        append_tar_file(
+            &mut builder,
+            &format!("{package_root}/app/Versions/A/resource"),
+            b"resource",
+            0o600,
+        );
+        append_tar_symlink(
+            &mut builder,
+            &format!("{package_root}/app/Versions/Current"),
+            target,
+        );
+        builder.into_inner().unwrap().finish().unwrap()
+    };
+
+    let archive = build_archive("A");
+    let checksums = checksum_line(&manager.release_asset().archive_name, &archive);
+    let receipt = manager
+        .install_verified_archive(&archive, checksums.as_bytes())
+        .unwrap();
+    assert_eq!(
+        std::fs::read_link(receipt.runtime_dir.join("app/Versions/Current")).unwrap(),
+        Path::new("A")
+    );
+
+    let unsafe_archive = build_archive("../../../outside");
+    let unsafe_checksums = checksum_line(&manager.release_asset().archive_name, &unsafe_archive);
+    let error = manager
+        .install_verified_archive(&unsafe_archive, unsafe_checksums.as_bytes())
+        .unwrap_err();
+    assert!(error.contains("symlink"), "{error}");
 }
 
 #[tokio::test]

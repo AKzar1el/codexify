@@ -153,7 +153,7 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
             "fixture-pair",
             "fixture-pair-execute",
             ActionPrompt::PairVerify {
-                reference: "fixture-reference".into(),
+                reference: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             },
         ),
         base(

@@ -31,6 +31,28 @@ jobs:
         with:
           save-if: false
 
+      - uses: oven-sh/setup-bun@v2.2.0
+        id: browser-bun
+        with:
+          bun-version: 1.4.0
+
+      - name: Install browser companion dependencies
+        working-directory: browser-companion
+        run: bun install --frozen-lockfile
+
+      - name: Verify browser companion source and protocol
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/generate-browser-companion-protocol-fixtures.mjs
+          git diff --exit-code -- browser-companion/protocol-fixtures/v1.json
+          node scripts/update-browser-companion-upstream.mjs --check
+          cd browser-companion
+          bun test
+          bun run typecheck
+          cd ..
+          node --test scripts/test-browser-companion-boundary.mjs
+
       - name: Verify tag matches Cargo.toml version
         run: |
           MANIFEST="$(cargo metadata --format-version=1 --no-deps \
@@ -50,6 +72,11 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+      - name: Test Rust and TypeScript browser companion contract
+        env:
+          CODEXIFY_TEST_BROWSER_COMPANION_BUN: ${{ steps.browser-bun.outputs.bun-path }}
+        run: cargo test --test browser_companion_contract -- --ignored --nocapture
 
   build:
     timeout-minutes: 30
@@ -214,6 +241,91 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/codexify-signing.keychain-db" >/dev/null 2>&1 || true
           rm -f "$RUNNER_TEMP/codexify-developer-id.p12"
 
+  browser-build:
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            archive: tar.gz
+            smoke: true
+          - name: linux-arm64
+            os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            archive: tar.gz
+            smoke: false
+          - name: darwin-x64
+            os: macos-14
+            platform: darwin
+            arch: x64
+            archive: tar.gz
+            smoke: false
+          - name: darwin-arm64
+            os: macos-14
+            platform: darwin
+            arch: arm64
+            archive: tar.gz
+            smoke: true
+          - name: windows-x64
+            os: windows-latest
+            platform: win32
+            arch: x64
+            archive: zip
+            smoke: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.4.0
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: browser-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('browser-companion/bun.lock') }}
+
+      - name: Install browser companion dependencies
+        working-directory: browser-companion
+        run: bun install --frozen-lockfile
+
+      - name: Install Linux smoke dependencies
+        if: matrix.smoke && matrix.platform == 'linux'
+        run: |
+          sudo rm -f \
+            /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/google-chrome.sources
+          cd browser-companion
+          bun x --no-install playwright-core install-deps chromium
+
+      - name: Package browser companion
+        working-directory: browser-companion
+        run: bun run package -- --platform=${{ matrix.platform }} --arch=${{ matrix.arch }}
+
+      - name: Smoke packaged browser companion
+        if: matrix.smoke
+        working-directory: browser-companion
+        run: bun run smoke:package
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: codexify-browser-${{ matrix.name }}
+          path: browser-companion/artifacts/codexify-browser-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
+          if-no-files-found: error
+
   deploy-installers:
     needs: [check, build]
     permissions:
@@ -223,7 +335,7 @@ jobs:
     uses: ./.github/workflows/pages.yml
 
   stage-release:
-    needs: [check, build, deploy-installers]
+    needs: [check, build, browser-build, deploy-installers]
     runs-on: macos-14
     timeout-minutes: 15
     permissions:
