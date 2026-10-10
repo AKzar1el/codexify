@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_automation::AgentAutomationStore;
 use crate::artifact_egress::ArtifactEgressStore;
 use crate::conversation_auth::ConversationAuthorizationStore;
 use crate::diff::DiffCheckpointManager;
@@ -27,6 +28,8 @@ pub struct ToolRequestContext {
     pub conversation: Option<ConversationIdentity>,
     /// Stable Codexify task owner used for workspace, chat, diff, and exec state.
     pub task_conversation: Option<ConversationIdentity>,
+    /// Continuation generation of the task's current physical owner.
+    pub task_owner_generation: Option<u64>,
     /// Whether the physical ChatGPT conversation has handed this task off.
     pub conversation_retired: bool,
     /// Last version served on an identified connector reload; never from a widget echo.
@@ -38,6 +41,8 @@ pub struct ToolRequestContext {
     pub diff_checkpoints: Arc<DiffCheckpointManager>,
     pub artifact_egress: Arc<ArtifactEgressStore>,
     pub markdown_chat: Arc<crate::markdown_chat::MarkdownChatStore>,
+    /// Task-rooted automation state, available only when browser automation is enabled.
+    pub agent_automation: Option<Arc<AgentAutomationStore>>,
     /// Cancelled when the transport drops or a per-call deadline (e.g. the
     /// artifact-ingress idle timeout) fires, so long-running tools can abort.
     pub cancellation: CancellationToken,

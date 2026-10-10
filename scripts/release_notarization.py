@@ -127,13 +127,26 @@ class FinalizeServices(Protocol):
     def publish_release(self, repo: str, release_id: int, make_latest: bool) -> None: ...
 
 
-def expected_archive_names(tag: str) -> tuple[str, ...]:
+def expected_codexify_archive_names(tag: str) -> tuple[str, ...]:
     validate_tag(tag)
     names = []
     for platform in ALL_PLATFORMS:
         suffix = ".zip" if platform == "windows-x64" else ".tar.gz"
         names.append(f"codexify-{tag}-{platform}{suffix}")
     return tuple(names)
+
+
+def expected_browser_archive_names(tag: str) -> tuple[str, ...]:
+    validate_tag(tag)
+    names = []
+    for platform in ALL_PLATFORMS:
+        suffix = ".zip" if platform == "windows-x64" else ".tar.gz"
+        names.append(f"codexify-browser-{tag}-{platform}{suffix}")
+    return tuple(names)
+
+
+def expected_archive_names(tag: str) -> tuple[str, ...]:
+    return (*expected_codexify_archive_names(tag), *expected_browser_archive_names(tag))
 
 
 def expected_public_asset_names(tag: str) -> tuple[str, ...]:
@@ -215,7 +228,7 @@ def collect_public_assets(options: StageOptions) -> list[Path]:
         path.name
         for path in options.artifacts_dir.iterdir()
         if path.is_file()
-        and path.name.startswith(f"codexify-{options.tag}-")
+        and path.name.startswith((f"codexify-{options.tag}-", f"codexify-browser-{options.tag}-"))
         and path.name not in expected_archives
     )
     if missing:

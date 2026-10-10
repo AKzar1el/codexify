@@ -231,7 +231,7 @@ impl ToolCallLogger {
         let traversal_truncated = Cell::new(false);
         if result.audit.sensitive_output {
             return preview_serializable(
-                &"<private Markdown chat history>",
+                &"<private tool output>",
                 self.max_response_bytes,
                 &traversal_truncated,
             );
@@ -773,7 +773,37 @@ mod tests {
         let preview = logger.preview_response(&result);
         assert!(!preview.text.contains("private history excerpt"));
         assert!(!preview.text.contains("private widget history"));
-        assert!(preview.text.contains("private Markdown chat history"));
+        assert!(preview.text.contains("private tool output"));
+    }
+
+    #[test]
+    fn agent_automation_goal_data_never_enters_payload_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = default_config(root.path().to_path_buf());
+        config.tool_logging.mode = ToolLogMode::All;
+        let logger = ToolCallLogger::new(&config).unwrap();
+        let tool = crate::tools::goal::GoalTool::Finish;
+        let schema = crate::tool::Tool::input_schema(&tool);
+        let request = logger.preview_request(
+            &serde_json::json!({
+                "expectedRevision": 4,
+                "status": "blocked",
+                "reason": "private goal blocker"
+            }),
+            Some(&schema),
+        );
+        assert!(!request.text.contains("private goal blocker"));
+
+        let mut result =
+            ToolResult::text("private goal markdown").with_structured(serde_json::json!({
+                "markdown": "private goal markdown",
+                "blockedReason": "private goal blocker"
+            }));
+        result.audit.sensitive_output = true;
+        let response = logger.preview_response(&result);
+        assert!(!response.text.contains("private goal markdown"));
+        assert!(!response.text.contains("private goal blocker"));
+        assert!(response.text.contains("private tool output"));
     }
 
     #[test]

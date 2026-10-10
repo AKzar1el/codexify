@@ -1,6 +1,7 @@
 //! Tool implementations. Each file is one Codex-style MCP tool.
 
 pub mod apply_patch;
+pub mod automation_pair;
 pub mod check_for_updates;
 pub mod clock_curr_time;
 pub mod clock_sleep;
@@ -17,6 +18,7 @@ pub mod git_log;
 pub mod git_push;
 pub mod git_status;
 pub mod glob;
+pub mod goal;
 pub mod grep;
 pub mod import_host_file;
 pub mod list_directory;

@@ -1,0 +1,83 @@
+{
+  "protocolVersion": 1,
+  "kind": "codexify-browser-companion",
+  "fieldNaming": "camelCase",
+  "strictObjects": true,
+  "buildBinding": "<component-version>+protocol.<sha256-of-this-file>",
+  "endpoints": [
+    "GET /v1/health",
+    "POST /v1/session/login",
+    "POST /v1/session/capabilities",
+    "POST /v1/window/reveal",
+    "POST /v1/actions/execute",
+    "POST /v1/actions/cancel",
+    "GET /v1/actions/{actionId}",
+    "GET /v1/actions/{actionId}/events?after={sequence}"
+  ],
+  "sessionStatuses": [
+    "idle",
+    "busy",
+    "authentication_required",
+    "unavailable"
+  ],
+  "actionStates": [
+    "unpaired",
+    "unverified",
+    "queued",
+    "navigating",
+    "sending",
+    "generating",
+    "idle",
+    "approval_required",
+    "authentication_required",
+    "rate_limited",
+    "external_interference",
+    "ambiguous",
+    "stalled",
+    "failed"
+  ],
+  "promptKinds": {
+    "pair_verify": ["reference"],
+    "offline_chat": ["batchId", "messages"],
+    "offline_goal": ["goalRevision"],
+    "offline_combined": ["batchId", "messages", "goalRevision"]
+  },
+  "fieldLimits": {
+    "opaqueIdBytes": 256,
+    "pairingReferenceBytes": 43,
+    "connectorNameBytes": 128,
+    "modelLabelBytes": 256,
+    "effortLabelBytes": 256,
+    "effortReasonBytes": 1024,
+    "attentionMessageBytes": 65536
+  },
+  "eventTypes": [
+    "queued",
+    "navigating",
+    "composer_ready",
+    "model_verified",
+    "connector_verified",
+    "send_accepted",
+    "status_delta",
+    "commentary_delta",
+    "answer_delta",
+    "generation_complete",
+    "approval_required",
+    "authentication_required",
+    "rate_limited",
+    "external_interference",
+    "ambiguous_send",
+    "failed"
+  ],
+  "limits": {
+    "descriptorBytes": 8192,
+    "jsonBytes": 1048576,
+    "eventStreamBytes": 16777216,
+    "eventLineBytes": 131072,
+    "deltaBytes": 65536,
+    "finalAnswerBytes": 1048576,
+    "promptBytes": 262144,
+    "unreadMessages": 128,
+    "chatGptUrlBytes": 4096
+  }
+}

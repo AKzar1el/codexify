@@ -29,6 +29,22 @@ pub(crate) struct ClaimedContinuation {
     pub workspace: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskOwnerSnapshot {
+    pub task: ConversationIdentity,
+    pub owner_key: String,
+    pub generation: u64,
+    pub active: bool,
+}
+
+impl TaskOwnerSnapshot {
+    #[cfg(test)]
+    fn with_active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+}
+
 pub(crate) struct ModelCallGuard {
     store: Weak<ConversationContinuationStore>,
     physical_key: String,
@@ -131,6 +147,7 @@ impl ConversationContinuationStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         physical: &ConversationIdentity,
@@ -140,6 +157,57 @@ impl ConversationContinuationStore {
             .lock()
             .map_err(|_| "Conversation handoff state is unavailable")?;
         resolve_stored(&runtime.stored, physical)
+    }
+
+    pub(crate) fn owner_snapshot(
+        &self,
+        physical: &ConversationIdentity,
+    ) -> Result<TaskOwnerSnapshot, String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Conversation handoff state is unavailable")?;
+        let Some(task_key) = runtime.stored.aliases.get(physical.stable_key()) else {
+            return Ok(TaskOwnerSnapshot {
+                task: physical.clone(),
+                owner_key: physical.stable_key().to_string(),
+                generation: 0,
+                active: true,
+            });
+        };
+        let task_record = runtime.stored.tasks.get(task_key).ok_or_else(|| {
+            "Conversation handoff state contains a missing task record".to_string()
+        })?;
+        let task = ConversationIdentity::from_stable_keys(
+            task_key.clone(),
+            task_record.legacy_key.clone(),
+        )
+        .ok_or_else(|| {
+            "Conversation handoff state contains an invalid task identity".to_string()
+        })?;
+        Ok(TaskOwnerSnapshot {
+            task,
+            owner_key: task_record.owner.clone(),
+            generation: task_record.generation,
+            active: task_record.owner == physical.stable_key(),
+        })
+    }
+
+    pub(crate) fn owner_generation_for_task_key(&self, task_key: &str) -> Result<u64, String> {
+        if ConversationIdentity::from_stable_keys(task_key.to_string(), task_key.to_string())
+            .is_none()
+        {
+            return Err("Invalid stable Codexify task identity".into());
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Conversation handoff state is unavailable")?;
+        Ok(runtime
+            .stored
+            .tasks
+            .get(task_key)
+            .map_or(0, |task| task.generation))
     }
 
     pub(crate) fn begin_model_call(
@@ -821,5 +889,32 @@ mod tests {
         drop(guard);
         store.claim(&destination, &token, |_, _| Ok(())).unwrap();
         assert_active(&store, &destination, &source);
+    }
+
+    #[test]
+    fn owner_snapshots_expose_task_owner_generation_without_raw_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConversationContinuationStore::new(root.path().join("state.json")).unwrap();
+        let source = identity("snapshot-source");
+        let destination = identity("snapshot-destination");
+        let workspace = root.path().join("workspace");
+
+        let initial = store.owner_snapshot(&source).unwrap();
+        assert_eq!(initial.task.stable_key(), source.stable_key());
+        assert_eq!(initial.owner_key, source.stable_key());
+        assert_eq!(initial.generation, 0);
+        assert!(initial.active);
+
+        let token = store.issue_token(&source, &source, &workspace).unwrap();
+        store.claim(&destination, &token, |_, _| Ok(())).unwrap();
+
+        let retired = store.owner_snapshot(&source).unwrap();
+        assert_eq!(retired.task.stable_key(), source.stable_key());
+        assert_eq!(retired.owner_key, destination.stable_key());
+        assert_eq!(retired.generation, 1);
+        assert!(!retired.active);
+
+        let active = store.owner_snapshot(&destination).unwrap();
+        assert_eq!(active, retired.with_active(true));
     }
 }

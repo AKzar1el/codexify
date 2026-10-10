@@ -155,7 +155,10 @@ sending another ChatGPT message. Enable the feature in your Codexify config:
   "agentChat": {
     "enabled": true,
     "port": 3120,
-    "maxWaitMs": 55000
+    "maxWaitMs": 55000,
+    "automation": {
+      "enabled": false
+    }
   }
 }
 ```
@@ -197,6 +200,47 @@ ChatGPT does not pass conversation titles to the
 connector, so list titles are derived from chat entries (preferring the first
 user entry). See the
 [standalone chat reference](docs/REFERENCE.md#standalone-owner-chat).
+
+### Offline browser fallback
+
+The standalone page can optionally wake an offline agent through the user's
+authenticated ChatGPT web session. This is a fallback for agent chat; it does not
+add ChatGPT Web models to Codex or change the ordinary online delivery path. The
+user pastes the exact ChatGPT conversation URL, verifies that conversation with a
+one-time Codexify tool call, and chooses the model and effort in standalone chat.
+Codexify never guesses from the most recent browser tab, a project, or
+`openai/session`.
+
+Install the optional native companion after enabling
+`agentChat.automation.enabled`:
+
+```bash
+codexify browser install
+codexify browser status
+codexify browser login
+```
+
+The release installer can perform the same explicit opt-in with
+`CODEXIFY_INSTALL_BROWSER=1`. No companion is downloaded or started for existing
+installations while automation remains disabled. The `browser start`, `stop`, and
+`reveal` commands manage the separate user-session process; restarting the
+Codexify service does not terminate it.
+
+While the agent is online, messages continue through `CHAT.md` and normal tool
+results. After the existing five-minute offline threshold, unread messages or an
+active goal can queue one bounded browser action. Codexify uses one shared browser
+window, so responses are serialized and the window is never navigated away from a
+generating turn. Visible stable answer text streams back to standalone chat;
+`chat_write` remains the authoritative persisted reply when both paths produce
+output.
+
+Goals use `/goal set`, `/goal run`, `/goal stop`, `/goal clear`, and `/goal status`.
+The model reads the exact revision through `goal_read` and must call `goal_finish`
+to mark it completed or blocked; a blocked result requires a reason. Browser
+automation is unofficial and deliberately fails closed when ChatGPT changes its
+UI, the selected model or connector cannot be verified, approval is required, or
+Send acceptance is ambiguous. See
+[Optional browser automation](docs/REFERENCE.md#optional-browser-automation).
 
 If `agentChat.notifications` is configured, the server also attempts one
 notification when this indicator turns offline after 5 minutes without an agent

@@ -573,7 +573,7 @@ impl Tool for ConversationAuthorization {
                     "type": "string",
                     "description": "Copy the connector version marker from this tool's advertised description unchanged. Omit only when the cached connector schema does not provide this argument.",
                     "minLength": 1,
-                    "maxLength": 64
+                    "maxLength": 128
                 }
             },
             "required": ["ref"],
@@ -720,7 +720,7 @@ impl Tool for SetupStatus {
         )
     }
     fn input_schema(&self) -> Value {
-        json!({"type":"object", "properties": {"forceUpdateCheck": {"type":"boolean"}, "conversationVersion": {"type":"string", "minLength":1, "maxLength":64}}, "additionalProperties":false})
+        json!({"type":"object", "properties": {"forceUpdateCheck": {"type":"boolean"}, "conversationVersion": {"type":"string", "minLength":1, "maxLength":128}}, "additionalProperties":false})
     }
     fn output_schema(&self) -> Option<Value> {
         Some(ConversationAuthorization::output_schema_value())
@@ -939,7 +939,7 @@ mod tests {
         }
         for args in [
             json!({"conversationVersion":""}),
-            json!({"conversationVersion":"x".repeat(65)}),
+            json!({"conversationVersion":"x".repeat(129)}),
             json!({"conversationVersion":1}),
             json!({"connectorVersion":"1.2.4"}),
         ] {
@@ -1070,6 +1070,7 @@ mod tests {
         ToolRequestContext {
             conversation: identity.clone(),
             task_conversation: identity,
+            task_owner_generation: Some(0),
             conversation_retired: false,
             connector_schema_version: None,
             conversation_schema_version: None,
@@ -1083,6 +1084,7 @@ mod tests {
                 crate::types::ArtifactEgressConfig::default(),
                 state_root.join("artifacts"),
             )),
+            agent_automation: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

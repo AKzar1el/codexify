@@ -169,6 +169,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
+    /// Manage the optional ChatGPT browser companion.
+    Browser {
+        #[command(subcommand)]
+        command: BrowserCommand,
+    },
     /// Print the private, localhost-only owner chat URL for the running service.
     Chat,
     /// Inspect or edit the selected Codexify JSON configuration.
@@ -241,6 +246,29 @@ pub struct ConfigUnsetArgs {
 #[derive(Args, Debug)]
 pub struct DoctorArgs {
     /// Emit one stable machine-readable JSON document.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BrowserCommand {
+    /// Install the companion artifact matching this Codexify release.
+    Install,
+    /// Start the installed companion in the current user session.
+    Start,
+    /// Stop the companion without removing its installed runtime or profile.
+    Stop,
+    /// Show installation, process, authentication, and protocol state.
+    Status(BrowserStatusArgs),
+    /// Start the companion when needed and reveal its ChatGPT sign-in surface.
+    Login,
+    /// Reveal the existing shared browser window without navigating it.
+    Reveal,
+}
+
+#[derive(Args, Debug)]
+pub struct BrowserStatusArgs {
+    /// Emit one machine-readable JSON status object.
     #[arg(long)]
     pub json: bool,
 }
@@ -1747,7 +1775,7 @@ pub fn load_config_quiet(cli: Cli) -> Result<AppConfig, String> {
     load_config_with_announcements(&cli, false, true)
 }
 
-pub(crate) fn load_config_quiet_read_only(cli: Cli) -> Result<AppConfig, String> {
+pub fn load_config_quiet_read_only(cli: Cli) -> Result<AppConfig, String> {
     load_config_with_announcements(&cli, false, false)
 }
 
@@ -2367,7 +2395,13 @@ mod tests {
             ("memory", &["dir", "enabled", "maxBytes"]),
             (
                 "agentChat",
-                &["enabled", "maxWaitMs", "notifications", "port"],
+                &[
+                    "automation",
+                    "enabled",
+                    "maxWaitMs",
+                    "notifications",
+                    "port",
+                ],
             ),
             ("skills", &["dirs", "enabled", "includePlugins"]),
             ("codexMcp", &["cliPath", "enabled", "useCli"]),
@@ -2375,6 +2409,17 @@ mod tests {
         ] {
             assert_keys(&example[path], path, keys);
         }
+        assert_keys(
+            &example["agentChat"]["automation"],
+            "agentChat.automation",
+            &[
+                "autoApproveToolCalls",
+                "connectorName",
+                "descriptorPath",
+                "enabled",
+                "maxQueuedActions",
+            ],
+        );
         assert_keys(
             &example["agentChat"]["notifications"],
             "agentChat.notifications",
@@ -3295,6 +3340,52 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn browser_lifecycle_cli_parses_install_start_stop_login_and_reveal() {
+        for (name, expected) in [
+            ("install", "install"),
+            ("start", "start"),
+            ("stop", "stop"),
+            ("login", "login"),
+            ("reveal", "reveal"),
+        ] {
+            let parsed = Cli::try_parse_from(["codexify", "browser", name]).unwrap();
+            let Some(CliCommand::Browser { command }) = parsed.command else {
+                panic!("browser {name} subcommand was not parsed");
+            };
+            let actual = match command {
+                BrowserCommand::Install => "install",
+                BrowserCommand::Start => "start",
+                BrowserCommand::Stop => "stop",
+                BrowserCommand::Login => "login",
+                BrowserCommand::Reveal => "reveal",
+                BrowserCommand::Status(_) => "status",
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn browser_status_cli_accepts_json_and_global_config() {
+        let parsed = Cli::try_parse_from([
+            "codexify",
+            "browser",
+            "status",
+            "--json",
+            "--config",
+            "/missing/config.json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.config.as_deref(), Some("/missing/config.json"));
+        let Some(CliCommand::Browser {
+            command: BrowserCommand::Status(args),
+        }) = parsed.command
+        else {
+            panic!("browser status subcommand was not parsed");
+        };
+        assert!(args.json);
     }
 
     #[test]

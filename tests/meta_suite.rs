@@ -71,6 +71,25 @@ fn artifact_egress_can_be_omitted_by_configuration() {
 }
 
 #[test]
+fn agent_chat_always_advertises_the_automation_contract() {
+    let mut config = default_config(PathBuf::from("/tmp"));
+    config.markdown_chat.enabled = true;
+    for enabled in [false, true] {
+        config.markdown_chat.automation.enabled = enabled;
+        let names = load_tools_for_config(&config)
+            .into_iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        for expected in ["automation_verify_pairing", "goal_read", "goal_finish"] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected} when enabled={enabled}"
+            );
+        }
+    }
+}
+
+#[test]
 fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     let mut config = default_config(PathBuf::from("/tmp"));
     config.conversation_auth_token =

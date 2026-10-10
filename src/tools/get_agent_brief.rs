@@ -76,6 +76,26 @@ impl Tool for GetAgentBrief {
             }
             brief.push_str(&format!("\n\n## This task's Markdown chat\n\nCHAT.md: `{}`\n\nRead this task's new messages using chat_read whenever possible. Direct read_file or grep is for finding previous messages only and does not acknowledge new messages. You have read-only access to the transcript through ordinary file tools; send or append messages only with chat_write. Unrelated conversations and workspace-only resumptions have separate files; a full continue_task handoff keeps this task's existing file and cursor.\n", chat.path().display()));
         }
+        if config.markdown_chat.automation.enabled
+            && let (Some(task), Some(store)) = (
+                context.task_conversation.as_ref(),
+                context.agent_automation.as_deref(),
+            )
+        {
+            match store.load(task) {
+                Ok(state)
+                    if state.goal.as_ref().is_some_and(|goal| {
+                        goal.status == crate::agent_automation::GoalStatus::Active
+                    }) =>
+                {
+                    brief.push_str("\n\n## Active agent-chat goal\n\n- Call `goal_read` before goal work to obtain the exact current revision.\n- Continue using `chat_read`, `chat_write`, and `chat_await` for owner communication.\n- During each offline browser wake-up, evaluate the current goal in the same turn.\n- Call `goal_finish` only for the exact current revision when it is completed or genuinely blocked.\n- A blocked goal requires a concrete reason.\n- Do not request a separate turn merely to assess completion.\n- Do not treat an ordinary final answer as goal completion. A successful `goal_finish` receipt is the browser-driven turn's explicit terminal condition.\n");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not read agent automation state for the agent brief");
+                }
+            }
+        }
         ToolResult::text(brief)
     }
 }

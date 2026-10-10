@@ -541,6 +541,12 @@ Each release ships a compiled binary per platform — `windows-x64`, `linux-x64`
 | `config unset KEY` | Remove a dotted setting while preserving the rest of the document |
 | `config edit` | Edit a validated staging copy using `VISUAL`, `EDITOR`, `nano`/`vi`, or Notepad |
 | `doctor` | Run read-only local diagnostics for configuration, command dependencies, service/update state, local health, and native tunnel prerequisites; add `--json` for machine-readable output |
+| `browser install` | Download the current platform's version-matched companion release, verify its published SHA-256, and atomically install it under the private browser runtime directory |
+| `browser start` | Start the installed browser companion as an independent user-session process |
+| `browser stop` | Stop the running companion without changing the Codexify background service |
+| `browser status [--json]` | Report disabled, missing, stopped, incompatible, authentication-required, busy, or healthy companion state without changing it |
+| `browser login` | Start the companion if necessary and reveal its ChatGPT sign-in surface |
+| `browser reveal` | Reveal the one shared companion window; an active browser action is never navigated away |
 | `quickstart` | Interactively configure the project scope, native OpenAI tunnel credentials, JSON config, and ChatGPT developer-mode connector; restart the installed service or optionally start a foreground server |
 | `service install` | Install, enable, and start the native per-user service using the selected absolute config path |
 | `service start` | Start the installed service without changing whether it starts at login |
@@ -589,6 +595,13 @@ Codex semantics (a missing Git binary warns for a Git checkout, while a found bu
 unusable Git binary always warns). A missing configured exec shell is a failure.
 Configured stdio MCP commands are resolved using their effective cwd and PATH but
 are never launched by the diagnostic.
+
+When `agentChat.automation.enabled` is true, Doctor also inspects the optional
+browser companion without installing or launching it. It distinguishes an absent
+runtime, a stopped process, protocol/build incompatibility, missing ChatGPT
+authentication, a changed account fingerprint, an occupied shared window, and a
+healthy idle companion. Descriptor bearer tokens, ChatGPT URLs, account values,
+goals, prompts, and browser output are never printed.
 
 ```bash
 codexify doctor
@@ -1765,6 +1778,114 @@ can be stored directly in the JSON configuration; keep the config and private
 service URLs out of source control. See the installation steps and URL examples
 in [Waiting and notifications](#waiting-and-notifications).
 
+### Optional browser automation
+
+`agentChat.automation` is an opt-in offline fallback for the same agent-chat task.
+It is not a model provider and never adds ChatGPT Web models to Codex. Existing
+configurations remain valid, and a disabled or absent block requires no browser
+runtime:
+
+```json
+{
+  "agentChat": {
+    "enabled": true,
+    "automation": {
+      "enabled": false,
+      "descriptorPath": "~/.codexify/browser/descriptor.json",
+      "connectorName": "Codexify",
+      "maxQueuedActions": 64,
+      "autoApproveToolCalls": false
+    }
+  }
+}
+```
+
+`agentChat.automation.enabled` requires `agentChat.enabled`. The descriptor path
+must be absolute or start with `~/`; the connector name is bounded visible text;
+`maxQueuedActions` accepts 1–1024; and `autoApproveToolCalls` defaults to `false`.
+The first release reuses agent chat's existing five-minute offline threshold and
+always uses one shared window rather than a configurable tab count.
+
+The three model-visible tools (`automation_verify_pairing`, `goal_read`, and
+`goal_finish`) and the `+agent-automation-v1` marker are advertised whenever
+`agentChat.enabled` is true, independent of the local automation toggle. Therefore
+turning `agentChat.automation.enabled` on or off does not itself change the cached
+connector schema. Upgrading from a release that predates these tools still requires
+the ordinary connector Refresh and a new ChatGPT conversation. Restart the
+Codexify service after changing the local setting so the supervisor is created or
+removed with the effective configuration.
+
+Install and inspect the version-matched companion explicitly:
+
+```bash
+codexify browser install
+codexify browser status
+codexify browser start
+codexify browser login
+codexify browser reveal
+codexify browser stop
+```
+
+Release installers remain server-only unless `CODEXIFY_INSTALL_BROWSER=1` is set.
+`browser install` downloads the exact
+`codexify-browser-v<version>-<platform>` archive and `checksums.txt`, verifies the
+SHA-256 entry, extracts only bounded safe paths, validates the manifest's protocol
+hash and platform, and atomically publishes it under
+`~/.codexify/browser/runtime/<version>/`. `CODEXIFY_BROWSER_RELEASE_ROOT` selects
+an explicit release mirror; the top-level installer propagates its
+`CODEXIFY_RELEASE_ROOT` value unless a browser-specific override is already set.
+The persistent profile, descriptor, install manifest, and runtime live under the
+private `~/.codexify/browser/` directory. The companion is a separate user-session
+process, so restarting the Codexify service does not intentionally stop it.
+
+Pairing is explicit. In the standalone page, paste the exact ChatGPT conversation
+URL and choose **Pair**. Codexify stores it as an unverified candidate and queues a
+content-free verification message. The target conversation must call
+`automation_verify_pairing` with the short-lived one-time reference. Only then is
+the canonical URL bound to the current stable task and owner generation. Codexify
+does not infer a URL from recency, browser history, projects, or `openai/session`,
+does not create a replacement conversation, and does not transfer or retire task
+ownership. A later full task continuation invalidates the old pairing until the
+user verifies the new physical conversation.
+
+Online behavior is unchanged: ordinary messages remain unread in `CHAT.md` until
+the existing tool path returns or consumes them, and no browser action is queued.
+Once the same task is offline, a verified pairing can mirror a bounded batch of
+unread message Markdown, run an active goal, or combine both purposes in one
+prompt. The model is instructed to call `chat_read`, so browser mirroring itself
+does not acknowledge messages or advance the read cursor. New messages that arrive
+during generation wait for a later action.
+
+The standalone UI exposes model and effort choices from the companion's live,
+account-bound capability catalog. Before every physical Send, the companion
+reopens the ChatGPT controls and verifies the exact conversation, account, model,
+effort, connector, empty composer, and pairing generation. Rust owns one global
+queue for every task; unread chat outranks goal-only work, unsent batches may
+coalesce, and the one long-lived Electron window is never navigated while a
+response is generating.
+
+Goals are bounded to 10 KiB and use `/goal set`, `/goal run`, `/goal stop`,
+`/goal clear`, and `/goal status`; `//goal` sends a literal chat message. There is
+no pause/resume state. `goal_read` returns the current private revision and text.
+Only `goal_finish` can mark that exact revision `completed` or `blocked`, and a
+blocked transition requires a concrete explanation. Goal evaluation is part of
+the same offline wake-up rather than a second judging prompt.
+
+Stable visible browser status and answer Markdown are available only in the
+standalone page during an automated turn. At completion, `chat_write` output wins;
+Codexify appends the stable browser final once only when no agent message was
+written after the action's transcript checkpoint. Status/commentary rows never
+become transcript messages, browser output does not make the agent appear online,
+and mirrored messages remain unread until the normal chat cursor advances.
+
+This is unofficial ChatGPT UI automation and deliberately fails closed. Selector
+drift, an inaccessible conversation, account changes, stale capabilities, a model
+or effort mismatch, a user draft, unexpected navigation, approval, authentication,
+rate limits, and ambiguous Send acceptance stop the action without choosing a
+fallback or replaying a possibly accepted prompt. Ordinary connector usage and
+agent chat remain available while an affected automation task waits for explicit
+repair. Account-bound live tests are opt-in and never run in ordinary CI.
+
 For example, `codexify config set agentChat.enabled true` enables the setting.
 Use `codexify config set agentChat.maxWaitMs 55000` to set a 55-second timeout.
 Configuration is loaded when the service starts: restart the service after a
@@ -2602,6 +2723,7 @@ Native tunnel mode ignores `allowedHosts` and forces the accepted authorities to
 - **Command execution authority**: `exec_command` performs no command allow-listing or shell-token filtering. Every non-empty command runs through the selected shell with the full authority of the Codexify process. `exec.maxSessions`, `exec.idleTimeoutMs`, and output limits bound resources; they do not restrict what a command may do.
 - **Bridged servers carry delegated authority**: an explicit `mcpServers` entry or an automatically imported Codex MCP—including one contributed by a Codex plugin—can receive model-directed calls. A stdio upstream launches a real process that runs as your OS user; a Streamable HTTP upstream receives calls plus its configured bearer token and HTTP headers. Catalog mode reduces connector-schema exposure, not runtime authority: `mcp_call_tool` can still dispatch any filtered catalogue entry. Only bridge servers you trust, use `tools`/`disabledTools` to narrow callable operations, prefer catalog mode to keep transitive schemas private, keep secrets in `bearerTokenEnvVar`/`envHttpHeaders` rather than static JSON, set `codexMcp.useCli` to `false` to exclude plugin-only discovery, or set `codexMcp.enabled` to `false` to disable all automatic Codex import. Launch, connection, authentication, and handshake failures are reported rather than silently ignored.
 - **Native OpenAI tunnel is outbound-only**: Codexify binds its MCP listener to loopback and supervises OpenAI's official runtime-only tunnel client. Startup fails unless the runtime reports `/readyz` and completes a control-plane poll. Failure of either process stops the other, and HTTP shutdown has a bounded grace period before remaining connections are aborted.
+- **Optional browser automation is a private, fail-closed boundary**: the companion listens only on IPv4 loopback and publishes a private, non-symlink descriptor containing a random bearer token. Rust validates the live PID, exact protocol/build hash, endpoint, permissions, account fingerprint, model/effort catalog, pairing generation, and canonical ChatGPT URL before use. Conversation URLs, one-time pairing references, unread Markdown, goals, prompts, browser output, and account fingerprints are private state: payload logging omits sensitive goal results, schema-marked inputs are redacted, audit records retain shape and sizes rather than values, and normal companion errors do not echo prompts or page content. The owner page never receives the descriptor, bearer, or control endpoint. This remains unofficial ChatGPT UI automation; UI drift, ambiguous Send, approval, authentication, rate limits, account changes, and interference fail closed without fallback selection or automatic replay.
 - **The loopback MCP hop is authenticated**: native mode generates a random per-process bearer token and configures the tunnel runtime to send it on MCP requests and discovery probes. The token is never printed, written to the config file, or inherited by model-launched commands and bridged MCP children.
 - **Optional conversation-level authorization**: `conversationAuthToken` blocks all tools except the deliberately innocuous `setup` wire tool until the stable ChatGPT conversation presents the configured authentication token as `ref`. Successful grants persist by hashed conversation identity and are invalidated by token rotation; clients without `openai/session` get transport-only grants. Initialization withholds the project-aware brief until authorization succeeds. The `setup(ref)` naming and SHA-256-shaped token avoid ChatGPT's false-positive connector secret-leak refusal; they do not make the token public or replace real authentication. This gate controls model conversations, not network callers: keep the native tunnel, reverse proxy, ChatGPT workspace, and local account secured independently. The token remains plaintext in `codexify.config.json` because the server must compare chat-supplied values, so keep that file private and out of version control.
 - **Verified tunnel-client installation**: the managed client is pinned to a specific official release and per-platform archive SHA-256 embedded in Codexify, extracted by exact filename under size limits, installed atomically with private permissions, and hash-checked against its installation manifest on subsequent starts. Set `clientPath` to opt out of managed installation while retaining compatibility checks.

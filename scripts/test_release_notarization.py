@@ -204,6 +204,8 @@ class StageTests(unittest.TestCase):
         windows = self.artifacts / f"codexify-{TAG}-windows-x64.zip"
         with zipfile.ZipFile(windows, "w") as archive:
             archive.writestr(f"codexify-{TAG}-windows-x64/codexify.exe", b"windows")
+        for name in release_module().expected_browser_archive_names(TAG):
+            (self.artifacts / name).write_bytes(f"browser-{name}".encode())
 
     def options(self):
         module = release_module()
@@ -232,6 +234,11 @@ class StageTests(unittest.TestCase):
                 f"codexify-{TAG}-darwin-x64.tar.gz",
                 f"codexify-{TAG}-darwin-arm64.tar.gz",
                 f"codexify-{TAG}-windows-x64.zip",
+                f"codexify-browser-{TAG}-linux-x64.tar.gz",
+                f"codexify-browser-{TAG}-linux-arm64.tar.gz",
+                f"codexify-browser-{TAG}-darwin-x64.tar.gz",
+                f"codexify-browser-{TAG}-darwin-arm64.tar.gz",
+                f"codexify-browser-{TAG}-windows-x64.zip",
                 "checksums.txt",
             },
         )
@@ -372,7 +379,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertLess(workflow.index("scripts/sign-macos-release.sh"), workflow.index("Stage artifacts"))
         active = "\n".join(line for line in workflow.splitlines() if not line.lstrip().startswith("#"))
-        self.assertIn("needs: [check, build, deploy-installers]", active)
+        self.assertIn("needs: [check, build, browser-build, deploy-installers]", active)
         temporary = "Publish signed release without notarization" in active
         notarized = "scripts/release_notarization.py stage" in active
         self.assertNotEqual(temporary, notarized, "exactly one publication path must be active")
@@ -427,7 +434,11 @@ class TemporaryPublicationTests(unittest.TestCase):
         self.assertNotIn("--draft", args)
         self.assertIn("--verify-tag", args)
         self.assertIn("--latest=true", args)
-        self.assertEqual({Path(value).name for value in args[4:10]}, set(self.module.expected_public_asset_names(TAG)))
+        repo_index = args.index("--repo")
+        self.assertEqual(
+            {Path(value).name for value in args[4:repo_index]},
+            set(self.module.expected_public_asset_names(TAG)),
+        )
         checksums = self.module.parse_checksums(self.artifacts / "checksums.txt", set(self.module.expected_archive_names(TAG)))
         for name, digest in checksums.items():
             self.assertEqual(digest, self.module.sha256_file(self.artifacts / name))
@@ -604,6 +615,8 @@ class FinalizeTests(unittest.TestCase):
         windows = self.artifacts / f"codexify-{TAG}-windows-x64.zip"
         with zipfile.ZipFile(windows, "w") as archive:
             archive.writestr(f"codexify-{TAG}-windows-x64/codexify.exe", b"windows")
+        for name in self.module.expected_browser_archive_names(TAG):
+            (self.artifacts / name).write_bytes(f"browser-{name}".encode())
 
     def services(self, x64="Accepted", arm64="Accepted", published_tags=()):
         return FakeFinalizeServices(
@@ -646,6 +659,11 @@ class FinalizeTests(unittest.TestCase):
 
     def test_accepted_submissions_verify_every_asset_and_publish(self) -> None:
         services = self.services()
+        manifest_id = next(
+            asset["id"]
+            for asset in self.release["assets"]
+            if asset["name"] == "codexify-notarization.json"
+        )
         summary = self.module.finalize_releases(self.options(), services)
         self.assertEqual(summary, {"ignored": 0, "pending": 0, "published": 1})
         events = services.events
@@ -654,9 +672,6 @@ class FinalizeTests(unittest.TestCase):
         publish = next(event for event in events if event[0] == "publish")
         self.assertEqual(publish[3], True)
         deleted_ids = {event[2] for event in events if event[0] == "delete_asset"}
-        manifest_id = next(
-            asset["id"] for asset in self.release["assets"] if asset["name"] == "codexify-notarization.json"
-        ) if self.release["draft"] else 106
         self.assertIn(manifest_id, deleted_ids)
 
     def test_changed_asset_prevents_publication(self) -> None:

@@ -28,6 +28,14 @@ fn markdown_chat_defaults_and_validation() {
     assert_eq!(config.port, Some(DEFAULT_OWNER_CHAT_PORT));
     assert_eq!(config.max_wait_ms, 55_000);
     assert!(config.notifications.is_none());
+    assert!(!config.automation.enabled);
+    assert_eq!(
+        config.automation.descriptor_path,
+        "~/.codexify/browser/descriptor.json"
+    );
+    assert_eq!(config.automation.connector_name, "Codexify");
+    assert_eq!(config.automation.max_queued_actions, 64);
+    assert!(!config.automation.auto_approve_tool_calls);
     assert!(config.validate().is_ok());
     for wait in [0, 999, 300_001, u64::MAX] {
         let config = MarkdownChatConfig {
@@ -49,6 +57,74 @@ fn markdown_chat_defaults_and_validation() {
     .unwrap();
     assert!(config.validate().is_ok());
     assert!(!format!("{config:?}").contains("private-test-token"));
+}
+
+#[test]
+fn agent_chat_automation_defaults_overrides_and_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.json");
+    let load = |agent_chat: serde_json::Value| {
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "workDir": root.path(),
+                "codexMcp": {"enabled": false},
+                "agentChat": agent_chat
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["codexify", "--config", path.to_str().unwrap()]).unwrap();
+        load_config_quiet(cli)
+    };
+
+    let defaulted = load(serde_json::json!({"enabled": true})).unwrap();
+    assert!(!defaulted.markdown_chat.automation.enabled);
+    assert_eq!(
+        defaulted.markdown_chat.automation.descriptor_path,
+        "~/.codexify/browser/descriptor.json"
+    );
+    assert_eq!(
+        defaulted.markdown_chat.automation.connector_name,
+        "Codexify"
+    );
+    assert_eq!(defaulted.markdown_chat.automation.max_queued_actions, 64);
+    assert!(!defaulted.markdown_chat.automation.auto_approve_tool_calls);
+
+    let overridden = load(serde_json::json!({
+        "enabled": true,
+        "automation": {
+            "enabled": true,
+            "descriptorPath": "/tmp/codexify-browser.json",
+            "connectorName": "Codexify DEV",
+            "maxQueuedActions": 17,
+            "autoApproveToolCalls": true
+        }
+    }))
+    .unwrap();
+    assert!(overridden.markdown_chat.automation.enabled);
+    assert_eq!(
+        overridden.markdown_chat.automation.descriptor_path,
+        "/tmp/codexify-browser.json"
+    );
+    assert_eq!(
+        overridden.markdown_chat.automation.connector_name,
+        "Codexify DEV"
+    );
+    assert_eq!(overridden.markdown_chat.automation.max_queued_actions, 17);
+    assert!(overridden.markdown_chat.automation.auto_approve_tool_calls);
+
+    for invalid in [
+        serde_json::json!({"automation":{"enabled":true}}),
+        serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":0}}),
+        serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":1025}}),
+        serde_json::json!({"enabled":true,"automation":{"connectorName":"  "}}),
+        serde_json::json!({"enabled":true,"automation":{"descriptorPath":""}}),
+        serde_json::json!({"enabled":true,"automation":{"unexpected":true}}),
+    ] {
+        assert!(load(invalid.clone()).is_err(), "{invalid}");
+    }
 }
 
 #[test]

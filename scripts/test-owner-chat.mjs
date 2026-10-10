@@ -61,6 +61,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
       if (failPolling) return route.fulfill({ status:503, body:"Preview connection unavailable" });
       if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats, serverTimeMs:Date.now() } });
       const id = url.pathname.split("/")[3];
+      if (url.pathname.endsWith("/automation")) return route.fulfill({ json:{ enabled:false, serverTimeMs:Date.now() } });
       if (url.pathname.endsWith("/markdown")) {
         markdownRequests.push(url.pathname);
         return route.fulfill({ contentType:"text/markdown; charset=utf-8", body:wholeTranscript });
@@ -94,6 +95,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     for (const size of await page.locator(".presence").evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().width))) assert(size <= 14);
     assert(!((await page.locator(".conversation-detail").allTextContents()).some(text => text.includes("No messages"))));
     await page.getByRole("button", { name:/Fix tests/ }).click();
+    assert.equal(await page.locator("#automation-panel:visible").count(), 0);
     chats[0].agentWaitingUntilMs = Date.now() + 120000;
     await page.locator(".conversation:first-child .presence.waiting").waitFor();
     await page.locator('#chat-host #presence[data-state="waiting"]').waitFor();
@@ -117,7 +119,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     await page.evaluate(() => {
       navigator.clipboard.writeText = text => window.__writeTestClipboard(text);
     });
-    const chat = page.locator("#chat-host").locator("div").first().locator("#draft");
+    const chat = page.locator("#chat-host .chat-shell #draft");
     await chat.fill("Please run the test suite");
     await page.locator("#chat-host #send:enabled").waitFor();
     await chat.press("Enter");
@@ -160,6 +162,194 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     failPolling = true;
     await page.clock.fastForward(20000);
     await page.locator(".conversation:nth-child(2) .presence.away").waitFor();
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test(`${engineName}: standalone automation controls drive only authenticated owner APIs`, { timeout:30000 }, async () => {
+  const browser = await engine.launch();
+  try {
+    const page = await browser.newPage({ viewport:{ width:1280, height:900 } });
+    page.setDefaultTimeout(5000);
+    const errors = [];
+    const operations = [];
+    page.on("pageerror", error => errors.push(error.message));
+    const now = Date.now();
+    const chat = {
+      id:"d".repeat(64), title:"Automate task", workspace:"project-d",
+      lastEntryEnd:100, lastEntryAtMs:now, lastAgentCallAtMs:now - 360000,
+      agentWaitingUntilMs:null, totalToolCalls:4
+    };
+    const messages = [];
+    const automation = {
+      enabled:true,
+      ownerGeneration:0,
+      pairing:{ status:"unpaired", candidateUrl:null, canonicalUrl:null, generation:0, verifiedAtMs:null, expiresAtMs:null },
+      selection:{ model:null, effort:null, catalogRevision:null },
+      goal:null,
+      action:{ id:null, kind:null, status:"idle", pairingGeneration:null, goalRevision:null, lastError:null, lastStableAnswer:null, updatedAtMs:null },
+      live:{ actionId:"action-live", phase:"generating", status:"Inspecting the workspace", commentary:"Visible commentary", answer:"Partial browser answer", updatedAtMs:now },
+      companion:{ status:"idle", authenticated:true, activeActionId:null, detail:null },
+      presence:{ lastAgentCallAtMs:chat.lastAgentCallAtMs, agentWaitingUntilMs:null, totalToolCalls:chat.totalToolCalls },
+      queue:{ position:2, total:3 },
+      serverTimeMs:now
+    };
+    const meta = payload => ({ _meta:{ [META]:payload } });
+    await page.route("http://127.0.0.1:43211/**", async route => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml, headers:{
+        "content-security-policy":"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob: data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+      } });
+      assert.equal(request.headers().authorization, "Bearer test-token");
+      if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats:[chat], serverTimeMs:Date.now() } });
+      if (url.pathname === `/api/chats/${chat.id}`) return route.fulfill({ json:meta({
+        chat_file:`/private/${chat.id}/CHAT.md`, revision:String(chat.lastEntryEnd),
+        delivered_through:0, read_through:0, last_agent_call_at_ms:chat.lastAgentCallAtMs,
+        agent_waiting_until_ms:null, total_tool_calls:chat.totalToolCalls, server_time_ms:Date.now(),
+        messages, has_more:false, before:null, unchanged:false
+      }) });
+      if (url.pathname === `/api/chats/${chat.id}/automation` && request.method() === "GET") {
+        return route.fulfill({ json:automation });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/capabilities`) {
+        operations.push("capabilities");
+        return route.fulfill({ json:{
+          companion:automation.companion,
+          catalogRevision:"catalog-live",
+          models:[
+            { id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[
+              { id:"high", label:"High", available:true, reason:null },
+              { id:"max", label:"Max", available:false, reason:"Not available for this account" }
+            ] },
+            { id:"gpt-5.6-sol", label:"GPT-5.6 Sol", efforts:[
+              { id:"medium", label:"Medium", available:true, reason:null }
+            ] }
+          ]
+        } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/selection`) {
+        const body = request.postDataJSON(); operations.push(["selection", body]);
+        automation.selection = { model:body.model, effort:body.effort, catalogRevision:"catalog-live" };
+        return route.fulfill({ json:{ selection:automation.selection } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/pair`) {
+        const body = request.postDataJSON(); operations.push(["pair", body]);
+        automation.pairing = { status:"unverified", candidateUrl:body.url, canonicalUrl:null, generation:1, verifiedAtMs:null, expiresAtMs:now + 60000 };
+        automation.action = { id:"pair-action", kind:"pair_verify", status:"queued", pairingGeneration:1, goalRevision:null, lastError:null, lastStableAnswer:null, updatedAtMs:Date.now() };
+        return route.fulfill({ json:{ pairing:automation.pairing, action:automation.action } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/unlink`) {
+        operations.push(["unlink", request.postDataJSON()]);
+        automation.pairing = { status:"unpaired", candidateUrl:null, canonicalUrl:null, generation:2, verifiedAtMs:null, expiresAtMs:null };
+        automation.action = { id:null, kind:null, status:"idle", pairingGeneration:null, goalRevision:null, lastError:null, lastStableAnswer:null, updatedAtMs:Date.now() };
+        return route.fulfill({ json:{ pairing:automation.pairing } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/login`) {
+        operations.push("login"); automation.companion.authenticated = true;
+        return route.fulfill({ json:{ companion:automation.companion } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/reveal`) {
+        operations.push("reveal"); return route.fulfill({ json:{ revealed:true, activeActionId:null } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/action/cancel`) {
+        const body = request.postDataJSON(); operations.push(["cancel", body]);
+        if (automation.action.kind === "pair_verify") {
+          automation.pairing = { status:"unpaired", candidateUrl:null, canonicalUrl:null, generation:automation.pairing.generation + 1, verifiedAtMs:null, expiresAtMs:null };
+          automation.action = { id:null, kind:null, status:"unpaired", pairingGeneration:automation.pairing.generation, goalRevision:null, lastError:null, lastStableAnswer:null, updatedAtMs:Date.now() };
+        } else {
+          automation.action = { ...automation.action, status:"failed", lastError:"Browser action cancelled before Send", updatedAtMs:Date.now() };
+        }
+        automation.queue = null;
+        return route.fulfill({ json:{ action:automation.action, queue:null } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/automation/action/retry`) {
+        const body = request.postDataJSON(); operations.push(["retry", body]);
+        automation.action = { ...automation.action, id:"retried-action", status:"queued", lastError:null, updatedAtMs:Date.now() };
+        automation.queue = { position:1, total:1 };
+        return route.fulfill({ json:{ action:automation.action, queue:automation.queue } });
+      }
+      if (url.pathname === `/api/chats/${chat.id}/send`) {
+        const body = request.postDataJSON(); operations.push(["send", body.message]);
+        if (body.message.startsWith("/goal set ")) automation.goal = {
+          revision:1, markdown:body.message.slice(10), status:"configured", createdAtMs:now,
+          updatedAtMs:Date.now(), finishedAtMs:null, summary:null, blockedReason:null
+        };
+        else if (body.message === "/goal run") automation.goal.status = "active";
+        else if (body.message === "/goal stop") automation.goal.status = "configured";
+        else if (body.message === "/goal clear") automation.goal = null;
+        return route.fulfill({ json:meta({ localCommand:{}, goal:automation.goal, goalCommand:body.message.split(" ")[1], replayed:false }) });
+      }
+      return route.fulfill({ status:404, body:"Not found" });
+    });
+
+    await page.goto(`http://127.0.0.1:43211/?chat=${chat.id}#test-token`);
+    const panel = page.locator("#automation-panel");
+    await panel.waitFor();
+    await panel.getByRole("heading", { name:"Browser automation" }).waitFor();
+    await panel.getByText("Offline", { exact:true }).waitFor();
+    await panel.getByText("Queue 2 of 3", { exact:true }).waitFor();
+    await panel.getByText("Inspecting the workspace", { exact:true }).waitFor();
+    await panel.getByText("Partial browser answer", { exact:true }).waitFor();
+
+    await panel.getByRole("button", { name:"Refresh models" }).click();
+    const model = panel.getByLabel("ChatGPT model");
+    const effort = panel.getByLabel("Reasoning effort");
+    await model.selectOption("gpt-6-sol");
+    assert.deepEqual(await effort.locator("option").allTextContents(), ["High", "Max — Not available for this account"]);
+    assert.equal(await effort.locator('option[value="max"]').isDisabled(), true);
+    await effort.selectOption("high");
+    await panel.getByRole("button", { name:"Save model and effort" }).click();
+
+    await panel.getByLabel("ChatGPT conversation URL").fill("https://chatgpt.com/c/owner-automation");
+    await panel.getByRole("button", { name:"Pair conversation" }).click();
+    await panel.getByText("Pairing verification queued", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Cancel queued action" }).click();
+    await panel.getByText("Not paired", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Pair conversation" }).click();
+    await panel.getByText("Pairing verification queued", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Open in ChatGPT" }).click();
+
+    await panel.getByLabel("Goal Markdown").fill("Finish the standalone controls.");
+    await panel.getByRole("button", { name:"Set goal" }).click();
+    await panel.getByText("Configured", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Run goal" }).click();
+    await panel.getByText("Active", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Stop goal" }).click();
+    await panel.getByRole("button", { name:"Goal status" }).click();
+    await panel.getByRole("button", { name:"Clear goal" }).click();
+    await panel.getByText("No goal configured", { exact:true }).waitFor();
+    assert.equal(messages.length, 0, "local goal controls must not enter chat history");
+
+    automation.action = { id:"failed-action", kind:"offline_chat", status:"failed", pairingGeneration:1, goalRevision:null, lastError:"Selector verification failed before Send", lastStableAnswer:null, updatedAtMs:Date.now() };
+    automation.queue = null;
+    await panel.getByRole("button", { name:"Retry failed action" }).waitFor({ state:"visible" });
+    await page.waitForFunction(() => !document.querySelector("#automation-retry-action")?.disabled);
+    await panel.getByRole("button", { name:"Retry failed action" }).click();
+    await panel.locator("#automation-action").getByText("Queued", { exact:true }).waitFor();
+    await panel.getByRole("button", { name:"Cancel queued action" }).click();
+    await panel.locator("#automation-action").getByText("Failed", { exact:true }).waitFor();
+
+    await panel.getByRole("button", { name:"Unlink conversation" }).click();
+    await panel.getByText("Not paired", { exact:true }).waitFor();
+    assert(operations.includes("capabilities"));
+    assert(operations.includes("reveal"));
+    assert(operations.some(entry => Array.isArray(entry) && entry[0] === "selection"));
+    assert(operations.some(entry => Array.isArray(entry) && entry[0] === "pair"));
+    assert(operations.some(entry => Array.isArray(entry) && entry[0] === "unlink"));
+    assert(operations.some(entry => Array.isArray(entry) && entry[0] === "cancel"));
+    assert(operations.some(entry => Array.isArray(entry) && entry[0] === "retry"));
+    assert.deepEqual(operations.filter(entry => Array.isArray(entry) && entry[0] === "send").map(entry => entry[1]), [
+      "/goal set Finish the standalone controls.", "/goal run", "/goal stop", "/goal status", "/goal clear"
+    ]);
+    const bodyText = await page.locator("body").textContent();
+    assert(!bodyText.includes("owner_account_1"));
+    assert(!bodyText.includes("Bearer test-token"));
+
+    await page.setViewportSize({ width:640, height:800 });
+    const box = await panel.boundingBox();
+    assert(box && box.x >= 0 && box.x + box.width <= 640);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

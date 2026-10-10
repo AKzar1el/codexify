@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,10 @@ use super::MAX_UNREAD_BYTES;
 
 #[path = "widget.rs"]
 mod widget;
-pub use widget::{OwnerChatSummary, UserSendReceipt, WidgetPage};
+pub use widget::{
+    BrowserAppendReceipt, OwnerChatSummary, TranscriptCheckpoint, UnreadMessage, UnreadSnapshot,
+    UserSendReceipt, WidgetPage,
+};
 
 const HEADER: &str = "# Codexify Chat\n\nAppend user messages at the bottom and save the file. Do not change earlier content\nwhile the agent is active. The agent sends messages only through chat_write.\n";
 const AGENT_START: &str = "\n\n<!-- codexify-agent-message:v1:start id=\"";
@@ -47,6 +51,8 @@ struct Cursor {
     #[serde(default)]
     offline_notified_for_tool_call_count: Option<u64>,
     #[serde(default)]
+    offline_claims: BTreeMap<String, u64>,
+    #[serde(default)]
     total_tool_calls: u64,
     #[serde(default)]
     tool_call_epoch: Option<String>,
@@ -69,11 +75,28 @@ pub struct AppendReceipt {
     pub cursor_warning: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct OfflineActivity {
-    pub last_call_at_ms: Option<u64>,
-    pub tool_call_count: u64,
-    pub notified_for_tool_call_count: Option<u64>,
+#[derive(Clone)]
+pub(crate) struct OfflineActivity {
+    pub(crate) last_call_at_ms: Option<u64>,
+    pub(crate) tool_call_count: u64,
+    pub(crate) activity_epoch: Option<String>,
+    pub(crate) activity_sequence: u64,
+    pub(crate) notified_for_tool_call_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfflineClaim {
+    Notification,
+    AutomationGoal,
+}
+
+impl OfflineClaim {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::AutomationGoal => "automation_goal",
+        }
+    }
 }
 
 pub struct ChatFile {
@@ -199,12 +222,14 @@ impl ChatFile {
         .await
     }
 
-    pub(super) async fn offline_activity(self: &Arc<Self>) -> Result<OfflineActivity, String> {
+    pub(crate) async fn offline_activity(self: &Arc<Self>) -> Result<OfflineActivity, String> {
         self.run(|chat| {
             chat.with_cursor(|cursor, _| {
                 Ok(OfflineActivity {
                     last_call_at_ms: cursor.last_agent_call_at_ms,
                     tool_call_count: cursor.total_tool_calls,
+                    activity_epoch: cursor.tool_call_epoch.clone(),
+                    activity_sequence: cursor.tool_call_sequence,
                     notified_for_tool_call_count: cursor.offline_notified_for_tool_call_count,
                 })
             })
@@ -217,18 +242,46 @@ impl ChatFile {
         now_ms: u64,
         offline_after_ms: u64,
     ) -> Result<bool, String> {
+        self.claim_offline(OfflineClaim::Notification, now_ms, offline_after_ms)
+            .await
+    }
+
+    pub async fn claim_offline_automation_goal(
+        self: &Arc<Self>,
+        now_ms: u64,
+        offline_after_ms: u64,
+    ) -> Result<bool, String> {
+        self.claim_offline(OfflineClaim::AutomationGoal, now_ms, offline_after_ms)
+            .await
+    }
+
+    async fn claim_offline(
+        self: &Arc<Self>,
+        claim: OfflineClaim,
+        now_ms: u64,
+        offline_after_ms: u64,
+    ) -> Result<bool, String> {
         self.run(move |chat| {
             chat.with_cursor(|cursor, _| {
                 let Some(last_call_at_ms) = cursor.last_agent_call_at_ms else {
                     return Ok(false);
                 };
+                let claimed_for = cursor.offline_claims.get(claim.key()).copied().or_else(|| {
+                    (claim == OfflineClaim::Notification)
+                        .then_some(cursor.offline_notified_for_tool_call_count)
+                        .flatten()
+                });
                 if now_ms.saturating_sub(last_call_at_ms) < offline_after_ms
-                    || cursor.offline_notified_for_tool_call_count == Some(cursor.total_tool_calls)
+                    || claimed_for == Some(cursor.total_tool_calls)
                 {
                     return Ok(false);
                 }
                 let mut next = cursor.clone();
-                next.offline_notified_for_tool_call_count = Some(cursor.total_tool_calls);
+                next.offline_claims
+                    .insert(claim.key().into(), cursor.total_tool_calls);
+                if claim == OfflineClaim::Notification {
+                    next.offline_notified_for_tool_call_count = Some(cursor.total_tool_calls);
+                }
                 chat.save_cursor(&next)?;
                 *cursor = next;
                 Ok(true)
@@ -390,7 +443,15 @@ fn agent_block(message: &str, tool_call_count: u64) -> String {
         chrono::Utc::now().timestamp_micros(),
         MESSAGE_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    let created_at_ms = super::now_ms();
+    agent_block_with_id(&id, message, tool_call_count, super::now_ms())
+}
+
+fn agent_block_with_id(
+    id: &str,
+    message: &str,
+    tool_call_count: u64,
+    created_at_ms: u64,
+) -> String {
     format!(
         "{AGENT_START}{id}\" created_at_ms=\"{created_at_ms}\" tool_call_count=\"{tool_call_count}\" -->\n\n## Agent\n\n{message}\n\n<!-- codexify-agent-message:v1:end id=\"{id}\" -->\n"
     )

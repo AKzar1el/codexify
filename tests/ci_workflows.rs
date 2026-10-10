@@ -63,6 +63,65 @@ fn notification_integration_is_not_silently_skipped_in_ci() {
 }
 
 #[test]
+fn browser_companion_contract_is_built_and_exercised_in_ci() {
+    let ci = workflow(".github/workflows/ci.yml");
+    let check = job_section(&ci, "check", "diff-widget");
+
+    assert!(check.contains("oven-sh/setup-bun@v2.2.0"));
+    assert!(check.contains("bun-version: 1.4.0"));
+    assert!(check.contains("bun install --frozen-lockfile"));
+    assert!(check.contains("node scripts/generate-browser-companion-protocol-fixtures.mjs"));
+    assert!(check.contains("node scripts/update-browser-companion-upstream.mjs --check"));
+    assert!(check.contains("bun test"));
+    assert!(check.contains("bun run typecheck"));
+    assert!(check.contains("bun run build"));
+    assert!(check.contains("node --test scripts/test-browser-companion-boundary.mjs"));
+    assert!(check.contains("CODEXIFY_TEST_BROWSER_COMPANION_BUN:"));
+    assert!(
+        check.contains("cargo test --test browser_companion_contract -- --ignored --nocapture")
+    );
+}
+
+#[test]
+fn browser_companion_packages_are_smoked_and_published_with_each_release() {
+    let ci = workflow(".github/workflows/ci.yml");
+    let check = job_section(&ci, "check", "diff-widget");
+    assert!(check.contains("bun run package"));
+    assert!(check.contains("bun run smoke:package"));
+    assert!(check.contains("playwright-core install-deps chromium"));
+
+    let release = workflow(".github/workflows/release.yml");
+    let check = job_section(&release, "check", "build");
+    assert!(check.contains("CODEXIFY_TEST_BROWSER_COMPANION_BUN:"));
+    assert!(
+        check.contains("cargo test --test browser_companion_contract -- --ignored --nocapture")
+    );
+    let browser = job_section(&release, "browser-build", "deploy-installers");
+    for platform in [
+        "linux-x64",
+        "linux-arm64",
+        "darwin-x64",
+        "darwin-arm64",
+        "windows-x64",
+    ] {
+        assert!(
+            browser.contains(platform),
+            "browser release matrix missing {platform}"
+        );
+    }
+    assert!(browser.contains("oven-sh/setup-bun@v2.2.0"));
+    assert!(browser.contains("bun install --frozen-lockfile"));
+    assert!(browser.contains("bun run package --"));
+    assert!(browser.contains("bun run smoke:package"));
+    assert!(browser.contains("playwright-core install-deps chromium"));
+    assert!(browser.contains("actions/upload-artifact@v5"));
+
+    let stage = job_section(&release, "stage-release", "unused");
+    assert!(stage.contains("needs: [check, build, browser-build, deploy-installers]"));
+    assert!(stage.contains("pattern: codexify-*"));
+}
+
+#[test]
 fn release_builds_run_parallel_to_validation_and_publish_only_after_both() {
     let release = workflow(".github/workflows/release.yml");
     let build = job_section(&release, "build", "deploy-installers");
@@ -106,4 +165,16 @@ fn default_branch_warms_target_specific_release_dependency_caches() {
     ] {
         assert!(warmer.contains(target), "warmer missing target {target}");
     }
+
+    let browser = job_section(&warmer, "browser", "unused");
+    assert!(browser.contains("actions/cache@v4"));
+    assert!(browser.contains("browser-companion/bun.lock"));
+    assert!(browser.contains("~/.bun/install/cache"));
+    assert!(browser.contains("electron-builder"));
+    assert!(browser.contains("bun run package --"));
+
+    let release = workflow(".github/workflows/release.yml");
+    let browser_release = job_section(&release, "browser-build", "deploy-installers");
+    assert!(browser_release.contains("actions/cache/restore@v4"));
+    assert!(browser_release.contains("browser-companion/bun.lock"));
 }

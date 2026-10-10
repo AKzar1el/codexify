@@ -25,6 +25,7 @@ $EnvironmentNames = @(
     'CODEXIFY_INSTALL_DIR',
     'CODEXIFY_CONFIG',
     'CODEXIFY_SKIP_SERVICE',
+    'CODEXIFY_INSTALL_BROWSER',
     'NO_COLOR',
     'CLICOLOR_FORCE',
     'CODEXIFY_TEST_SERVICE_MARKER'
@@ -75,6 +76,20 @@ fn main() {
             if !text.contains("\"workDir\"") {
                 std::process::exit(1);
             }
+        }
+        [config, path, command, action]
+            if config == "--config" && command == "browser" && action == "install" =>
+        {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            if !text.contains("\"automation\"") {
+                std::process::exit(1);
+            }
+            if std::env::var("CODEXIFY_BROWSER_RELEASE_ROOT").ok()
+                != std::env::var("CODEXIFY_RELEASE_ROOT").ok()
+            {
+                std::process::exit(1);
+            }
+            record("browser");
         }
         [service, arg] if service == "service" && arg == "--help" => {}
         [service, action] if service == "service" && action == "install" => record("install"),
@@ -170,6 +185,12 @@ fn main() {
     & (Join-Path $RepositoryRoot 'install.ps1')
     $env:CODEXIFY_SKIP_SERVICE = '1'
     & (Join-Path $RepositoryRoot 'install.ps1')
+    @{ workDir = $Project; agentChat = @{ enabled = $true; automation = @{ enabled = $true } } } |
+        ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath $Config -Encoding ascii
+    $env:CODEXIFY_INSTALL_BROWSER = '1'
+    & (Join-Path $RepositoryRoot 'install.ps1')
+    Remove-Item Env:CODEXIFY_INSTALL_BROWSER -ErrorAction SilentlyContinue
     Remove-Item Env:CODEXIFY_SKIP_SERVICE -ErrorAction SilentlyContinue
 
     $Target = Join-Path $InstallDir 'codexify.exe'
@@ -187,8 +208,11 @@ fn main() {
     if (@($Calls | Where-Object { $_ -eq 'disable' }).Count -ne 2) {
         throw 'Installer did not disable the existing service before replacement.'
     }
-    if (@($Calls | Where-Object { $_ -eq 'migrate' }).Count -ne 4) {
+    if (@($Calls | Where-Object { $_ -eq 'migrate' }).Count -ne 5) {
         throw 'Installer did not run legacy state migration after each executable replacement.'
+    }
+    if (@($Calls | Where-Object { $_ -eq 'browser' }).Count -ne 1) {
+        throw 'Installer did not install the optional browser companion exactly once.'
     }
     if ($NoConfigOutput -notmatch 'Background service setup deferred until quickstart creates the selected config:') {
         throw "Installer did not explain deferred service setup.`n$NoConfigOutput"

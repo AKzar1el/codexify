@@ -42,9 +42,7 @@ use crate::audit::{
 use crate::auth::{generate_internal_bearer_token, require_auth};
 use crate::bridged_resources::{BRIDGED_RESOURCE_URI_PREFIX, BridgedResourceStore};
 use crate::conversation_auth::{AUTHORIZATION_TOOL_WIRE_NAME, ConversationAuthorizationStore};
-use crate::conversation_continuations::{
-    ConversationContinuationStore, ConversationOwnership, RETIRED_MESSAGE,
-};
+use crate::conversation_continuations::{ConversationContinuationStore, RETIRED_MESSAGE};
 use crate::diff::{DiffAvailability, DiffCheckpointManager, DiffOwner};
 use crate::diff_ui;
 use crate::exec_sessions::{ConversationExecSessionStore, SessionState};
@@ -117,6 +115,7 @@ pub struct CodexHandler {
     project_bindings: Arc<ProjectBindingStore>,
     connector_schemas: Arc<crate::connector_schema::ConnectorSchemaStore>,
     markdown_chat: Arc<crate::markdown_chat::MarkdownChatStore>,
+    agent_automation: Option<Arc<crate::agent_automation::AgentAutomationSupervisor>>,
     conversation_authorizations: Arc<ConversationAuthorizationStore>,
     conversation_exec_sessions: Arc<ConversationExecSessionStore>,
     continuations: Arc<ConversationContinuationStore>,
@@ -163,6 +162,7 @@ impl CodexHandler {
     async fn record_chat_activity(
         &self,
         task_conversation: Option<&ConversationIdentity>,
+        task_owner_generation: Option<u64>,
         at_ms: u64,
         tool_name: &str,
     ) -> Option<crate::markdown_chat::AgentActivity> {
@@ -171,6 +171,7 @@ impl CodexHandler {
                 .record_agent_call(task_conversation, &self.session, at_ms)?;
         self.persist_chat_activity(
             task_conversation,
+            task_owner_generation,
             activity.clone(),
             !tool_name.starts_with("chat_"),
         )
@@ -181,6 +182,7 @@ impl CodexHandler {
     async fn persist_chat_activity(
         &self,
         task_conversation: Option<&ConversationIdentity>,
+        task_owner_generation: Option<u64>,
         activity: crate::markdown_chat::AgentActivity,
         clear_waiting: bool,
     ) {
@@ -203,8 +205,38 @@ impl CodexHandler {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
-                    self.markdown_chat
-                        .monitor_offline(chat, &effective.markdown_chat, workspace);
+                    self.markdown_chat.monitor_offline(
+                        chat.clone(),
+                        &effective.markdown_chat,
+                        workspace,
+                    );
+                    if let (Some(supervisor), Some(task), Some(owner_generation)) = (
+                        self.agent_automation.as_ref(),
+                        task_conversation,
+                        task_owner_generation,
+                    ) {
+                        match crate::agent_automation::AgentAutomationStore::for_config(&effective)
+                        {
+                            Ok(store) => {
+                                if let Err(error) = supervisor
+                                    .register_task(
+                                        crate::agent_automation::AutomationTaskHandle::new(
+                                            task.clone(),
+                                            owner_generation,
+                                            Arc::new(store),
+                                            chat,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(%error, "could not register task for browser automation");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "could not open browser automation state");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -648,12 +680,31 @@ impl ServerHandler for CodexHandler {
         let tool = self.tools.iter().find(|t| t.name() == name);
         let model_call = !tool.is_some_and(|tool| app_only_tool(tool.as_ref()));
         let mut task_conversation = conversation.clone();
+        let mut task_owner_generation = None;
         let mut conversation_retired = false;
         let mut _model_call_guard = None;
         if let Some(physical) = conversation.as_ref() {
             if model_call {
                 match self.continuations.begin_model_call(physical) {
                     Ok((task, guard)) => {
+                        let snapshot = match self.continuations.owner_snapshot(physical) {
+                            Ok(snapshot)
+                                if snapshot.active
+                                    && snapshot.task.stable_key() == task.stable_key() =>
+                            {
+                                snapshot
+                            }
+                            Ok(_) => {
+                                return Ok(to_call_tool_result(ToolResult::error(
+                                    "Conversation ownership changed while the tool call was starting.",
+                                ))
+                                .into());
+                            }
+                            Err(error) => {
+                                return Ok(to_call_tool_result(ToolResult::error(error)).into());
+                            }
+                        };
+                        task_owner_generation = Some(snapshot.generation);
                         task_conversation = Some(task);
                         _model_call_guard = Some(guard);
                     }
@@ -662,17 +713,17 @@ impl ServerHandler for CodexHandler {
                     }
                 }
             } else {
-                match self.continuations.resolve(physical) {
-                    Ok(ConversationOwnership::Active { task }) => {
-                        task_conversation = Some(task);
+                match self.continuations.owner_snapshot(physical) {
+                    Ok(snapshot) if snapshot.active => {
+                        task_owner_generation = Some(snapshot.generation);
+                        task_conversation = Some(snapshot.task);
                     }
-                    Ok(ConversationOwnership::Retired { task })
-                        if tool.is_some_and(|tool| tool.behavior().read_only) =>
-                    {
-                        task_conversation = Some(task);
+                    Ok(snapshot) if tool.is_some_and(|tool| tool.behavior().read_only) => {
+                        task_owner_generation = Some(snapshot.generation);
+                        task_conversation = Some(snapshot.task);
                         conversation_retired = true;
                     }
-                    Ok(ConversationOwnership::Retired { .. }) => {
+                    Ok(_) => {
                         return Ok(to_call_tool_result(ToolResult::error(RETIRED_MESSAGE)).into());
                     }
                     Err(error) => {
@@ -780,11 +831,12 @@ impl ServerHandler for CodexHandler {
         let reported_schema = (name == AUTHORIZATION_TOOL_WIRE_NAME)
             .then(|| args.get("connectorVersion").and_then(Value::as_str))
             .flatten()
-            .filter(|value| !value.is_empty() && value.len() <= 64)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
             .map(str::to_owned);
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),
             task_conversation: task_conversation.clone(),
+            task_owner_generation,
             conversation_retired,
             connector_schema_version,
             conversation_schema_version: conversation
@@ -795,6 +847,7 @@ impl ServerHandler for CodexHandler {
             project_bindings: self.project_bindings.clone(),
             diff_checkpoints: self.diff_checkpoints.clone(),
             artifact_egress: self.artifact_egress.clone(),
+            agent_automation: None,
             cancellation: context.ct.clone(),
         };
 
@@ -820,8 +873,13 @@ impl ServerHandler for CodexHandler {
             Ok((None, None))
         };
         let activity = if agent_call && authorized_before && name != ContinueTask::NAME {
-            self.record_chat_activity(task_conversation.as_ref(), called_at_ms, &name)
-                .await
+            self.record_chat_activity(
+                task_conversation.as_ref(),
+                task_owner_generation,
+                called_at_ms,
+                &name,
+            )
+            .await
         } else {
             None
         };
@@ -994,8 +1052,24 @@ impl ServerHandler for CodexHandler {
                         })();
                         match continued {
                             Ok(claimed) => {
-                                task_conversation = Some(claimed.task);
-                                ContinueTask::result(&claimed.workspace.to_string_lossy())
+                                let physical = conversation
+                                    .as_ref()
+                                    .expect("continuation requires physical conversation");
+                                match self.continuations.owner_snapshot(physical) {
+                                    Ok(snapshot)
+                                        if snapshot.active
+                                            && snapshot.task.stable_key()
+                                                == claimed.task.stable_key() =>
+                                    {
+                                        task_owner_generation = Some(snapshot.generation);
+                                        task_conversation = Some(claimed.task);
+                                        ContinueTask::result(&claimed.workspace.to_string_lossy())
+                                    }
+                                    Ok(_) => ToolResult::error(
+                                        "Conversation ownership changed while the continuation was completing.",
+                                    ),
+                                    Err(error) => ToolResult::error(error),
+                                }
                             }
                             Err(error) => ToolResult::error(error),
                         }
@@ -1072,6 +1146,28 @@ impl ServerHandler for CodexHandler {
                             }
                             Err(error) => ToolResult::error(error),
                             Ok(effective_config) => {
+                                let mut effective_context = tool_context.clone();
+                                if effective_config.markdown_chat.automation.enabled
+                                    && matches!(
+                                        name.as_str(),
+                                        "automation_verify_pairing"
+                                            | "goal_read"
+                                            | "goal_finish"
+                                            | "get_agent_brief"
+                                    )
+                                {
+                                    match crate::agent_automation::AgentAutomationStore::for_config(
+                                        &effective_config,
+                                    ) {
+                                        Ok(store) => {
+                                            effective_context.agent_automation =
+                                                Some(Arc::new(store));
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(%error, "agent automation state is unavailable for this tool call");
+                                        }
+                                    }
+                                }
                                 let owner = match task_conversation.as_ref() {
                                     Some(identity) => DiffOwner::conversation(identity),
                                     None => DiffOwner::transport(self.session.diff_state()),
@@ -1081,7 +1177,7 @@ impl ServerHandler for CodexHandler {
                                         args,
                                         &effective_config,
                                         session,
-                                        &tool_context,
+                                        &effective_context,
                                     )
                                     .await
                                 } else if tool.may_modify_project() {
@@ -1116,7 +1212,7 @@ impl ServerHandler for CodexHandler {
                                                     args,
                                                     &effective_config,
                                                     session,
-                                                    &tool_context,
+                                                    &effective_context,
                                                 )
                                                 .await };
                                             drop(guard);
@@ -1148,7 +1244,7 @@ impl ServerHandler for CodexHandler {
                                         args,
                                         &effective_config,
                                         session,
-                                        &tool_context,
+                                        &effective_context,
                                     )
                                     .await
                                 }
@@ -1171,13 +1267,23 @@ impl ServerHandler for CodexHandler {
                 .is_none()
         {
             if name == ContinueTask::NAME || !authorized_before {
-                self.record_chat_activity(task_conversation.as_ref(), called_at_ms, &name)
-                    .await;
+                self.record_chat_activity(
+                    task_conversation.as_ref(),
+                    task_owner_generation,
+                    called_at_ms,
+                    &name,
+                )
+                .await;
             } else if name == SetProjectRoot::NAME
                 && let Some(activity) = activity
             {
-                self.persist_chat_activity(task_conversation.as_ref(), activity, true)
-                    .await;
+                self.persist_chat_activity(
+                    task_conversation.as_ref(),
+                    task_owner_generation,
+                    activity,
+                    true,
+                )
+                .await;
             }
         }
         finalize_model_visible_result(tool.map(|tool| tool.as_ref()), &mut result, &self.config);
@@ -1543,6 +1649,18 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         }
     }
     let config = Arc::new(config);
+    let agent_automation = config.markdown_chat.automation.enabled.then(|| {
+        let executor = Arc::new(crate::agent_automation::BrowserAutomationExecutor::new(
+            config.markdown_chat.automation.clone(),
+        ));
+        crate::agent_automation::AgentAutomationSupervisor::new(
+            config.markdown_chat.automation.clone(),
+            executor,
+        )
+    });
+    let _agent_automation_worker = agent_automation
+        .as_ref()
+        .map(|supervisor| supervisor.start());
 
     // Connect to any configured upstream MCP servers and merge their tools in.
     // The returned services must stay alive for the whole server lifetime, so
@@ -1615,6 +1733,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         let factory_tools = tools.clone();
         let factory_project_bindings = project_bindings.clone();
         let factory_markdown_chat = owner_chat_store.clone();
+        let factory_agent_automation = agent_automation.clone();
         let factory_conversation_authorizations = conversation_authorizations.clone();
         let factory_conversation_exec_sessions = conversation_exec_sessions.clone();
         let factory_continuations = continuations.clone();
@@ -1636,6 +1755,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
                     project_bindings: factory_project_bindings.clone(),
                     connector_schemas: factory_connector_schemas.clone(),
                     markdown_chat: factory_markdown_chat.clone(),
+                    agent_automation: factory_agent_automation.clone(),
                     conversation_authorizations: factory_conversation_authorizations.clone(),
                     conversation_exec_sessions: factory_conversation_exec_sessions.clone(),
                     continuations: factory_continuations.clone(),
@@ -1703,8 +1823,14 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((bind_host, config.port)).await?;
     let _owner_chat = if config.markdown_chat.enabled {
         Some(
-            crate::owner_chat::start(config.clone(), owner_chat_store, artifact_egress.clone())
-                .await?,
+            crate::owner_chat::start_with_automation(
+                config.clone(),
+                owner_chat_store,
+                artifact_egress.clone(),
+                continuations.clone(),
+                agent_automation.clone(),
+            )
+            .await?,
         )
     } else {
         None
@@ -2574,6 +2700,7 @@ mod tests {
     include!("server_workspace_tests.rs");
     include!("server_starvation_tests.rs");
     include!("server_agent_ticket_tests.rs");
+    include!("server_agent_automation_tests.rs");
     include!("server_continuation_tests.rs");
 
     fn handler_with_tools(
@@ -2593,6 +2720,7 @@ mod tests {
             tools: Arc::new(tools),
             connector_schemas: Arc::new(crate::connector_schema::ConnectorSchemaStore::default()),
             markdown_chat: Arc::new(crate::markdown_chat::MarkdownChatStore::default()),
+            agent_automation: None,
             project_bindings: Arc::new(ProjectBindingStore::new(root.join("bindings"))),
             conversation_authorizations: Arc::new(ConversationAuthorizationStore::new()),
             conversation_exec_sessions: Arc::new(ConversationExecSessionStore::new()),
@@ -3237,6 +3365,7 @@ mod tests {
             tools: Arc::new(crate::registry::load_tools()),
             connector_schemas: Arc::new(crate::connector_schema::ConnectorSchemaStore::default()),
             markdown_chat: Arc::new(crate::markdown_chat::MarkdownChatStore::default()),
+            agent_automation: None,
             project_bindings: Arc::new(ProjectBindingStore::new(root.path().join("bindings"))),
             conversation_authorizations: Arc::new(ConversationAuthorizationStore::new()),
             conversation_exec_sessions: Arc::new(ConversationExecSessionStore::new()),
@@ -3345,6 +3474,7 @@ mod tests {
             tools: Arc::new(crate::registry::load_tools()),
             connector_schemas: Arc::new(crate::connector_schema::ConnectorSchemaStore::default()),
             markdown_chat: Arc::new(crate::markdown_chat::MarkdownChatStore::default()),
+            agent_automation: None,
             project_bindings: Arc::new(ProjectBindingStore::new(root.path().join("bindings"))),
             conversation_authorizations: Arc::new(ConversationAuthorizationStore::new()),
             conversation_exec_sessions: Arc::new(ConversationExecSessionStore::new()),
@@ -3388,6 +3518,7 @@ mod tests {
             tools: Arc::new(tools),
             connector_schemas: Arc::new(crate::connector_schema::ConnectorSchemaStore::default()),
             markdown_chat: Arc::new(crate::markdown_chat::MarkdownChatStore::default()),
+            agent_automation: None,
             project_bindings: Arc::new(ProjectBindingStore::new(root.path().join("bindings"))),
             conversation_authorizations: authorizations.clone(),
             conversation_exec_sessions: Arc::new(ConversationExecSessionStore::new()),

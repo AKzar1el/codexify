@@ -1,0 +1,60 @@
+{
+  "repository": "miuuyy/codex-chatgpt-web",
+  "tag": "v6.1.7",
+  "commit": "f9ad4ae83a579287105ad822dd0c3e0029b04ef6",
+  "wholeFiles": [
+    {
+      "source": "src/chatgpt-session.ts",
+      "local": "browser-companion/src/session.ts"
+    },
+    {
+      "source": "src/adapters/chatgpt-web/model-selection.ts",
+      "local": "browser-companion/src/model-selection.ts"
+    },
+    {
+      "source": "src/adapters/chatgpt-web/markdown.ts",
+      "local": "browser-companion/src/response-stream.ts"
+    },
+    {
+      "source": "src/adapters/chatgpt-web/ui-labels.ts",
+      "local": "browser-companion/src/ui-labels.ts"
+    }
+  ],
+  "derivedSymbols": [
+    {
+      "source": "src/adapters/chatgpt-web/browser-worker.ts",
+      "local": "browser-companion/src/composer.ts",
+      "symbols": ["insertPlainTextIntoComposer", "activeComposer", "attachedPromptText"]
+    },
+    {
+      "source": "src/adapters/chatgpt-web/browser-worker.ts",
+      "local": "browser-companion/src/connector-selection.ts",
+      "symbols": ["selectConnector", "clearChatGptComposerState", "verifyConnectorExclusive"]
+    },
+    {
+      "source": "src/adapters/chatgpt-web/browser-worker.ts",
+      "local": "browser-companion/src/turn-binding.ts",
+      "symbols": ["chatGptSubmissionEvidence", "chatGptNewTurnIdentity", "chatGptReboundTurnIdentity", "captureSubmissionBaseline", "waitForNewAssistantTurn"]
+    },
+    {
+      "source": "src/adapters/chatgpt-web/browser-worker.ts",
+      "local": "browser-companion/src/response-observer.ts",
+      "symbols": ["ChatGptVisibleTraceTracker", "responseDomSnapshot"]
+    },
+    {
+      "source": "src/adapters/chatgpt-web/browser-worker.ts",
+      "local": "browser-companion/src/browser-session.ts",
+      "symbols": ["throwIfChatGptRateLimitDialog", "throwIfChatGptSessionFailureAlert", "resolveChatGptToolConfirmation"]
+    },
+    {
+      "source": "src/adapters/chatgpt-web/limits.ts",
+      "local": "browser-companion/src/account.ts",
+      "symbols": ["readChatGptUsageAccount"]
+    },
+    {
+      "source": "launcher/electron/browser-host.cjs",
+      "local": "browser-companion/src/electron-surface.ts",
+      "symbols": ["BrowserWindow", "remote-debugging-port", "connectOverCDP"]
+    }
+  ]
+}

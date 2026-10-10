@@ -84,6 +84,7 @@ impl Fixture {
         ToolRequestContext {
             conversation: None,
             task_conversation: None,
+            task_owner_generation: None,
             conversation_retired: false,
             connector_schema_version: None,
             conversation_schema_version: None,
@@ -97,6 +98,7 @@ impl Fixture {
                 ArtifactEgressConfig::default(),
                 self.root.path().join("artifact-state"),
             )),
+            agent_automation: None,
             cancellation,
         }
     }

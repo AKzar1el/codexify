@@ -76,6 +76,9 @@ fn load_tools_with_options(
         all.push(Box::new(tools::markdown_chat::ChatTool::Read));
         all.push(Box::new(tools::markdown_chat::ChatTool::Write));
         all.push(Box::new(tools::markdown_chat::ChatTool::Await));
+        all.push(Box::new(tools::automation_pair::AutomationVerifyPairing));
+        all.push(Box::new(tools::goal::GoalTool::Read));
+        all.push(Box::new(tools::goal::GoalTool::Finish));
     }
     if conversation_auth {
         all.push(Box::new(tools::setup::ConversationAuthorization));

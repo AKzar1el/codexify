@@ -739,6 +739,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_automation_audit_summary_never_contains_private_state_values() {
+        let arguments = json!({
+            "candidateUrl": "https://chatgpt.com/c/private-conversation",
+            "reference": "private-pairing-reference",
+            "prompt": "private browser prompt",
+            "goal": {"markdown":"private goal markdown"},
+            "accountFingerprint": "private-account-fingerprint"
+        });
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "candidateUrl": {"type":"string"},
+                "reference": {"type":"string", "writeOnly":true},
+                "prompt": {"type":"string"},
+                "goal": {"type":"object"},
+                "accountFingerprint": {"type":"string"}
+            }
+        });
+
+        let summary = summarize_arguments(&arguments, Some(&schema)).to_string();
+        for private in [
+            "private-conversation",
+            "private-pairing-reference",
+            "private browser prompt",
+            "private goal markdown",
+            "private-account-fingerprint",
+        ] {
+            assert!(!summary.contains(private), "{private}: {summary}");
+        }
+        assert!(summary.contains("field_count"));
+    }
+
+    #[test]
     fn exported_file_output_summary_counts_but_never_names_the_capability() {
         let resource = rmcp::model::Resource::new(
             "codexify://artifact/abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE",

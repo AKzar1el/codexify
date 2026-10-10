@@ -6,6 +6,7 @@ INSTALL_DIR="$HOME/.codexify/bin"
 CONFIG_PATH=${CODEXIFY_CONFIG:-"$HOME/.codexify/codexify.config.json"}
 RELEASE_ROOT=${CODEXIFY_RELEASE_ROOT:-"https://github.com/$REPOSITORY/releases/download"}
 VERSION=${CODEXIFY_VERSION:-}
+INSTALL_BROWSER=${CODEXIFY_INSTALL_BROWSER:-0}
 
 fail() {
     printf 'codexify installer: %s\n' "$*" >&2
@@ -193,6 +194,12 @@ case "$VERSION" in
     ''|*[!A-Za-z0-9._-]*) fail "invalid release tag: $VERSION" ;;
 esac
 
+case "$INSTALL_BROWSER" in
+    0|'') ;;
+    1) ;;
+    *) fail 'CODEXIFY_INSTALL_BROWSER must be 0 or 1' ;;
+esac
+
 asset="codexify-$VERSION-$platform_os-$platform_arch.tar.gz"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/codexify-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0
@@ -254,6 +261,18 @@ if [ "${CODEXIFY_SKIP_SERVICE:-0}" != 1 ]; then
     else
         printf 'Background service setup deferred until quickstart creates the selected config: %s\n' "$CONFIG_PATH"
     fi
+fi
+
+if [ "$INSTALL_BROWSER" = 1 ]; then
+    [ -f "$CONFIG_PATH" ] \
+        || fail "the optional browser companion requires an existing config: $CONFIG_PATH"
+    "$target" --config "$CONFIG_PATH" config validate >/dev/null 2>&1 \
+        || fail "the optional browser companion requires a valid config: $CONFIG_PATH"
+    browser_release_root=${CODEXIFY_BROWSER_RELEASE_ROOT:-$RELEASE_ROOT}
+    CODEXIFY_BROWSER_RELEASE_ROOT=$browser_release_root \
+        "$target" --config "$CONFIG_PATH" browser install \
+        || fail 'the Codexify executable was installed, but the optional browser companion could not be installed'
+    printf 'Installed the optional browser companion.\n'
 fi
 
 printf '\nInstalled Codexify %s to %s\n' "$VERSION" "$target"

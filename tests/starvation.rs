@@ -116,6 +116,7 @@ async fn a_failed_checkpoint_prevents_sending_stdin() {
     let context = ToolRequestContext {
         conversation: None,
         task_conversation: None,
+        task_owner_generation: None,
         conversation_retired: false,
         connector_schema_version: None,
         conversation_schema_version: None,
@@ -131,6 +132,7 @@ async fn a_failed_checkpoint_prevents_sending_stdin() {
             config.artifact_egress.clone(),
             root.path().join("artifacts"),
         )),
+        agent_automation: None,
         cancellation: CancellationToken::new(),
     };
     let result = WriteStdin

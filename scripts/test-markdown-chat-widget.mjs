@@ -408,12 +408,15 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
   test(`${engineName}: Markdown chat composer, synchronization and receipts`, { timeout:180000 }, async t => {
     const browser = await engine.launch();
     try {
-      await t.test("embedded widgets do not expose standalone clipboard controls", async () => {
+      await t.test("embedded widgets do not expose standalone clipboard or browser controls", async () => {
         const backend = new ChatBackend();
         backend.add("agent", "Raw **Markdown** source");
         const { page, frames:[frame], errors } = await mount(browser, backend);
         assert.equal(await frame.getByRole("button", { name:"Copy message Markdown", exact:true }).count(), 0);
         assert.equal(await frame.getByRole("button", { name:"Copy whole chat as Markdown", exact:true }).count(), 0);
+        assert.equal(await frame.getByText("Browser automation", { exact:true }).count(), 0);
+        assert.equal(await frame.getByLabel("ChatGPT conversation URL").count(), 0);
+        assert.equal(await frame.getByRole("button", { name:"Open in ChatGPT", exact:true }).count(), 0);
         assert.deepEqual(errors, []);
         await page.close();
       });

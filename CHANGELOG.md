@@ -6,6 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Agent-chat browser automation is available as an opt-in offline fallback in the
+  standalone chat. It uses one separately packaged, version-matched Electron
+  companion and one shared ChatGPT window, explicit verified conversation URLs,
+  exact model/effort/connector checks, a Rust-owned global queue, streamed stable
+  browser output, and 10 KiB revisioned goals through `goal_read`/`goal_finish`.
+  Ordinary online chat remains unchanged, Web models are not added to Codex, and
+  ambiguous Send, UI drift, approvals, rate limits, account changes, and manual
+  interference fail closed without automatic replay.
+- `codexify browser install|start|stop|status|login|reveal` manages the optional
+  user-session companion. Release installers remain server-only unless
+  `CODEXIFY_INSTALL_BROWSER=1` is set. Browser archives are SHA-256-verified,
+  installed privately under `~/.codexify/browser/runtime/`, and include Codexify's
+  license plus the upstream `codex-chatgpt-web` MIT notice.
+
+### Security
+
+- Automation pairing references, ChatGPT URLs, prompts, goals, browser output, and
+  account fingerprints are omitted from audit values and redacted from payload
+  logging. Goal tool inputs use write-only schema fields and private goal results
+  suppress their complete payload preview.
+
 ## [1.7.0] - 2026-10-07
 
 ### Added

@@ -1683,3 +1683,79 @@ fn build_carries_environment_and_notes() {
     assert!(text.contains("Shell for exec_command: bash (posix)"));
     assert!(text.contains("apply_patch"));
 }
+
+fn repository_document(path: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+}
+
+fn normalized_repository_document(path: &str) -> String {
+    repository_document(path)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn agent_chat_browser_automation_is_documented_across_user_and_operator_surfaces() {
+    let readme = normalized_repository_document("README.md");
+    for required in [
+        "### Offline browser fallback",
+        "codexify browser install",
+        "codexify browser login",
+        "exact ChatGPT conversation URL",
+        "one shared browser window",
+        "does not add ChatGPT Web models to Codex",
+    ] {
+        assert!(readme.contains(required), "README missing {required}");
+    }
+
+    let reference = normalized_repository_document("docs/REFERENCE.md");
+    for required in [
+        "### Optional browser automation",
+        "agentChat.automation.enabled",
+        "automation_verify_pairing",
+        "goal_read",
+        "goal_finish",
+        "~/.codexify/browser/runtime/",
+        "unofficial ChatGPT UI automation",
+        "fails closed",
+    ] {
+        assert!(reference.contains(required), "reference missing {required}");
+    }
+
+    let architecture = normalized_repository_document("docs/ARCHITECTURE.md");
+    for required in [
+        "### Agent-chat browser automation",
+        "AgentAutomationStore",
+        "AgentAutomationSupervisor",
+        "BrowserCompanionClient",
+        "one long-lived Electron window",
+        "Rust-owned global queue",
+    ] {
+        assert!(
+            architecture.contains(required),
+            "architecture missing {required}"
+        );
+    }
+
+    let changelog = normalized_repository_document("CHANGELOG.md");
+    assert!(changelog.contains("Agent-chat browser automation"));
+
+    let config = repository_document("codexify.config.example.json");
+    for required in [
+        "\"automation\"",
+        "\"descriptorPath\"",
+        "\"maxQueuedActions\"",
+        "\"autoApproveToolCalls\"",
+    ] {
+        assert!(
+            config.contains(required),
+            "example config missing {required}"
+        );
+    }
+
+    let notices = repository_document("THIRD_PARTY_NOTICES.md");
+    assert!(notices.contains("miuuyy/codex-chatgpt-web"));
+    assert!(notices.contains("f9ad4ae83a579287105ad822dd0c3e0029b04ef6"));
+}

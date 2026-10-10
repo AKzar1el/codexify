@@ -34,10 +34,37 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .unread[hidden] { display:none; }
 #list-note { padding:10px 16px; border-top:1px solid var(--line); color:var(--muted); font-size:11px; }
 main { min-width:0; min-height:0; display:flex; justify-content:center; padding:18px; }
-#chat-host { width:min(100%,900px); min-height:0; background:var(--panel); border:1px solid var(--line); border-radius:18px; overflow:hidden; }
+#chat-host { width:min(100%,960px); min-height:0; background:var(--panel); border:1px solid var(--line); border-radius:18px; overflow:hidden; display:flex; flex-direction:column; }
 #placeholder { display:grid; place-items:center; height:100%; color:var(--muted); padding:24px; text-align:center; }
 #error { color:#ad2d30; padding:10px 16px; font-size:12px; }
-@media(max-width:680px) { #layout { grid-template-columns:minmax(145px,33%) minmax(0,1fr); } main { padding:0; } #chat-host { border:0; border-radius:0; } .conversation { grid-template-columns:16px minmax(0,1fr) 7px; gap:5px; padding:9px 5px; } aside header { padding:12px 8px; } aside h1 { font-size:14px; } aside p { font-size:10px; } }
+.automation-panel { flex:none; max-height:48%; overflow:auto; padding:16px 18px 18px; border-bottom:1px solid var(--line); background:linear-gradient(135deg, color-mix(in srgb, var(--selected) 70%, var(--panel)), var(--panel) 52%); }
+.automation-panel[hidden] { display:none; }
+.automation-header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px; }
+.automation-header h2 { margin:0; font-size:16px; letter-spacing:-.01em; }
+.automation-header p { margin:3px 0 0; color:var(--muted); font-size:12px; }
+.automation-badges { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
+.automation-badge { display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--muted); font-size:11px; font-weight:650; white-space:nowrap; }
+.automation-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.automation-card { min-width:0; padding:12px; border:1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius:12px; background:color-mix(in srgb, var(--panel) 92%, transparent); }
+.automation-card h3 { margin:0 0 9px; font-size:12px; text-transform:uppercase; letter-spacing:.075em; color:var(--muted); }
+.automation-card label { display:block; margin:8px 0 4px; color:var(--muted); font-size:11px; font-weight:650; }
+.automation-card input,.automation-card select,.automation-card textarea { width:100%; min-width:0; border:1px solid var(--line); border-radius:8px; padding:8px 9px; background:var(--panel); color:var(--ink); font:inherit; }
+.automation-card textarea { min-height:72px; resize:vertical; }
+.automation-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; }
+.automation-actions button { min-height:32px; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--ink); }
+.automation-actions button.primary { border-color:var(--accent); background:var(--accent); color:var(--panel); }
+.automation-actions button:disabled { cursor:not-allowed; opacity:.5; }
+.automation-detail { margin:8px 0 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
+.automation-error { margin-top:10px; padding:9px 10px; border:1px solid color-mix(in srgb, #ad2d30 45%, var(--line)); border-radius:9px; background:color-mix(in srgb, #ad2d30 8%, var(--panel)); color:#ad2d30; font-size:12px; }
+.automation-error[hidden] { display:none; }
+.automation-stream { grid-column:1/-1; }
+.automation-stream-output { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+.automation-stream-output section { min-width:0; padding:8px; border-radius:8px; background:var(--bg); }
+.automation-stream-output strong { display:block; margin-bottom:4px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+.automation-stream-output div { max-height:96px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
+.chat-shell { flex:1; min-height:300px; }
+@media(max-width:760px) { .automation-grid { grid-template-columns:1fr; } .automation-stream { grid-column:auto; } .automation-stream-output { grid-template-columns:1fr; } }
+@media(max-width:680px) { #layout { grid-template-columns:minmax(145px,33%) minmax(0,1fr); } main { padding:0; } #chat-host { border:0; border-radius:0; } .automation-panel { max-height:54%; padding:12px 10px 14px; } .automation-header { align-items:flex-start; flex-direction:column; } .automation-badges { justify-content:flex-start; } .conversation { grid-template-columns:16px minmax(0,1fr) 7px; gap:5px; padding:9px 5px; } aside header { padding:12px 8px; } aside h1 { font-size:14px; } aside p { font-size:10px; } }
 </style>
 </head>
 <body>
@@ -62,6 +89,7 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
   const errorNode = document.getElementById("error");
   let selected = null, controller = null, chats = [], clockOffset = 0, presenceTimer = null;
   const chatIdPattern = /^[0-9a-f]{64}$/;
+  const chatMeta = "io.github.devnoname120/codexify/markdown-chat";
   let seen = {};
   try { seen = JSON.parse(localStorage.getItem("owner-chat-seen-v1") || "{}"); } catch {}
 
@@ -111,6 +139,211 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
     });
     if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
     return response;
+  }
+  function requestId(prefix) {
+    const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${prefix}-${random}`;
+  }
+  function sentenceCase(value) {
+    const text = String(value || "").replaceAll("_", " ");
+    return text ? text[0].toUpperCase() + text.slice(1) : "Unknown";
+  }
+  function createAutomationPanel(id) {
+    const panel = document.createElement("section");
+    panel.id = "automation-panel";
+    panel.className = "automation-panel";
+    panel.hidden = true;
+    panel.setAttribute("aria-label", "Browser automation");
+    panel.innerHTML = `
+      <div class="automation-header">
+        <div><h2>Browser automation</h2><p>Offline fallback through one shared ChatGPT window</p></div>
+        <div class="automation-badges"><span id="automation-presence" class="automation-badge">Offline</span><span id="automation-queue" class="automation-badge" hidden></span><span id="automation-action" class="automation-badge">Idle</span></div>
+      </div>
+      <div class="automation-grid">
+        <section class="automation-card">
+          <h3>Companion</h3>
+          <p id="companion-status" class="automation-detail">Checking browser companion…</p>
+          <div class="automation-actions"><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div>
+        </section>
+        <section class="automation-card">
+          <h3>Conversation</h3>
+          <label for="automation-url">ChatGPT conversation URL</label>
+          <input id="automation-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://chatgpt.com/c/…">
+          <div class="automation-actions"><button type="button" class="primary" id="automation-pair">Pair conversation</button><button type="button" id="automation-unlink">Unlink conversation</button></div>
+          <p id="pairing-status" class="automation-detail">Not paired</p>
+        </section>
+        <section class="automation-card">
+          <h3>Model</h3>
+          <label for="automation-model">ChatGPT model</label><select id="automation-model"><option value="">Refresh models first</option></select>
+          <label for="automation-effort">Reasoning effort</label><select id="automation-effort"><option value="">Choose a model</option></select>
+          <div class="automation-actions"><button type="button" class="primary" id="automation-save-selection">Save model and effort</button></div>
+          <p id="selection-status" class="automation-detail">No verified model selection</p>
+        </section>
+        <section class="automation-card">
+          <h3>Goal</h3>
+          <label for="automation-goal">Goal Markdown</label><textarea id="automation-goal" maxlength="10240" placeholder="Describe the bounded task goal"></textarea>
+          <div class="automation-actions"><button type="button" class="primary" id="automation-set-goal">Set goal</button><button type="button" id="automation-run-goal">Run goal</button><button type="button" id="automation-stop-goal">Stop goal</button><button type="button" id="automation-clear-goal">Clear goal</button><button type="button" id="automation-goal-status">Goal status</button></div>
+          <p id="goal-status" class="automation-detail">No goal configured</p>
+        </section>
+        <section class="automation-card automation-stream">
+          <h3>Browser activity</h3>
+          <div class="automation-stream-output"><section><strong>Status</strong><div id="automation-live-status"></div></section><section><strong>Commentary</strong><div id="automation-live-commentary"></div></section><section><strong>Answer</strong><div id="automation-live-answer"></div></section></div>
+          <div class="automation-actions"><button type="button" id="automation-cancel-action">Cancel queued action</button><button type="button" id="automation-retry-action">Retry failed action</button></div>
+        </section>
+      </div>
+      <div id="automation-error" class="automation-error" role="alert" hidden></div>`;
+
+    const byId = name => panel.querySelector(`#${name}`);
+    const nodes = {
+      presence:byId("automation-presence"), queue:byId("automation-queue"), action:byId("automation-action"),
+      companion:byId("companion-status"), login:byId("automation-login"), capabilities:byId("automation-capabilities"), reveal:byId("automation-reveal"),
+      url:byId("automation-url"), pair:byId("automation-pair"), unlink:byId("automation-unlink"), pairing:byId("pairing-status"),
+      model:byId("automation-model"), effort:byId("automation-effort"), saveSelection:byId("automation-save-selection"), selection:byId("selection-status"),
+      goal:byId("automation-goal"), setGoal:byId("automation-set-goal"), runGoal:byId("automation-run-goal"), stopGoal:byId("automation-stop-goal"), clearGoal:byId("automation-clear-goal"), goalStatusButton:byId("automation-goal-status"), goalStatus:byId("goal-status"),
+      liveStatus:byId("automation-live-status"), liveCommentary:byId("automation-live-commentary"), liveAnswer:byId("automation-live-answer"), cancelAction:byId("automation-cancel-action"), retryAction:byId("automation-retry-action"), error:byId("automation-error")
+    };
+    let current = null, models = [], closed = false, timer = null, requestInFlight = false;
+    const setError = message => { nodes.error.hidden = !message; nodes.error.textContent = message || ""; };
+    const post = async (operation, body = {}) => {
+      const response = await api(`/api/chats/${id}/automation/${operation}`, { method:"POST", body:JSON.stringify(body) });
+      return response.json();
+    };
+    function renderEfforts() {
+      const model = models.find(candidate => candidate.id === nodes.model.value);
+      nodes.effort.replaceChildren();
+      if (!model) {
+        nodes.effort.append(new Option("Choose a model", ""));
+      } else {
+        for (const effort of model.efforts || []) {
+          const suffix = effort.available === false && effort.reason ? ` — ${effort.reason}` : "";
+          const option = new Option(`${effort.label}${suffix}`, effort.id);
+          option.disabled = effort.available === false;
+          nodes.effort.append(option);
+        }
+        const selected = current?.selection?.model === model.id ? current.selection.effort : null;
+        if (selected && [...nodes.effort.options].some(option => option.value === selected && !option.disabled)) nodes.effort.value = selected;
+        else nodes.effort.value = [...nodes.effort.options].find(option => !option.disabled)?.value || "";
+      }
+      nodes.saveSelection.disabled = !nodes.model.value || !nodes.effort.value;
+    }
+    function renderModels() {
+      const selected = current?.selection?.model;
+      nodes.model.replaceChildren();
+      if (!models.length) nodes.model.append(new Option("Refresh models first", ""));
+      else for (const model of models) nodes.model.append(new Option(model.label, model.id));
+      if (selected && models.some(model => model.id === selected)) nodes.model.value = selected;
+      renderEfforts();
+    }
+    function render(state) {
+      current = state;
+      if (!state?.enabled) { panel.hidden = true; return; }
+      panel.hidden = false;
+      const now = Number.isSafeInteger(state.serverTimeMs) ? state.serverTimeMs : Date.now() + clockOffset;
+      const presenceState = presence(state.presence?.lastAgentCallAtMs, now, state.presence?.agentWaitingUntilMs);
+      nodes.presence.textContent = sentenceCase(presenceState);
+      nodes.queue.hidden = !Number.isSafeInteger(state.queue?.position);
+      nodes.queue.textContent = nodes.queue.hidden ? "" : `Queue ${state.queue.position} of ${state.queue.total}`;
+      nodes.action.textContent = sentenceCase(state.action?.status || state.live?.phase || "idle");
+
+      const companion = state.companion || {};
+      nodes.companion.textContent = companion.authenticated ? `Connected · ${sentenceCase(companion.status || "idle")}` : companion.status === "unavailable" ? (companion.detail || "Browser companion is unavailable") : "ChatGPT sign-in required";
+      nodes.login.disabled = companion.authenticated === true;
+      nodes.capabilities.disabled = companion.authenticated !== true;
+
+      const pairing = state.pairing || { status:"unpaired" };
+      const pairedUrl = pairing.canonicalUrl || pairing.candidateUrl || "";
+      if (pairedUrl && document.activeElement !== nodes.url && nodes.url.value !== pairedUrl) nodes.url.value = pairedUrl;
+      if (pairing.status === "verified") nodes.pairing.textContent = "Verified";
+      else if (pairing.status === "unverified" && state.action?.status === "queued") nodes.pairing.textContent = "Pairing verification queued";
+      else if (pairing.status === "unverified") nodes.pairing.textContent = "Verification required";
+      else nodes.pairing.textContent = "Not paired";
+      nodes.pair.textContent = pairing.status === "unpaired" ? "Pair conversation" : "Replace pairing";
+      nodes.pair.disabled = !nodes.url.value.trim() || !state.selection?.model || !state.selection?.effort;
+      nodes.unlink.disabled = pairing.status === "unpaired";
+      nodes.reveal.disabled = !pairedUrl && !companion.activeActionId;
+
+      nodes.selection.textContent = state.selection?.model && state.selection?.effort ? `${state.selection.model} · ${state.selection.effort}` : "No verified model selection";
+      if (models.length) renderModels();
+
+      const goal = state.goal;
+      if (goal && document.activeElement !== nodes.goal && !nodes.goal.value) nodes.goal.value = goal.markdown || "";
+      nodes.goalStatus.textContent = goal ? sentenceCase(goal.status) : "No goal configured";
+      if (goal?.status === "blocked" && goal.blockedReason) nodes.goalStatus.textContent += ` · ${goal.blockedReason}`;
+      nodes.setGoal.disabled = !nodes.goal.value.trim();
+      nodes.runGoal.disabled = !goal || goal.status === "active" || !["configured"].includes(goal.status);
+      nodes.stopGoal.disabled = goal?.status !== "active";
+      nodes.clearGoal.disabled = !goal || goal.status === "active";
+      nodes.goalStatusButton.disabled = false;
+
+      nodes.liveStatus.textContent = state.live?.status || state.action?.lastError || "";
+      nodes.liveCommentary.textContent = state.live?.commentary || "";
+      nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
+      nodes.cancelAction.disabled = state.action?.status !== "queued" || !state.action?.id;
+      nodes.retryAction.disabled = state.action?.status !== "failed" || state.action?.kind === "pair_verify" || !state.action?.id;
+      const actionError = state.action?.lastError;
+      if (actionError) setError(actionError);
+    }
+    async function refreshState({ quiet = false } = {}) {
+      if (closed || requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const state = await (await api(`/api/chats/${id}/automation`)).json();
+        if (!closed) { if (!quiet) setError(""); render(state); }
+      } catch (error) {
+        if (!closed && !quiet) setError(error.message || "Browser automation state unavailable");
+      } finally { requestInFlight = false; }
+    }
+    async function run(operation) {
+      setError("");
+      try { await operation(); await refreshState(); }
+      catch (error) { setError(error.message || "Browser automation operation failed"); }
+    }
+    async function goalCommand(command) {
+      const response = await api(`/api/chats/${id}/send`, { method:"POST", body:JSON.stringify({ request_id:requestId("goal"), message:command }) });
+      const payload = await response.json();
+      const local = payload?._meta?.[chatMeta];
+      if (current && local && Object.hasOwn(local, "goal")) { current.goal = local.goal; render(current); }
+    }
+
+    nodes.model.addEventListener("change", renderEfforts);
+    nodes.effort.addEventListener("change", () => { nodes.saveSelection.disabled = !nodes.model.value || !nodes.effort.value; });
+    nodes.url.addEventListener("input", () => { nodes.pair.disabled = !nodes.url.value.trim() || !current?.selection?.model || !current?.selection?.effort; });
+    nodes.goal.addEventListener("input", () => { nodes.setGoal.disabled = !nodes.goal.value.trim(); });
+    nodes.login.addEventListener("click", () => run(async () => { await post("login"); }));
+    nodes.capabilities.addEventListener("click", () => run(async () => {
+      const catalog = await post("capabilities"); models = catalog.models || []; renderModels();
+    }));
+    nodes.saveSelection.addEventListener("click", () => run(async () => {
+      const result = await post("selection", { requestId:requestId("selection"), model:nodes.model.value, effort:nodes.effort.value });
+      if (current) current.selection = result.selection;
+    }));
+    nodes.pair.addEventListener("click", () => run(async () => {
+      const result = await post("pair", { requestId:requestId("pair"), url:nodes.url.value.trim() });
+      if (current) { current.pairing = result.pairing; current.action = result.action; render(current); }
+    }));
+    nodes.unlink.addEventListener("click", () => run(async () => {
+      const result = await post("unlink", { requestId:requestId("unlink") });
+      nodes.url.value = "";
+      if (current) { current.pairing = result.pairing; current.action = { status:"idle" }; render(current); }
+    }));
+    nodes.reveal.addEventListener("click", () => run(async () => { await post("reveal"); }));
+    nodes.setGoal.addEventListener("click", () => run(async () => { await goalCommand(`/goal set ${nodes.goal.value}`); }));
+    nodes.runGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal run"); }));
+    nodes.stopGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal stop"); }));
+    nodes.clearGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal clear"); nodes.goal.value = ""; }));
+    nodes.goalStatusButton.addEventListener("click", () => run(async () => { await goalCommand("/goal status"); }));
+    nodes.cancelAction.addEventListener("click", () => run(async () => {
+      const result = await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id });
+      if (current) { current.action = result.action; current.queue = result.queue; render(current); }
+    }));
+    nodes.retryAction.addEventListener("click", () => run(async () => {
+      const result = await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id });
+      if (current) { current.action = result.action; current.queue = result.queue; render(current); }
+    }));
+
+    void refreshState();
+    timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
+    return { element:panel, close() { closed = true; clearInterval(timer); } };
   }
   function renderList() {
     const now = Date.now() + clockOffset;
@@ -164,11 +397,12 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
     }
     controller?.close(); controller = null; selected = id;
     host.replaceChildren();
+    const automation = createAutomationPanel(id);
     const shell = document.createElement("div");
-    shell.style.height = "100%";
+    shell.className = "chat-shell";
     const scope = shell.attachShadow({ mode:"open" });
     scope.append(document.getElementById("chat-template").content.cloneNode(true));
-    host.append(shell);
+    host.append(automation.element, shell);
     const key = `owner-chat-widget-v1:${id}`;
     const bridge = {
       getState() { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } },
@@ -219,8 +453,9 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
         await navigator.clipboard.writeText(await response.text());
       }
     };
-    controller = window.mountCodexifyChat(scope, bridge);
-    controller.setAvailable(true);
+    const chatController = window.mountCodexifyChat(scope, bridge);
+    chatController.setAvailable(true);
+    controller = { close() { automation.close(); chatController.close(); } };
     renderList();
   }
   function selectFromUrl() {

@@ -15,6 +15,7 @@ pub(crate) fn schema_version(config: &AppConfig) -> String {
     let mut version = format!("{}+continuation-v1", env!("CARGO_PKG_VERSION"));
     if config.markdown_chat.enabled {
         version.push_str("+markdown-chat-v5");
+        version.push_str("+agent-automation-v1");
     }
     if config.experimental.agent_tickets {
         version.push_str("+tickets-v1");
@@ -146,7 +147,7 @@ impl ConnectorSchemaStore {
             return Some(version.clone());
         }
         let version = std::fs::read_to_string(self.directory.as_ref()?.join(key)).ok()?;
-        if version.is_empty() || version.len() > 64 {
+        if version.is_empty() || version.len() > 128 {
             return None;
         }
         versions.insert(key.to_string(), version.clone());
@@ -191,24 +192,29 @@ mod tests {
                 true,
                 "+continuation-v1+tickets-v1+workspace-v1",
             ),
-            (true, false, false, "+continuation-v1+markdown-chat-v5"),
+            (
+                true,
+                false,
+                false,
+                "+continuation-v1+markdown-chat-v5+agent-automation-v1",
+            ),
             (
                 true,
                 false,
                 true,
-                "+continuation-v1+markdown-chat-v5+workspace-v1",
+                "+continuation-v1+markdown-chat-v5+agent-automation-v1+workspace-v1",
             ),
             (
                 true,
                 true,
                 false,
-                "+continuation-v1+markdown-chat-v5+tickets-v1",
+                "+continuation-v1+markdown-chat-v5+agent-automation-v1+tickets-v1",
             ),
             (
                 true,
                 true,
                 true,
-                "+continuation-v1+markdown-chat-v5+tickets-v1+workspace-v1",
+                "+continuation-v1+markdown-chat-v5+agent-automation-v1+tickets-v1+workspace-v1",
             ),
         ] {
             let mut config = crate::config::default_config(PathBuf::from("/tmp/project"));
@@ -217,7 +223,7 @@ mod tests {
             config.multi_project = multi_project;
             let version = schema_version(&config);
             assert_eq!(version, format!("{}{suffix}", env!("CARGO_PKG_VERSION")));
-            assert!(version.len() <= 64);
+            assert!(version.len() <= 128);
         }
     }
 
