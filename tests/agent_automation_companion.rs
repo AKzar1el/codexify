@@ -646,7 +646,10 @@ async fn capability_text_bounds_match_the_typescript_protocol() {
         .unwrap();
     assert_eq!(catalog.models[0].label.len(), 200);
     assert_eq!(catalog.models[0].efforts[0].label.len(), 200);
-    assert_eq!(catalog.models[0].efforts[0].reason.as_ref().unwrap().len(), 500);
+    assert_eq!(
+        catalog.models[0].efforts[0].reason.as_ref().unwrap().len(),
+        500
+    );
     task.abort();
 }
 
@@ -923,6 +926,37 @@ async fn invalid_action_data_is_rejected_before_network_access() {
         );
     }
     assert_eq!(state.posts.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn protocol_valid_prompt_can_use_the_full_json_transport_bound() {
+    let state = FakeState::default();
+    let app = Router::new()
+        .route("/v1/actions/execute", post(execute))
+        .route("/v1/actions/{action_id}", get(action_state))
+        .with_state(state.clone());
+    let (endpoint, task) = spawn_fake(app).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+    let mut request = action_request();
+    request.connector_name = "C".repeat(200);
+    request.prompt = ActionPrompt::OfflineChat {
+        batch_id: "batch_1".into(),
+        messages: vec![CompanionUnreadMessage {
+            id: "message_1".into(),
+            markdown: "\\\"".repeat(100_000),
+        }],
+    };
+
+    let snapshot = client
+        .execute(&request, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.state, CompanionActionState::Queued);
+    assert_eq!(state.posts.load(Ordering::SeqCst), 1);
     task.abort();
 }
 

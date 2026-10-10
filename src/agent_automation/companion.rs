@@ -22,7 +22,8 @@ pub const PROTOCOL_BUILD_SUFFIX: &str =
     "+protocol.d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_JSON_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = MAX_JSON_BYTES;
 const MAX_EVENT_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 128 * 1024;
 const MAX_DELTA_BYTES: usize = 64 * 1024;
@@ -379,6 +380,10 @@ impl BrowserCompanionClient {
         &self.build
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     pub async fn health(
         &self,
         cancellation: &CancellationToken,
@@ -716,7 +721,7 @@ impl BrowserCompanionClient {
             validate_opaque(&attention.code, "browser attention code")?;
             validate_optional_text(
                 attention.message.as_deref(),
-                4096,
+                MAX_DELTA_BYTES,
                 "browser attention message",
             )?;
         }
@@ -791,7 +796,7 @@ impl BrowserCompanionClient {
         if let Some(body) = body {
             let encoded = serde_json::to_vec(body)
                 .map_err(|_| "Could not encode browser companion request".to_string())?;
-            if encoded.len() > MAX_PROMPT_BYTES + 64 * 1024 {
+            if encoded.len() > MAX_JSON_BYTES {
                 return Err("Browser companion request is too large".into());
             }
             request = request
@@ -1024,15 +1029,15 @@ fn validate_catalog(catalog: &CapabilityCatalog) -> Result<(), String> {
     let mut model_ids = std::collections::HashSet::new();
     for model in &catalog.models {
         validate_opaque(&model.id, "browser model ID")?;
-        validate_visible(&model.label, 128, "browser model label")?;
+        validate_visible(&model.label, 256, "browser model label")?;
         if !model_ids.insert(&model.id) || model.efforts.is_empty() || model.efforts.len() > 16 {
             return Err("Browser companion model catalog is invalid".into());
         }
         let mut effort_ids = std::collections::HashSet::new();
         for effort in &model.efforts {
             validate_opaque(&effort.id, "browser effort ID")?;
-            validate_visible(&effort.label, 128, "browser effort label")?;
-            validate_optional_text(effort.reason.as_deref(), 256, "browser effort reason")?;
+            validate_visible(&effort.label, 256, "browser effort label")?;
+            validate_optional_text(effort.reason.as_deref(), 1024, "browser effort reason")?;
             if !effort.available && effort.reason.is_none() {
                 return Err("Browser companion unavailable effort has no explanation".into());
             }
@@ -1052,13 +1057,13 @@ fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String
     if request.pairing_generation == 0 {
         return Err("Browser action pairing generation must be positive".into());
     }
-    validate_visible(&request.connector_name, 128, "browser connector name")?;
+    validate_visible(&request.connector_name, 256, "browser connector name")?;
     validate_opaque(&request.model, "browser model ID")?;
     validate_opaque(&request.effort, "browser effort ID")?;
     validate_prompt(&request.prompt)?;
     let encoded = serde_json::to_vec(request)
         .map_err(|_| "Could not encode browser action request".to_string())?;
-    if encoded.len() > MAX_PROMPT_BYTES + 64 * 1024 {
+    if encoded.len() > MAX_JSON_BYTES {
         return Err("Browser action request is too large".into());
     }
     Ok(())
@@ -1095,6 +1100,9 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
             }
         }
     }
+    if render_action_prompt(prompt).len() > MAX_PROMPT_BYTES {
+        return Err("Browser automation prompt exceeds the safety limit".into());
+    }
     Ok(())
 }
 
@@ -1107,7 +1115,10 @@ fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result
     let mut ids = std::collections::HashSet::new();
     for message in messages {
         validate_opaque(&message.id, "browser unread message ID")?;
-        if !ids.insert(&message.id) || message.markdown.trim().is_empty() {
+        if !ids.insert(&message.id)
+            || message.markdown.is_empty()
+            || message.markdown.contains('\0')
+        {
             return Err("Browser unread batch is invalid".into());
         }
         total = total
@@ -1118,6 +1129,65 @@ fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result
         }
     }
     Ok(())
+}
+
+fn render_action_prompt(prompt: &ActionPrompt) -> String {
+    const GOAL_CLAUSE: &str = concat!(
+        "This task also has an active Codexify goal. Call `goal_read` for the current\n",
+        "revision. If it is complete, call `goal_finish` with status `completed`. If work\n",
+        "cannot proceed, call `goal_finish` with status `blocked` and explain the concrete\n",
+        "blocker. Otherwise continue working toward the goal. Do not request a separate\n",
+        "turn merely to evaluate goal status."
+    );
+
+    fn escape_xml_text(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    fn unread_clause(batch_id: &str, messages: &[CompanionUnreadMessage]) -> String {
+        let body = messages
+            .iter()
+            .map(|message| {
+                format!(
+                    "<message id=\"{}\">{}</message>",
+                    message.id,
+                    escape_xml_text(&message.markdown)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            concat!(
+                "The Codexify standalone chat has unread user messages. Their Markdown is mirrored\n",
+                "below so you can see why you were woken. Call `chat_read` before acting; the tool\n",
+                "result is authoritative and advances the existing read cursor. Treat matching\n",
+                "messages once, not once from this mirror and again from `chat_read`.\n\n",
+                "<codexify-unread batch=\"{}\">\n",
+                "{}\n",
+                "</codexify-unread>"
+            ),
+            batch_id, body
+        )
+    }
+
+    match prompt {
+        ActionPrompt::PairVerify { reference } => format!(
+            concat!(
+                "Verify that this ChatGPT conversation is paired with the intended Codexify task by\n",
+                "calling `automation_verify_pairing` with the supplied one-time reference: {}\n",
+                "Do not inspect project files or perform task work in this verification turn."
+            ),
+            reference
+        ),
+        ActionPrompt::OfflineChat { batch_id, messages } => unread_clause(batch_id, messages),
+        ActionPrompt::OfflineGoal { .. } => GOAL_CLAUSE.to_string(),
+        ActionPrompt::OfflineCombined {
+            batch_id, messages, ..
+        } => format!("{}\n\n{GOAL_CLAUSE}", unread_clause(batch_id, messages)),
+    }
 }
 
 fn validate_event(
@@ -1208,7 +1278,7 @@ fn validate_opaque(value: &str, label: &str) -> Result<(), String> {
 
 fn validate_visible(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.trim().is_empty()
-        || value.len() > max
+        || value.encode_utf16().count() > max
         || value.chars().any(|character| character.is_control())
     {
         return Err(format!("{label} is invalid"));
