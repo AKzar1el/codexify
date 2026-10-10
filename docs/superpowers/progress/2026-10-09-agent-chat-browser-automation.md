@@ -1531,3 +1531,6 @@ Implement the approved agent-chat browser automation architecture completely: re
   filesystem/upstream/checkpoint execution and optional single-window agent-chat
   browser automation. Existing source and Codexify-managed worktrees remain
   preserved; only the clean temporary `main` worktree was used for integration.
+- The browser-automation branch was merged into local `main` as merge commit
+  `d7e8131`, on top of the separately committed anti-starvation work `1650b76`.
+  No remote branch was pushed and no existing managed worktree was removed.
