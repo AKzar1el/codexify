@@ -1,4 +1,5 @@
 mod companion;
+mod install;
 mod store;
 mod supervisor;
 
@@ -9,6 +10,10 @@ pub use companion::{
     CompanionUnreadMessage, EffortCapability, ExecuteActionRequest, ModelCapability,
     PROTOCOL_BUILD_SUFFIX, PROTOCOL_SCHEMA_HASH, PROTOCOL_VERSION, RevealWindowReceipt,
     RevealWindowRequest,
+};
+pub use install::{
+    BrowserArchiveKind, BrowserCompanionManager, BrowserCompanionStatus, BrowserInstallReceipt,
+    BrowserLifecycleState, BrowserReleaseAsset, BrowserRuntimeLayout, BrowserRuntimeManifest,
 };
 pub use store::{
     AgentAutomationStore, AutomationActionKind, AutomationActionState, AutomationActionStatus,

@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::agent_automation::{
+    BrowserCompanionManager, BrowserCompanionStatus, BrowserLifecycleState,
+};
 use crate::config::{
     Cli, CodexCliDiagnosticConfig, ConfigPathSelection, ConfigPathSource,
     codex_cli_diagnostic_config, config_path_selection, load_config_quiet_read_only,
@@ -888,6 +891,110 @@ async fn tunnel_runtime_check(config: &AppConfig) -> DoctorCheck {
     }
 }
 
+async fn browser_companion_check(
+    config: &crate::markdown_chat::AgentAutomationConfig,
+) -> DoctorCheck {
+    if !config.enabled {
+        return browser_companion_check_from_status(BrowserCompanionStatus {
+            state: BrowserLifecycleState::Disabled,
+            enabled: false,
+            installed: false,
+            running: false,
+            authenticated: false,
+            active_action_id: None,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: None,
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            runtime_dir: None,
+            descriptor_path: PathBuf::new(),
+            log_path: PathBuf::new(),
+            detail: None,
+        });
+    }
+    match BrowserCompanionManager::from_config(config) {
+        Ok(manager) => browser_companion_check_from_status(manager.status().await),
+        Err(message) => DoctorCheck::failure(
+            "browser_companion",
+            "Browser companion lifecycle configuration is invalid",
+        )
+        .with_detail(message)
+        .with_remediation("Correct agentChat.automation and rerun codexify doctor"),
+    }
+}
+
+fn browser_companion_check_from_status(status: BrowserCompanionStatus) -> DoctorCheck {
+    let runtime_detail = || {
+        let mut parts = vec![
+            format!("version={}", status.version),
+            format!("platform={}", status.platform),
+        ];
+        if let Some(path) = &status.runtime_dir {
+            parts.push(format!("runtime={}", path.display()));
+        }
+        if let Some(detail) = &status.detail {
+            parts.push(detail.clone());
+        }
+        parts.join("; ")
+    };
+    match status.state {
+        BrowserLifecycleState::Disabled => DoctorCheck::skipped(
+            "browser_companion",
+            "Agent-chat browser automation is disabled",
+        ),
+        BrowserLifecycleState::NotInstalled => DoctorCheck::warning(
+            "browser_companion",
+            "Browser automation is enabled but its companion is not installed",
+        )
+        .with_detail(runtime_detail())
+        .with_remediation("Run `codexify browser install`, then `codexify browser start`"),
+        BrowserLifecycleState::Stopped => DoctorCheck::warning(
+            "browser_companion",
+            "The installed browser companion is stopped",
+        )
+        .with_detail(runtime_detail())
+        .with_remediation("Run `codexify browser start`"),
+        BrowserLifecycleState::AuthenticationRequired => DoctorCheck::warning(
+            "browser_companion",
+            "The browser companion requires ChatGPT authentication",
+        )
+        .with_detail(runtime_detail())
+        .with_remediation(
+            "Run `codexify browser login` and complete sign-in in the companion window",
+        ),
+        BrowserLifecycleState::AccountChanged => DoctorCheck::warning(
+            "browser_companion",
+            "The authenticated ChatGPT account changed",
+        )
+        .with_detail(runtime_detail())
+        .with_remediation(
+            "Refresh browser capabilities and verify each paired ChatGPT conversation again",
+        ),
+        BrowserLifecycleState::Busy => DoctorCheck::pass(
+            "browser_companion",
+            "The browser companion is operational and currently busy",
+        )
+        .with_detail(runtime_detail()),
+        BrowserLifecycleState::Ready => DoctorCheck::pass(
+            "browser_companion",
+            "The browser companion is installed, authenticated, and ready",
+        )
+        .with_detail(runtime_detail()),
+        BrowserLifecycleState::Incompatible => DoctorCheck::failure(
+            "browser_companion",
+            "The browser companion is incompatible with this Codexify build",
+        )
+        .with_detail(runtime_detail())
+        .with_remediation(
+            "Run `codexify browser install` to install the matching verified artifact",
+        ),
+        BrowserLifecycleState::Unavailable => {
+            DoctorCheck::failure("browser_companion", "The browser companion is unavailable")
+                .with_detail(runtime_detail())
+                .with_remediation("Inspect `codexify browser status` and the private companion log")
+        }
+    }
+}
+
 fn effective_configuration_check(config: &AppConfig) -> DoctorCheck {
     let mode = if config.multi_project {
         "multi-project"
@@ -935,9 +1042,14 @@ async fn finish_report(
     checks.push(service_check);
     checks.push(health_check(config, service_status.as_ref()).await);
     if let Some(config) = config {
+        checks.push(browser_companion_check(&config.markdown_chat.automation).await);
         checks.push(tunnel_credential_check(config));
         checks.push(tunnel_runtime_check(config).await);
     } else {
+        checks.push(DoctorCheck::skipped(
+            "browser_companion",
+            "Browser companion state could not be checked because configuration is invalid",
+        ));
         checks.push(DoctorCheck::skipped(
             "openai_tunnel_credential",
             "OpenAI tunnel credential could not be checked because configuration is invalid",
@@ -1003,11 +1115,76 @@ pub async fn run_for_config(config: &AppConfig) -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_automation::{
+        BrowserCompanionStatus, BrowserLifecycleState, PROTOCOL_BUILD_SUFFIX,
+    };
     use crate::config::default_config;
     use crate::self_update::{LatestVersionInspection, LatestVersionSource, LatestVersionStatus};
     use crate::types::OpenAiTunnelConfig;
     use semver::Version;
     use std::path::Path;
+
+    fn browser_status(state: BrowserLifecycleState) -> BrowserCompanionStatus {
+        BrowserCompanionStatus {
+            state,
+            enabled: state != BrowserLifecycleState::Disabled,
+            installed: !matches!(
+                state,
+                BrowserLifecycleState::Disabled | BrowserLifecycleState::NotInstalled
+            ),
+            running: matches!(
+                state,
+                BrowserLifecycleState::Ready
+                    | BrowserLifecycleState::Busy
+                    | BrowserLifecycleState::AuthenticationRequired
+                    | BrowserLifecycleState::AccountChanged
+                    | BrowserLifecycleState::Unavailable
+            ),
+            authenticated: matches!(
+                state,
+                BrowserLifecycleState::Ready
+                    | BrowserLifecycleState::Busy
+                    | BrowserLifecycleState::AccountChanged
+            ),
+            active_action_id: (state == BrowserLifecycleState::Busy)
+                .then(|| "action-private".to_string()),
+            version: "1.7.0".into(),
+            build: Some(format!("1.7.0{PROTOCOL_BUILD_SUFFIX}")),
+            platform: "darwin-arm64".into(),
+            runtime_dir: Some(PathBuf::from("/private/runtime")),
+            descriptor_path: PathBuf::from("/private/descriptor.json"),
+            log_path: PathBuf::from("/private/companion.log"),
+            detail: Some("bounded lifecycle detail".into()),
+        }
+    }
+
+    #[test]
+    fn browser_companion_doctor_maps_every_lifecycle_state_without_private_identity() {
+        let cases = [
+            (BrowserLifecycleState::Disabled, DoctorStatus::Skipped),
+            (BrowserLifecycleState::NotInstalled, DoctorStatus::Warning),
+            (BrowserLifecycleState::Stopped, DoctorStatus::Warning),
+            (
+                BrowserLifecycleState::AuthenticationRequired,
+                DoctorStatus::Warning,
+            ),
+            (BrowserLifecycleState::AccountChanged, DoctorStatus::Warning),
+            (BrowserLifecycleState::Busy, DoctorStatus::Pass),
+            (BrowserLifecycleState::Ready, DoctorStatus::Pass),
+            (BrowserLifecycleState::Incompatible, DoctorStatus::Failure),
+            (BrowserLifecycleState::Unavailable, DoctorStatus::Failure),
+        ];
+        for (state, expected) in cases {
+            let check = browser_companion_check_from_status(browser_status(state));
+            assert_eq!(check.id, "browser_companion");
+            assert_eq!(check.status, expected, "state={state:?}");
+            let rendered = serde_json::to_string(&check).unwrap();
+            assert!(!rendered.contains("action-private"));
+            assert!(!rendered.contains("accountFingerprint"));
+            assert!(!rendered.contains("token"));
+            assert!(!rendered.contains("endpoint"));
+        }
+    }
 
     #[test]
     fn doctor_checks_every_tunnel_credential_reference() {

@@ -6,8 +6,9 @@ use serde::Serialize;
 
 use anyhow::Context;
 use codexify::config::{
-    Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand, config_path_for_quickstart,
-    config_path_for_service, load_config, load_project_catalog_for_cli,
+    BrowserCommand, Cli, CliCommand, ProjectsCommand, ProjectsListArgs, ServiceCommand,
+    config_path_for_quickstart, config_path_for_service, load_config, load_config_quiet,
+    load_config_quiet_read_only, load_project_catalog_for_cli,
 };
 use codexify::doctor;
 use codexify::legacy_migration;
@@ -166,6 +167,9 @@ async fn main() {
 async fn run(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(command) = cli.command.take() {
         match command {
+            CliCommand::Browser { command } => {
+                return run_browser(cli, command).await;
+            }
             CliCommand::Chat => {
                 println!("{}", codexify::owner_chat::dashboard_url().await?);
                 return Ok(());
@@ -246,6 +250,120 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
     start_http_server(config)
         .await
         .context("start Codexify server")
+}
+
+async fn run_browser(cli: Cli, command: BrowserCommand) -> anyhow::Result<()> {
+    use codexify::agent_automation::{BrowserCompanionManager, BrowserLifecycleState};
+
+    let config = if matches!(command, BrowserCommand::Status(_)) {
+        load_config_quiet_read_only(cli)
+    } else {
+        load_config_quiet(cli)
+    }
+    .map_err(anyhow::Error::msg)?;
+    let manager = BrowserCompanionManager::from_config(&config.markdown_chat.automation)
+        .map_err(anyhow::Error::msg)?;
+    match command {
+        BrowserCommand::Install => {
+            let receipt = manager.install().await.map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&format!(
+                "Installed browser companion {} for {} at {}\n",
+                receipt.version,
+                receipt.platform,
+                receipt.runtime_dir.display()
+            ))?;
+        }
+        BrowserCommand::Start => {
+            let status = manager.start().await.map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&render_browser_status(&status))?;
+        }
+        BrowserCommand::Stop => {
+            let status = manager.stop().await.map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&render_browser_status(&status))?;
+        }
+        BrowserCommand::Login => {
+            let status = manager.login().await.map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&render_browser_status(&status))?;
+        }
+        BrowserCommand::Reveal => {
+            let status = manager.reveal().await.map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&render_browser_status(&status))?;
+        }
+        BrowserCommand::Status(args) => {
+            let status = manager.status().await;
+            if args.json {
+                codexify::terminal::write_stdout(&format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&status)?
+                ))?;
+            } else {
+                codexify::terminal::write_stdout(&render_browser_status(&status))?;
+            }
+            std::io::stdout().flush()?;
+            let exit_code = match status.state {
+                BrowserLifecycleState::Ready | BrowserLifecycleState::Busy => 0,
+                BrowserLifecycleState::Stopped => 3,
+                BrowserLifecycleState::Disabled | BrowserLifecycleState::NotInstalled => 4,
+                BrowserLifecycleState::Incompatible
+                | BrowserLifecycleState::AuthenticationRequired
+                | BrowserLifecycleState::AccountChanged
+                | BrowserLifecycleState::Unavailable => 1,
+            };
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_browser_status(status: &codexify::agent_automation::BrowserCompanionStatus) -> String {
+    use codexify::terminal::{ACCENT, EMPHASIS, FAILURE, MUTED, SUCCESS, WARNING, paint};
+
+    let (label, style) = match status.state {
+        codexify::agent_automation::BrowserLifecycleState::Ready => ("ready", SUCCESS),
+        codexify::agent_automation::BrowserLifecycleState::Busy => ("busy", ACCENT),
+        codexify::agent_automation::BrowserLifecycleState::Stopped => ("stopped", WARNING),
+        codexify::agent_automation::BrowserLifecycleState::Disabled => ("disabled", MUTED),
+        codexify::agent_automation::BrowserLifecycleState::NotInstalled => {
+            ("not installed", WARNING)
+        }
+        codexify::agent_automation::BrowserLifecycleState::AuthenticationRequired => {
+            ("authentication required", WARNING)
+        }
+        codexify::agent_automation::BrowserLifecycleState::AccountChanged => {
+            ("account changed", WARNING)
+        }
+        codexify::agent_automation::BrowserLifecycleState::Incompatible => {
+            ("incompatible", FAILURE)
+        }
+        codexify::agent_automation::BrowserLifecycleState::Unavailable => ("unavailable", FAILURE),
+    };
+    let mut output = format!(
+        "{} {}\n{} {}\n{} {}\n",
+        paint(EMPHASIS, "Browser companion:"),
+        paint(style, label),
+        paint(MUTED, "Version:"),
+        status.version,
+        paint(MUTED, "Platform:"),
+        status.platform
+    );
+    if let Some(path) = &status.runtime_dir {
+        output.push_str(&format!(
+            "{} {}\n",
+            paint(MUTED, "Runtime:"),
+            path.display()
+        ));
+    }
+    output.push_str(&format!(
+        "{} {}\n",
+        paint(MUTED, "Log:"),
+        status.log_path.display()
+    ));
+    if let Some(detail) = &status.detail {
+        output.push_str(&format!("{}\n", paint(style, detail)));
+    }
+    output
 }
 
 async fn run_service(cli: &Cli, command: ServiceCommand) -> anyhow::Result<()> {

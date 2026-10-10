@@ -1,6 +1,6 @@
 # Agent Chat Browser Automation Progress
 
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-10
 
 **Branch:** `feat/agent-chat-browser-automation`
 
@@ -537,6 +537,12 @@ Implement the approved agent-chat browser automation architecture completely: re
   - companion suite — 43 passed, 0 failed, 183 assertions;
   - companion typecheck and build passed (146.83 KiB bundle);
   - CI workflow contract test passed.
+- Committed the pinned cross-language protocol contract as `f8abcc4`
+  (`test: pin browser companion protocol contract`).
+- Task 11 is now active: add explicit browser-companion lifecycle commands,
+  versioned/checksummed installation, doctor states, user-session launch handling,
+  package smoke tests, and release/installer integration without changing ordinary
+  installations when automation is disabled.
 - Resumed Task 10 after exhaustively rereading the complete 1,336-line approved
   architecture, this full progress journal, and the complete 13-task execution
   plan. The checkout contains an uncommitted protocol-contract slice: a checked-in
@@ -553,3 +559,72 @@ Implement the approved agent-chat browser automation architecture completely: re
   - the restart contract is red only because its assertion expected a literal
     `not found` string while the strict Rust client intentionally maps the 404 to
     the bounded redacted error `Browser companion resource is unavailable`.
+- Resumed at the committed Task 10 boundary (`f8abcc4`) and exhaustively reread the
+  complete 1,336-line revised architecture plus this complete progress journal.
+  Task 11 is the active implementation boundary: lifecycle CLI, private versioned
+  installation, checksum verification, user-session process control, doctor
+  diagnostics, package smoke tests, and opt-in release/installer integration.
+- Completed the Task 11 surface audit:
+  - no browser lifecycle/install module or CLI command family existed;
+  - doctor had no companion-specific state check;
+  - CI tested and bundled source but did not package or smoke-test an installed app;
+  - release workflows and installers carried only the Codexify server artifacts.
+- Task 11 CLI red-green slice:
+  - red: focused config tests failed because `CliCommand::Browser` and
+    `BrowserCommand` did not exist;
+  - green: `codexify browser install|start|stop|status|login|reveal` now parses,
+    including `browser status --json` with global config arguments;
+  - both focused parser tests pass.
+- Task 11 private-runtime red-green slice:
+  - red: a new integration target failed because no browser release asset,
+    versioned runtime layout, checksum verifier, manifest validator, or installer
+    existed;
+  - green: the lifecycle module now selects the exact platform asset for the current
+    Codexify version, verifies one exact SHA-256 entry, safely extracts bounded
+    tar/ZIP packages, rejects unsafe paths and incompatible manifests, and publishes
+    atomically under `~/.codexify/browser/runtime/<version>/` with private modes;
+  - disabled automation refuses installation before creating browser state;
+  - status distinguishes disabled, missing, stopped, authentication-required,
+    account-changed, busy, ready, incompatible, and unavailable states without
+    returning account fingerprints or companion credentials;
+  - `cargo test --test browser_companion_install` — 4 passed.
+- Resumed from the uncommitted Task 11 lifecycle handoff after rereading the full
+  1,336-line revised architecture and this complete progress journal. The current
+  lifecycle/install implementation was audited rather than assumed complete.
+- Focused Task 11 verification is green:
+  - `cargo test --test browser_companion_cli` — 2 passed;
+  - `cargo test --test browser_companion_install` — 6 passed, including the real
+    detached user-process start/login/reveal/stop fixture;
+  - the focused CLI parser tests and the doctor lifecycle-state mapping test each
+    pass.
+- Task 11 status-read red-green slice:
+  - red: a legacy-config integration test proved that `browser status` used the
+    mutating config loader and silently persisted a schema migration plus backup;
+  - green: status now uses the read-only quiet loader, while lifecycle mutations
+    retain the normal migration path; the focused integration test passes and the
+    config bytes remain unchanged.
+- Task 11 process-ownership red-green slice:
+  - red: a stale but private descriptor whose PID had been reused for an unrelated
+    process allowed `browser stop` to signal that PID without proving the
+    authenticated loopback companion still answered;
+  - green: stop now requires a bounded authenticated health response and exact
+    build before signalling the descriptor PID; the regression leaves the
+    unrelated process alive and the full install/lifecycle suite passes 7 tests.
+- Cross-language contract repair completed before packaging continued:
+  - red: the committed Rust client rejected TypeScript-valid 256-code-unit model
+    and effort labels, 1 KiB effort reasons, 64 KiB attention messages, and a valid
+    request whose JSON escaping exceeded the old ad-hoc prompt-plus-slack limit;
+  - red: NUL-containing unread Markdown and XML-escaped prompt expansion reached
+    the fake companion instead of failing before network access;
+  - green: Rust now applies the protocol's 1 MiB JSON bound, exact visible-text and
+    delta bounds, NUL rejection, and the same fixed XML-escaped prompt rendering
+    used by the TypeScript companion; `agent_automation_companion` passes 17 tests.
+- Task 11 lifecycle/diagnostic aggregate verification is green:
+  - browser CLI integration — 3 passed;
+  - browser install/lifecycle integration — 7 passed;
+  - Rust companion protocol integration — 17 passed;
+  - checked-in protocol fixtures — 2 passed, with 3 real-Bun tests intentionally
+    gated for explicit CI execution;
+  - doctor-focused library suite — 17 passed;
+  - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check`, and
+    `git diff --check` passed.
