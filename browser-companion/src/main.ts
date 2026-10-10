@@ -6,8 +6,11 @@ import { SingleWindowCoordinator } from "./browser-window";
 import { ChatGptBrowserDriver } from "./chatgpt-driver";
 import { startControlServer, type ControlServer } from "./control-server";
 import { ElectronSingleWindowSurface } from "./electron-surface";
+import { protocolBuild, validateProtocolBuild } from "./protocol";
 
-const BUILD = process.env.CODEXIFY_BROWSER_BUILD ?? "1.0.0-protocol-v1";
+const BUILD = process.env.CODEXIFY_BROWSER_BUILD
+  ? validateProtocolBuild(process.env.CODEXIFY_BROWSER_BUILD)
+  : protocolBuild("1.0.0");
 const root = resolve(process.env.CODEXIFY_BROWSER_HOME ?? join(homedir(), ".codexify", "browser"));
 const profilePath = join(root, "profile");
 const descriptorPath = resolve(process.env.CODEXIFY_BROWSER_DESCRIPTOR ?? join(root, "descriptor.json"));

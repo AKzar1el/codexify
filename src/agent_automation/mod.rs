@@ -7,7 +7,8 @@ pub use companion::{
     CompanionActionSnapshot, CompanionActionState, CompanionAttention, CompanionEvent,
     CompanionEventKind, CompanionHealth, CompanionSelection, CompanionSessionStatus,
     CompanionUnreadMessage, EffortCapability, ExecuteActionRequest, ModelCapability,
-    PROTOCOL_VERSION, RevealWindowReceipt, RevealWindowRequest,
+    PROTOCOL_BUILD_SUFFIX, PROTOCOL_SCHEMA_HASH, PROTOCOL_VERSION, RevealWindowReceipt,
+    RevealWindowRequest,
 };
 pub use store::{
     AgentAutomationStore, AutomationActionKind, AutomationActionState, AutomationActionStatus,

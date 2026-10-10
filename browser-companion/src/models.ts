@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { CapabilityCatalog, EffortCapability, ModelCapability } from "./protocol";
+import { protocolBuild, type CapabilityCatalog, type EffortCapability, type ModelCapability } from "./protocol";
 
 export type BrowserModelId = "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-6-sol";
 export type BrowserEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -56,7 +56,7 @@ function catalogRevision(accountFingerprint: string, models: readonly ModelCapab
 export function buildCapabilityCatalog(
   capabilities: AccountCapabilities,
   accountFingerprint: string,
-  build = "development",
+  build = protocolBuild("development"),
 ): CapabilityCatalog {
   if (!/^[A-Za-z0-9_.-]{1,256}$/.test(accountFingerprint)) {
     throw new Error("ChatGPT account fingerprint is invalid");

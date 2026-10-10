@@ -20,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const BUILD: &str = "test-build-v1";
+const BUILD: &str =
+    "test-build-v1+protocol.d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -607,6 +608,84 @@ async fn invalid_capability_catalogs_fail_closed() {
 }
 
 #[tokio::test]
+async fn capability_text_bounds_match_the_typescript_protocol() {
+    async fn wide_catalog(headers: HeaderMap) -> Response {
+        if !authorized(&headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        axum::Json(json!({
+            "protocolVersion":PROTOCOL_VERSION,
+            "build":BUILD,
+            "accountFingerprint":"account_fingerprint_1",
+            "catalogRevision":"catalog_revision_1",
+            "models":[{
+                "id":"gpt-6-sol",
+                "label":"M".repeat(200),
+                "efforts":[
+                    {
+                        "id":"xhigh",
+                        "label":"E".repeat(200),
+                        "available":false,
+                        "reason":"R".repeat(500)
+                    }
+                ]
+            }]
+        }))
+        .into_response()
+    }
+
+    let app = Router::new().route("/v1/session/capabilities", post(wide_catalog));
+    let (endpoint, task) = spawn_fake(app).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+
+    let catalog = client
+        .capabilities(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(catalog.models[0].label.len(), 200);
+    assert_eq!(catalog.models[0].efforts[0].label.len(), 200);
+    assert_eq!(catalog.models[0].efforts[0].reason.as_ref().unwrap().len(), 500);
+    task.abort();
+}
+
+#[tokio::test]
+async fn action_attention_uses_the_protocol_delta_bound() {
+    async fn action_with_attention(headers: HeaderMap) -> Response {
+        if !authorized(&headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        let detail = "detail".repeat(900);
+        axum::Json(json!({
+            "protocolVersion":PROTOCOL_VERSION,
+            "build":BUILD,
+            "actionId":"action_1",
+            "state":"approval_required",
+            "sendAccepted":true,
+            "canonicalUrl":"https://chatgpt.com/c/example",
+            "selected":{"model":"gpt-6-sol","effort":"high"},
+            "lastEventSequence":7,
+            "attention":{"code":"approval_required","message":detail}
+        }))
+        .into_response()
+    }
+
+    let app = Router::new().route("/v1/actions/action_1", get(action_with_attention));
+    let (endpoint, task) = spawn_fake(app).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+
+    let snapshot = client
+        .action("action_1", &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.attention.unwrap().message.unwrap().len(), 5400);
+    task.abort();
+}
+
+#[tokio::test]
 async fn cancellation_and_response_bounds_are_enforced_without_echoing_payloads() {
     async fn slow_health() -> Response {
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -712,6 +791,27 @@ fn action_request() -> ExecuteActionRequest {
     }
 }
 
+#[test]
+fn action_prompt_wire_fields_are_camel_case_like_the_protocol_envelope() {
+    let value = serde_json::to_value(ExecuteActionRequest {
+        prompt: ActionPrompt::OfflineCombined {
+            batch_id: "batch_1".into(),
+            messages: vec![CompanionUnreadMessage {
+                id: "message_1".into(),
+                markdown: "Continue.".into(),
+            }],
+            goal_revision: 3,
+        },
+        ..action_request()
+    })
+    .unwrap();
+
+    assert_eq!(value["prompt"]["batchId"], "batch_1");
+    assert_eq!(value["prompt"]["goalRevision"], 3);
+    assert!(value["prompt"].get("batch_id").is_none());
+    assert!(value["prompt"].get("goal_revision").is_none());
+}
+
 #[tokio::test]
 async fn malformed_execute_receipt_reconciles_status_without_replaying_send() {
     let state = FakeState::default();
@@ -792,6 +892,24 @@ async fn invalid_action_data_is_rejected_before_network_access() {
         messages: vec![CompanionUnreadMessage {
             id: "message_1".into(),
             markdown: "x".repeat(300 * 1024),
+        }],
+    };
+    invalid.push(request);
+    let mut request = action_request();
+    request.prompt = ActionPrompt::OfflineChat {
+        batch_id: "batch_1".into(),
+        messages: vec![CompanionUnreadMessage {
+            id: "message_1".into(),
+            markdown: "x\0y".into(),
+        }],
+    };
+    invalid.push(request);
+    let mut request = action_request();
+    request.prompt = ActionPrompt::OfflineChat {
+        batch_id: "batch_1".into(),
+        messages: vec![CompanionUnreadMessage {
+            id: "message_1".into(),
+            markdown: "&".repeat(60 * 1024),
         }],
     };
     invalid.push(request);

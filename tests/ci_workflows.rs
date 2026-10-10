@@ -63,6 +63,26 @@ fn notification_integration_is_not_silently_skipped_in_ci() {
 }
 
 #[test]
+fn browser_companion_contract_is_built_and_exercised_in_ci() {
+    let ci = workflow(".github/workflows/ci.yml");
+    let check = job_section(&ci, "check", "diff-widget");
+
+    assert!(check.contains("oven-sh/setup-bun@v2.2.0"));
+    assert!(check.contains("bun-version: 1.4.0"));
+    assert!(check.contains("bun install --frozen-lockfile"));
+    assert!(check.contains("node scripts/generate-browser-companion-protocol-fixtures.mjs"));
+    assert!(check.contains("node scripts/update-browser-companion-upstream.mjs --check"));
+    assert!(check.contains("bun test"));
+    assert!(check.contains("bun run typecheck"));
+    assert!(check.contains("bun run build"));
+    assert!(check.contains("node --test scripts/test-browser-companion-boundary.mjs"));
+    assert!(check.contains("CODEXIFY_TEST_BROWSER_COMPANION_BUN:"));
+    assert!(
+        check.contains("cargo test --test browser_companion_contract -- --ignored --nocapture")
+    );
+}
+
+#[test]
 fn release_builds_run_parallel_to_validation_and_publish_only_after_both() {
     let release = workflow(".github/workflows/release.yml");
     let build = job_section(&release, "build", "deploy-installers");

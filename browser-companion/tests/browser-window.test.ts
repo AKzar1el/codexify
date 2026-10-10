@@ -5,6 +5,9 @@ import {
   type BrowserDriver,
   type DriverExecution,
 } from "../src/browser-window";
+import { protocolBuild } from "../src/protocol";
+
+const TEST_BUILD = protocolBuild("test-build");
 
 const request = (id: string): ExecuteActionRequest => ({
   actionId:id,
@@ -36,7 +39,7 @@ class DeferredDriver implements BrowserDriver {
   async login() { this.authenticated = true; return this.health(); }
   async capabilities(): Promise<CapabilityCatalog> {
     return {
-      protocolVersion:1, build:"test-build", accountFingerprint:"account-1", catalogRevision:"catalog-1",
+      protocolVersion:1, build:TEST_BUILD, accountFingerprint:"account-1", catalogRevision:"catalog-1",
       models:[{ id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[{ id:"high", label:"High", available:true, reason:null }] }],
     };
   }
@@ -65,7 +68,7 @@ async function collect(coordinator: SingleWindowCoordinator, actionId: string): 
 
 test("one companion window refuses a second task while a response is generating", async () => {
   const driver = new DeferredDriver();
-  const coordinator = new SingleWindowCoordinator(driver, "test-build");
+  const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
   const first = await coordinator.execute(request("first"));
   expect(first.state).toBe("queued");
   const eventsPromise = collect(coordinator, "first");
@@ -84,7 +87,7 @@ test("one companion window refuses a second task while a response is generating"
 
 test("execute is idempotent but an action ID cannot be rebound to another request", async () => {
   const driver = new DeferredDriver();
-  const coordinator = new SingleWindowCoordinator(driver, "test-build");
+  const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
   const submitted = request("same");
   expect((await coordinator.execute(submitted)).actionId).toBe("same");
   expect((await coordinator.execute(structuredClone(submitted))).actionId).toBe("same");
@@ -96,7 +99,7 @@ test("execute is idempotent but an action ID cannot be rebound to another reques
 
 test("cancellation is idempotent and never starts another action", async () => {
   const driver = new DeferredDriver();
-  const coordinator = new SingleWindowCoordinator(driver, "test-build");
+  const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
   await coordinator.execute(request("cancel"));
   await Bun.sleep(10);
   const first = await coordinator.cancel({ actionId:"cancel", idempotencyKey:"cancel-1" });
@@ -112,7 +115,7 @@ test("cancellation is idempotent and never starts another action", async () => {
 test("a manually busy shared window is rejected before navigation or queue ownership", async () => {
   const driver = new DeferredDriver();
   driver.status = "busy";
-  const coordinator = new SingleWindowCoordinator(driver, "test-build");
+  const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
 
   await expect(coordinator.execute(request("manual-busy"))).rejects.toThrow("not idle");
 

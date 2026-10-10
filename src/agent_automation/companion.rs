@@ -16,6 +16,10 @@ use crate::markdown_chat::AgentAutomationConfig;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
+pub const PROTOCOL_SCHEMA_HASH: &str =
+    "d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
+pub const PROTOCOL_BUILD_SUFFIX: &str =
+    "+protocol.d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -139,7 +143,11 @@ pub struct ExecuteActionRequest {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ActionPrompt {
     PairVerify {
         reference: String,
@@ -1000,8 +1008,9 @@ fn validate_build(value: &str) -> Result<(), String> {
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+        || !value.ends_with(PROTOCOL_BUILD_SUFFIX)
     {
-        return Err("Browser companion build identifier is invalid".into());
+        return Err("Browser companion build is not bound to the current protocol schema".into());
     }
     Ok(())
 }

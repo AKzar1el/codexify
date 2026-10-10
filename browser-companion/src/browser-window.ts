@@ -15,6 +15,7 @@ import {
   type CapabilityCatalog,
   type CompanionHealth,
   type ExecuteActionRequest,
+  validateProtocolBuild,
 } from "./protocol";
 
 type WithoutEventEnvelope<T> = T extends ActionEvent
@@ -118,7 +119,7 @@ export class SingleWindowCoordinator {
   private activeActionId: string | null = null;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string) {
-    if (!/^[A-Za-z0-9_.-]{1,256}$/.test(build)) throw new Error("Browser companion build identifier is invalid");
+    validateProtocolBuild(build);
   }
 
   async health(): Promise<CompanionHealth> {

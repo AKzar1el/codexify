@@ -504,3 +504,52 @@ Implement the approved agent-chat browser automation architecture completely: re
   - `node --test scripts/test-browser-companion-boundary.mjs` — 4 passed;
   - `node scripts/update-browser-companion-upstream.mjs --source
     /tmp/codex-chatgpt-web-v6.1.7 --check` — passed at exact commit `f9ad4ae`.
+- Committed the complete single-window companion extraction as `0b9052d`
+  (`feat: add single-window ChatGPT browser companion`).
+- Task 10 is now active: exercise the real TypeScript protocol server through the
+  Rust `BrowserCompanionClient`, then add restart/cancellation/build-mismatch
+  contract coverage before lifecycle packaging.
+- Completed the Rust↔TypeScript protocol contract:
+  - added a checked-in canonical protocol-v1 schema and SHA-256 build binding;
+    descriptors and every response now require a build suffix tied to those exact
+    schema bytes, so a self-consistent but incompatible companion is rejected;
+  - added generated golden JSON covering descriptor, health, capabilities,
+    reveal, all four prompt kinds, action snapshots, cancellation, and every event
+    variant; strict TypeScript parsing and Rust serialization/deserialization both
+    consume the same fixtures;
+  - the real TypeScript fixture server is now exercised through the Rust HTTP
+    client for health, login, capabilities, reveal, execute, status, ordered NDJSON
+    events, idempotent replay, accepted cancellation, build mismatch, and companion
+    restart;
+  - the cross-language test exposed that nested Rust prompt fields were serialized
+    as `batch_id`/`goal_revision`; the wire contract now correctly uses camelCase
+    throughout, with a dedicated regression test;
+  - accepted cancellation remains `ambiguous` across the real process boundary and
+    cannot be converted into a replayable failed action after restart.
+- CI now installs pinned Bun 1.4.0, regenerates and diff-checks fixtures, verifies
+  the upstream extraction boundary, tests/typechecks/builds the companion, runs the
+  source-boundary checks, and executes all ignored Rust↔TypeScript contract tests.
+- Task 10 verification:
+  - Rust fake-companion suite — 14 passed;
+  - Rust golden fixture suite — 2 passed, with the 3 Bun-backed process tests
+    explicitly gated from ordinary Cargo runs;
+  - Bun-backed Rust process suite — 3 passed;
+  - companion suite — 43 passed, 0 failed, 183 assertions;
+  - companion typecheck and build passed (146.83 KiB bundle);
+  - CI workflow contract test passed.
+- Resumed Task 10 after exhaustively rereading the complete 1,336-line approved
+  architecture, this full progress journal, and the complete 13-task execution
+  plan. The checkout contains an uncommitted protocol-contract slice: a checked-in
+  protocol schema/hash, generated golden fixtures, Rust and TypeScript parsers,
+  and a cross-process Bun fixture server. The next step is to run the focused
+  contract suites, identify the remaining red cases, and complete restart,
+  cancellation, bounds, authentication, and build-mismatch coverage before the
+  Task 10 commit.
+- Task 10 focused verification began:
+  - TypeScript golden-contract tests pass (3 tests, 17 assertions) and strict
+    typechecking passes;
+  - Rust golden-fixture parsing passes;
+  - the real Bun server round-trip and accepted-action cancellation tests pass;
+  - the restart contract is red only because its assertion expected a literal
+    `not found` string while the strict Rust client intentionally maps the 404 to
+    the bounded redacted error `Browser companion resource is unavailable`.

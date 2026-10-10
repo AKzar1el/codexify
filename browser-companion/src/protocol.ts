@@ -2,6 +2,8 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
+export const PROTOCOL_SCHEMA_HASH = "d70114c06e8c98d320f7f726f2bec6147602d63bb0c980d786cc42486e0c7bac" as const;
+export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
 export const MAX_EVENT_LINE_BYTES = 128 * 1024;
@@ -62,6 +64,28 @@ export const chatGptUrlSchema = z.string().superRefine((value, context) => {
     validateChatGptConversationUrl(value);
   } catch (error) {
     context.addIssue({ code: "custom", message: error instanceof Error ? error.message : "Invalid ChatGPT conversation URL" });
+  }
+});
+
+export function protocolBuild(version: string): string {
+  if (!/^[A-Za-z0-9._-]{1,53}$/.test(version)) throw new Error("Browser companion version is invalid");
+  return `${version}${PROTOCOL_BUILD_SUFFIX}`;
+}
+
+export function validateProtocolBuild(value: string): string {
+  if (value.length > 128
+    || !/^[A-Za-z0-9._+-]+$/.test(value)
+    || !value.endsWith(PROTOCOL_BUILD_SUFFIX)) {
+    throw new Error("Browser companion build is not bound to the current protocol schema");
+  }
+  return value;
+}
+
+export const protocolBuildSchema = boundedVisibleSchema(128).superRefine((value, context) => {
+  try {
+    validateProtocolBuild(value);
+  } catch (error) {
+    context.addIssue({ code:"custom", message:error instanceof Error ? error.message : "Invalid browser companion build" });
   }
 });
 
@@ -207,7 +231,7 @@ export type ModelCapability = z.infer<typeof modelCapabilitySchema>;
 
 export const capabilityCatalogSchema = z.strictObject({
   protocolVersion: z.literal(PROTOCOL_VERSION),
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   accountFingerprint: opaqueIdSchema,
   catalogRevision: opaqueIdSchema,
   models: z.array(modelCapabilitySchema).min(1).max(32),
@@ -217,7 +241,7 @@ export type CapabilityCatalog = z.infer<typeof capabilityCatalogSchema>;
 export const healthSchema = z.strictObject({
   protocolVersion: z.literal(PROTOCOL_VERSION),
   kind: z.literal(COMPANION_KIND),
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   status: sessionStatusSchema,
   authenticated: z.boolean(),
   accountFingerprint: opaqueIdSchema.nullable(),
@@ -227,7 +251,7 @@ export type CompanionHealth = z.infer<typeof healthSchema>;
 
 export const actionSnapshotSchema = z.strictObject({
   protocolVersion: z.literal(PROTOCOL_VERSION),
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   actionId: opaqueIdSchema,
   state: actionStateSchema,
   sendAccepted: z.boolean(),
@@ -281,14 +305,14 @@ export const descriptorSchema = z.strictObject({
   pid: z.number().int().positive(),
   endpoint: z.string().url(),
   token: companionTokenSchema,
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   createdAt: z.string().datetime({ offset:true }),
 });
 export type CompanionDescriptor = z.infer<typeof descriptorSchema>;
 
 export const cancelActionReceiptSchema = z.strictObject({
   protocolVersion: z.literal(PROTOCOL_VERSION),
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   actionId: opaqueIdSchema,
   state: actionStateSchema,
   cancelled: z.boolean(),
@@ -296,7 +320,7 @@ export const cancelActionReceiptSchema = z.strictObject({
 
 export const revealWindowReceiptSchema = z.strictObject({
   protocolVersion: z.literal(PROTOCOL_VERSION),
-  build: boundedVisibleSchema(256),
+  build: protocolBuildSchema,
   revealed: z.boolean(),
   activeActionId: opaqueIdSchema.nullable(),
 });

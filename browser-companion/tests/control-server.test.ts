@@ -6,6 +6,9 @@ import { expect, test } from "bun:test";
 import type { CapabilityCatalog } from "../src/protocol";
 import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } from "../src/browser-window";
 import { startControlServer } from "../src/control-server";
+import { protocolBuild } from "../src/protocol";
+
+const TEST_BUILD = protocolBuild("test-build");
 
 class ImmediateDriver implements BrowserDriver {
   async health() {
@@ -19,7 +22,7 @@ class ImmediateDriver implements BrowserDriver {
   async login() { return this.health(); }
   async capabilities(): Promise<CapabilityCatalog> {
     return {
-      protocolVersion:1, build:"test-build", accountFingerprint:"account-test", catalogRevision:"catalog-test",
+      protocolVersion:1, build:TEST_BUILD, accountFingerprint:"account-test", catalogRevision:"catalog-test",
       models:[{ id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[{ id:"high", label:"High", available:true, reason:null }] }],
     };
   }
@@ -65,7 +68,7 @@ function executeBody() {
 test("private loopback server enforces bearer auth and streams bounded NDJSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "codexify-browser-control-"));
   const descriptorPath = join(root, "descriptor.json");
-  const coordinator = new SingleWindowCoordinator(new ImmediateDriver(), "test-build");
+  const coordinator = new SingleWindowCoordinator(new ImmediateDriver(), TEST_BUILD);
   const server = await startControlServer(coordinator, descriptorPath);
   try {
     const descriptor = JSON.parse(await readFile(descriptorPath, "utf8"));
@@ -105,7 +108,7 @@ test("private loopback server enforces bearer auth and streams bounded NDJSON", 
 
 test("request schemas are strict and descriptor symlinks fail closed", async () => {
   const root = await mkdtemp(join(tmpdir(), "codexify-browser-control-"));
-  const coordinator = new SingleWindowCoordinator(new ImmediateDriver(), "test-build");
+  const coordinator = new SingleWindowCoordinator(new ImmediateDriver(), TEST_BUILD);
   const server = await startControlServer(coordinator, join(root, "descriptor.json"));
   try {
     const headers = { Authorization:`Bearer ${server.token}`, "Content-Type":"application/json" };
@@ -127,7 +130,7 @@ test("request schemas are strict and descriptor symlinks fail closed", async () 
 
 test("shutdown aborts an active action before waiting for its NDJSON client", async () => {
   const root = await mkdtemp(join(tmpdir(), "codexify-browser-control-"));
-  const coordinator = new SingleWindowCoordinator(new BlockingDriver(), "test-build");
+  const coordinator = new SingleWindowCoordinator(new BlockingDriver(), TEST_BUILD);
   const server = await startControlServer(coordinator, join(root, "descriptor.json"));
   const headers = { Authorization:`Bearer ${server.token}` };
   await fetch(`${server.endpoint}/v1/actions/execute`, {

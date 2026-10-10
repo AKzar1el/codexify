@@ -23,6 +23,29 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: oven-sh/setup-bun@v2.2.0
+        id: browser-bun
+        with:
+          bun-version: 1.4.0
+
+      - name: Install browser companion dependencies
+        working-directory: browser-companion
+        run: bun install --frozen-lockfile
+
+      - name: Test and build browser companion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/generate-browser-companion-protocol-fixtures.mjs
+          git diff --exit-code -- browser-companion/protocol-fixtures/v1.json
+          node scripts/update-browser-companion-upstream.mjs --check
+          cd browser-companion
+          bun test
+          bun run typecheck
+          bun run build
+          cd ..
+          node --test scripts/test-browser-companion-boundary.mjs
+
       - name: Validate POSIX installer
         run: |
           sh -n install.sh
@@ -62,6 +85,11 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+      - name: Test Rust and TypeScript browser companion contract
+        env:
+          CODEXIFY_TEST_BROWSER_COMPANION_BUN: ${{ steps.browser-bun.outputs.bun-path }}
+        run: cargo test --test browser_companion_contract -- --ignored --nocapture
 
       - uses: actions/setup-python@v7
         id: notification-python
