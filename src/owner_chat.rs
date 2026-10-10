@@ -1264,7 +1264,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
 
     #[derive(Clone, Default)]
     struct OwnerCompanionState {

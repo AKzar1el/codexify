@@ -50,6 +50,20 @@ class BlockingDriver extends ImmediateDriver {
   }
 }
 
+class PrivateFailureDriver extends ImmediateDriver {
+  override async capabilities(): Promise<CapabilityCatalog> {
+    throw new Error(
+      "capability probe failed at https://chatgpt.com/c/private-conversation with private page text",
+    );
+  }
+
+  override async reveal() {
+    throw new Error(
+      "reveal failed at https://chatgpt.com/c/private-conversation with private browser prompt",
+    );
+  }
+}
+
 function executeBody() {
   return {
     actionId:"control-action",
@@ -147,4 +161,31 @@ test("shutdown aborts an active action before waiting for its NDJSON client", as
 
   const events = (await stream.text()).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
   expect(events.at(-1)?.type).toBe("ambiguous_send");
+});
+
+test("control responses never expose raw browser page or request failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codexify-browser-control-"));
+  const coordinator = new SingleWindowCoordinator(new PrivateFailureDriver(), TEST_BUILD);
+  const server = await startControlServer(coordinator, join(root, "descriptor.json"));
+  const headers = { Authorization:`Bearer ${server.token}`, "Content-Type":"application/json" };
+  try {
+    for (const [path, body] of [
+      ["/v1/session/capabilities", {}],
+      ["/v1/window/reveal", { url:"https://chatgpt.com/c/private-conversation" }],
+    ] as const) {
+      const response = await fetch(`${server.endpoint}${path}`, {
+        method:"POST",
+        headers,
+        body:JSON.stringify(body),
+      });
+      const text = await response.text();
+      expect(response.status).toBe(409);
+      expect(text).toBe("Browser companion operation failed");
+      expect(text).not.toContain("private-conversation");
+      expect(text).not.toContain("private page text");
+      expect(text).not.toContain("private browser prompt");
+    }
+  } finally {
+    await server.close();
+  }
 });

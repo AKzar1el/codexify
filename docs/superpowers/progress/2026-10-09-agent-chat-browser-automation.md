@@ -735,3 +735,68 @@ Implement the approved agent-chat browser automation architecture completely: re
   `edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2`,
   `git diff --check` remains clean, all four browser-companion source-boundary tests
   pass, and the upstream extraction check still matches exact commit `f9ad4ae`.
+- Committed the complete Task 11 package/lifecycle/release slice as `2068881`
+  (`feat: package agent chat browser companion`). Task 12 is now active: document
+  the operator and security model, complete redaction/audit coverage, and record the
+  opt-in migration and live-test limitations before final aggregate verification.
+- Task 12 privacy hardening is in progress under TDD:
+  - new red tests proved generic JSON payload redaction exposed paired ChatGPT URLs,
+    browser prompts/output, goal Markdown, mirrored messages, and pairing state;
+  - the redactor now treats those automation-specific keys as sensitive while
+    preserving nonprivate operational status;
+  - `goal_finish` summary/reason inputs are now write-only in the advertised schema,
+    and every `goal_read`/`goal_finish` result suppresses its complete payload preview;
+  - tool logging now uses the generic `<private tool output>` placeholder and focused
+    request/response tests prove goal text and blocked reasons never enter previews;
+  - focused redaction and goal/tool-logging tests are green.
+- Documentation is now being driven by an integration contract across README,
+  REFERENCE, ARCHITECTURE, CHANGELOG, the example config, and third-party notices.
+  The contract first failed on the missing user-facing browser-fallback section;
+  those operator, lifecycle, pairing, queue, goal, failure, security, and migration
+  explanations have now been added and await the focused documentation rerun.
+- Task 12 documentation and browser-error privacy are now green in focused tests:
+  - the cross-document integration contract passes after adding user, operator,
+    architecture, release-note, lifecycle, pairing, queue, goal, and fail-closed
+    guidance;
+  - an audit-shape test confirms candidate URLs, pairing references, prompts, goal
+    text, and account fingerprints never enter audit values;
+  - a new companion test first reproduced raw Playwright/page failure text crossing
+    the protocol, including a paired URL and prompt excerpt; unknown failures now
+    map to a generic operational error, controlled companion errors keep their
+    bounded message, and dynamic health/model/ambiguous-Send wrappers no longer
+    forward arbitrary underlying text;
+  - the focused companion error tests and strict TypeScript typecheck pass.
+- Control-server error redaction is now covered independently: a real authenticated
+  fixture first returned raw capability/reveal failures containing a paired URL,
+  page text, and browser prompt; non-protocol internal failures now pass through the
+  companion's public error boundary before HTTP serialization. All four control
+  server tests (30 assertions) and strict TypeScript typechecking pass.
+- Task 12 aggregate privacy/documentation verification is green:
+  - redaction-focused tests — 9 passed;
+  - audit-focused tests — 18 passed;
+  - tool-logging-focused tests — 18 passed;
+  - complete skills/documentation suite — 104 passed;
+  - agent automation tool integration — 11 passed.
+  These runs cover automation-specific private keys, write-only goal completion
+  arguments, private goal outputs, audit shape-only retention, generic companion
+  failures, the cross-document contract, and unchanged pairing/goal behavior.
+- A broader owner-chat rerun exposed one stale test descriptor build that predated
+  the protocol-schema suffix. Updating that fixture to the current exact
+  protocol-bound build restored the credential-isolation API test. The complete
+  owner-chat library suite (11), agent-automation tool suite (11), and
+  skills/documentation suite (104) now pass together.
+- Task 12 final static verification is green: `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `git diff --check` pass; the
+  complete companion package also passes 52 tests with 231 assertions, strict
+  typechecking, and a fresh bundle build.
+- Account-bound ChatGPT smoke tests remain intentionally unrun: they require the
+  user's authenticated companion profile and a dedicated real conversation, are
+  opt-in by architecture, and never run in ordinary CI. All non-account package,
+  protocol, browser-fixture, Rust integration, UI, installer, and release paths are
+  covered before that live operational validation.
+- The final documentation pass now distinguishes local runtime activation from the
+  cached connector schema: the automation tools/marker are stable whenever agent
+  chat is enabled, so toggling the runtime setting needs a service restart but not
+  another schema change; upgrading from a pre-automation release still requires the
+  ordinary connector Refresh and a new conversation. The focused cross-document
+  contract and `git diff --check` remain green.

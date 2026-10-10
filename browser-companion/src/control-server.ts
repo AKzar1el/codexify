@@ -13,6 +13,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { SingleWindowCoordinator } from "./browser-window";
+import { asCompanionError } from "./errors";
 import {
   COMPANION_KIND,
   MAX_DESCRIPTOR_BYTES,
@@ -89,10 +90,10 @@ class ClientError extends Error {
 function httpError(error: unknown): ClientError {
   if (error instanceof ClientError) return error;
   if (error instanceof z.ZodError) return new ClientError(400, "Request does not match the browser companion protocol");
-  const message = error instanceof Error ? error.message : String(error);
-  if (/not found/i.test(message)) return new ClientError(404, "Browser action was not found");
-  if (/busy|different request|belongs to another|already/i.test(message)) return new ClientError(409, message.slice(0, 500));
-  return new ClientError(409, message.slice(0, 500) || "Browser companion operation failed");
+  if (error instanceof Error && error.message === "Browser action was not found") {
+    return new ClientError(404, "Browser action was not found");
+  }
+  return new ClientError(409, asCompanionError(error).message);
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {

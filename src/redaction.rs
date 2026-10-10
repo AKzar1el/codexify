@@ -472,6 +472,25 @@ fn sensitive_json_key(key: &str) -> bool {
             | "hash"
             | "etag"
             | "fingerprint"
+            | "candidateurl"
+            | "canonicalurl"
+            | "expectedurl"
+            | "conversationurl"
+            | "chatgpturl"
+            | "prompt"
+            | "renderedprompt"
+            | "markdown"
+            | "messages"
+            | "goal"
+            | "pairing"
+            | "chatmirror"
+            | "goalwake"
+            | "liveoutput"
+            | "browseroutput"
+            | "laststableanswer"
+            | "finalmarkdown"
+            | "descriptor"
+            | "descriptorpath"
             | "base64"
             | "binary"
             | "blob"
@@ -738,5 +757,53 @@ mod tests {
         assert!(!rendered.contains("stale-auth-reference"));
         assert!(!rendered.contains("schema-password"));
         assert!(rendered.contains("keep-me"));
+    }
+
+    #[test]
+    fn agent_automation_private_state_is_redacted_by_key() {
+        let root = tempfile::tempdir().unwrap();
+        let config = default_config(root.path().to_path_buf());
+        let redactor = SecretRedactor::for_tool_logging(&config);
+        let value = json!({
+            "candidateUrl": "https://chatgpt.com/c/private-candidate",
+            "canonicalUrl": "https://chatgpt.com/c/private-canonical",
+            "expectedUrl": "https://chatgpt.com/c/private-expected",
+            "prompt": "private browser prompt",
+            "markdown": "private goal markdown",
+            "messages": [{"id":"message-1","markdown":"private unread chat"}],
+            "goal": {"summary":"private completion summary"},
+            "pairing": {"generation":3,"reference":"private pairing reference"},
+            "liveOutput": {"answer":"private live browser answer"},
+            "lastStableAnswer": "private stable browser answer",
+            "finalMarkdown": "private final browser answer",
+            "accountFingerprint": "private-account-fingerprint",
+            "status": "idle"
+        });
+
+        let traversal_truncated = Cell::new(false);
+        let rendered = serde_json::to_string(&redactor.redacted_json(
+            &value,
+            None,
+            16 * 1024,
+            &traversal_truncated,
+        ))
+        .unwrap();
+        for private in [
+            "private-candidate",
+            "private-canonical",
+            "private-expected",
+            "private browser prompt",
+            "private goal markdown",
+            "private unread chat",
+            "private completion summary",
+            "private pairing reference",
+            "private live browser answer",
+            "private stable browser answer",
+            "private final browser answer",
+            "private-account-fingerprint",
+        ] {
+            assert!(!rendered.contains(private), "{private}: {rendered}");
+        }
+        assert!(rendered.contains("idle"));
     }
 }

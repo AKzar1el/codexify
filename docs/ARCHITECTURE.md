@@ -643,6 +643,58 @@ The UI supports MCP Apps and the existing `window.openai` bridge, including nest
 tool-result envelopes. The browser suite runs in Chromium and WebKit on the
 existing widget CI runner, with dispatch/storage tests on all supported platforms.
 
+### Agent-chat browser automation
+
+`agent_automation` adds an optional offline control plane without changing the
+online Markdown-chat path or registering a ChatGPT Web model with Codex.
+`AgentAutomationStore` persists one bounded private record beside each stable task's
+chat state. It owns explicit URL pairing, owner generation, account/catalog/model
+selection, goal revision and lifecycle, mirrored-message receipts, action state,
+and one-nudge-per-activity-epoch state. Mutations use the same private-directory,
+cross-process lock, bounded parse, atomic publication, and corruption-fail-closed
+properties as continuation state.
+
+`AgentAutomationSupervisor` consumes the existing model-visible activity clock and
+structured unread snapshots. While a task is online it does nothing. Once the
+existing five-minute offline rule applies, it can build one immutable
+pair-verification, unread-chat, goal-only, or combined action. The supervisor owns
+the Rust-owned global queue, prioritizes explicit pairing and unread chat, coalesces
+only unsent compatible batches, revalidates every pairing/model/goal snapshot before
+execution, and never acknowledges `CHAT.md` merely because text was mirrored. An
+accepted or ambiguous Send consumes its automatic replay budget.
+
+`BrowserCompanionClient` reads `~/.codexify/browser/descriptor.json`, validates a
+private regular file, live process, IPv4-loopback endpoint, random bearer, and exact
+protocol-schema build suffix, then uses bounded authenticated JSON/NDJSON RPC. The
+separate TypeScript/Electron companion owns one long-lived Electron window and
+private ChatGPT profile. Its upstream-derived selector layer performs exact URL,
+account, model, effort, connector, composer, Send-acceptance, assistant-turn, and
+stable visible-response verification. It accepts fixed prompt kinds only; there is
+no arbitrary JavaScript, selector, filesystem, Responses, Codex-provider, tunnel,
+subagent, or retained-tab API.
+
+The authenticated standalone owner API is the only browser-control surface exposed
+to page JavaScript. It supplies pairing/model/goal/queue/live-output state but never
+the companion descriptor, bearer, or endpoint. The embedded ChatGPT widget has no
+automation controls. Pairing requires the user-supplied exact URL plus a one-time
+`automation_verify_pairing` call from that already-authorized physical conversation;
+it does not migrate the stable task. `goal_read` and exact-revision `goal_finish`
+are the only model-visible goal operations.
+
+At turn start the supervisor records a transcript checkpoint. Visible browser
+output is transient until completion. If `chat_write` appended an agent block after
+the checkpoint, that output remains authoritative; otherwise one stable final answer
+may be appended idempotently by action ID. Status and commentary never enter the
+transcript or activity clock. Browser UI drift, account/model mismatch, approval,
+rate limit, interference, and ambiguous acceptance fail closed without replay.
+
+Distribution is also optional. Release CI packages five platform-specific Electron
+archives, publishes their checksums beside the native Codexify binaries, and includes
+the upstream MIT notice. `BrowserCompanionManager` verifies and extracts a
+version-matched archive into `~/.codexify/browser/runtime/<version>/`, launches it as
+an independent user-session process, and keeps server-service restart semantics
+separate from companion lifecycle.
+
 ### Signed asynchronous releases (`release.yml`, `finalize-release.yml`)
 
 The release matrix signs each final Darwin Mach-O with the Developer ID

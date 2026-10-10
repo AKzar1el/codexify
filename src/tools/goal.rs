@@ -95,11 +95,13 @@ impl Tool for GoalTool {
                     },
                     "summary": {
                         "type": "string",
-                        "maxLength": MAX_GOAL_RESULT_BYTES
+                        "maxLength": MAX_GOAL_RESULT_BYTES,
+                        "writeOnly": true
                     },
                     "reason": {
                         "type": "string",
-                        "maxLength": MAX_GOAL_RESULT_BYTES
+                        "maxLength": MAX_GOAL_RESULT_BYTES,
+                        "writeOnly": true
                     }
                 },
                 "required": ["expectedRevision", "status"],
@@ -306,7 +308,7 @@ fn goal_result(goal: Option<&GoalRecord>, terminal_receipt: bool) -> ToolResult 
             )
         }
     };
-    ToolResult::text(content.clone()).with_structured(json!({
+    let mut result = ToolResult::text(content.clone()).with_structured(json!({
         "content": content,
         "enabled": true,
         "status": status,
@@ -315,7 +317,9 @@ fn goal_result(goal: Option<&GoalRecord>, terminal_receipt: bool) -> ToolResult 
         "summary": summary,
         "blockedReason": blocked_reason,
         "terminal": terminal
-    }))
+    }));
+    result.audit.sensitive_output = true;
+    result
 }
 
 fn goal_status(status: GoalStatus) -> &'static str {
@@ -325,5 +329,31 @@ fn goal_status(status: GoalStatus) -> &'static str {
         GoalStatus::Completed => "completed",
         GoalStatus::Blocked => "blocked",
         GoalStatus::Error => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::Tool;
+
+    #[test]
+    fn goal_payloads_are_private_for_tool_logging() {
+        let schema = GoalTool::Finish.input_schema();
+        assert_eq!(schema["properties"]["summary"]["writeOnly"], true);
+        assert_eq!(schema["properties"]["reason"]["writeOnly"], true);
+
+        let goal = GoalRecord {
+            revision: 1,
+            markdown: "private goal markdown".into(),
+            status: GoalStatus::Blocked,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            finished_at_ms: Some(2),
+            summary: None,
+            blocked_reason: Some("private blocker".into()),
+        };
+        let result = goal_result(Some(&goal), true);
+        assert!(result.audit.sensitive_output);
     }
 }

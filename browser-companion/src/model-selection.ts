@@ -175,7 +175,11 @@ async function setLunaThinkMode(
 
 async function availableEffort(menu: EffortMenu, index: number): Promise<Awaited<ReturnType<typeof readChatGptEffortSnapshot>>> {
   const state = await readChatGptEffortSnapshot(menu.sliderContainer).catch(error => {
-    throw new BrowserCompanionError(String(error), "model_unavailable", { cause:error });
+    throw new BrowserCompanionError(
+      "ChatGPT effort availability could not be verified",
+      "model_unavailable",
+      { cause:error },
+    );
   });
   if (index > state.max - state.min) {
     throw new BrowserCompanionError(`ChatGPT effort slider does not expose index ${index}`, "model_unavailable");

@@ -4,7 +4,7 @@ import { resolveToolApproval, throwIfSessionAttention, toolApprovalVisible } fro
 import type { BrowserDriver, DriverExecution } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, uniqueSendButton } from "./composer";
 import { connectorIsSelected, selectConnector } from "./connector-selection";
-import { BrowserCompanionError } from "./errors";
+import { asCompanionError, BrowserCompanionError } from "./errors";
 import { assertSelectedModelAndEffort, selectModelAndEffort } from "./model-selection";
 import { buildCapabilityCatalog, type AccountCapabilities } from "./models";
 import { canonicalChatGptConversationUrl, validateChatGptConversationUrl, type CapabilityCatalog } from "./protocol";
@@ -122,7 +122,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           authenticated:true,
           accountFingerprint:account.fingerprint,
           status:"unavailable",
-          detail:error instanceof Error ? error.message : "ChatGPT requires attention",
+          detail:asCompanionError(error).message,
         };
       }
       if (await generationRunning(page)) {
@@ -169,7 +169,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         authenticated:false,
         accountFingerprint:null,
         status:"authentication_required",
-        detail:error instanceof Error ? error.message : "ChatGPT sign-in is required",
+        detail:asCompanionError(error).message,
       };
     }
   }
@@ -277,7 +277,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     } catch (error) {
       if (sendActivated && !sendAccepted && !(error instanceof BrowserCompanionError && error.code === "ambiguous_send")) {
         throw new BrowserCompanionError(
-          error instanceof Error ? error.message : String(error),
+          asCompanionError(error).message,
           "ambiguous_send",
           { sendAccepted:true, cause:error },
         );

@@ -34,5 +34,5 @@ export function asCompanionError(error: unknown): BrowserCompanionError {
   if (error instanceof DOMException && error.name === "AbortError") {
     return new BrowserCompanionError("Browser action was cancelled", "cancelled", { cause:error });
   }
-  return new BrowserCompanionError(error instanceof Error ? error.message : String(error), "failed", { cause:error });
+  return new BrowserCompanionError("Browser companion operation failed", "failed", { cause:error });
 }
