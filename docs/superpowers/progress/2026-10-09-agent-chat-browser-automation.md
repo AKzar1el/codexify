@@ -1534,3 +1534,13 @@ Implement the approved agent-chat browser automation architecture completely: re
 - The browser-automation branch was merged into local `main` as merge commit
   `d7e8131`, on top of the separately committed anti-starvation work `1650b76`.
   No remote branch was pushed and no existing managed worktree was removed.
+- At the user's request, merged `main` was pushed to `origin/main` at `c6f3b8e` and
+  the remote ref was read back to prove the exact commit landed.
+- The temporary integration worktree was removed, its registration was pruned, and
+  the durable source checkout at `/Volumes/data/dev/codexify` was switched to the
+  clean, up-to-date `main` branch. Existing Codexify-managed worktrees remain intact.
+- A locked `aarch64-apple-darwin` release build was produced at
+  `/Volumes/data/dev/codexify/target/aarch64-apple-darwin/release/codexify` and
+  signed as `dev.codexify` with the Developer ID Application certificate for team
+  `4HN6WUZ995`. `codesign --verify --strict` accepts it, the designated requirement
+  is satisfied, and the binary starts successfully through its help entry point.
