@@ -4,7 +4,6 @@ import type { Locator, Page } from "playwright-core";
 import { activeComposer, composerText } from "./composer";
 import { BrowserCompanionError } from "./errors";
 
-const CONNECTOR_MENTION_QUERY = "@codex";
 const CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
 const MAX_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 
@@ -87,7 +86,7 @@ export async function selectConnector(
       composer = await activeComposer(page, 30_000, signal);
       await composer.fill("", { timeout:CONNECTOR_ACTION_TIMEOUT_MS, signal });
       await composer.focus({ timeout:CONNECTOR_ACTION_TIMEOUT_MS, signal });
-      await composer.pressSequentially(CONNECTOR_MENTION_QUERY, {
+      await composer.pressSequentially(`@${connectorName}`, {
         delay:25,
         timeout:CONNECTOR_ACTION_TIMEOUT_MS,
         signal,
