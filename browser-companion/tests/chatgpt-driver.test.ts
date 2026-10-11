@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { Page } from "playwright-core";
+import type { Page } from "patchright";
 import {
   assertCapabilityAccount,
   ChatGptBrowserDriver,

@@ -1337,6 +1337,8 @@ MCP dispatchers also emit `resolved_tool`, `mcp_server`, and `mcp_tool`. These c
 
 Payloads are redacted lazily before their bytes reach the bounded serializer. Codexify removes configured API/conversation credentials, credential-labelled and nontrivial MCP environment/HTTP-header values, resolved MCP bearer/header environment variables, the OpenAI tunnel key when readable, common secret-bearing process environment variables, values named through `toolLogging.redactEnv` / `--tool-log-redact-env`, input fields marked `writeOnly` or `format: "password"` by the tool schema, secret/checksum-labelled JSON fields, signed native-file `download_url` and `file_id` values, signed-URL query parameters, and common command-line/header credential syntax. This is defense in depth, not proof that arbitrary source text or tool output contains no unknown sensitive literal. JSON has no raw byte-buffer type, so image blocks and resource capabilities receive explicit safe representations; an application-specific base64 string in an otherwise ordinary text field is inside the operator trust boundary. Tool payload logging is therefore disabled by default and should be treated as sensitive operational data.
 
+An absolute `CODEX_HOME` directory configured for an MCP server is excluded from automatic tool-payload value redaction, so it does not hide the prefix of `.codexify` paths. Naming `CODEX_HOME` in `toolLogging.redactEnv` still redacts it, and audit command previews retain their blanket MCP-value policy. The doctor report’s `openai_tunnel_credential` check label is preserved; credential values elsewhere in the same text remain subject to redaction.
+
 The `toolLogging` config block provides the same controls:
 
 | Key | Default | Description |
@@ -2007,8 +2009,16 @@ To explicitly rotate the token, stop Codexify, remove `~/.codexify/owner-chat.js
 then start it and run `codexify chat` for a new URL. Old URLs remain authorized
 until this deliberate rotation; restarting the service no longer revokes them.
 
-The left pane lists persisted conversations sorted by the timestamp of their
-latest chat entry. It shows the same waiting/online/away/offline state as
+The left pane groups persisted conversations by project by default. Projects
+and their chats are ordered by the timestamp of the latest chat entry. The
+**Projects** and **Recent** buttons switch between this grouping and a flat
+recent-first list, and the browser remembers the choice. **Search chats** searches
+saved names and complete persisted transcripts, including history outside the
+loaded message page. Matching is literal and case-insensitive; the server uses
+`rg` when available, with an in-process fallback otherwise. Search filters the
+list while keeping the selected conversation open.
+
+The list shows the same waiting/online/away/offline state as
 the embedded widget, plus a blue dot for a new entry not yet viewed in that
 browser. Seen positions and unfinished drafts are stored locally in the
 browser; chat messages, delivery receipts, activity, and counters come from the
@@ -2037,11 +2047,21 @@ fixed `agentChat.port`, the complete URL survives service restarts. Run
 `agentChat.port: null`; the token itself remains unchanged.
 
 ChatGPT's conversation display title is not part of the connector metadata.
-The list therefore derives a local title from the first user chat entry, or
-the first agent entry if no user entry exists. It shows “Untitled conversation”
-if there is none. It does not claim to reproduce
-ChatGPT's title. Transport-scoped chats without a stable conversation identity
+The list derives its title from the latest user or agent message. It shows
+“Untitled conversation” if there is none. **Rename chat** in the chat header
+saves a custom name in the persisted chat state; it survives browser reloads
+and service restarts and takes precedence over new messages. Saving an empty
+name restores the latest-message title. Transport-scoped chats without a stable conversation identity
 are not listed, because they cannot be safely associated with a durable chat.
+
+When browser automation is enabled, model and effort selectors sit inside the
+composer and save changes immediately. They use the signed-in browser
+companion's capability catalog and omit unavailable choices. Changes are
+allowed only while the agent is offline; online, away, and waiting states lock
+both controls, and the owner API enforces the same restriction. Connection
+settings, sign-in, pairing, and model refresh are available from the composer’s
+settings button. A configured goal appears directly above the input, with
+controls to edit, run or pause, and clear it after pausing.
 
 The localhost/token boundary prevents direct access through the tunnel but is
 **not an isolation boundary from connector users**: unrestricted tool execution

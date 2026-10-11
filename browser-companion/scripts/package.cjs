@@ -4,6 +4,7 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { installChrome } = require("./install-chrome.cjs");
 
 const root = path.resolve(__dirname, "..");
 const repositoryRoot = path.resolve(root, "..");
@@ -100,7 +101,17 @@ const packageRoot = path.join(packageStage, packageRootName);
 const appRoot = path.join(packageRoot, "app");
 
 try {
+  const browserRoot = installChrome(targetPlatform, targetArch);
   runChecked("bun", ["run", "build"]);
+  const builderConfig = path.join(scratch, "electron-builder.json");
+  fs.writeFileSync(builderConfig, JSON.stringify({
+    ...packageManifest.build,
+    extraResources:[{
+      from:browserRoot,
+      to:"chrome",
+      filter:["chromium-*/**", "chrome-executable.json"],
+    }],
+  }));
   const targetFlag = targetPlatform === "darwin" ? "--mac"
     : targetPlatform === "linux" ? "--linux"
       : "--win";
@@ -112,6 +123,7 @@ try {
     `--${targetArch}`,
     "--publish",
     "never",
+    `--config=${builderConfig}`,
     `--config.directories.output=${builderOutput}`,
     `--config.extraMetadata.version=${version}`,
   ];
@@ -167,7 +179,9 @@ try {
   if (targetPlatform === "win32") {
     runChecked("tar", ["-a", "-cf", artifact, "-C", packageStage, packageRootName]);
   } else {
-    runChecked("tar", ["-czf", artifact, "-C", packageStage, packageRootName]);
+    runChecked("tar", ["-czf", artifact, "-C", packageStage, packageRootName], {
+      env:{ ...process.env, COPYFILE_DISABLE:"1" },
+    });
   }
   process.stdout.write(`${artifact}\n`);
 } finally {

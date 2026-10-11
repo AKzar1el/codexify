@@ -12,3 +12,4 @@ node_modules/
 
 # Source archive drops (reference material, not part of the repo)
 *.zip
+/browser-companion/.browsers/

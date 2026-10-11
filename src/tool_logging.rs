@@ -736,6 +736,41 @@ mod tests {
     }
 
     #[test]
+    fn chat_paths_and_doctor_output_survive_payload_redaction() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = if cfg!(windows) {
+            r"C:\Users\paul\.codex"
+        } else {
+            "/Users/paul/.codex"
+        };
+        let mut config = default_config(root.path().into());
+        config.tool_logging.mode = ToolLogMode::All;
+        config.api_key = Some("fixture-private-token".into());
+        config.mcp_servers.insert(
+            "node_repl".into(),
+            crate::types::McpServerSpec {
+                env: std::collections::HashMap::from([("CODEX_HOME".into(), codex_home.into())]),
+                ..Default::default()
+            },
+        );
+        let logger = ToolCallLogger::new(&config).unwrap();
+        let path = format!("{codex_home}ify/projects/iTLS-Enso/chats/task/CHAT.md");
+        let request = logger.preview_request(&json!({"expected_chat_file":path}), None);
+        let request: Value = serde_json::from_str(&request.text).unwrap();
+        assert_eq!(request["expected_chat_file"], path);
+        let result = ToolResult::text(format!(
+            "PASS runtime: Running executable is usable\n  {codex_home}ify/bin/codexify\nPASS browser_companion: Ready\n  {codex_home}ify/browser/runtime/1.7.0\nPASS openai_tunnel_credential: OpenAI tunnel credential references are usable\nfixture-private-token"
+        ));
+        let response = logger.preview_response(&result);
+        let response: Value = serde_json::from_str(&response.text).unwrap();
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("{codex_home}ify/bin/codexify")));
+        assert!(text.contains(&format!("{codex_home}ify/browser/runtime/1.7.0")));
+        assert!(text.contains("OpenAI tunnel credential references are usable"));
+        assert!(!text.contains("fixture-private-token"));
+    }
+
+    #[test]
     fn markdown_chat_body_never_enters_payload_preview() {
         let root = tempfile::tempdir().unwrap();
         let mut config = default_config(root.path().to_path_buf());

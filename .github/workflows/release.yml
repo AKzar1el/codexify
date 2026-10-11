@@ -309,7 +309,7 @@ jobs:
             /etc/apt/sources.list.d/google-chrome.list \
             /etc/apt/sources.list.d/google-chrome.sources
           cd browser-companion
-          bun x --no-install playwright-core install-deps chromium
+          bun x --no-install patchright install-deps chromium
 
       - name: Package browser companion
         working-directory: browser-companion

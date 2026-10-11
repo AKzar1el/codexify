@@ -56,6 +56,7 @@ percent-encoding = "2"
 notify = "8.2"
 schemars = "1.2.2"
 jsonschema = { version = "0.52.0", default-features = false }
+open = "5.4.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

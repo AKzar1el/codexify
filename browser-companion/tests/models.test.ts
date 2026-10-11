@@ -1,53 +1,48 @@
 import { expect, test } from "bun:test";
-import {
-  buildCapabilityCatalog,
-  resolveBrowserModel,
-  type AccountCapabilities,
-} from "../src/models";
+import { buildCapabilityCatalog, browserEffortIdFromLabel, browserModelFamilyFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserModelFamily, type DiscoveredBrowserEffort } from "../src/models";
 
-const account = (overrides: Partial<AccountCapabilities> = {}): AccountCapabilities => ({
-  solAvailable: true,
-  extraHighAvailable: true,
-  proAvailable: true,
-  ...overrides,
-});
+const observed = (labels: readonly string[], locked: readonly number[] = []): DiscoveredBrowserEffort[] => labels.map((label, index) => ({
+  id:browserEffortIdFromLabel(label), label, index, available:!locked.includes(index), reason:locked.includes(index) ? "not_available_for_account" : null,
+}));
+const account = (family: BrowserModelFamily, labels: readonly string[], locked: readonly number[] = []): AccountCapabilities => ({ models:modelsFromDiscoveredEfforts(family, observed(labels, locked)) });
 
-test("Luna-only accounts expose only Luna and Think without pretending Sol exists", () => {
-  const catalog = buildCapabilityCatalog(account({ solAvailable: false, extraHighAvailable: false, proAvailable: false }), "account-a");
-  expect(catalog.models).toEqual([{
-    id: "gpt-5.6-luna",
-    label: "Luna",
-    efforts: [
-      { id: "low", label: "Luna", available: true, reason: null },
-      { id: "medium", label: "Think", available: true, reason: null },
-    ],
-  }]);
+test("catalogs contain only observed efforts, including new labels and different orders", () => {
+  const capabilities = account("5.5", ["Deep", "Instant", "Balanced"]);
+  const catalog = buildCapabilityCatalog(capabilities, "account-a");
+  expect(catalog.models.map(model => [model.label, model.efforts.map(effort => effort.label)])).toEqual([["GPT-5.5 Sol", ["Deep", "Instant", "Balanced"]]]);
+  expect(catalog.models[0]!.efforts.some(effort => effort.id === "max")).toBeFalse();
+  expect(resolveBrowserModel("gpt-5.5-sol", "low", capabilities).effortIndex).toBe(1);
+  expect(resolveBrowserModel("gpt-5.5-sol", browserEffortIdFromLabel("Deep"), capabilities).effortIndex).toBe(0);
   expect(catalog.accountFingerprint).toBe("account-a");
   expect(catalog.catalogRevision).toMatch(/^[0-9a-f]{64}$/);
+  expect(() => buildCapabilityCatalog({models:[]}, "account-a")).toThrow();
 });
 
-test("Sol accounts expose stable model IDs and preserve locked effort evidence", () => {
-  const catalog = buildCapabilityCatalog(account({ extraHighAvailable: false, proAvailable: true }), "account-b");
-  expect(catalog.models.map(model => model.id)).toEqual(["gpt-5.6-sol", "gpt-6-sol"]);
-  for (const model of catalog.models) {
-    expect(model.efforts.map(effort => [effort.id, effort.available])).toEqual([
-      ["low", true], ["medium", true], ["high", true], ["xhigh", false], ["max", true],
-    ]);
-    expect(model.efforts[3]?.reason).toBe("not_available_for_account");
-  }
+test("family-specific availability is preserved and unobserved efforts are never added", () => {
+  const capabilities: AccountCapabilities = { models:[
+    ...account("6", ["Instant", "High", "Pro"], [1]).models,
+    ...account("5.5", ["Medium", "Extra High"]).models,
+  ] };
+  const catalog = buildCapabilityCatalog(capabilities, "account-b");
+  expect(catalog.models.map(model => [model.label, model.efforts.map(effort => [effort.label, effort.available])])).toEqual([
+    ["GPT-6 Astra", [["Pro", true]]], ["GPT-6 Sol", [["Instant", true], ["High", false]]], ["GPT-5.5 Sol", [["Medium", true], ["Extra High", true]]],
+  ]);
+  expect(resolveBrowserModel("gpt-6-astra", "max", capabilities).effortIndex).toBe(2);
+  expect(() => resolveBrowserModel("gpt-6-sol", "max", capabilities)).toThrow("not discovered");
+  expect(() => resolveBrowserModel("gpt-6-astra", "high", capabilities)).toThrow("not discovered");
+  expect(() => resolveBrowserModel("gpt-6-sol", "high", capabilities)).toThrow("not available");
+  expect(() => resolveBrowserModel("gpt-5.5-sol", "max", capabilities)).toThrow("not discovered");
+  expect(() => resolveBrowserModel("gpt-5.6-sol", "high", capabilities)).toThrow("not discovered");
+  expect(() => resolveBrowserModel("__proto__", "high", capabilities)).toThrow("not discovered");
 });
 
-test("route resolution refuses unavailable effort or cross-family invention", () => {
-  expect(resolveBrowserModel("gpt-6-sol", "high", account())).toEqual({
-    id: "gpt-6-sol", family: "6", effort: "high", effortIndex: 2, lunaThink: false,
-  });
-  expect(resolveBrowserModel("gpt-5.6-sol", "max", account())).toEqual({
-    id: "gpt-5.6-sol", family: "5.6", effort: "max", effortIndex: 4, lunaThink: false,
-  });
-  expect(resolveBrowserModel("gpt-5.6-luna", "medium", account({ solAvailable: false }))).toEqual({
-    id: "gpt-5.6-luna", family: null, effort: "medium", effortIndex: null, lunaThink: true,
-  });
-  expect(() => resolveBrowserModel("gpt-6-sol", "xhigh", account({ extraHighAvailable: false }))).toThrow("Extra High");
-  expect(() => resolveBrowserModel("gpt-5.6-luna", "medium", account())).toThrow("Luna");
-  expect(() => resolveBrowserModel("unknown", "high", account())).toThrow("not supported");
+test("only an observed GPT-6 Pro effort creates the Astra naming exception", () => {
+  expect(account("6", ["Instant", "Turbo"]).models.map(model => model.label)).toEqual(["GPT-6 Sol"]);
+  expect(account("6", ["Pro"]).models.map(model => model.label)).toEqual(["GPT-6 Astra"]);
+  expect(account("5.6", ["Pro"]).models.map(model => model.label)).toEqual(["GPT-5.6 Sol"]);
+});
+
+test("supported model rows include GPT-5.5's retirement notice", () => {
+  expect(["GPT-6", "GPT-5.6 Sol", "GPT-5.5Leaving on October 14"].map(browserModelFamilyFromLabel)).toEqual(["6", "5.6", "5.5"]);
+  expect(browserModelFamilyFromLabel("GPT-5.5 Preview")).toBeUndefined();
 });

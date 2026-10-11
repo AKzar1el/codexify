@@ -45,6 +45,7 @@ pub struct UserSendReceipt {
 #[derive(Debug, Serialize)]
 pub struct OwnerChatSummary {
     pub title: String,
+    pub custom_title: Option<String>,
     pub last_entry_end: u64,
     pub last_entry_at_ms: u64,
     pub last_agent_call_at_ms: Option<u64>,
@@ -308,7 +309,11 @@ impl ChatFile {
                     && cached.modified == modified
                 {
                     return Ok(OwnerChatSummary {
-                        title: cached.title.clone(),
+                        title: cursor
+                            .custom_title
+                            .clone()
+                            .unwrap_or_else(|| cached.title.clone()),
+                        custom_title: cursor.custom_title.clone(),
                         last_entry_end: cached.last_entry_end,
                         last_entry_at_ms: cached.last_entry_at_ms,
                         last_agent_call_at_ms: cursor.last_agent_call_at_ms,
@@ -317,10 +322,10 @@ impl ChatFile {
                     });
                 }
                 let records = spans(file)?;
-                let title = records
+                let title: String = records
                     .iter()
-                    .find(|span| span.role == "user")
-                    .or_else(|| records.first())
+                    .rev()
+                    .find(|span| matches!(span.role, "user" | "agent"))
                     .and_then(|span| {
                         read_range(
                             file,
@@ -341,7 +346,8 @@ impl ChatFile {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 let summary = OwnerChatSummary {
-                    title,
+                    title: cursor.custom_title.clone().unwrap_or_else(|| title.clone()),
+                    custom_title: cursor.custom_title.clone(),
                     last_entry_end: last.map_or(0, |span| span.end),
                     last_entry_at_ms: last
                         .and_then(|span| span.created_at_ms)
@@ -353,7 +359,7 @@ impl ChatFile {
                 *cache = Some(OwnerSummaryCache {
                     length: metadata.len(),
                     modified,
-                    title: summary.title.clone(),
+                    title,
                     last_entry_end: summary.last_entry_end,
                     last_entry_at_ms: summary.last_entry_at_ms,
                 });

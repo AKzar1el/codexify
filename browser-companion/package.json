@@ -9,13 +9,14 @@
     "build": "bun build src/main.ts --target=node --packages=external --outdir=dist",
     "typecheck": "bun x --no-install --bun tsc --noEmit",
     "test": "bun test ./tests",
+    "install:chrome": "node scripts/install-chrome.cjs",
     "package": "node scripts/package.cjs",
     "smoke:package": "node scripts/smoke-package.cjs",
     "start": "bun run build && electron ."
   },
   "dependencies": {
     "@mixmark-io/domino": "2.2.0",
-    "playwright-core": "^1.62.0",
+    "patchright": "1.63.0",
     "turndown": "7.2.0",
     "turndown-plugin-gfm": "1.0.2",
     "zod": "4.4.3"
@@ -41,7 +42,10 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "extendInfo": {
+        "LSBackgroundOnly": true
+      }
     },
     "linux": {
       "category": "Development",

@@ -6,6 +6,7 @@ import {
   activateChatGptEffortMenu,
   parseChatGptEffortSliderState,
   parseChatGptModelAnnouncement,
+  chatGptEffortLabelFromAnnouncement,
 } from "../src/session";
 
 test("composer and effort selectors exclude unrelated editors and menus", () => {
@@ -35,7 +36,8 @@ test("model announcements tolerate localized punctuation without weakening ident
 
 test("effort slider state is bounded and internally consistent", () => {
   expect(parseChatGptEffortSliderState("0", "4", "2")).toEqual({ min:0, max:4, value:2 });
-  expect(parseChatGptEffortSliderState("0", "5", "2")).toBeUndefined();
+  expect(parseChatGptEffortSliderState("0", "5", "2")).toEqual({ min:0, max:5, value:2 });
+  expect(parseChatGptEffortSliderState("0", "16", "2")).toBeUndefined();
   expect(parseChatGptEffortSliderState("0", "4", "5")).toBeUndefined();
   expect(parseChatGptEffortSliderState("x", "4", "2")).toBeUndefined();
 });
@@ -44,7 +46,10 @@ test("effort activation retries a ghost click with primary pointerdown", async (
   let ghostOpen = false;
   let pointerOpened = false;
   const events: unknown[] = [];
-  const ownedMenu = { isVisible: async () => pointerOpened };
+  const ownedSlider = {
+    filter() { return this; }, locator() { return this; }, isVisible:async () => pointerOpened,
+  };
+  const ownedMenu = { isVisible: async () => pointerOpened, locator:() => ownedSlider };
   const hiddenSurface = {
     filter() { return this; }, last() { return this; }, locator() { return this; }, isVisible: async () => false,
   };
@@ -71,4 +76,31 @@ test("effort activation retries a ghost click with primary pointerdown", async (
     ["keyboard", "Escape"],
     ["pointerdown", { button:0, buttons:1, pointerType:"mouse", isPrimary:true }],
   ]);
+});
+
+test("an outgoing global slider cannot stand in for the control's new menu", async () => {
+  let currentMenuVisible = false;
+  let clicks = 0;
+  const slider = { filter() { return this; }, locator() { return this; }, isVisible:async () => true };
+  const menu = { isVisible:async () => currentMenuVisible, locator:() => slider };
+  const control = {
+    getAttribute:async (name: string) => name === "aria-controls" ? "current-menu" : "true",
+    click:async () => { clicks += 1; currentMenuVisible = true; },
+  };
+  const page = {
+    locator:(selector: string) => selector === '[id="current-menu"]' ? menu : slider,
+    keyboard:{ press:async () => {} },
+  };
+  const result = await activateChatGptEffortMenu(page as never, control as never, { settleMs:0 });
+  expect(result.method).toBe("click");
+  expect(clicks).toBe(1);
+});
+
+
+test("native effort labels are read without a fixed vocabulary and must match the slider position", () => {
+  expect(chatGptEffortLabelFromAnnouncement("Balanced, 2 of 3.", {min:0,max:2,value:1})).toBe("Balanced");
+  expect(chatGptEffortLabelFromAnnouncement("GPT-5.5 Sol Deep, 3 of 3.", {min:0,max:2,value:2})).toBe("Deep");
+  expect(chatGptEffortLabelFromAnnouncement("Pro, 5 of 5.", {min:0,max:4,value:0})).toBeUndefined();
+  expect(chatGptEffortLabelFromAnnouncement("Deep, 3 of 4.", {min:0,max:2,value:2})).toBeUndefined();
+  expect(chatGptEffortLabelFromAnnouncement("Use Left and Right arrow keys to adjust power", {min:0,max:2,value:2})).toBeUndefined();
 });

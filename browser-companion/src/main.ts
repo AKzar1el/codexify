@@ -1,50 +1,63 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { app } from "electron";
 import { SingleWindowCoordinator } from "./browser-window";
 import { ChatGptBrowserDriver } from "./chatgpt-driver";
 import { startControlServer, type ControlServer } from "./control-server";
-import { ElectronSingleWindowSurface } from "./electron-surface";
+import { ChromeSingleWindowSurface } from "./chrome-surface";
+import { privateChromeExecutable } from "./chrome-executable";
 import { PROTOCOL_VERSION, protocolBuild, validateProtocolBuild } from "./protocol";
+
+if (process.platform === "darwin") app.setActivationPolicy("prohibited");
 
 const BUILD = process.env.CODEXIFY_BROWSER_BUILD
   ? validateProtocolBuild(process.env.CODEXIFY_BROWSER_BUILD)
   : protocolBuild("1.0.0");
 const root = resolve(process.env.CODEXIFY_BROWSER_HOME ?? join(homedir(), ".codexify", "browser"));
-const profilePath = join(root, "profile");
+const profilePath = join(root, "chrome-profile");
 const descriptorPath = resolve(process.env.CODEXIFY_BROWSER_DESCRIPTOR ?? join(root, "descriptor.json"));
 const smokeFile = process.env.CODEXIFY_BROWSER_SMOKE_FILE;
 
 let server: ControlServer | undefined;
+let surface: ChromeSingleWindowSurface | undefined;
 let stopping: Promise<void> | undefined;
 
 async function stop(): Promise<void> {
   stopping ??= (async () => {
-    await server?.close().catch(error => {
+    await (server ? server.close() : surface?.close())?.catch(error => {
       console.error(`Browser companion shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     server = undefined;
+    surface = undefined;
   })();
   await stopping;
 }
 
 async function main(): Promise<void> {
+  const launcherPath = join(root, "launcher");
+  mkdirSync(launcherPath, { recursive:true, mode:0o700 });
+  app.setPath("userData", launcherPath);
   if (!app.requestSingleInstanceLock()) {
     app.quit();
     return;
   }
-  await mkdir(root, { recursive:true, mode:0o700 });
-  const surface = await ElectronSingleWindowSurface.create({ profilePath, title:"Codexify ChatGPT" });
+  await app.whenReady();
+  const browserRoot = app.isPackaged
+    ? join(process.resourcesPath, "chrome")
+    : resolve(import.meta.dirname, "../.browsers", `${process.platform}-${process.arch}`);
+  const executablePath = await privateChromeExecutable(browserRoot);
+  surface = await ChromeSingleWindowSurface.create({ profilePath, executablePath });
   const driver = new ChatGptBrowserDriver(surface, BUILD);
   const coordinator = new SingleWindowCoordinator(driver, BUILD);
   server = await startControlServer(coordinator, descriptorPath);
-  app.on("second-instance", () => { void coordinator.reveal(null); });
   app.on("before-quit", event => {
     if (stopping) return;
     event.preventDefault();
     void stop().finally(() => app.exit(0));
   });
+  void surface.closed.then(() => { if (!stopping) app.quit(); });
   process.once("SIGINT", () => { void stop().finally(() => app.exit(0)); });
   process.once("SIGTERM", () => { void stop().finally(() => app.exit(0)); });
 }

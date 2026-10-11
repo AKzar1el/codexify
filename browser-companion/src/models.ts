@@ -1,47 +1,72 @@
 import { createHash } from "node:crypto";
-import { protocolBuild, type CapabilityCatalog, type EffortCapability, type ModelCapability } from "./protocol";
+import { capabilityCatalogSchema, protocolBuild, type CapabilityCatalog, type EffortCapability, type ModelCapability } from "./protocol";
 
-export type BrowserModelId = "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-6-sol";
-export type BrowserEffort = "low" | "medium" | "high" | "xhigh" | "max";
-export type BrowserModelFamily = "5.6" | "6";
+export type BrowserModelId = "gpt-5.6-luna" | "gpt-5.5-sol" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-astra";
+export type BrowserEffort = string;
+export type BrowserModelFamily = "5.5" | "5.6" | "6";
+
+export const MODEL_FAMILY_LABELS: Record<BrowserModelFamily, RegExp> = {
+  "5.5": /^GPT[-\s]?5\.5(?:\s+Sol)?(?:\s*Leaving on\s+.+)?$/i,
+  "5.6": /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i,
+  "6": /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+(?:Sol|Astra))?(?:\s+Pro)?)$/i,
+};
+
+export function browserModelFamilyFromLabel(label: string): BrowserModelFamily | undefined {
+  const normalized = label.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
+  return (["6", "5.6", "5.5"] as const).find(family => MODEL_FAMILY_LABELS[family].test(normalized));
+}
 
 export interface AccountCapabilities {
-  solAvailable: boolean;
-  extraHighAvailable: boolean;
-  proAvailable: boolean;
+  models: readonly DiscoveredBrowserModel[];
+}
+
+export interface DiscoveredBrowserEffort extends EffortCapability {
+  index: number | null;
+  lunaThink?: boolean;
+}
+
+export interface DiscoveredBrowserModel {
+  id: BrowserModelId;
+  label: string;
+  family: BrowserModelFamily | null;
+  efforts: readonly DiscoveredBrowserEffort[];
 }
 
 export interface ResolvedBrowserModel {
   id: BrowserModelId;
   family: BrowserModelFamily | null;
   effort: BrowserEffort;
-  effortIndex: 0 | 1 | 2 | 3 | 4 | null;
+  effortIndex: number | null;
   lunaThink: boolean;
 }
 
-const SOL_EFFORTS: readonly { id: BrowserEffort; label: string; index: 0 | 1 | 2 | 3 | 4 }[] = [
-  { id:"low", label:"Instant", index:0 },
-  { id:"medium", label:"Medium", index:1 },
-  { id:"high", label:"High", index:2 },
-  { id:"xhigh", label:"Extra High", index:3 },
-  { id:"max", label:"Pro", index:4 },
-];
+/** Compatibility aliases preserve saved selections; they never create capabilities. */
+export function browserEffortIdFromLabel(label: string): string {
+  const normalized = label.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim().toLowerCase();
+  switch (normalized) {
+    case "instant": return "low";
+    case "medium": return "medium";
+    case "high": return "high";
+    case "extra high": return "xhigh";
+    case "pro": return "max";
+    default:
+      if (!normalized) throw new Error("ChatGPT effort label is empty");
+      return `effort-${createHash("sha256").update(normalized).digest("hex").slice(0, 24)}`;
+  }
+}
 
-function effortAvailability(
-  effort: typeof SOL_EFFORTS[number],
-  capabilities: AccountCapabilities,
-): EffortCapability {
-  const available = effort.id === "xhigh"
-    ? capabilities.extraHighAvailable
-    : effort.id === "max"
-      ? capabilities.proAvailable
-      : true;
-  return {
-    id:effort.id,
-    label:effort.label,
-    available,
-    reason:available ? null : "not_available_for_account",
-  };
+export function modelsFromDiscoveredEfforts(
+  family: BrowserModelFamily,
+  efforts: readonly DiscoveredBrowserEffort[],
+): DiscoveredBrowserModel[] {
+  // ChatGPT's GPT-6 Pro option uses Astra. This is the explicit naming exception.
+  if (family === "6") {
+    return [
+      { id:"gpt-6-astra", label:"GPT-6 Astra", family, efforts:efforts.filter(effort => /^Pro$/i.test(effort.label)) },
+      { id:"gpt-6-sol", label:"GPT-6 Sol", family, efforts:efforts.filter(effort => !/^Pro$/i.test(effort.label)) },
+    ].filter(model => model.efforts.length > 0) as DiscoveredBrowserModel[];
+  }
+  return [{ id:`gpt-${family}-sol`, label:`GPT-${family} Sol`, family, efforts }];
 }
 
 function catalogRevision(accountFingerprint: string, models: readonly ModelCapability[]): string {
@@ -61,26 +86,17 @@ export function buildCapabilityCatalog(
   if (!/^[A-Za-z0-9_.-]{1,256}$/.test(accountFingerprint)) {
     throw new Error("ChatGPT account fingerprint is invalid");
   }
-  const models: ModelCapability[] = capabilities.solAvailable
-    ? ([
-      { id:"gpt-5.6-sol", label:"GPT-5.6 Sol", efforts:SOL_EFFORTS.map(effort => effortAvailability(effort, capabilities)) },
-      { id:"gpt-6-sol", label:"GPT-6 Sol", efforts:SOL_EFFORTS.map(effort => effortAvailability(effort, capabilities)) },
-    ] satisfies ModelCapability[])
-    : ([{
-      id:"gpt-5.6-luna",
-      label:"Luna",
-      efforts:[
-        { id:"low", label:"Luna", available:true, reason:null },
-        { id:"medium", label:"Think", available:true, reason:null },
-      ],
-    }] satisfies ModelCapability[]);
-  return {
+  const models: ModelCapability[] = capabilities.models.map(model => ({
+    id:model.id, label:model.label,
+    efforts:model.efforts.map(({ id, label, available, reason }) => ({ id, label, available, reason })),
+  }));
+  return capabilityCatalogSchema.parse({
     protocolVersion:1,
     build,
     accountFingerprint,
     catalogRevision:catalogRevision(accountFingerprint, models),
     models,
-  };
+  });
 }
 
 export function resolveBrowserModel(
@@ -88,40 +104,16 @@ export function resolveBrowserModel(
   effort: string,
   capabilities: AccountCapabilities,
 ): ResolvedBrowserModel {
-  if (model === "gpt-5.6-luna") {
-    if (capabilities.solAvailable) {
-      throw new Error("ChatGPT Luna is unavailable while the account exposes the Sol selector");
-    }
-    if (effort !== "low" && effort !== "medium") {
-      throw new Error(`ChatGPT Luna effort is not supported: ${effort}`);
-    }
-    return {
-      id:model,
-      family:null,
-      effort,
-      effortIndex:null,
-      lunaThink:effort === "medium",
-    };
-  }
-  if (model !== "gpt-5.6-sol" && model !== "gpt-6-sol") {
-    throw new Error(`ChatGPT browser model is not supported: ${model}`);
-  }
-  if (!capabilities.solAvailable) {
-    throw new Error("ChatGPT Sol models are unavailable for this Luna-only account");
-  }
-  const option = SOL_EFFORTS.find(candidate => candidate.id === effort);
-  if (!option) throw new Error(`ChatGPT browser effort is not supported: ${effort}`);
-  if (option.id === "xhigh" && !capabilities.extraHighAvailable) {
-    throw new Error("ChatGPT Extra High effort is not available for this account");
-  }
-  if (option.id === "max" && !capabilities.proAvailable) {
-    throw new Error("ChatGPT Pro effort is not available for this account");
-  }
+  const discovered = capabilities.models.find(candidate => candidate.id === model);
+  if (!discovered) throw new Error(`ChatGPT model was not discovered for this account: ${model}`);
+  const option = discovered.efforts.find(candidate => candidate.id === effort);
+  if (!option) throw new Error(`ChatGPT effort was not discovered for ${discovered.label}: ${effort}`);
+  if (!option.available) throw new Error(`ChatGPT ${option.label} effort is not available for this account`);
   return {
-    id:model,
-    family:model === "gpt-5.6-sol" ? "5.6" : "6",
+    id:discovered.id,
+    family:discovered.family,
     effort:option.id,
     effortIndex:option.index,
-    lunaThink:false,
+    lunaThink:option.lunaThink === true,
   };
 }

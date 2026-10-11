@@ -1,7 +1,7 @@
 // Derived from miuuyy/codex-chatgpt-web
 // src/adapters/chatgpt-web/browser-worker.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 // Exact insertion semantics remain structurally aligned with upstream.
-import type { Locator, Page } from "playwright-core";
+import type { Locator, Page } from "patchright";
 import { CHATGPT_COMPOSER_SELECTOR, CHATGPT_SEND_BUTTON_SELECTOR } from "./session";
 
 export const COMPOSER_READY_TIMEOUT_MS = 30_000;

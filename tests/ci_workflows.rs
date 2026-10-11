@@ -88,7 +88,9 @@ fn browser_companion_packages_are_smoked_and_published_with_each_release() {
     let check = job_section(&ci, "check", "diff-widget");
     assert!(check.contains("bun run package"));
     assert!(check.contains("bun run smoke:package"));
-    assert!(check.contains("playwright-core install-deps chromium"));
+    assert!(check.contains("patchright install-deps chromium"));
+    assert!(check.contains("bun run install:chrome"));
+    assert!(check.contains("CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test"));
 
     let release = workflow(".github/workflows/release.yml");
     let check = job_section(&release, "check", "build");
@@ -113,7 +115,7 @@ fn browser_companion_packages_are_smoked_and_published_with_each_release() {
     assert!(browser.contains("bun install --frozen-lockfile"));
     assert!(browser.contains("bun run package --"));
     assert!(browser.contains("bun run smoke:package"));
-    assert!(browser.contains("playwright-core install-deps chromium"));
+    assert!(browser.contains("patchright install-deps chromium"));
     assert!(browser.contains("actions/upload-artifact@v5"));
 
     let stage = job_section(&release, "stage-release", "unused");

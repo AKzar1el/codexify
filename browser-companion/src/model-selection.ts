@@ -1,10 +1,10 @@
 // Derived from miuuyy/codex-chatgpt-web
 // src/adapters/chatgpt-web/model-selection.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 import { activateChatGptEffortMenu, parseChatGptEffortSliderState, parseChatGptModelAnnouncement, readChatGptModelAnnouncements } from "./session";
-import type { Locator, Page } from "playwright-core";
+import type { Locator, Page } from "patchright";
 import { activeComposer, composerText } from "./composer";
-import { readChatGptEffortSnapshot, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
-import { resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
+import { readChatGptEffortSnapshot, moveChatGptEffortSlider, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
+import { MODEL_FAMILY_LABELS, browserEffortIdFromLabel, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
 import { BrowserCompanionError } from "./errors";
 
 type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
@@ -19,9 +19,7 @@ function familyError(family: BrowserModelFamily, cause?: unknown): BrowserCompan
 
 function familyOption(menu: EffortMenu, family: BrowserModelFamily) {
   return menu.menu.getByRole("menuitemradio", {
-    name: family === "5.6" ? /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i
-      // Simplified/Traditional Chinese and Japanese share 最新; Korean uses 최신.
-      : /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
+    name: MODEL_FAMILY_LABELS[family],
     exact: true,
     includeHidden: true,
   });
@@ -86,7 +84,27 @@ export function chatGptModelFamilyMatches(
   });
   return states.length > 0 && states.every(state => state.version === family
     && (!state.name || state.name === expectedName)
-    && (effort === "max" ? /^Pro$/i.test(state.mode) : !/^Pro$/i.test(state.mode)));
+    && browserEffortIdFromLabel(state.mode) === effort);
+}
+
+export function chatGptModelSelectionMatches(
+  descriptions: readonly string[],
+  family: BrowserModelFamily,
+  effort: BrowserEffort,
+  familyChecked: boolean,
+  familyLabel: string | null,
+): boolean {
+  if (!familyChecked) return false;
+  // The current picker announces only the effort. Its checked family radio is
+  // the model evidence; retain explicit version announcements when present.
+  const hasVersion = descriptions.some(text => parseChatGptModelAnnouncement(text) !== undefined);
+  const selectedVersion = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?=\s|Leaving|$)/i
+    .exec(familyLabel?.normalize("NFKC").trim() ?? "")?.[1];
+  if (!hasVersion && selectedVersion !== family) return false;
+  const evidence = hasVersion ? descriptions : descriptions
+    .filter(text => { const label = text.trim().replace(/[,、]\s*\d+\s+of\s+\d+\.?$/i, ""); return label && browserEffortIdFromLabel(label) === effort; })
+    .map(text => `${family} ${text}`);
+  return chatGptModelFamilyMatches(evidence, family, effort);
 }
 
 export async function assertChatGptModelFamily(
@@ -105,7 +123,8 @@ export async function assertChatGptModelFamily(
       await menu.slider.getAttribute("aria-valuenow"),
     );
     const descriptions = await readChatGptModelAnnouncements(menu.slider);
-    if (checked && state && state.value === state.min + effortIndex && chatGptModelFamilyMatches(descriptions, family, effort)) return;
+    const familyLabel = checked ? await option.textContent() : null;
+    if (state && state.value === state.min + effortIndex && chatGptModelSelectionMatches(descriptions, family, effort, checked, familyLabel)) return;
     if (Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (true);
@@ -215,27 +234,10 @@ export async function selectModelAndEffort(
   const control = controls.first();
   let menu = await activateChatGptEffortMenu(page, control);
   menu = await selectChatGptModelFamily(menu, resolved.family!, () => activateChatGptEffortMenu(page, control));
-  let slider = await availableEffort(menu, resolved.effortIndex);
+  const slider = await availableEffort(menu, resolved.effortIndex);
   const origin = slider.min;
   const target = origin + resolved.effortIndex;
-  const sliderControl = menu.slider.locator("xpath=ancestor::*[@role='menuitem'][1]");
-  while (slider.value !== target) {
-    if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
-    const direction = target > slider.value ? 1 : -1;
-    const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
-    const before = slider.value;
-    await sliderControl.press(key, { timeout:5_000, signal });
-    const deadline = Date.now() + 5_000;
-    do {
-      slider = await availableEffort(menu, resolved.effortIndex);
-      if (slider.min !== origin) throw new BrowserCompanionError("ChatGPT changed its effort range", "model_unavailable");
-      if (slider.value !== before) break;
-      await new Promise(resolve => setTimeout(resolve, 50));
-    } while (Date.now() < deadline);
-    if (slider.value !== before + direction) {
-      throw new BrowserCompanionError(`ChatGPT effort slider did not move one step with ${key}`, "model_unavailable");
-    }
-  }
+  await moveChatGptEffortSlider(menu, target, signal);
   const selectedUrl = page.url();
   await page.keyboard.press("Escape");
   const label = (await control.innerText()).trim();

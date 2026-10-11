@@ -1,4 +1,4 @@
-import type { Locator, Page } from "playwright-core";
+import type { Locator, Page } from "patchright";
 import { readChatGptAccount } from "./account";
 import { resolveToolApproval, throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
 import type { BrowserDriver, DriverExecution } from "./browser-window";

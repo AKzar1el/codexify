@@ -70,7 +70,20 @@ impl SecretRedactor {
             redacted = redacted.replace(secret, REDACTED);
         }
         for (pattern, replacement) in &self.secret_patterns {
-            redacted = pattern.replace_all(&redacted, *replacement).into_owned();
+            redacted = pattern
+                .replace_all(&redacted, |captures: &regex::Captures<'_>| {
+                    let mut text = String::new();
+                    captures.expand(
+                        if captures.name("diagnostic").is_some() {
+                            "$diagnostic"
+                        } else {
+                            replacement
+                        },
+                        &mut text,
+                    );
+                    text
+                })
+                .into_owned();
         }
         redacted
     }
@@ -272,6 +285,16 @@ fn collect_secret_values(
     }
     for server in config.mcp_servers.values() {
         for (name, value) in &server.env {
+            // CODEX_HOME is a directory setting. Matching it as a secret also
+            // hides the prefix of .codexify paths in otherwise useful payloads.
+            // Audit's blanket policy and explicit operator redactions still apply.
+            if !redact_all_mcp_values
+                && name == "CODEX_HOME"
+                && Path::new(value).is_absolute()
+                && !redact_env.iter().any(|requested| requested == name)
+            {
+                continue;
+            }
             push_secret(
                 &mut values,
                 value,
@@ -559,8 +582,10 @@ fn secret_patterns() -> Vec<(Regex, &'static str)> {
             "$1[REDACTED]",
         ),
         (
-            r#"(?i)([\"']?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|passphrase|credential|checksum|digest|fingerprint|hash|etag|sha(?:1|256|384|512)|md5|crc32)[A-Za-z0-9_-]*[\"']?\s*:\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"#,
-            "$1[REDACTED]",
+            // Consume only this public doctor label, leaving the following
+            // text subject to all credential rules. It is not a credential field.
+            r#"(?im)(?P<diagnostic>^[ \t]*(?:PASS|WARN|FAIL|SKIP)[ \t]+openai_tunnel_credential:[ \t]*)|([\"']?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|passphrase|credential|checksum|digest|fingerprint|hash|etag|sha(?:1|256|384|512)|md5|crc32)[A-Za-z0-9_-]*[\"']?\s*:\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"#,
+            "$2[REDACTED]",
         ),
         (
             r#"(?i)([?&](?:x-amz-signature|signature|sig|token|access_token|api[-_]?key)=)[^&\s'\"]+"#,
@@ -702,6 +727,84 @@ mod tests {
         assert!(redacted.contains("1 dev"));
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("xyz"));
+    }
+
+    #[test]
+    fn mcp_codex_home_does_not_redact_codexify_paths_in_tool_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = if cfg!(windows) {
+            r"C:\Users\paul\.codex"
+        } else {
+            "/Users/paul/.codex"
+        };
+        let mut config = default_config(root.path().into());
+        config.mcp_servers.insert(
+            "node_repl".into(),
+            crate::types::McpServerSpec {
+                env: HashMap::from([
+                    ("CODEX_HOME".into(), codex_home.into()),
+                    ("API_TOKEN".into(), "fixture-private-token".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let redactor = SecretRedactor::for_tool_logging(&config);
+        for suffix in [
+            "bin/codexify",
+            "projects/iTLS-Enso/chats/task/CHAT.md",
+            "browser/runtime/1.7.0",
+        ] {
+            let path = format!("{codex_home}ify/{suffix}");
+            assert_eq!(redactor.redact_text(&path), path);
+        }
+        assert_eq!(redactor.redact_text("fixture-private-token"), REDACTED);
+        assert_eq!(
+            SecretRedactor::for_audit(&config).redact_text(codex_home),
+            REDACTED
+        );
+        config.tool_logging.redact_env.push("CODEX_HOME".into());
+        assert_eq!(
+            SecretRedactor::for_tool_logging(&config).redact_text(codex_home),
+            REDACTED
+        );
+    }
+
+    #[test]
+    fn doctor_credential_check_labels_preserve_the_openai_name() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = default_config(root.path().into());
+        config.api_key = Some("fixture-private-key".into());
+        for redactor in [
+            SecretRedactor::for_tool_logging(&config),
+            SecretRedactor::for_audit(&config),
+        ] {
+            for label in ["PASS", "WARN", "FAIL", "SKIP"] {
+                let text = format!(
+                    "{label} openai_tunnel_credential: OpenAI tunnel credential references are usable\n  2 tunnel credential references checked\n"
+                );
+                assert_eq!(redactor.redact_text(&text), text);
+                let text = format!(
+                    "{label} openai_tunnel_credential: token: unknown-private-token --api-key unknown-private-key fixture-private-key"
+                );
+                let redacted = redactor.redact_text(&text);
+                for secret in [
+                    "unknown-private-token",
+                    "unknown-private-key",
+                    "fixture-private-key",
+                ] {
+                    assert!(!redacted.contains(secret));
+                }
+            }
+            for text in [
+                "openai_tunnel_credential: unknown-private-token",
+                "prefix PASS openai_tunnel_credential: unknown-private-token",
+                "PASS password: unknown-private-token",
+                "PASS \"openai_tunnel_credential\": \"unknown-private-token\"",
+                "{\"openai_tunnel_credential\":\"unknown-private-token\"}",
+            ] {
+                assert!(!redactor.redact_text(text).contains("unknown-private-token"));
+            }
+        }
     }
 
     #[test]

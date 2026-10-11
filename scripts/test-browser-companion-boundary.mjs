@@ -46,7 +46,8 @@ test("companion source contains no imported Responses, Codex, tunnel, subagent, 
     /tunnel-client/i,
     /from\s+["'][^"']*launcher-browser-host[^"']*["']/,
   ]) assert.doesNotMatch(combined, forbidden);
-  assert.equal((combined.match(/new BrowserWindow\s*\(/g) ?? []).length, 1);
+  assert.equal((combined.match(/launchPersistentContext\s*\(/g) ?? []).length, 1);
+  assert.doesNotMatch(combined, /BrowserWindow|connectOverCDP/);
   assert.doesNotMatch(combined, /from\s+["'](?:\.\.\/){2,}/);
 });
 
@@ -65,13 +66,13 @@ test("control protocol exposes only the approved loopback RPC surface", async ()
   assert.doesNotMatch(control, /javascript|cssSelector|cookie|filesystemPath/);
 });
 
-test("build artifact is optional, bounded, and does not vendor Electron or Playwright", async () => {
+test("build artifact is optional, bounded, and does not vendor Electron or Patchright", async () => {
   const output = join(companion, "dist", "main.js");
   const metadata = await stat(output);
   assert(metadata.size > 0 && metadata.size < 1024 * 1024);
   const text = await readFile(output, "utf8");
   assert.match(text, /codexify-browser-companion/);
-  assert.match(text, /playwright-core/);
+  assert.match(text, /patchright/);
   assert.match(text, /electron/);
   assert.doesNotMatch(text, /MAX_CHATGPT_BROWSER_TABS|\/v1\/responses|retainConversation/);
 });

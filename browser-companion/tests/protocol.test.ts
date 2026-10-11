@@ -32,6 +32,7 @@ describe("protocol identity and URL boundaries", () => {
     for (const url of [
       "https://chatgpt.com/c/ordinary",
       "https://chatgpt.com/g/g-project/c/thread?model=gpt-6",
+      "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-example-project/c/01234567-89ab-cdef-0123-456789abcdef",
       "https://chatgpt.com/share/not-used-as-a-heuristic?x=1",
     ]) {
       expect(validateChatGptConversationUrl(url)).toBe(url);

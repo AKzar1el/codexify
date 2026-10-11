@@ -53,7 +53,7 @@
     },
     {
       "source": "launcher/electron/browser-host.cjs",
-      "local": "browser-companion/src/electron-surface.ts",
+      "local": "browser-companion/src/chrome-surface.ts",
       "symbols": ["BrowserWindow", "remote-debugging-port", "connectOverCDP"]
     }
   ]

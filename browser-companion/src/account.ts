@@ -2,7 +2,7 @@
 // src/adapters/chatgpt-web/limits.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { Page } from "playwright-core";
+import type { Page } from "patchright";
 
 const sessionProjectionSchema = z.strictObject({
   userId:z.string().min(1).max(256),

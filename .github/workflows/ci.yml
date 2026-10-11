@@ -52,7 +52,9 @@ jobs:
             /etc/apt/sources.list.d/google-chrome.list \
             /etc/apt/sources.list.d/google-chrome.sources
           cd browser-companion
-          bun x --no-install playwright-core install-deps chromium
+          bun x --no-install patchright install-deps chromium
+          bun run install:chrome
+          CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/chrome-surface.test.ts ./tests/capability-discovery.test.ts
           bun run package
           bun run smoke:package
 

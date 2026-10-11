@@ -41,6 +41,8 @@ struct Cursor {
     offset: u64,
     anchor: Vec<u8>,
     #[serde(default)]
+    custom_title: Option<String>,
+    #[serde(default)]
     last_agent_end: Option<u64>,
     #[serde(default)]
     notification: NotificationState,
@@ -130,6 +132,23 @@ impl ChatFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub async fn set_owner_title(self: &Arc<Self>, title: String) -> Result<(), String> {
+        let title = title.trim().to_string();
+        if title.chars().count() > 200 {
+            return Err("Chat name must not exceed 200 characters".into());
+        }
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                let mut next = cursor.clone();
+                next.custom_title = (!title.is_empty()).then_some(title);
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn run<T, F>(self: &Arc<Self>, operation: F) -> Result<T, String>

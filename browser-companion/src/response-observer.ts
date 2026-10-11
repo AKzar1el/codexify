@@ -1,7 +1,7 @@
 // Derived from miuuyy/codex-chatgpt-web
 // src/adapters/chatgpt-web/browser-worker.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 // The DOM projection and append-only boundaries intentionally remain close to upstream.
-import type { Locator } from "playwright-core";
+import type { Locator } from "patchright";
 import { CHATGPT_COMPLETION_ACTION_SELECTOR } from "./session";
 import type { ChatGptMarkdownSegment } from "./response-stream";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "./ui-labels";
@@ -162,8 +162,8 @@ export async function responseDomSnapshot(
       });
       registry.states.set(root, state);
     }
-    // Browser turn WebContents are intentionally allowed to run while their Electron view is
-    // hidden or has no measured width. Layout geometry is therefore not response visibility:
+    // A browser turn can remain readable while Chrome is minimized or its content has no
+    // measured width. Layout geometry is therefore not response visibility:
     // completed Markdown can have width=0 while remaining connected, rendered and readable.
     const isRendered = (candidate: HTMLElement): boolean => {
       if (!candidate.isConnected) return false;

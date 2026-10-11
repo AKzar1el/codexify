@@ -25,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_automation::{
     AgentAutomationStore, AgentAutomationSupervisor, AutomationTaskHandle, BrowserCompanionClient,
-    RevealWindowRequest,
 };
 use crate::artifact_egress::ArtifactEgressStore;
 use crate::conversation_continuations::ConversationContinuationStore;
@@ -36,6 +35,7 @@ use crate::types::AppConfig;
 use crate::util::home_dir;
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+type BrowserOpener = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnerMessage {
@@ -81,6 +81,7 @@ struct OwnerState {
     artifacts: Arc<ArtifactEgressStore>,
     continuations: Arc<ConversationContinuationStore>,
     automation: Option<Arc<AgentAutomationSupervisor>>,
+    open_browser: BrowserOpener,
     token: String,
 }
 
@@ -349,7 +350,10 @@ fn wrap(value: Value) -> Json<Value> {
 struct ChatListing {
     id: String,
     title: String,
+    custom_title: Option<String>,
     workspace: String,
+    project_id: String,
+    project_path: String,
     last_entry_end: u64,
     last_entry_at_ms: u64,
     last_agent_call_at_ms: Option<u64>,
@@ -357,15 +361,115 @@ struct ChatListing {
     total_tool_calls: u64,
 }
 
-async fn list_chats(State(state): State<OwnerState>) -> ApiResult {
+#[derive(Default, Deserialize)]
+struct ListQuery {
+    q: Option<String>,
+}
+
+async fn transcript_matches(
+    chats: &[LocatedChat],
+    query: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut matches = std::collections::HashSet::new();
+    // Explicit paths keep the search confined to persisted chats. Literal matching
+    // avoids treating user input as flags or a regular expression.
+    for batch in chats.chunks(100) {
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("rg")
+                .args([
+                    "--no-config",
+                    "--text",
+                    "--fixed-strings",
+                    "--ignore-case",
+                    "--files-with-matches",
+                    "--null",
+                    "--",
+                    query,
+                ])
+                .args(batch.iter().map(|chat| &chat.path))
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| "Chat search timed out")?;
+        match output {
+            Ok(output) if matches!(output.status.code(), Some(0 | 1)) => {
+                for path in output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                {
+                    if let Some(chat) = batch
+                        .iter()
+                        .find(|chat| chat.path.to_string_lossy().as_bytes() == path)
+                    {
+                        matches.insert(chat.id.clone());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The standalone UI also works on installations without an rg binary.
+                let paths: Vec<_> = batch
+                    .iter()
+                    .map(|chat| (chat.id.clone(), chat.path.clone()))
+                    .collect();
+                let pattern = regex::RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|_| "Invalid chat search")?;
+                let found = tokio::task::spawn_blocking(move || {
+                    use std::io::BufRead;
+                    let mut found = Vec::new();
+                    for (id, path) in paths {
+                        let file =
+                            std::fs::File::open(path).map_err(|_| "Chat transcript unavailable")?;
+                        for line in std::io::BufReader::new(file).lines() {
+                            if pattern.is_match(&line.map_err(|_| "Chat transcript unavailable")?) {
+                                found.push(id);
+                                break;
+                            }
+                        }
+                    }
+                    Ok::<_, String>(found)
+                })
+                .await
+                .map_err(|_| "Chat search was interrupted")??;
+                matches.extend(found);
+            }
+            _ => return Err("Chat transcripts could not be searched".into()),
+        }
+    }
+    Ok(matches)
+}
+
+async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQuery>) -> ApiResult {
+    let query = query.q.unwrap_or_default().trim().to_string();
+    if query.len() > 1024 || query.contains(['\n', '\r', '\0']) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Search must be a single line of at most 1 KiB".into(),
+        ));
+    }
+    let located_chats = locate(&state.config);
+    let mut matched = if query.is_empty() {
+        None
+    } else {
+        Some(
+            transcript_matches(&located_chats, &query)
+                .await
+                .map_err(internal_error)?,
+        )
+    };
     let mut list = Vec::new();
-    for located in locate(&state.config) {
+    for located in located_chats {
         let chat = state
             .chats
             .chat_at_path(located.path.clone(), true)
             .map_err(internal_error)?;
         let OwnerChatSummary {
             title,
+            custom_title,
             last_entry_end,
             last_entry_at_ms,
             last_agent_call_at_ms,
@@ -378,6 +482,7 @@ async fn list_chats(State(state): State<OwnerState>) -> ApiResult {
                 let metadata = std::fs::metadata(&located.path).map_err(internal_error)?;
                 OwnerChatSummary {
                     title: "Conversation unavailable".into(),
+                    custom_title: None,
                     last_entry_end: metadata.len(),
                     last_entry_at_ms: metadata
                         .modified()
@@ -391,10 +496,25 @@ async fn list_chats(State(state): State<OwnerState>) -> ApiResult {
                 }
             }
         };
+        if title.to_lowercase().contains(&query.to_lowercase())
+            && let Some(matched) = matched.as_mut()
+        {
+            matched.insert(located.id.clone());
+        }
+        let project_path = located
+            .work_dir
+            .as_ref()
+            .unwrap_or(&located.state_root)
+            .to_string_lossy()
+            .into_owned();
+        let project_id = format!("{:x}", Sha256::digest(project_path.as_bytes()));
         list.push(ChatListing {
             id: located.id,
             title,
+            custom_title,
             workspace: located.workspace,
+            project_id,
+            project_path,
             last_entry_end,
             last_entry_at_ms,
             last_agent_call_at_ms,
@@ -408,7 +528,32 @@ async fn list_chats(State(state): State<OwnerState>) -> ApiResult {
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(Json(
-        json!({"chats": list, "serverTimeMs": crate::markdown_chat::now_ms()}),
+        json!({"chats": list, "matchedChatIds": matched, "serverTimeMs": crate::markdown_chat::now_ms()}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TitleBody {
+    title: String,
+}
+
+async fn rename_chat(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<TitleBody>,
+) -> ApiResult {
+    let located = selected(&state.config, &id)?;
+    let chat = state
+        .chats
+        .chat_at_path(located.path, true)
+        .map_err(internal_error)?;
+    chat.set_owner_title(body.title)
+        .await
+        .map_err(internal_error)?;
+    let summary = chat.owner_summary().await.map_err(internal_error)?;
+    Ok(Json(
+        json!({"title": summary.title, "customTitle": summary.custom_title}),
     ))
 }
 
@@ -549,6 +694,7 @@ async fn automation_selection(
     validate_owner_request_id(&body.request_id)?;
     let located = selected(&state.config, &id)?;
     let context = automation_context(&state, &located).await?;
+    ensure_selection_offline(&context.chat).await?;
     let catalog = companion_client(&state)?
         .capabilities(&CancellationToken::new())
         .await
@@ -571,6 +717,8 @@ async fn automation_selection(
                 .unwrap_or("The selected ChatGPT effort is unavailable"),
         ));
     }
+    // Capability inspection can take time; check presence again before committing.
+    ensure_selection_offline(&context.chat).await?;
     let selection = context
         .store
         .set_selection(
@@ -593,6 +741,25 @@ async fn automation_selection(
             "catalogRevision": selection.catalog_revision
         }
     })))
+}
+
+async fn ensure_selection_offline(
+    chat: &Arc<crate::markdown_chat::ChatFile>,
+) -> Result<(), (StatusCode, String)> {
+    let summary = chat.owner_summary().await.map_err(internal_error)?;
+    let now = crate::markdown_chat::now_ms();
+    if summary
+        .last_agent_call_at_ms
+        .is_some_and(|last| now.saturating_sub(last) < crate::markdown_chat::OFFLINE_AFTER_MS)
+        || summary
+            .agent_waiting_until_ms
+            .is_some_and(|until| now < until)
+    {
+        return Err(internal_error(
+            "Model and effort can only be changed while the agent is offline",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -692,24 +859,22 @@ async fn automation_reveal(
     Json(_): Json<Value>,
 ) -> ApiResult {
     let located = selected(&state.config, &id)?;
-    let context = automation_context(&state, &located).await?;
-    let automation = context.store.load(&context.task).map_err(internal_error)?;
-    let receipt = companion_client(&state)?
-        .reveal(
-            &RevealWindowRequest {
-                url: automation
-                    .pairing
-                    .canonical_url
-                    .or(automation.pairing.candidate_url),
-            },
-            &CancellationToken::new(),
-        )
-        .await
+    let store = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
         .map_err(internal_error)?;
-    Ok(Json(json!({
-        "revealed": receipt.revealed,
-        "activeActionId": receipt.active_action_id
-    })))
+    let automation = store
+        .load(&automation_task(&located)?)
+        .map_err(internal_error)?;
+    let url = automation
+        .pairing
+        .canonical_url
+        .or(automation.pairing.candidate_url)
+        .ok_or_else(|| internal_error("Pair a ChatGPT conversation before opening it"))?;
+    let open_browser = state.open_browser.clone();
+    tokio::task::spawn_blocking(move || open_browser(&url))
+        .await
+        .map_err(internal_error)?
+        .map_err(|error| internal_error(format!("Could not open the default browser: {error}")))?;
+    Ok(Json(json!({"opened": true})))
 }
 
 #[derive(Deserialize)]
@@ -1153,6 +1318,7 @@ pub(crate) async fn start_with_automation(
         artifacts,
         continuations,
         automation,
+        open_browser: Arc::new(|url| open::that(url)),
         token: info.token,
     };
     let app = router(state);
@@ -1179,6 +1345,7 @@ fn router(state: OwnerState) -> Router {
         .route("/", get(page))
         .route("/api/chats", get(list_chats))
         .route("/api/chats/{id}", get(chat_state))
+        .route("/api/chats/{id}/title", post(rename_chat))
         .route("/api/chats/{id}/automation", get(automation_state))
         .route(
             "/api/chats/{id}/automation/capabilities",
@@ -1572,6 +1739,7 @@ mod tests {
             artifacts,
             continuations,
             automation: None,
+            open_browser: Arc::new(|_| Ok(())),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1656,6 +1824,106 @@ mod tests {
         for index in 0..55 {
             chat.append(format!("Agent answer {index}")).await.unwrap();
         }
+        let latest: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(latest["chats"][0]["title"], "Agent answer 54");
+        let before_rename = std::fs::read(chat.path()).unwrap();
+        let unauthorized_rename = client
+            .post(format!("{base}/api/chats/{id}/title"))
+            .json(&json!({"title":"Hidden"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized_rename.status(), StatusCode::UNAUTHORIZED);
+        let named: Value = client
+            .post(format!("{base}/api/chats/{id}/title"))
+            .bearer_auth("test-token")
+            .json(&json!({"title":"Release checklist"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(named["title"], "Release checklist");
+        assert_eq!(named["customTitle"], "Release checklist");
+        assert_eq!(std::fs::read(chat.path()).unwrap(), before_rename);
+        let reopened = MarkdownChatStore::default()
+            .chat_at_path(chat.path().into(), true)
+            .unwrap();
+        assert_eq!(
+            reopened.owner_summary().await.unwrap().title,
+            "Release checklist"
+        );
+        for (query, expected) in [
+            ("RELEASE CHECKLIST", true),
+            ("check the build", true),
+            ("Agent answer 0", true),
+            ("[not a regex]", false),
+            ("--hidden", false),
+        ] {
+            let found: Value = client
+                .get(format!(
+                    "{base}/api/chats?q={}",
+                    percent_encoding::utf8_percent_encode(
+                        query,
+                        percent_encoding::NON_ALPHANUMERIC
+                    )
+                ))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                found["matchedChatIds"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(id)),
+                expected,
+                "{query}"
+            );
+            assert_eq!(
+                found["chats"].as_array().unwrap().len(),
+                1,
+                "search must preserve selected chat metadata"
+            );
+        }
+        let invalid_search = client
+            .get(format!("{base}/api/chats?q=line%0Abreak"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_search.status(), StatusCode::BAD_REQUEST);
+        let cleared: Value = client
+            .post(format!("{base}/api/chats/{id}/title"))
+            .bearer_auth("test-token")
+            .json(&json!({"title":"  "}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared["title"], "Agent answer 54");
+        assert!(cleared["customTitle"].is_null());
+        let reopened = MarkdownChatStore::default()
+            .chat_at_path(chat.path().into(), true)
+            .unwrap();
+        assert_eq!(
+            reopened.owner_summary().await.unwrap().title,
+            "Agent answer 54"
+        );
         let unauthorized_markdown = client
             .get(format!("{base}/api/chats/{id}/markdown"))
             .send()
@@ -1729,6 +1997,7 @@ mod tests {
             artifacts,
             continuations,
             automation: Some(supervisor),
+            open_browser: Arc::new(|_| Ok(())),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1852,14 +2121,21 @@ mod tests {
             config.markdown_chat.automation.clone(),
             Arc::new(OwnerNoopExecutor),
         );
+        let opened_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record_urls = opened_urls.clone();
         let state = OwnerState {
             config: Arc::new(config),
             chats,
             artifacts,
             continuations,
             automation: Some(supervisor.clone()),
+            open_browser: Arc::new(move |url| {
+                record_urls.lock().unwrap().push(url.to_owned());
+                Ok(())
+            }),
             token: "test-token".into(),
         };
+        let open_state = state.clone();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1879,6 +2155,23 @@ mod tests {
             .await
             .unwrap();
         let id = list["chats"][0]["id"].as_str().unwrap();
+
+        let unauthorized_open = client
+            .post(format!("{base}/api/chats/{id}/automation/reveal"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized_open.status(), StatusCode::UNAUTHORIZED);
+        let unpaired_open = client
+            .post(format!("{base}/api/chats/{id}/automation/reveal"))
+            .bearer_auth("test-token")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unpaired_open.status(), StatusCode::CONFLICT);
+        assert!(opened_urls.lock().unwrap().is_empty());
 
         let unauthorized = client
             .post(format!("{base}/api/chats/{id}/automation/capabilities"))
@@ -2016,7 +2309,67 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(revealed["revealed"], true);
+        assert_eq!(revealed["opened"], true);
+        assert_eq!(
+            *opened_urls.lock().unwrap(),
+            ["https://chatgpt.com/c/owner-management"]
+        );
+        assert_eq!(supervisor.queued_count().await, 1);
+
+        // Prefer the canonical project URL and do not depend on a companion or supervisor.
+        let located = selected(&open_state.config, id).unwrap();
+        let store =
+            AgentAutomationStore::for_state_root(&open_state.config, &located.state_root).unwrap();
+        let task = automation_task(&located).unwrap();
+        let project_url = "https://chatgpt.com/g/g-p-owner-project/c/owner-management";
+        store
+            .record_pairing_canonical_url(
+                &task,
+                paired_again["pairing"]["generation"].as_u64().unwrap(),
+                project_url,
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        let saved_before_open = store.load(&task).unwrap();
+        let mut disconnected_config = (*open_state.config).clone();
+        disconnected_config.markdown_chat.automation.descriptor_path = temp
+            .path()
+            .join("missing-descriptor.json")
+            .display()
+            .to_string();
+        let disconnected_state = OwnerState {
+            config: Arc::new(disconnected_config),
+            automation: None,
+            ..open_state.clone()
+        };
+        let Json(opened) = automation_reveal(
+            State(disconnected_state.clone()),
+            Path(id.to_owned()),
+            Json(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["opened"], true);
+        assert_eq!(
+            *opened_urls.lock().unwrap(),
+            ["https://chatgpt.com/c/owner-management", project_url]
+        );
+        assert_eq!(
+            serde_json::to_value(store.load(&task).unwrap()).unwrap(),
+            serde_json::to_value(saved_before_open).unwrap()
+        );
+        assert_eq!(supervisor.queued_count().await, 1);
+        let failing_state = OwnerState {
+            open_browser: Arc::new(|_| Err(std::io::Error::other("test opener failure"))),
+            ..disconnected_state
+        };
+        let error = automation_reveal(State(failing_state), Path(id.to_owned()), Json(json!({})))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("Could not open the default browser"));
+        assert_eq!(opened_urls.lock().unwrap().len(), 2);
 
         let unlinked: Value = client
             .post(format!("{base}/api/chats/{id}/automation/unlink"))
@@ -2048,7 +2401,28 @@ mod tests {
         assert!(!joined.contains(&descriptor.display().to_string()));
         assert_eq!(companion_state.login_calls.load(Ordering::SeqCst), 1);
         assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(companion_state.reveal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(companion_state.reveal_calls.load(Ordering::SeqCst), 0);
+        for age in [0, 240_000] {
+            chat.record_agent_call(crate::markdown_chat::now_ms() - age)
+                .await
+                .unwrap();
+            let denied = client
+                .post(format!("{base}/api/chats/{id}/automation/selection"))
+                .bearer_auth("test-token")
+                .json(
+                    &json!({"requestId":"online-selection", "model":"gpt-6-sol", "effort":"high"}),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::CONFLICT);
+            assert!(denied.text().await.unwrap().contains("offline"));
+        }
+        assert_eq!(
+            companion_state.capabilities_calls.load(Ordering::SeqCst),
+            2,
+            "online selection must be rejected before inspecting the browser"
+        );
         owner_task.abort();
         companion_task.abort();
     }
@@ -2144,6 +2518,7 @@ mod tests {
             artifacts,
             continuations,
             automation: Some(supervisor.clone()),
+            open_browser: Arc::new(|_| Ok(())),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

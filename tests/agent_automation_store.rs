@@ -253,6 +253,23 @@ fn pairing_rejects_the_chatgpt_homepage_without_a_conversation_path() {
 }
 
 #[test]
+fn pairing_preserves_project_conversation_urls() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("project-pairing");
+    let url = "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-example-project/c/01234567-89ab-cdef-0123-456789abcdef";
+    let pairing = store.issue_pairing(&task, url, 0, 1_000).unwrap();
+    assert_eq!(
+        store.load(&task).unwrap().pairing.candidate_url.as_deref(),
+        Some(url)
+    );
+    let recorded = store
+        .record_pairing_canonical_url(&task, pairing.generation, url, 1_001)
+        .unwrap();
+    assert_eq!(recorded.canonical_url.as_deref(), Some(url));
+}
+
+#[test]
 fn pairing_reference_index_is_private_and_digest_only() {
     let root = tempfile::tempdir().unwrap();
     let state_root = root.path().join("automation");

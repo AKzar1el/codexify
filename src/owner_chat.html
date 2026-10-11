@@ -37,46 +37,63 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
 #chat-host { width:min(100%,960px); min-height:0; background:var(--panel); border:1px solid var(--line); border-radius:18px; overflow:hidden; display:flex; flex-direction:column; }
 #placeholder { display:grid; place-items:center; height:100%; color:var(--muted); padding:24px; text-align:center; }
 #error { color:#ad2d30; padding:10px 16px; font-size:12px; }
-.automation-panel { flex:none; max-height:48%; overflow:auto; padding:16px 18px 18px; border-bottom:1px solid var(--line); background:linear-gradient(135deg, color-mix(in srgb, var(--selected) 70%, var(--panel)), var(--panel) 52%); }
-.automation-panel[hidden] { display:none; }
-.automation-header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px; }
-.automation-header h2 { margin:0; font-size:16px; letter-spacing:-.01em; }
-.automation-header p { margin:3px 0 0; color:var(--muted); font-size:12px; }
-.automation-badges { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:6px; }
-.automation-badge { display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--muted); font-size:11px; font-weight:650; white-space:nowrap; }
-.automation-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
-.automation-card { min-width:0; padding:12px; border:1px solid color-mix(in srgb, var(--line) 88%, transparent); border-radius:12px; background:color-mix(in srgb, var(--panel) 92%, transparent); }
-.automation-card h3 { margin:0 0 9px; font-size:12px; text-transform:uppercase; letter-spacing:.075em; color:var(--muted); }
-.automation-card label { display:block; margin:8px 0 4px; color:var(--muted); font-size:11px; font-weight:650; }
-.automation-card input,.automation-card select,.automation-card textarea { width:100%; min-width:0; border:1px solid var(--line); border-radius:8px; padding:8px 9px; background:var(--panel); color:var(--ink); font:inherit; }
-.automation-card textarea { min-height:72px; resize:vertical; }
-.automation-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; }
-.automation-actions button { min-height:32px; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--ink); }
-.automation-actions button.primary { border-color:var(--accent); background:var(--accent); color:var(--panel); }
-.automation-actions button:disabled { cursor:not-allowed; opacity:.5; }
-.automation-detail { margin:8px 0 0; color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
-.automation-error { margin-top:10px; padding:9px 10px; border:1px solid color-mix(in srgb, #ad2d30 45%, var(--line)); border-radius:9px; background:color-mix(in srgb, #ad2d30 8%, var(--panel)); color:#ad2d30; font-size:12px; }
-.automation-error[hidden] { display:none; }
-.automation-stream { grid-column:1/-1; }
-.automation-stream-output { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-.automation-stream-output section { min-width:0; padding:8px; border-radius:8px; background:var(--bg); }
-.automation-stream-output strong { display:block; margin-bottom:4px; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
-.automation-stream-output div { max-height:96px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
-.chat-shell { flex:1; min-height:300px; }
-@media(max-width:760px) { .automation-grid { grid-template-columns:1fr; } .automation-stream { grid-column:auto; } .automation-stream-output { grid-template-columns:1fr; } }
-@media(max-width:680px) { #layout { grid-template-columns:minmax(145px,33%) minmax(0,1fr); } main { padding:0; } #chat-host { border:0; border-radius:0; } .automation-panel { max-height:54%; padding:12px 10px 14px; } .automation-header { align-items:flex-start; flex-direction:column; } .automation-badges { justify-content:flex-start; } .conversation { grid-template-columns:16px minmax(0,1fr) 7px; gap:5px; padding:9px 5px; } aside header { padding:12px 8px; } aside h1 { font-size:14px; } aside p { font-size:10px; } }
+input,select,textarea { font:inherit; }
+#chat-search { width:100%; margin-top:14px; padding:8px 10px; border:1px solid var(--line); border-radius:9px; background:var(--bg); color:var(--ink); }
+#list-view { display:flex; gap:4px; margin-top:9px; }
+#list-view button { flex:1; padding:6px 8px; border:0; border-radius:7px; color:var(--muted); background:transparent; font-size:12px; }
+#list-view button[aria-pressed="true"] { background:var(--selected); color:var(--ink); }
+.project-heading { margin:14px 9px 4px; font-size:12px; font-weight:600; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.chat-shell { flex:1; min-height:0; }
+@media(max-width:680px) { #layout { grid-template-columns:minmax(145px,33%) minmax(0,1fr); } main { padding:0; } #chat-host { border:0; border-radius:0; } .conversation { grid-template-columns:16px minmax(0,1fr) 7px; gap:5px; padding:9px 5px; } aside header { padding:12px 8px; } aside h1 { font-size:14px; } #list-view { flex-direction:column; } }
 </style>
 </head>
 <body>
 <div id="layout">
   <aside aria-label="Conversations">
-    <header><h1>Agent chats</h1><p>Most recent message first</p></header>
+    <header><h1>Agent chats</h1><input id="chat-search" type="search" aria-label="Search chats" placeholder="Search chats…" maxlength="1024"><div id="list-view" aria-label="Chat list view"><button type="button" id="view-projects" aria-pressed="true">Projects</button><button type="button" id="view-recent" aria-pressed="false">Recent</button></div></header>
     <div id="error" hidden></div>
     <nav id="conversations" aria-label="Agent chat conversations"></nav>
-    <div id="list-note">Local titles come from the first chat entry (preferring a user entry); ChatGPT titles are not exposed by the connector.</div>
+    <div id="list-note">Search names and conversation content. Use Rename chat to save a name.</div>
   </aside>
   <main><div id="chat-host"><div id="placeholder">Select a conversation to view its chat.</div></div></main>
 </div>
+<template id="owner-composer-style"><style>
+.footer { position:relative; border-top:0; padding:12px 18px 10px; background:var(--surface); }
+#composer { display:grid; grid-template-columns:minmax(0,1fr) 38px; gap:10px; padding:14px; border:1px solid var(--border); border-radius:25px; background:var(--bg); box-shadow:0 2px 8px #00000006; }
+#draft { grid-column:1/-1; width:100%; min-height:56px; border:0; border-radius:0; padding:2px 5px; background:transparent; }
+#chat[data-awaiting="true"] #draft { border:0; box-shadow:none; }
+#send { grid-column:2; grid-row:2; background:var(--ink); color:var(--bg); }
+#composer-tools { grid-column:1; grid-row:2; display:flex; align-items:center; gap:5px; min-width:0; flex-wrap:wrap; }
+#composer-tools select { max-width:100%; min-width:0; border:0; border-radius:7px; padding:5px 3px; color:var(--ink); background:transparent; font:inherit; cursor:pointer; }
+#automation-effort { color:var(--muted) !important; }
+#composer-tools select:disabled { cursor:default; opacity:.65; }
+.composer-button { border:0; border-radius:7px; padding:5px 7px; background:transparent; color:var(--muted); font:inherit; cursor:pointer; }
+.composer-button:hover { background:var(--agent); }
+#automation-settings-toggle { margin-right:auto; }
+#goal-bar { display:flex; align-items:center; gap:8px; margin:0 16px -10px; padding:10px 12px 18px; border:1px solid var(--border); border-bottom:0; border-radius:18px 18px 0 0; }
+#goal-caption { white-space:nowrap; font-weight:500; }
+#goal-text { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--muted); }
+#goal-bar button { flex:none; padding:3px; display:grid; place-items:center; }
+#goal-bar svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+#automation-settings,#goal-editor { position:absolute; bottom:calc(100% - 8px); left:18px; right:18px; max-height:60dvh; overflow:auto; z-index:5; padding:16px; border:1px solid var(--border); border-radius:16px; background:var(--surface); box-shadow:0 8px 24px #0002; }
+.automation-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+.automation-heading strong { font-size:14px; }
+.automation-detail { margin:6px 0; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+.automation-actions { display:flex; flex-wrap:wrap; gap:7px; margin:8px 0; }
+.automation-actions button { padding:6px 9px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+.automation-actions button:disabled { opacity:.5; }
+.automation-field { display:block; margin:10px 0 5px; color:var(--muted); font-size:12px; }
+#automation-url,#automation-goal,#chat-name { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+#automation-goal { min-height:90px; resize:vertical; }
+#automation-notice { margin:7px 4px 0; color:var(--muted); font-size:11px; }
+#automation-error { color:var(--error); margin:8px 4px; font-size:12px; }
+#rename-form { padding:12px 18px; border-bottom:1px solid var(--border); }
+#rename-form label { display:block; margin-bottom:5px; }
+#rename-form p { color:var(--muted); font-size:12px; margin:5px 0; }
+#rename-chat svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.7; }
+[hidden] { display:none !important; }
+@media(max-width:480px) { .footer { padding:10px 8px; } #composer { padding:10px; } #goal-bar { margin-left:8px; margin-right:8px; gap:5px; font-size:12px; } #goal-caption { max-width:90px; overflow:hidden; text-overflow:ellipsis; } #automation-settings,#goal-editor { left:8px; right:8px; } #composer-tools { gap:2px; font-size:12px; } }
+</style></template>
 <!-- CHAT_TEMPLATE -->
 <script>
 /* CHAT_SCRIPT */
@@ -87,7 +104,10 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
   const list = document.getElementById("conversations");
   const host = document.getElementById("chat-host");
   const errorNode = document.getElementById("error");
+  const search = document.getElementById("chat-search");
   let selected = null, controller = null, chats = [], clockOffset = 0, presenceTimer = null;
+  let listMode = "projects", matchedIds = null, matchedQuery = "", searchTimer = null, listRequest = 0, pendingList = null;
+  try { if (localStorage.getItem("owner-chat-list-view-v1") === "recent") listMode = "recent"; } catch {}
   const chatIdPattern = /^[0-9a-f]{64}$/;
   const chatMeta = "io.github.devnoname120/codexify/markdown-chat";
   let seen = {};
@@ -148,202 +168,210 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
     const text = String(value || "").replaceAll("_", " ");
     return text ? text[0].toUpperCase() + text.slice(1) : "Unknown";
   }
-  function createAutomationPanel(id) {
+  function createAutomationPanel(id, scope) {
     const panel = document.createElement("section");
     panel.id = "automation-panel";
-    panel.className = "automation-panel";
     panel.hidden = true;
-    panel.setAttribute("aria-label", "Browser automation");
+    panel.setAttribute("aria-label", "Chat automation");
     panel.innerHTML = `
-      <div class="automation-header">
-        <div><h2>Browser automation</h2><p>Offline fallback through one shared ChatGPT window</p></div>
-        <div class="automation-badges"><span id="automation-presence" class="automation-badge">Offline</span><span id="automation-queue" class="automation-badge" hidden></span><span id="automation-action" class="automation-badge">Idle</span></div>
+      <div id="automation-settings" hidden>
+        <div class="automation-heading"><strong>Chat connection</strong><button type="button" class="composer-button" id="automation-settings-close" aria-label="Close connection settings">✕</button></div>
+        <p id="companion-status" class="automation-detail"></p>
+        <div class="automation-actions"><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div>
+        <label class="automation-field" for="automation-url">ChatGPT conversation URL</label>
+        <input id="automation-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://chatgpt.com/c/…">
+        <div class="automation-actions"><button type="button" id="automation-pair">Pair conversation</button><button type="button" id="automation-unlink">Unlink conversation</button></div>
+        <p id="pairing-status" class="automation-detail"></p>
+        <p class="automation-detail"><span id="automation-presence"></span> · <span id="automation-action"></span> <span id="automation-queue" hidden></span></p>
+        <p id="automation-live-status" class="automation-detail"></p>
+        <p id="automation-live-commentary" class="automation-detail"></p>
+        <p id="automation-live-answer" class="automation-detail"></p>
+        <div class="automation-actions"><button type="button" id="automation-cancel-action">Cancel queued action</button><button type="button" id="automation-retry-action">Retry failed action</button></div>
       </div>
-      <div class="automation-grid">
-        <section class="automation-card">
-          <h3>Companion</h3>
-          <p id="companion-status" class="automation-detail">Checking browser companion…</p>
-          <div class="automation-actions"><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div>
-        </section>
-        <section class="automation-card">
-          <h3>Conversation</h3>
-          <label for="automation-url">ChatGPT conversation URL</label>
-          <input id="automation-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://chatgpt.com/c/…">
-          <div class="automation-actions"><button type="button" class="primary" id="automation-pair">Pair conversation</button><button type="button" id="automation-unlink">Unlink conversation</button></div>
-          <p id="pairing-status" class="automation-detail">Not paired</p>
-        </section>
-        <section class="automation-card">
-          <h3>Model</h3>
-          <label for="automation-model">ChatGPT model</label><select id="automation-model"><option value="">Refresh models first</option></select>
-          <label for="automation-effort">Reasoning effort</label><select id="automation-effort"><option value="">Choose a model</option></select>
-          <div class="automation-actions"><button type="button" class="primary" id="automation-save-selection">Save model and effort</button></div>
-          <p id="selection-status" class="automation-detail">No verified model selection</p>
-        </section>
-        <section class="automation-card">
-          <h3>Goal</h3>
-          <label for="automation-goal">Goal Markdown</label><textarea id="automation-goal" maxlength="10240" placeholder="Describe the bounded task goal"></textarea>
-          <div class="automation-actions"><button type="button" class="primary" id="automation-set-goal">Set goal</button><button type="button" id="automation-run-goal">Run goal</button><button type="button" id="automation-stop-goal">Stop goal</button><button type="button" id="automation-clear-goal">Clear goal</button><button type="button" id="automation-goal-status">Goal status</button></div>
-          <p id="goal-status" class="automation-detail">No goal configured</p>
-        </section>
-        <section class="automation-card automation-stream">
-          <h3>Browser activity</h3>
-          <div class="automation-stream-output"><section><strong>Status</strong><div id="automation-live-status"></div></section><section><strong>Commentary</strong><div id="automation-live-commentary"></div></section><section><strong>Answer</strong><div id="automation-live-answer"></div></section></div>
-          <div class="automation-actions"><button type="button" id="automation-cancel-action">Cancel queued action</button><button type="button" id="automation-retry-action">Retry failed action</button></div>
-        </section>
+      <div id="goal-editor" hidden>
+        <div class="automation-heading"><strong>Goal</strong><button type="button" class="composer-button" id="goal-editor-close" aria-label="Close goal editor">✕</button></div>
+        <label class="automation-field" for="automation-goal">Goal Markdown</label><textarea id="automation-goal" maxlength="10240" placeholder="Describe the task goal"></textarea>
+        <div class="automation-actions"><button type="button" id="automation-set-goal">Set goal</button></div>
+        <p id="goal-status" class="automation-detail"></p>
       </div>
-      <div id="automation-error" class="automation-error" role="alert" hidden></div>`;
-
-    const byId = name => panel.querySelector(`#${name}`);
+      <div id="goal-bar" hidden>
+        <span aria-hidden="true">◎</span><span id="goal-caption"></span><span id="goal-text"></span>
+        <button type="button" class="composer-button" id="automation-clear-goal" aria-label="Clear goal" title="Clear goal"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v7m4-7v7"/></svg></button>
+        <button type="button" class="composer-button" id="automation-toggle-goal" aria-label="Run goal" title="Run goal"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path id="goal-toggle-icon" d="m10 8 6 4-6 4Z"/></svg></button>
+        <button type="button" class="composer-button" id="automation-edit-goal" aria-label="Edit goal" title="Edit goal"><svg viewBox="0 0 24 24"><path d="m4 16 12-12 4 4-12 12H4ZM14 6l4 4"/></svg></button>
+      </div>
+      <div id="automation-error" role="alert" hidden></div>`;
+    const composer = scope.querySelector("#composer");
+    composer.before(panel);
+    const tools = document.createElement("div");
+    tools.id = "composer-tools";
+    tools.hidden = true;
+    tools.innerHTML = `<button type="button" class="composer-button" id="automation-settings-toggle" aria-label="Connection settings" title="Connection settings" aria-expanded="false">⚙</button><button type="button" class="composer-button" id="automation-add-goal">Add goal</button><select id="automation-model" aria-label="ChatGPT model"><option value="">Models unavailable</option></select><select id="automation-effort" aria-label="Reasoning effort"><option value="">Effort</option></select>`;
+    composer.insertBefore(tools, scope.querySelector("#send"));
+    const notice = document.createElement("p"); notice.id = "automation-notice"; notice.hidden = true;
+    composer.after(notice);
+    const byId = name => scope.querySelector(`#${name}`);
     const nodes = {
       presence:byId("automation-presence"), queue:byId("automation-queue"), action:byId("automation-action"),
       companion:byId("companion-status"), login:byId("automation-login"), capabilities:byId("automation-capabilities"), reveal:byId("automation-reveal"),
       url:byId("automation-url"), pair:byId("automation-pair"), unlink:byId("automation-unlink"), pairing:byId("pairing-status"),
-      model:byId("automation-model"), effort:byId("automation-effort"), saveSelection:byId("automation-save-selection"), selection:byId("selection-status"),
-      goal:byId("automation-goal"), setGoal:byId("automation-set-goal"), runGoal:byId("automation-run-goal"), stopGoal:byId("automation-stop-goal"), clearGoal:byId("automation-clear-goal"), goalStatusButton:byId("automation-goal-status"), goalStatus:byId("goal-status"),
+      model:byId("automation-model"), effort:byId("automation-effort"),
+      goal:byId("automation-goal"), setGoal:byId("automation-set-goal"), toggleGoal:byId("automation-toggle-goal"), clearGoal:byId("automation-clear-goal"), goalStatus:byId("goal-status"),
       liveStatus:byId("automation-live-status"), liveCommentary:byId("automation-live-commentary"), liveAnswer:byId("automation-live-answer"), cancelAction:byId("automation-cancel-action"), retryAction:byId("automation-retry-action"), error:byId("automation-error")
     };
-    let current = null, models = [], closed = false, timer = null, requestInFlight = false;
+    let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, catalogAttempted = false, loadingModels = false, savingSelection = false, selectionDraft = null, selectionRevision = 0;
     const setError = message => { nodes.error.hidden = !message; nodes.error.textContent = message || ""; };
     const post = async (operation, body = {}) => {
       const response = await api(`/api/chats/${id}/automation/${operation}`, { method:"POST", body:JSON.stringify(body) });
       return response.json();
     };
-    function renderEfforts() {
+    const offline = () => presence(current?.presence?.lastAgentCallAtMs, Date.now() + clockOffset, current?.presence?.agentWaitingUntilMs) === "offline";
+    function renderEfforts(preferred = (selectionDraft || current?.selection)?.effort) {
       const model = models.find(candidate => candidate.id === nodes.model.value);
       nodes.effort.replaceChildren();
-      if (!model) {
-        nodes.effort.append(new Option("Choose a model", ""));
-      } else {
-        for (const effort of model.efforts || []) {
-          const suffix = effort.available === false && effort.reason ? ` — ${effort.reason}` : "";
-          const option = new Option(`${effort.label}${suffix}`, effort.id);
-          option.disabled = effort.available === false;
-          nodes.effort.append(option);
-        }
-        const selected = current?.selection?.model === model.id ? current.selection.effort : null;
-        if (selected && [...nodes.effort.options].some(option => option.value === selected && !option.disabled)) nodes.effort.value = selected;
-        else nodes.effort.value = [...nodes.effort.options].find(option => !option.disabled)?.value || "";
+      for (const effort of model?.efforts || []) {
+        if (effort.available) nodes.effort.append(new Option(effort.label, effort.id));
       }
-      nodes.saveSelection.disabled = !nodes.model.value || !nodes.effort.value;
+      if (!nodes.effort.options.length) {
+        const saved = !catalogLoaded ? (selectionDraft || current?.selection)?.effort : null;
+        nodes.effort.append(new Option(saved ? "Saved effort" : "Choose effort", saved || ""));
+      }
+      if ([...nodes.effort.options].some(option => option.value === preferred)) nodes.effort.value = preferred;
     }
     function renderModels() {
-      const selected = current?.selection?.model;
+      const selected = (selectionDraft || current?.selection)?.model;
       nodes.model.replaceChildren();
-      if (!models.length) nodes.model.append(new Option("Refresh models first", ""));
-      else for (const model of models) nodes.model.append(new Option(model.label, model.id));
-      if (selected && models.some(model => model.id === selected)) nodes.model.value = selected;
+      for (const model of models) if (model.efforts.some(effort => effort.available)) nodes.model.append(new Option(model.label, model.id));
+      if (!nodes.model.options.length) nodes.model.append(new Option(!catalogLoaded && selected ? "Saved model" : "Models unavailable", !catalogLoaded ? selected || "" : ""));
+      else if (!selected || ![...nodes.model.options].some(option => option.value === selected)) nodes.model.prepend(new Option("Choose model", ""));
+      if (selected && [...nodes.model.options].some(option => option.value === selected)) nodes.model.value = selected;
       renderEfforts();
     }
     function render(state) {
       current = state;
-      if (!state?.enabled) { panel.hidden = true; return; }
-      panel.hidden = false;
-      const now = Number.isSafeInteger(state.serverTimeMs) ? state.serverTimeMs : Date.now() + clockOffset;
-      const presenceState = presence(state.presence?.lastAgentCallAtMs, now, state.presence?.agentWaitingUntilMs);
+      panel.hidden = tools.hidden = notice.hidden = !state?.enabled;
+      if (!state?.enabled) return;
+      const presenceState = presence(state.presence?.lastAgentCallAtMs, Date.now() + clockOffset, state.presence?.agentWaitingUntilMs);
       nodes.presence.textContent = sentenceCase(presenceState);
       nodes.queue.hidden = !Number.isSafeInteger(state.queue?.position);
-      nodes.queue.textContent = nodes.queue.hidden ? "" : `Queue ${state.queue.position} of ${state.queue.total}`;
+      nodes.queue.textContent = nodes.queue.hidden ? "" : `· Queue ${state.queue.position} of ${state.queue.total}`;
       nodes.action.textContent = sentenceCase(state.action?.status || state.live?.phase || "idle");
-
       const companion = state.companion || {};
       nodes.companion.textContent = companion.authenticated ? `Connected · ${sentenceCase(companion.status || "idle")}` : companion.status === "unavailable" ? (companion.detail || "Browser companion is unavailable") : "ChatGPT sign-in required";
       nodes.login.disabled = companion.authenticated === true;
-      nodes.capabilities.disabled = companion.authenticated !== true;
-
+      nodes.capabilities.disabled = companion.authenticated !== true || presenceState !== "offline" || loadingModels || Boolean(companion.activeActionId);
       const pairing = state.pairing || { status:"unpaired" };
       const pairedUrl = pairing.canonicalUrl || pairing.candidateUrl || "";
-      if (pairedUrl && document.activeElement !== nodes.url && nodes.url.value !== pairedUrl) nodes.url.value = pairedUrl;
-      if (pairing.status === "verified") nodes.pairing.textContent = "Verified";
-      else if (pairing.status === "unverified" && state.action?.status === "queued") nodes.pairing.textContent = "Pairing verification queued";
-      else if (pairing.status === "unverified") nodes.pairing.textContent = "Verification required";
-      else nodes.pairing.textContent = "Not paired";
+      if (pairedUrl && scope.activeElement !== nodes.url) nodes.url.value = pairedUrl;
+      nodes.pairing.textContent = pairing.status === "verified" ? "Verified" : pairing.status === "unverified" ? (state.action?.status === "queued" ? "Pairing verification queued" : "Verification required") : "Not paired";
       nodes.pair.textContent = pairing.status === "unpaired" ? "Pair conversation" : "Replace pairing";
       nodes.pair.disabled = !nodes.url.value.trim() || !state.selection?.model || !state.selection?.effort;
       nodes.unlink.disabled = pairing.status === "unpaired";
-      nodes.reveal.disabled = !pairedUrl && !companion.activeActionId;
-
-      nodes.selection.textContent = state.selection?.model && state.selection?.effort ? `${state.selection.model} · ${state.selection.effort}` : "No verified model selection";
-      if (models.length) renderModels();
-
+      nodes.reveal.disabled = !pairedUrl;
+      if (!savingSelection && scope.activeElement !== nodes.model && scope.activeElement !== nodes.effort) renderModels();
+      const locked = presenceState !== "offline" || !companion.authenticated || !catalogLoaded || savingSelection || loadingModels || Boolean(companion.activeActionId);
+      nodes.model.disabled = locked || !models.some(model => model.efforts.some(effort => effort.available));
+      nodes.effort.disabled = locked || !models.some(model => model.id === nodes.model.value && model.efforts.some(effort => effort.available));
+      const explanation = presenceState !== "offline" ? "Model and effort can be changed when the agent is offline." : !companion.authenticated ? "Sign in through connection settings to load available models." : savingSelection ? "Saving model and effort…" : loadingModels ? "Loading available models…" : companion.activeActionId ? "Browser action in progress." : "";
+      nodes.model.title = nodes.effort.title = explanation;
+      notice.textContent = explanation; notice.hidden = !explanation;
       const goal = state.goal;
-      if (goal && document.activeElement !== nodes.goal && !nodes.goal.value) nodes.goal.value = goal.markdown || "";
-      nodes.goalStatus.textContent = goal ? sentenceCase(goal.status) : "No goal configured";
-      if (goal?.status === "blocked" && goal.blockedReason) nodes.goalStatus.textContent += ` · ${goal.blockedReason}`;
-      nodes.setGoal.disabled = !nodes.goal.value.trim();
-      nodes.runGoal.disabled = !goal || goal.status === "active" || !["configured"].includes(goal.status);
-      nodes.stopGoal.disabled = goal?.status !== "active";
-      nodes.clearGoal.disabled = !goal || goal.status === "active";
-      nodes.goalStatusButton.disabled = false;
-
+      byId("goal-bar").hidden = !goal;
+      byId("automation-add-goal").hidden = Boolean(goal);
+      byId("goal-caption").textContent = goal?.status === "active" ? "Pursuing goal" : goal?.status === "configured" ? "Goal paused" : `Goal ${goal?.status || ""}`;
+      byId("goal-text").textContent = goal?.markdown || "";
+      byId("goal-text").title = goal?.blockedReason || goal?.markdown || "";
+      if (byId("goal-editor").hidden) nodes.goal.value = goal?.markdown || "";
+      nodes.goalStatus.textContent = goal ? sentenceCase(goal.status) + (goal.blockedReason ? ` · ${goal.blockedReason}` : "") : "No goal configured";
+      nodes.setGoal.disabled = !nodes.goal.value.trim() || goal?.status === "active";
+      nodes.clearGoal.disabled = goal?.status === "active";
+      nodes.toggleGoal.disabled = !goal || !["active", "configured"].includes(goal.status);
+      const toggleLabel = goal?.status === "active" ? "Pause goal" : "Run goal";
+      nodes.toggleGoal.setAttribute("aria-label", toggleLabel); nodes.toggleGoal.title = toggleLabel;
+      byId("goal-toggle-icon").setAttribute("d", goal?.status === "active" ? "M9 8v8m6-8v8" : "m10 8 6 4-6 4Z");
       nodes.liveStatus.textContent = state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
       nodes.cancelAction.disabled = state.action?.status !== "queued" || !state.action?.id;
       nodes.retryAction.disabled = state.action?.status !== "failed" || state.action?.kind === "pair_verify" || !state.action?.id;
-      const actionError = state.action?.lastError;
-      if (actionError) setError(actionError);
+      if (state.action?.lastError) setError(state.action.lastError);
+    }
+    async function loadModels() {
+      if (closed || loadingModels || !offline() || !current?.companion?.authenticated || current.companion.activeActionId) return;
+      loadingModels = true; catalogAttempted = true; render(current);
+      try {
+        const catalog = await post("capabilities");
+        if (!closed) { models = catalog.models || []; catalogLoaded = true; renderModels(); }
+      } finally { loadingModels = false; if (!closed) render(current); }
     }
     async function refreshState({ quiet = false } = {}) {
-      if (closed || requestInFlight) return;
+      if (closed || requestInFlight || savingSelection) return;
       requestInFlight = true;
+      const revision = selectionRevision;
       try {
         const state = await (await api(`/api/chats/${id}/automation`)).json();
-        if (!closed) { if (!quiet) setError(""); render(state); }
-      } catch (error) {
-        if (!closed && !quiet) setError(error.message || "Browser automation state unavailable");
-      } finally { requestInFlight = false; }
+        if (!closed) {
+          if (revision !== selectionRevision && current) state.selection = current.selection;
+          if (Number.isSafeInteger(state.serverTimeMs)) clockOffset = state.serverTimeMs - Date.now();
+          if (!quiet) setError("");
+          if (!state.companion?.authenticated) { models = []; catalogLoaded = false; catalogAttempted = false; }
+          render(state);
+          if (state.enabled && !catalogAttempted) await loadModels();
+        }
+      } catch (error) { if (!closed) setError(error.message || "Chat automation state unavailable"); }
+      finally { requestInFlight = false; }
     }
     async function run(operation) {
       setError("");
-      try { await operation(); await refreshState(); }
-      catch (error) { setError(error.message || "Browser automation operation failed"); }
+      try { await operation(); if (!closed) await refreshState(); }
+      catch (error) { if (!closed) setError(error.message || "Chat automation operation failed"); }
+    }
+    async function saveSelection() {
+      if (!offline() || savingSelection || !nodes.model.value || !nodes.effort.value) return;
+      const submitted = selectionDraft || { model:nodes.model.value, effort:nodes.effort.value };
+      const { model, effort } = submitted;
+      savingSelection = true; render(current); setError("");
+      try {
+        const result = await post("selection", { requestId:requestId("selection"), model, effort });
+        if (!closed) {
+          current.selection = result.selection; selectionRevision += 1;
+          if (selectionDraft === submitted) selectionDraft = null;
+        }
+      } catch (error) { if (!closed) { if (selectionDraft === submitted) selectionDraft = null; setError(error.message); } }
+      finally { savingSelection = false; if (!closed) { renderModels(); render(current); await refreshState({ quiet:true }); } }
     }
     async function goalCommand(command) {
       const response = await api(`/api/chats/${id}/send`, { method:"POST", body:JSON.stringify({ request_id:requestId("goal"), message:command }) });
-      const payload = await response.json();
-      const local = payload?._meta?.[chatMeta];
-      if (current && local && Object.hasOwn(local, "goal")) { current.goal = local.goal; render(current); }
+      const local = (await response.json())?._meta?.[chatMeta];
+      if (!closed && current && local && Object.hasOwn(local, "goal")) { current.goal = local.goal; render(current); }
     }
-
-    nodes.model.addEventListener("change", renderEfforts);
-    nodes.effort.addEventListener("change", () => { nodes.saveSelection.disabled = !nodes.model.value || !nodes.effort.value; });
+    const showSettings = visible => { byId("automation-settings").hidden = !visible; byId("automation-settings-toggle").setAttribute("aria-expanded", String(visible)); byId("goal-editor").hidden = true; };
+    const editGoal = () => { showSettings(false); nodes.goal.value = current?.goal?.markdown || ""; byId("goal-editor").hidden = false; nodes.goal.focus(); };
+    byId("automation-settings-toggle").addEventListener("click", () => showSettings(byId("automation-settings").hidden));
+    byId("automation-settings-close").addEventListener("click", () => showSettings(false));
+    byId("automation-add-goal").addEventListener("click", editGoal);
+    byId("automation-edit-goal").addEventListener("click", editGoal);
+    byId("goal-editor-close").addEventListener("click", () => { byId("goal-editor").hidden = true; });
+    nodes.model.addEventListener("change", () => {
+      selectionDraft = { model:nodes.model.value, effort:null };
+      renderEfforts(null); selectionDraft.effort = nodes.effort.value; void saveSelection();
+    });
+    nodes.effort.addEventListener("change", () => { selectionDraft = { model:nodes.model.value, effort:nodes.effort.value }; void saveSelection(); });
     nodes.url.addEventListener("input", () => { nodes.pair.disabled = !nodes.url.value.trim() || !current?.selection?.model || !current?.selection?.effort; });
-    nodes.goal.addEventListener("input", () => { nodes.setGoal.disabled = !nodes.goal.value.trim(); });
+    nodes.goal.addEventListener("input", () => { nodes.setGoal.disabled = !nodes.goal.value.trim() || current?.goal?.status === "active"; });
     nodes.login.addEventListener("click", () => run(async () => { await post("login"); }));
-    nodes.capabilities.addEventListener("click", () => run(async () => {
-      const catalog = await post("capabilities"); models = catalog.models || []; renderModels();
-    }));
-    nodes.saveSelection.addEventListener("click", () => run(async () => {
-      const result = await post("selection", { requestId:requestId("selection"), model:nodes.model.value, effort:nodes.effort.value });
-      if (current) current.selection = result.selection;
-    }));
-    nodes.pair.addEventListener("click", () => run(async () => {
-      const result = await post("pair", { requestId:requestId("pair"), url:nodes.url.value.trim() });
-      if (current) { current.pairing = result.pairing; current.action = result.action; render(current); }
-    }));
-    nodes.unlink.addEventListener("click", () => run(async () => {
-      const result = await post("unlink", { requestId:requestId("unlink") });
-      nodes.url.value = "";
-      if (current) { current.pairing = result.pairing; current.action = { status:"idle" }; render(current); }
-    }));
+    nodes.capabilities.addEventListener("click", () => run(loadModels));
+    nodes.pair.addEventListener("click", () => run(async () => { await post("pair", { requestId:requestId("pair"), url:nodes.url.value.trim() }); }));
+    nodes.unlink.addEventListener("click", () => run(async () => { await post("unlink", { requestId:requestId("unlink") }); nodes.url.value = ""; }));
     nodes.reveal.addEventListener("click", () => run(async () => { await post("reveal"); }));
-    nodes.setGoal.addEventListener("click", () => run(async () => { await goalCommand(`/goal set ${nodes.goal.value}`); }));
-    nodes.runGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal run"); }));
-    nodes.stopGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal stop"); }));
-    nodes.clearGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal clear"); nodes.goal.value = ""; }));
-    nodes.goalStatusButton.addEventListener("click", () => run(async () => { await goalCommand("/goal status"); }));
-    nodes.cancelAction.addEventListener("click", () => run(async () => {
-      const result = await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id });
-      if (current) { current.action = result.action; current.queue = result.queue; render(current); }
-    }));
-    nodes.retryAction.addEventListener("click", () => run(async () => {
-      const result = await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id });
-      if (current) { current.action = result.action; current.queue = result.queue; render(current); }
-    }));
-
+    nodes.setGoal.addEventListener("click", () => run(async () => { await goalCommand(`/goal set ${nodes.goal.value}`); byId("goal-editor").hidden = true; }));
+    nodes.toggleGoal.addEventListener("click", () => run(async () => { await goalCommand(current?.goal?.status === "active" ? "/goal stop" : "/goal run"); }));
+    nodes.clearGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal clear"); }));
+    nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); }));
+    nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     void refreshState();
     timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
-    return { element:panel, close() { closed = true; clearInterval(timer); } };
+    return { close() { closed = true; clearInterval(timer); } };
   }
   function renderList() {
     const now = Date.now() + clockOffset;
@@ -351,11 +379,31 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
     const next = chats.flatMap(chat => [chat.agentWaitingUntilMs, ...[180000,300000].map(age => chat.lastAgentCallAtMs + age)].map(deadline => deadline - now)).filter(delay => Number.isFinite(delay) && delay > 0);
     if (!document.hidden && next.length) presenceTimer = setTimeout(renderList, Math.max(1, Math.min(...next)));
     list.replaceChildren();
+    document.getElementById("view-projects").setAttribute("aria-pressed", String(listMode === "projects"));
+    document.getElementById("view-recent").setAttribute("aria-pressed", String(listMode === "recent"));
     if (!chats.length) {
       list.append(textNode("p", "conversation-detail", "No persisted conversations yet."));
       return;
     }
-    for (const chat of chats) {
+    const query = search.value.trim();
+    if (query !== matchedQuery) {
+      list.append(textNode("p", "conversation-detail", "Searching…")); return;
+    }
+    const visibleChats = chats.filter(chat => !query || matchedIds?.has(chat.id));
+    if (!visibleChats.length) list.append(textNode("p", "conversation-detail", "No matching chats."));
+    const groups = new Map();
+    for (const chat of visibleChats) {
+      const key = listMode === "projects" ? (chat.projectId || chat.projectPath || chat.workspace) : "recent";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(chat);
+    }
+    for (const group of groups.values()) {
+      if (listMode === "projects") {
+        const heading = textNode("h2", "project-heading", group[0].workspace);
+        heading.title = group[0].projectPath || group[0].workspace;
+        list.append(heading);
+      }
+      for (const chat of group) {
       const button = document.createElement("button");
       button.type = "button"; button.className = "conversation";
       button.setAttribute("aria-current", String(chat.id === selected));
@@ -375,6 +423,7 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
       dot.setAttribute("aria-label", "New chat entry");
       button.append(icon, content, dot);
       list.append(button);
+      }
     }
   }
   function chatIdFromUrl() {
@@ -397,12 +446,40 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
     }
     controller?.close(); controller = null; selected = id;
     host.replaceChildren();
-    const automation = createAutomationPanel(id);
     const shell = document.createElement("div");
     shell.className = "chat-shell";
     const scope = shell.attachShadow({ mode:"open" });
     scope.append(document.getElementById("chat-template").content.cloneNode(true));
-    host.append(automation.element, shell);
+    scope.append(document.getElementById("owner-composer-style").content.cloneNode(true));
+    host.append(shell);
+    const automation = createAutomationPanel(id, scope);
+    const rename = document.createElement("button");
+    rename.id = "rename-chat"; rename.type = "button"; rename.className = "icon-button";
+    rename.setAttribute("aria-label", "Rename chat"); rename.title = "Rename chat";
+    rename.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16 12-12 4 4-12 12H4ZM14 6l4 4"/></svg>`;
+    scope.querySelector(".header-actions").prepend(rename);
+    const renameForm = document.createElement("form"); renameForm.id = "rename-form"; renameForm.hidden = true;
+    renameForm.innerHTML = `<label for="chat-name">Chat name</label><input id="chat-name" maxlength="200" autocomplete="off"><p>Leave empty to show the latest message.</p><div class="automation-actions"><button type="submit">Save name</button><button type="button" id="cancel-rename">Cancel</button></div><p id="rename-error" role="alert" hidden></p>`;
+    scope.querySelector(".header").after(renameForm);
+    rename.addEventListener("click", () => {
+      renameForm.hidden = false;
+      scope.querySelector("#chat-name").value = chats.find(chat => chat.id === id)?.customTitle || "";
+      scope.querySelector("#chat-name").focus();
+    });
+    scope.querySelector("#cancel-rename").addEventListener("click", () => { renameForm.hidden = true; });
+    renameForm.addEventListener("submit", async event => {
+      event.preventDefault();
+      const submit = renameForm.querySelector('[type="submit"]'); submit.disabled = true;
+      const error = scope.querySelector("#rename-error"); error.hidden = true;
+      try {
+        const payload = await (await api(`/api/chats/${id}/title`, { method:"POST", body:JSON.stringify({ title:scope.querySelector("#chat-name").value }) })).json();
+        const chat = chats.find(chat => chat.id === id);
+        if (chat) Object.assign(chat, payload);
+        renameForm.hidden = true;
+        renderList(); void refresh();
+      } catch (failure) { error.textContent = failure.message; error.hidden = false; }
+      finally { submit.disabled = false; }
+    });
     const key = `owner-chat-widget-v1:${id}`;
     const bridge = {
       getState() { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } },
@@ -470,15 +547,31 @@ main { min-width:0; min-height:0; display:flex; justify-content:center; padding:
   }
   async function refresh() {
     if (document.hidden) return;
+    const query = search.value.trim();
+    if (pendingList?.query === query) return;
+    const sequence = ++listRequest;
+    pendingList = { sequence, query };
     try {
-      const payload = await (await api("/api/chats")).json();
+      const payload = await (await api(`/api/chats${query ? `?${new URLSearchParams({ q:query })}` : ""}`)).json();
+      if (sequence !== listRequest || query !== search.value.trim()) return;
       chats = payload.chats || [];
+      matchedQuery = query; matchedIds = new Set(payload.matchedChatIds || []);
       if (Number.isSafeInteger(payload.serverTimeMs)) clockOffset = payload.serverTimeMs - Date.now();
       showError("");
       selectFromUrl();
       renderList();
-    } catch (error) { showError(error.message || "Chat list unavailable"); }
+    } catch (error) { if (sequence === listRequest) showError(error.message || "Chat list unavailable"); }
+    finally { if (pendingList?.sequence === sequence) pendingList = null; }
   }
+  search.addEventListener("input", () => {
+    clearTimeout(searchTimer); ++listRequest; pendingList = null; renderList();
+    searchTimer = setTimeout(refresh, 200);
+  });
+  for (const mode of ["projects", "recent"]) document.getElementById(`view-${mode}`).addEventListener("click", () => {
+    listMode = mode;
+    try { localStorage.setItem("owner-chat-list-view-v1", mode); } catch {}
+    renderList();
+  });
   window.addEventListener("popstate", selectFromUrl);
   window.addEventListener("focus", () => { renderList(); void refresh(); });
   document.addEventListener("visibilitychange", () => { renderList(); if (!document.hidden) void refresh(); });
