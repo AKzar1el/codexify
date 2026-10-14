@@ -90,7 +90,8 @@ try {
     CODEXIFY_BROWSER_SMOKE_FILE:marker,
   };
   if (process.platform === "linux") {
-    run("xvfb-run", ["-a", entrypoint], { env });
+    // This smoke path only writes metadata; extracted CI packages lack a configured SUID sandbox.
+    run("xvfb-run", ["-a", entrypoint, "--no-sandbox"], { env });
   } else {
     run(entrypoint, [], { env });
   }
