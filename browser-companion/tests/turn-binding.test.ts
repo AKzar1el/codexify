@@ -15,6 +15,7 @@ test("turn identity uses stable turn keys and never display indexes", () => {
 
 test("one physical Send may create only one new logical turn", () => {
   expect(newTurnIdentity(["old"], ["old", "new"])).toBe("new");
+  expect(newTurnIdentity(["old"], ["old", "old", "new", "new"])).toBe("new");
   expect(newTurnIdentity(["old"], ["old"])).toBeUndefined();
   expect(() => newTurnIdentity(["old"], ["old", "new-a", "new-b"])).toThrow("2 new");
 });

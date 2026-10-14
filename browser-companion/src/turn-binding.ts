@@ -42,7 +42,7 @@ export function turnIdentityFromAttributes(input: {
 
 export function newTurnIdentity(initial: readonly string[], current: readonly string[]): string | undefined {
   const previous = new Set(initial);
-  const added = current.filter(identity => !previous.has(identity));
+  const added = [...new Set(current)].filter(identity => !previous.has(identity));
   if (added.length > 1) {
     throw new Error(`ChatGPT exposed ${added.length} new conversation turns for one submitted message`);
   }
@@ -76,10 +76,9 @@ function unique(values: string[], kind: string): string[] {
   if (values.some(value => value.trim().length === 0)) {
     throw selectorDrift(`ChatGPT conversation ${kind} has an empty stable identity`);
   }
-  if (new Set(values).size !== values.length) {
-    throw selectorDrift(`ChatGPT exposed duplicate ${kind} identities`);
-  }
-  return values;
+  // Responsive views and remount transitions may render more than one physical
+  // node for the same logical turn. Stable IDs, rather than node counts, bind Send.
+  return [...new Set(values)];
 }
 
 export async function readTurnDomState(page: Page): Promise<TurnDomState> {

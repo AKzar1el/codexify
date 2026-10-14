@@ -40,6 +40,7 @@ let shiftedEfforts = false;
 let hideEffortLabels = false;
 let nestedHistory = false;
 let missingHistoryId = false;
+let duplicateHistoryViews = false;
 let initialModel = {family:"6",value:4,locked:[] as number[]};
 const pill = (name: string) => `<span app-mention-path="app://fixture" app-mention-display-name="${name}" contenteditable="false">${name}</span> `;
 
@@ -125,6 +126,7 @@ beforeAll(async () => {
           if (window.enableSend) setTimeout(()=>{
             // History hydration happens after composer insertion, before Send becomes usable.
             document.querySelector('#history').innerHTML=${JSON.stringify('<section data-turn-id-container="old">'+(nestedHistory?'<div data-turn-id-container="old">':'')+'<article '+(missingHistoryId?'':'data-turn-id="old" ')+'data-testid="conversation-turn-old" data-turn="assistant"><div data-message-author-role="assistant"><div class="markdown"><p>Old answer</p></div></div><button data-testid="copy-turn-action-button">Copy</button></article>'+(nestedHistory?'</div>':'')+'</section>')};
+            if(${duplicateHistoryViews})document.querySelector('#history').insertAdjacentHTML('beforeend',document.querySelector('#history').innerHTML);
             send.disabled=false;
           },300);
         });
@@ -169,7 +171,7 @@ async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
   generatingOnLoad=generating;acceptsStop=stopWorks;
   documentLoads=0;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
-  initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;
+  initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
   await surface.navigate(url);
   return new ChatGptBrowserDriver(surface,build);
 }
@@ -191,6 +193,13 @@ test.skipIf(!native)("sending an existing conversation tolerates nested wrappers
   const submitted=offlineRequest('gpt-6-astra','max');
   const error=await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
   expect(error).toBeUndefined();expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+},15_000);
+
+test.skipIf(!native)("sending counts duplicated history views as one logical turn",async()=>{
+  const driver=await fixture();duplicateHistoryViews=true;
+  const submitted=offlineRequest('gpt-6-astra','max');
+  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
 },15_000);
 
 test.skipIf(!native)("unsupported history markers report the cause before inserting any message",async()=>{
