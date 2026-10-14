@@ -29,7 +29,7 @@ class ImmediateDriver implements BrowserDriver {
   async reveal() {}
   async execute(execution: DriverExecution) {
     execution.emit({ type:"navigating" });
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({ type:"answer_delta", markdown:"Done", continuation:false });
@@ -39,7 +39,7 @@ class ImmediateDriver implements BrowserDriver {
 
 class BlockingDriver extends ImmediateDriver {
   override async execute(execution: DriverExecution) {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     await new Promise<void>((_resolve, reject) => {
@@ -73,6 +73,7 @@ function executeBody() {
     url:"https://chatgpt.com/c/control",
     pairingGeneration:1,
     connectorName:"Codexify",
+    expectedAccountFingerprint:"account-test",
     model:"gpt-6-sol",
     effort:"high",
     prompt:{ kind:"offline_chat", batchId:"batch-control", messages:[{ id:"message-control", markdown:"Continue." }] },
@@ -190,4 +191,29 @@ test("control responses never expose raw browser page or request failures", asyn
   } finally {
     await server.close();
   }
+});
+
+test('disconnecting a control request cancels its UI work and frees the queue',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'codexify-browser-disconnect-'));
+ let entered!:()=>void,cancelled=false;
+ const ready=new Promise<void>(resolve=>{entered=resolve;});
+ class DisconnectDriver extends ImmediateDriver {
+  override async capabilities(signal?:AbortSignal):Promise<CapabilityCatalog>{
+   entered();
+   await new Promise<void>((_resolve,reject)=>signal!.addEventListener('abort',()=>{cancelled=true;reject(new DOMException('aborted','AbortError'));},{once:true}));
+   return super.capabilities();
+  }
+ }
+ const coordinator=new SingleWindowCoordinator(new DisconnectDriver(),TEST_BUILD);
+ const server=await startControlServer(coordinator,join(root,'descriptor.json'));
+ const headers={Authorization:`Bearer ${server.token}`,'Content-Type':'application/json'};
+ try {
+  const abort=new AbortController();
+  const pending=fetch(`${server.endpoint}/v1/session/capabilities`,{method:'POST',headers,body:'{}',signal:abort.signal}).catch(error=>error);
+  await ready;abort.abort();await pending;
+  for(let attempt=0;!cancelled&&attempt<50;attempt++)await Bun.sleep(10);
+  expect(cancelled).toBeTrue();
+  const response=await fetch(`${server.endpoint}/v1/window/reveal`,{method:'POST',headers,body:JSON.stringify({url:null})});
+  expect(response.status).toBe(200);expect((await response.json() as any).revealed).toBeTrue();
+ }finally{await server.close();}
 });

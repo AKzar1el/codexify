@@ -201,6 +201,30 @@ connector, so list titles are derived from chat entries (preferring the first
 user entry). See the
 [standalone chat reference](docs/REFERENCE.md#standalone-owner-chat).
 
+The **New chat** button in standalone chat creates and verifies a corresponding
+ChatGPT conversation. Choose an existing project, a Git repository or GitHub
+PR/branch/commit URL, a saved worktree, or **Chat without a project**. The worktree
+checkbox defaults to the configured worktree mode and can be overridden per chat.
+Model and effort options are discovered from a fresh ChatGPT chat when the picker
+opens.
+
+To create these conversations inside a particular ChatGPT project, set the
+optional `agentChat.automation.chatgptProjectUrl` setting:
+
+```json
+{
+  "agentChat": {
+    "automation": {
+      "enabled": true,
+      "chatgptProjectUrl": "https://chatgpt.com/g/g-p-PROJECT_ID/project"
+    }
+  }
+}
+```
+
+Omit `chatgptProjectUrl` to create chats outside a ChatGPT project. Codexify uses
+its isolated Chrome profile and the existing shared browser action queue.
+
 ### Offline browser fallback
 
 The standalone page can optionally wake an offline agent through the user's
@@ -235,18 +259,23 @@ generating turn. Visible stable answer text streams back to standalone chat;
 output.
 
 Goals use `/goal set`, `/goal run`, `/goal stop`, `/goal clear`, and `/goal status`.
-The model reads the exact revision through `goal_read` and must call `goal_finish`
-to mark it completed or blocked; a blocked result requires a reason. Browser
+The model reads the exact revision through `goal_read`. It can create/update and
+automatically activate a goal with `goal_set`, or resume a paused/blocked goal
+with `goal_resume`. Both check the revision and deduplicate identical request IDs.
+It must call `goal_finish` to mark it completed or blocked; a blocked result
+requires a reason. Browser
 automation is unofficial and deliberately fails closed when ChatGPT changes its
 UI, the selected model or connector cannot be verified, approval is required, or
 Send acceptance is ambiguous. See
 [Optional browser automation](docs/REFERENCE.md#optional-browser-automation).
 
-If `agentChat.notifications` is configured, the server also attempts one
-notification when this indicator turns offline after 5 minutes without an agent
-tool call. The next agent call re-arms the alert. This works without an open
-chat card, but the Codexify service must be running; no alert is sent before the
-first recorded agent call.
+`agentChat.notifications.events` selects which alerts to receive: ordinary
+messages, completed chats/goals, requests for input, blocked goals, chat errors,
+and offline transitions. The example configuration enables completion, input,
+blocked-goal and error alerts, with ordinary messages and offline alerts disabled.
+Input requests alert once until the user replies; repeated `chat_await` calls and
+server restarts do not repeat the alert. Errors with an automatic retry pending
+stay quiet. See [Waiting and notifications](docs/REFERENCE.md#waiting-and-notifications).
 
 Messages show a small local `HH:mm` timestamp at the bottom right, before the
 ticks on user messages. Earlier local calendar days also show `YYYY-MM-DD`

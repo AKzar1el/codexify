@@ -1,5 +1,6 @@
 //! Optional conversation-scoped Markdown communication, separate from repository files.
 
+pub mod attachments;
 pub mod notification;
 mod offline;
 pub(crate) mod output;
@@ -19,9 +20,9 @@ use crate::project_bindings::ConversationIdentity;
 use crate::types::AppConfig;
 
 pub use storage::{
-    AppendReceipt, BrowserAppendReceipt, ChatFile, ChatSnapshot, NotificationState,
-    OwnerChatSummary, TranscriptCheckpoint, UnreadMessage, UnreadSnapshot, UserSendReceipt,
-    WidgetPage,
+    AGENT_STOP_MESSAGE, AppendReceipt, BrowserAppendReceipt, ChatFile, ChatSnapshot,
+    NotificationState, OwnerChatOrganization, OwnerChatSummary, TranscriptCheckpoint,
+    UnreadMessage, UnreadSnapshot, UserSendReceipt, WidgetPage,
 };
 pub use wait::WaitOutcome;
 
@@ -31,6 +32,8 @@ pub const MAX_UNREAD_BYTES: usize = 16 * 1024 * 1024;
 pub const USER_MESSAGE_FIELD: &str = "new_chat_message_from_user";
 pub const AWAY_AFTER_MS: u64 = 180_000;
 pub const OFFLINE_AFTER_MS: u64 = 300_000;
+pub const AUTOMATION_OFFLINE_AFTER_MS: u64 = OFFLINE_AFTER_MS - 60_000;
+pub const PAIRING_PRESENCE_GRACE_MS: u64 = 5_000;
 pub const DEFAULT_AUTOMATION_DESCRIPTOR_PATH: &str = "~/.codexify/browser/descriptor.json";
 pub const DEFAULT_AUTOMATION_CONNECTOR_NAME: &str = "Codexify";
 pub const DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS: usize = 64;
@@ -43,6 +46,9 @@ pub struct AgentAutomationConfig {
     pub connector_name: String,
     pub max_queued_actions: usize,
     pub auto_approve_tool_calls: bool,
+    pub chatgpt_project_url: Option<String>,
+    #[serde(deserialize_with = "deserialize_request_block_list")]
+    pub request_block_list: Vec<String>,
 }
 
 impl Default for AgentAutomationConfig {
@@ -53,12 +59,56 @@ impl Default for AgentAutomationConfig {
             connector_name: DEFAULT_AUTOMATION_CONNECTOR_NAME.into(),
             max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
             auto_approve_tool_calls: false,
+            chatgpt_project_url: None,
+            request_block_list: Vec::new(),
         }
     }
 }
 
 impl AgentAutomationConfig {
     fn validate(&self) -> Result<(), String> {
+        if self.request_block_list.len() > 128 {
+            return Err(
+                "agentChat.automation.requestBlockList accepts at most 128 patterns".into(),
+            );
+        }
+        for (index, pattern) in self.request_block_list.iter().enumerate() {
+            if pattern.is_empty()
+                || pattern.len() > 4096
+                || !pattern.is_ascii()
+                || pattern.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "agentChat.automation.requestBlockList[{index}] must be 1 to 4096 printable ASCII characters"
+                ));
+            }
+        }
+        if let Some(project) = &self.chatgpt_project_url {
+            let url = reqwest::Url::parse(project).map_err(
+                |_| "agentChat.automation.chatgptProjectUrl must be a ChatGPT project URL",
+            )?;
+            let parts = url
+                .path()
+                .trim_end_matches('/')
+                .split('/')
+                .collect::<Vec<_>>();
+            if project.len() > 4096
+                || parts.get(2).is_none_or(|id| id.len() <= 4)
+                || url.scheme() != "https"
+                || url.host_str() != Some("chatgpt.com")
+                || url.port().is_some()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || parts.len() != 4
+                || parts[1] != "g"
+                || !parts[2].starts_with("g-p-")
+                || parts[3] != "project"
+            {
+                return Err("agentChat.automation.chatgptProjectUrl must be an HTTPS ChatGPT project URL ending in /project".into());
+            }
+        }
         if self.descriptor_path.trim().is_empty()
             || self.descriptor_path.len() > 4096
             || self.descriptor_path.contains('\0')
@@ -81,6 +131,13 @@ impl AgentAutomationConfig {
         }
         Ok(())
     }
+}
+
+fn deserialize_request_block_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -121,6 +178,32 @@ pub struct NotificationsConfig {
     pub python_path: String,
     #[serde(default = "default_notification_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub events: NotificationEvents,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct NotificationEvents {
+    pub messages: bool,
+    pub completed: bool,
+    pub input_required: bool,
+    pub goal_blocked: bool,
+    pub errors: bool,
+    pub offline: bool,
+}
+
+impl Default for NotificationEvents {
+    fn default() -> Self {
+        Self {
+            messages: true,
+            completed: true,
+            input_required: true,
+            goal_blocked: true,
+            errors: true,
+            offline: true,
+        }
+    }
 }
 
 fn default_notification_python() -> String {
@@ -137,6 +220,7 @@ impl fmt::Debug for NotificationsConfig {
             .field("destinations", &self.urls.len())
             .field("python_path", &self.python_path)
             .field("timeout_ms", &self.timeout_ms)
+            .field("events", &self.events)
             .finish()
     }
 }
@@ -312,7 +396,7 @@ impl MarkdownChatStore {
         config: &MarkdownChatConfig,
         workspace: String,
     ) {
-        if config.notifications.is_none() {
+        if !notification::enabled(config, notification::NotificationEvent::Offline) {
             return;
         }
         let Ok(mut monitors) = self.offline_monitors.lock() else {
@@ -330,8 +414,9 @@ impl MarkdownChatStore {
                         let config = config.clone();
                         let workspace = workspace.clone();
                         async move {
-                            notification::publish_config(
+                            notification::publish_event(
                                 &config,
+                                notification::NotificationEvent::Offline,
                                 &workspace,
                                 offline::MESSAGE.to_string(),
                                 &tokio_util::sync::CancellationToken::new(),
@@ -390,6 +475,59 @@ pub(crate) async fn history_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_block_list_defaults_and_configuration_bounds() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"requestBlockList":null}),
+        ] {
+            let config: AgentAutomationConfig = serde_json::from_value(value).unwrap();
+            assert!(config.request_block_list.is_empty());
+        }
+        let mut config: AgentAutomationConfig = serde_json::from_value(
+            serde_json::json!({"requestBlockList":["^https?://example\\.com/"]}),
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        for pattern in ["".to_string(), "é".to_string(), "x".repeat(4097)] {
+            config.request_block_list = vec![pattern];
+            assert!(config.validate().is_err());
+        }
+        config.request_block_list = vec!["x".into(); 129];
+        assert!(config.validate().is_err());
+        assert!(
+            serde_json::from_value::<AgentAutomationConfig>(
+                serde_json::json!({"requestBlockList":[1]})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn new_chat_project_configuration_is_optional_and_validated() {
+        assert!(AgentAutomationConfig::default().validate().is_ok());
+        for (url, valid) in [
+            (
+                "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/project",
+                true,
+            ),
+            (
+                "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-example/project/",
+                true,
+            ),
+            ("https://example.com/g/g-p-id/project", false),
+            ("http://chatgpt.com/g/g-p-id/project", false),
+            ("https://chatgpt.com/c/id", false),
+            ("https://chatgpt.com/g/g-p-id/project?token=private", false),
+            ("https://user:secret@chatgpt.com/g/g-p-id/project", false),
+        ] {
+            let config = AgentAutomationConfig {
+                chatgpt_project_url: Some(url.into()),
+                ..AgentAutomationConfig::default()
+            };
+            assert_eq!(config.validate().is_ok(), valid);
+        }
+    }
 
     #[test]
     fn activity_is_conversation_scoped_with_transport_fallback() {

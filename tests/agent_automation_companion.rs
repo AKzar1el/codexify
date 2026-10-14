@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
+    "test-build-v1+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -859,8 +859,9 @@ fn action_request() -> ExecuteActionRequest {
         url: "https://chatgpt.com/c/example".into(),
         pairing_generation: 1,
         connector_name: "Codexify".into(),
-        model: "gpt-6-sol".into(),
-        effort: "high".into(),
+        expected_account_fingerprint: "account-1".into(),
+        model: Some("gpt-6-sol".into()),
+        effort: Some("high".into()),
         prompt: ActionPrompt::OfflineGoal { goal_revision: 3 },
         expected_url: "https://chatgpt.com/c/example".into(),
         auto_approve_tool_calls: false,
@@ -952,7 +953,7 @@ async fn invalid_action_data_is_rejected_before_network_access() {
     request.pairing_generation = 0;
     invalid.push(request);
     let mut request = action_request();
-    request.model = "bad model".into();
+    request.model = Some("bad model".into());
     invalid.push(request);
     let mut request = action_request();
     request.connector_name = "😀".repeat(40);

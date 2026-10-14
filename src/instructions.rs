@@ -14,7 +14,28 @@ use crate::types::AppConfig;
 // `setup(ref)` wire vocabulary instead of describing the authorization protocol.
 pub const CONVERSATION_AUTH_INSTRUCTIONS: &str = "This connector requires one-time setup for this conversation. Before calling any other tool, call `setup` once with the `ref` supplied in the chat or ChatGPT Project instructions. After setup completes, follow the tool response to load the project brief.";
 
-pub const MARKDOWN_CHAT_INSTRUCTIONS: &str = "## Markdown-driven communication\n\nMarkdown chat is enabled. This mandatory protocol overrides the normal answer-then-finish interaction pattern while it is active.\n\n### Mandatory state machine\n\n- USER-FACING OUTPUT: send only with chat_write. Do not send a normal ChatGPT final response while this mode is active.\n- AFTER chat_write, chat_read, or any completed work:\n  - If new_chat_message_from_user is present, answer or acknowledge it immediately with chat_write.\n  - Else if actionable work remains, continue working.\n  - Else call chat_await.\n- AFTER chat_await:\n  - If a user message is received, answer or acknowledge it immediately with chat_write, then continue.\n  - If it times out or is cancelled without a user message, call chat_await again.\n- TERMINATION: do not finish, stop, complete, or checkpoint the turn unless the user explicitly authorizes ending it or a higher-priority instruction requires it.\n\nCall setup once to open the persistent chat panel; chat_read/chat_write/chat_await update that panel without opening more cards. Do not repeat setup for routine messages. Before a workspace is selected, keep the setup project picker open and call chat_await to wait for the user. A greeting such as hello, an ambiguous project, or the desire to use chat_write is NOT permission to select scratch. Select scratch only when explicitly requested by the user. After a workspace_selected result or workspace_changed notice, call get_agent_brief before project work. Complete workspace selection first, then obtain this task's CHAT.md path from get_agent_brief. Inspect optional new_chat_message_from_user after every tool result. Ordinary tool deliveries do not consume pending user messages. The chat tools and new_chat_message_from_user bypass Codexify's ordinary output truncation.";
+pub const MARKDOWN_CHAT_INSTRUCTIONS: &str = "## Markdown-driven communication\n\nMarkdown chat is enabled. This mandatory protocol overrides the normal answer-then-finish interaction pattern while it is active.\n\n### Mandatory state machine\n\n- USER-FACING OUTPUT: send only with chat_write. Do not send a normal ChatGPT final response while this mode is active. Set event=\"completed\" when reporting that a user chat request is finished, event=\"input_required\" when asking a question that requires the user's reply, and leave event=\"message\" for progress. For a goal, use goal_finish to report completion or a blocker; do not duplicate its completion notification with chat_write event=\"completed\".\n- AFTER chat_write, chat_read, or any completed work:\n  - If new_chat_message_from_user is present, answer or acknowledge it immediately with chat_write.\n  - Else if actionable work remains, continue working.\n  - Else call chat_await.\n- AFTER chat_await:\n  - If a user message is received, answer or acknowledge it immediately with chat_write, then continue.\n  - If it times out or is cancelled without a user message, call chat_await again.\n- TERMINATION: do not finish, stop, complete, or checkpoint the turn unless the user explicitly authorizes ending it or a higher-priority instruction requires it.\n\nCall setup once to open the persistent chat panel; chat_read/chat_write/chat_await update that panel without opening more cards. Do not repeat setup for routine messages. Before a workspace is selected, keep the setup project picker open and call chat_await to wait for the user. A greeting such as hello, an ambiguous project, or the desire to use chat_write is NOT permission to select scratch. Select scratch only when explicitly requested by the user. After a workspace_selected result or workspace_changed notice, call get_agent_brief before project work. Complete workspace selection first, then obtain this task's CHAT.md path from get_agent_brief. Inspect optional new_chat_message_from_user after every tool result. Ordinary tool deliveries do not consume pending user messages. The chat tools and new_chat_message_from_user bypass Codexify's ordinary output truncation.";
+
+pub const COMMAND_REJECTION_INSTRUCTIONS: &str = concat!(
+    "## Rejected vital commands\n\n",
+    "Important: when a vital command is rejected, read the checker's stated reason and do NOT run the rejected command again unchanged. A rejection can concern safety, permissions, or policy; do not assume that missing exception handling is always the cause.\n\n",
+    "For a fixable safety issue, write a reviewable script named `safe-script-XXXX.sh`, `safe-script-XXXX.py`, or `safe-script-XXXX.js`, replacing XXXX with a unique suffix. Rewrite the operation with explicit preconditions, input/path validation, checked return values, handled exceptions/errors, bounded execution, and safe cleanup appropriate to the operation. Do not merely wrap the unchanged command. Submit the improved script through the same command checker. If it is rejected again, address that rejection before any further execution attempt. Another scripting language may help express stronger checks, but changing languages alone does not make an operation safe or permitted and must never bypass a safety, permission, or policy rejection.\n\n",
+    "If several substantive hardening attempts still cannot make a vital operation safe, stop attempting execution. Do not mark the goal blocked merely because this command was rejected. When Markdown chat is enabled, tell the user with `chat_write` (event=\"input_required\") which command or safe manual action is needed, why it was rejected, and what remains unresolved, then immediately call `chat_await` for their reply. Otherwise ask through the normal user interface. Respect the rejection's permission and policy boundaries; do not ask the user to perform a forbidden operation."
+);
+
+pub const TURN_HANDOFF_INSTRUCTIONS: &str = concat!(
+    "## Turn handoffs\n\n",
+    "These cases authorize finishing the turn instead of calling chat_await, including when Markdown chat is enabled. When only read-only tools are available, give the summary as a normal final answer even though Markdown chat normally requires chat_write.\n\n",
+    "If at some point you only have access to read-only tools then summarize what you did and the next steps and then finish the turn with this summary as the answer. You should not mark the goal as blocked/stopped/paused when this happens.\n\n",
+    "If at some point you notice that there are changes done in parallel in your workspace, it usually means that another agent is working in parallel on the same project and conflicting with you. So in this case check the most recent CHAT.md messages to see if the other agent also reported it and if not then you should use `chat_write` to inform the other agent that you will finish your turn to avoid conflicts but this other agent should continue, and then after you wrote that you should finish your turn."
+);
+
+pub const AGENT_GOAL_INSTRUCTIONS: &str = concat!(
+    "## Agent-chat goal control\n\n",
+    "- Use `goal_set` to create or update a goal; it activates the goal automatically. Call `goal_read` first and pass its revision as expectedRevision, or 0 when no goal exists. An active update retains its elapsed time and turn count.\n",
+    "- Use `goal_resume` to activate an existing paused or blocked goal without changing its text or progress. Pass the exact revision returned by `goal_read`. A completed goal requires `goal_set` for a new revision.\n",
+    "- For either mutation, choose a fresh requestId for each operation and reuse it only when retrying the identical arguments. If the revision changed, read the current goal and reassess the update; do not overwrite a concurrent user edit blindly."
+);
 
 /// The behavioural half of what Codex tells its model, ported from
 /// `codex-rs/core/gpt-5.2-codex_prompt.md`.
@@ -33,7 +54,7 @@ pub const AGENT_BRIEF: &str = concat!(
     "  - If the changes are in files you have worked on recently, read them carefully and work with them rather than reverting.\n",
     "  - If the changes are in unrelated files, ignore them.\n",
     "- Do not amend a commit unless explicitly asked.\n",
-    "- If changes appear that you did not make, STOP and ask the user how to proceed.\n",
+    "- If changes appear during your turn that you did not make, follow the concurrent-work instructions under Turn handoffs below.\n",
     "- NEVER run destructive commands such as `git reset --hard` or `git checkout --` unless the user specifically asked for or approved them.\n",
     "- After the final related file change, call show_diff once to present the project-scoped aggregate diff. By default it records the emitted snapshot as the next incremental baseline; this is private connector bookkeeping and does not modify the project. Use advance=false only when the user asks for a non-advancing inspection.\n",
     "\n## Running commands\n\n",
@@ -54,7 +75,7 @@ pub const AGENT_BRIEF: &str = concat!(
     "- Tool output is capped, and a truncated result says so on its last line. When you see that line, act on it: read the next window with read_file's offset, narrow a glob, or point tree at a subdirectory. Do not treat the visible part as the whole.\n",
     "- Read the part of the file you need rather than the file. Grep for the symbol, then read around the hit.\n",
     "\n## Special requests\n\n",
-    "- Call `self_update` only after the user explicitly asks to update Codexify. Pass `confirm=true`; when the server is service-supervised, warn that MCP will disconnect temporarily while the detached updater stops and restarts the service. After a scheduled update, explicitly tell the user to open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh after Codexify restarts so ChatGPT reloads the connector tools.\n",
+    "- Call `self_update` only after the user explicitly asks to update Codexify. Pass `confirm=true`; when the server is service-supervised, warn that MCP will disconnect temporarily while the detached updater stops and restarts the service. After a scheduled update, report the expected service interruption. Once readiness returns, the signed-in browser companion automatically refreshes the configured ChatGPT connector and selects Allow all tools; an unavailable browser or unconfirmed refresh is reported in standalone settings for manual retry.\n",
     "- Direct self-update progress checks to `codexify service logs -f`.\n",
     "- If the user asks for something a command would simply answer — the time, the current branch, whether the tests pass — run it instead of speculating.\n",
     "- If the user asks for a \"review\", switch to a code-review mindset: bugs, risks, behavioural regressions and missing tests come first. Lead with the findings, ordered by severity, each with a file and line reference. Follow with open questions and assumptions. A summary of the change, if any, comes last. If you find nothing, say so plainly and name the residual risks or testing gaps.\n",
@@ -75,6 +96,11 @@ fn configured_agent_brief(config: &AppConfig) -> String {
     } else {
         AGENT_BRIEF.to_string()
     };
+    brief.push_str(&format!("\n\n{COMMAND_REJECTION_INSTRUCTIONS}"));
+    brief.push_str(&format!("\n\n{TURN_HANDOFF_INSTRUCTIONS}"));
+    if config.markdown_chat.enabled && config.markdown_chat.automation.enabled {
+        brief.push_str(&format!("\n\n{AGENT_GOAL_INSTRUCTIONS}"));
+    }
     if config.experimental.agent_tickets {
         brief = format!("{}\n\n{brief}", crate::agent_tickets::INSTRUCTIONS);
     }
@@ -199,6 +225,62 @@ pub fn build_instructions(config: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_handoffs_override_conflicting_rules_in_initial_and_project_briefs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        for multi_project in [false, true] {
+            config.multi_project = multi_project;
+            for markdown_chat in [false, true] {
+                config.markdown_chat.enabled = markdown_chat;
+                for brief in [
+                    build_initial_instructions(&config),
+                    build_instructions(&config),
+                ] {
+                    assert!(brief.contains(TURN_HANDOFF_INSTRUCTIONS));
+                    assert!(brief.contains("blocked/stopped/paused"));
+                    assert!(brief.contains("check the most recent CHAT.md messages"));
+                    assert!(brief.contains("instead of calling chat_await"));
+                    assert!(!brief.contains("STOP and ask the user how to proceed"));
+                    assert!(
+                        brief.find(TURN_HANDOFF_INSTRUCTIONS).unwrap()
+                            > brief.find(AGENT_BRIEF).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_rejection_guidance_is_shared_by_initial_and_project_briefs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        for multi_project in [false, true] {
+            config.multi_project = multi_project;
+            for markdown_chat in [false, true] {
+                config.markdown_chat.enabled = markdown_chat;
+                config.markdown_chat.automation.enabled = markdown_chat;
+                for brief in [
+                    build_initial_instructions(&config),
+                    build_instructions(&config),
+                ] {
+                    assert!(brief.contains(COMMAND_REJECTION_INSTRUCTIONS));
+                    assert!(brief.contains("safe-script-XXXX.sh"));
+                    assert!(brief.contains("safe-script-XXXX.py"));
+                    assert!(brief.contains("safe-script-XXXX.js"));
+                    assert!(brief.contains("immediately call `chat_await`"));
+                    assert!(brief.contains("Do not mark the goal blocked merely"));
+                    assert!(
+                        brief.contains(
+                            "must never bypass a safety, permission, or policy rejection"
+                        )
+                    );
+                    assert_eq!(brief.contains(AGENT_GOAL_INSTRUCTIONS), markdown_chat);
+                }
+            }
+        }
+    }
 
     #[test]
     fn agent_tickets_instructions_and_schema_marker_are_opt_in() {

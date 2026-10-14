@@ -6,6 +6,9 @@
   "experimental": {
     "agentTickets": false,
     "forceReadOnlyToolAnnotations": false,
+    "forceDestructiveToolAnnotations": null,
+    "forceIdempotentToolAnnotations": null,
+    "forceOpenWorldToolAnnotations": null,
     "claudeSkills": false
   },
   "apiKey": null,
@@ -106,13 +109,22 @@
       "enabled": false,
       "descriptorPath": "~/.codexify/browser/descriptor.json",
       "connectorName": "Codexify",
+      "requestBlockList": [],
       "maxQueuedActions": 64,
       "autoApproveToolCalls": false
     },
     "notifications": {
       "urls": ["ntfys://ntfy.example/codexify?image=no"],
       "pythonPath": "python3",
-      "timeoutMs": 15000
+      "timeoutMs": 15000,
+      "events": {
+        "messages": false,
+        "completed": true,
+        "inputRequired": true,
+        "goalBlocked": true,
+        "errors": true,
+        "offline": false
+      }
     }
   },
   "skills": {

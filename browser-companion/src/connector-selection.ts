@@ -6,6 +6,12 @@ import { BrowserCompanionError } from "./errors";
 
 const CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
 const MAX_CONNECTOR_TRIGGER_ATTEMPTS = 3;
+export const SELECTED_CONNECTOR_SELECTOR = '[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][contenteditable="false"]';
+
+export interface SelectedConnector {
+  composer: Locator;
+  identity: string;
+}
 
 export function connectorSelectionSelector(name: string): string {
   if (!name.trim() || name.length > 256 || /[\u0000-\u001f\u007f]/u.test(name)) {
@@ -18,18 +24,31 @@ export function connectorSelectionSelector(name: string): string {
   ].join(", ");
 }
 
-export function selectedConnectorControl(composer: Locator, name: string): Locator {
-  return composer.locator(connectorSelectionSelector(name)).filter({ visible:true });
+export function selectedConnectorControl(composer: Locator, name: string, identity?: string): Locator {
+  return composer.locator(identity
+    ? `[data-id=${JSON.stringify(identity)}], [app-mention-path=${JSON.stringify(identity)}][contenteditable="false"]`
+    : connectorSelectionSelector(name)).filter({ visible:true });
 }
 
-export async function connectorIsSelected(composer: Locator, name: string): Promise<boolean> {
-  const selected = selectedConnectorControl(composer, name);
-  const names = await selected.evaluateAll(elements => elements.map(element => (
-    element.getAttribute("data-keyword") ?? element.getAttribute("app-mention-display-name")
-  )));
-  const exact = names.filter(value => value === name).length;
+export async function connectorIsSelected(composer: Locator, name: string, identity?: string): Promise<boolean> {
+  const selected = selectedConnectorControl(composer, name, identity);
+  const names = await selected.evaluateAll((elements, useIdentity) => elements.map(element => (
+    useIdentity
+      ? element.getAttribute("app-mention-path") ?? element.getAttribute("data-id")
+      : element.getAttribute("data-keyword") ?? element.getAttribute("app-mention-display-name")
+  )), identity !== undefined);
+  const exact = names.filter(value => value === (identity ?? name)).length;
   if (exact > 1) throw new BrowserCompanionError(`ChatGPT exposed duplicate ${JSON.stringify(name)} connector selections`, "connector_unavailable");
   return exact === 1;
+}
+
+async function selectedConnectorIdentity(composer: Locator): Promise<string> {
+  const identities = await composer.locator(SELECTED_CONNECTOR_SELECTOR).filter({ visible:true })
+    .evaluateAll(elements => elements.map(element => element.getAttribute("app-mention-path") ?? element.getAttribute("data-id")));
+  if (identities.length !== 1 || !identities[0]) {
+    throw new BrowserCompanionError("ChatGPT did not expose one selected connector identity", "connector_unavailable");
+  }
+  return identities[0];
 }
 
 export function normalizeConnectorRowTitles(texts: readonly string[]): string[] {
@@ -48,7 +67,7 @@ export async function clearComposerState(page: Page, connectorName: string, sign
   while (Date.now() < deadline) {
     const settled = await activeComposer(page, 5_000, signal);
     const text = await composerText(settled);
-    const selected = await connectorIsSelected(settled, connectorName);
+    const selected = await settled.locator(SELECTED_CONNECTOR_SELECTOR).filter({ visible:true }).count() > 0;
     if (!text.trim() && !selected) return;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
@@ -67,10 +86,10 @@ export async function selectConnector(
   page: Page,
   connectorName: string,
   signal?: AbortSignal,
-): Promise<Locator> {
+): Promise<SelectedConnector> {
   let composer = await activeComposer(page, 30_000, signal);
   if (await connectorIsSelected(composer, connectorName)) {
-    if (!(await composerText(composer)).trim()) return composer;
+    if (!(await composerText(composer)).trim()) return { composer, identity:await selectedConnectorIdentity(composer) };
     await clearComposerState(page, connectorName, signal);
     composer = await activeComposer(page, 30_000, signal);
   }
@@ -127,14 +146,17 @@ export async function selectConnector(
     }
     await composer.press("Enter", { timeout:CONNECTOR_ACTION_TIMEOUT_MS, signal });
     const selected = await activeComposer(page, 30_000, signal);
-    await selectedConnectorControl(selected, connectorName).waitFor({ state:"visible", timeout:CONNECTOR_ACTION_TIMEOUT_MS, signal });
-    if (!await connectorIsSelected(selected, connectorName)) {
+    // The exact menu row proves the configured display name. The selected chip can
+    // expose an internal slug instead, so bind its actual app identity for Send.
+    await selected.locator(SELECTED_CONNECTOR_SELECTOR).filter({ visible:true }).waitFor({ state:"visible", timeout:CONNECTOR_ACTION_TIMEOUT_MS, signal });
+    const identity = await selectedConnectorIdentity(selected);
+    if (!await connectorIsSelected(selected, connectorName, identity)) {
       throw new BrowserCompanionError(`ChatGPT did not retain the ${JSON.stringify(connectorName)} connector selection`, "connector_unavailable");
     }
     if ((await composerText(selected)).trim()) {
       throw new BrowserCompanionError("ChatGPT connector selection left an unexpected draft", "external_interference");
     }
-    return selected;
+    return { composer:selected, identity };
   } catch (error) {
     try {
       await clearComposerState(page, connectorName, signal);

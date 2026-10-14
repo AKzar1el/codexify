@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use super::MAX_UNREAD_BYTES;
+use super::{MAX_UNREAD_BYTES, notification::NotificationEvent};
 
 #[path = "widget.rs"]
 mod widget;
 pub use widget::{
-    BrowserAppendReceipt, OwnerChatSummary, TranscriptCheckpoint, UnreadMessage, UnreadSnapshot,
-    UserSendReceipt, WidgetPage,
+    AGENT_STOP_MESSAGE, BrowserAppendReceipt, OwnerChatOrganization, OwnerChatSummary,
+    TranscriptCheckpoint, UnreadMessage, UnreadSnapshot, UserSendReceipt, WidgetPage,
 };
 
 const HEADER: &str = "# Codexify Chat\n\nAppend user messages at the bottom and save the file. Do not change earlier content\nwhile the agent is active. The agent sends messages only through chat_write.\n";
@@ -33,6 +33,7 @@ pub enum NotificationState {
     Accepted,
     Failed,
     Cancelled,
+    Suppressed,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -42,14 +43,30 @@ struct Cursor {
     anchor: Vec<u8>,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pinned_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_at_ms: Option<u64>,
     #[serde(default)]
     last_agent_end: Option<u64>,
     #[serde(default)]
     notification: NotificationState,
     #[serde(default)]
+    last_message_event: NotificationEvent,
+    #[serde(default)]
+    input_notification_pending: bool,
+    #[serde(default)]
+    notification_claims: BTreeMap<String, String>,
+    #[serde(default)]
     delivered_through: u64,
     #[serde(default)]
     last_agent_call_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_presence_until_ms: Option<u64>,
+    #[serde(default)]
+    agent_stop_requested: bool,
+    #[serde(default)]
+    agent_stop_requests: Vec<String>,
     #[serde(default)]
     offline_notified_for_tool_call_count: Option<u64>,
     #[serde(default)]
@@ -79,11 +96,31 @@ pub struct AppendReceipt {
 
 #[derive(Clone)]
 pub(crate) struct OfflineActivity {
+    pub(crate) agent_stop_requested: bool,
     pub(crate) last_call_at_ms: Option<u64>,
+    pub(crate) agent_presence_until_ms: Option<u64>,
+    pub(crate) agent_waiting_until_ms: Option<u64>,
     pub(crate) tool_call_count: u64,
     pub(crate) activity_epoch: Option<String>,
     pub(crate) activity_sequence: u64,
     pub(crate) notified_for_tool_call_count: Option<u64>,
+}
+
+impl OfflineActivity {
+    pub(crate) fn is_online(&self, now_ms: u64, offline_after_ms: u64) -> bool {
+        self.agent_presence_until_ms.map_or_else(
+            || {
+                self.last_call_at_ms
+                    .is_some_and(|last| now_ms.saturating_sub(last) < offline_after_ms)
+            },
+            |until| now_ms < until,
+        )
+    }
+    pub(crate) fn last_call_for_presence(&self, now_ms: u64) -> Option<u64> {
+        self.agent_presence_until_ms
+            .filter(|until| now_ms >= *until)
+            .map_or(self.last_call_at_ms, |_| None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +153,8 @@ struct OwnerSummaryCache {
     title: String,
     last_entry_end: u64,
     last_entry_at_ms: u64,
+    last_user_entry_end: u64,
+    last_user_entry_at_ms: Option<u64>,
 }
 
 impl ChatFile {
@@ -193,7 +232,10 @@ impl ChatFile {
                             "Markdown chat read was cancelled; no messages were consumed".into(),
                         );
                     }
-                    let next = advanced_cursor(file, cursor.clone(), snapshot.end)?;
+                    let mut next = advanced_cursor(file, cursor.clone(), snapshot.end)?;
+                    if !snapshot.text.is_empty() {
+                        next.input_notification_pending = false;
+                    }
                     chat.save_cursor(&next)?;
                     *cursor = next;
                 }
@@ -206,6 +248,78 @@ impl ChatFile {
     pub async fn append(self: &Arc<Self>, message: String) -> Result<AppendReceipt, String> {
         self.run(move |chat| chat.append_sync(&message, || {}))
             .await
+    }
+
+    pub async fn append_with_event(
+        self: &Arc<Self>,
+        message: String,
+        event: NotificationEvent,
+    ) -> Result<AppendReceipt, String> {
+        self.run(move |chat| chat.append_sync_with_event(&message, event, || {}))
+            .await
+    }
+
+    pub(crate) async fn claim_input_notification(self: &Arc<Self>) -> Result<bool, String> {
+        self.run(|chat| {
+            chat.with_cursor(|cursor, file| {
+                if cursor.input_notification_pending
+                    || cursor.agent_stop_requested
+                    || cursor.last_message_event == NotificationEvent::Completed
+                    || cursor.last_agent_end.is_none()
+                    || !snapshot(file, cursor)?.text.is_empty()
+                {
+                    return Ok(false);
+                }
+                let mut next = cursor.clone();
+                next.input_notification_pending = true;
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn claim_notification(
+        self: &Arc<Self>,
+        category: &str,
+        key: &str,
+    ) -> Result<bool, String> {
+        let category = category.to_owned();
+        let key = key.to_owned();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                if cursor.notification_claims.get(&category) == Some(&key) {
+                    return Ok(false);
+                }
+                let mut next = cursor.clone();
+                next.notification_claims.insert(category, key);
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn clear_notification_claim(
+        self: &Arc<Self>,
+        category: &str,
+    ) -> Result<(), String> {
+        let category = category.to_owned();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                if !cursor.notification_claims.contains_key(&category) {
+                    return Ok(());
+                }
+                let mut next = cursor.clone();
+                next.notification_claims.remove(&category);
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                Ok(())
+            })
+        })
+        .await
     }
 
     pub(crate) async fn warn_ticket_rejection(self: &Arc<Self>) -> Result<(), String> {
@@ -245,7 +359,10 @@ impl ChatFile {
         self.run(|chat| {
             chat.with_cursor(|cursor, _| {
                 Ok(OfflineActivity {
+                    agent_stop_requested: cursor.agent_stop_requested,
                     last_call_at_ms: cursor.last_agent_call_at_ms,
+                    agent_presence_until_ms: cursor.agent_presence_until_ms,
+                    agent_waiting_until_ms: chat.agent_waiting_until_ms(),
                     tool_call_count: cursor.total_tool_calls,
                     activity_epoch: cursor.tool_call_epoch.clone(),
                     activity_sequence: cursor.tool_call_sequence,
@@ -282,15 +399,25 @@ impl ChatFile {
     ) -> Result<bool, String> {
         self.run(move |chat| {
             chat.with_cursor(|cursor, _| {
+                if cursor.agent_stop_requested {
+                    return Ok(false);
+                }
                 let Some(last_call_at_ms) = cursor.last_agent_call_at_ms else {
                     return Ok(false);
                 };
+                if claim == OfflineClaim::Notification && cursor.agent_presence_until_ms.is_some() {
+                    // Pairing verification is setup, not a working turn going silent.
+                    return Ok(false);
+                }
                 let claimed_for = cursor.offline_claims.get(claim.key()).copied().or_else(|| {
                     (claim == OfflineClaim::Notification)
                         .then_some(cursor.offline_notified_for_tool_call_count)
                         .flatten()
                 });
-                if now_ms.saturating_sub(last_call_at_ms) < offline_after_ms
+                if now_ms
+                    < cursor
+                        .agent_presence_until_ms
+                        .unwrap_or_else(|| last_call_at_ms.saturating_add(offline_after_ms))
                     || claimed_for == Some(cursor.total_tool_calls)
                 {
                     return Ok(false);
@@ -413,6 +540,15 @@ impl ChatFile {
         message: &str,
         before_append: impl FnOnce(),
     ) -> Result<AppendReceipt, String> {
+        self.append_sync_with_event(message, NotificationEvent::Message, before_append)
+    }
+
+    fn append_sync_with_event(
+        &self,
+        message: &str,
+        event: NotificationEvent,
+        before_append: impl FnOnce(),
+    ) -> Result<AppendReceipt, String> {
         if message.is_empty() {
             return Err("chat_write.message must not be empty".into());
         }
@@ -449,6 +585,8 @@ impl ChatFile {
             let mut next = advanced_cursor(file, cursor.clone(), end)?;
             next.last_agent_end = Some(end);
             next.notification = NotificationState::NotConfigured;
+            next.last_message_event = event;
+            if !user_text.is_empty() { next.input_notification_pending = false; }
             let cursor_warning = self.save_cursor(&next).err();
             *cursor = next;
             Ok(AppendReceipt { user_text, end_offset: end, cursor_warning })

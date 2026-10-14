@@ -23,6 +23,7 @@ const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
 pub const PAIRING_REFERENCE_TTL_MS: u64 = 10 * 60 * 1000;
+const AUTOMATIC_RETRY_DELAYS_MS: [u64; 3] = [30_000, 60_000, 120_000];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +46,33 @@ pub struct GoalRecord {
     pub finished_at_ms: Option<u64>,
     pub summary: Option<String>,
     pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub elapsed_active_ms: u64,
+    #[serde(default)]
+    pub active_since_ms: Option<u64>,
+    #[serde(default)]
+    pub timer_until_ms: Option<u64>,
+    #[serde(default = "initial_goal_turn")]
+    pub turn_count: u64,
+    #[serde(default)]
+    pub completed_chat_end: Option<u64>,
+}
+
+fn initial_goal_turn() -> u64 {
+    1
+}
+
+impl GoalRecord {
+    fn pause_timer(&mut self, now_ms: u64) {
+        if let Some(since) = self.active_since_ms.take() {
+            self.elapsed_active_ms = self.elapsed_active_ms.saturating_add(
+                now_ms
+                    .min(self.timer_until_ms.unwrap_or(now_ms))
+                    .saturating_sub(since),
+            );
+        }
+        self.timer_until_ms = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +107,8 @@ pub struct OwnerGoalCommandReceipt {
     pub kind: OwnerGoalCommandKind,
     pub goal: Option<GoalRecord>,
     pub replayed: bool,
+    #[serde(default)]
+    pub updated_active_goal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,12 +131,17 @@ pub struct PendingPairing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct PairingState {
+    pub creating_chat: bool,
     pub candidate_url: Option<String>,
     pub canonical_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempted_url: Option<String>,
     pub generation: u64,
     pub verified_owner_generation: Option<u64>,
     pub verified_at_ms: Option<u64>,
     pub pending: Option<PendingPairing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +200,10 @@ pub struct AutomationActionState {
     pub last_error: Option<String>,
     pub last_stable_answer: Option<String>,
     pub updated_at_ms: Option<u64>,
+    pub goal_turn_counted: bool,
+    pub send_accepted: Option<bool>,
+    pub messages_fenced: bool,
+    pub automatic_retry_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -207,6 +246,7 @@ pub struct GoalWakeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AutomationTaskState {
+    pub creation_request_digest: Option<String>,
     pub version: u32,
     pub pairing: PairingState,
     pub selection: SelectionState,
@@ -221,6 +261,7 @@ pub struct AutomationTaskState {
 impl Default for AutomationTaskState {
     fn default() -> Self {
         Self {
+            creation_request_digest: None,
             version: STATE_VERSION,
             pairing: PairingState::default(),
             selection: SelectionState::default(),
@@ -233,10 +274,100 @@ impl Default for AutomationTaskState {
     }
 }
 
+impl AutomationTaskState {
+    pub fn retry_mode(&self) -> Option<&'static str> {
+        action_retry_mode(self)
+    }
+
+    pub fn automatic_retry_at_ms(&self) -> Option<u64> {
+        let action = &self.action;
+        if action.status != AutomationActionStatus::Failed
+            || action.send_accepted != Some(false)
+            || action.messages_fenced
+            || action.goal_turn_counted
+            // Cancelling a queued action is an explicit user decision.
+            || action.last_error.as_deref() == Some("Browser action cancelled before Send")
+            || action.id.is_none()
+        {
+            return None;
+        }
+        match action.kind {
+            Some(AutomationActionKind::OfflineChat) => {}
+            Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined)
+                if self.goal.as_ref().is_some_and(|goal| {
+                    goal.status == GoalStatus::Active && Some(goal.revision) == action.goal_revision
+                }) => {}
+            _ => return None,
+        }
+        let delay = AUTOMATIC_RETRY_DELAYS_MS.get(action.automatic_retry_attempts as usize)?;
+        action
+            .updated_at_ms
+            .map(|finished| finished.saturating_add(*delay))
+    }
+
+    pub fn action_needs_attention(&self) -> bool {
+        matches!(
+            self.action.status,
+            AutomationActionStatus::Failed
+                | AutomationActionStatus::Ambiguous
+                | AutomationActionStatus::Stalled
+                | AutomationActionStatus::Interference
+                | AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::RateLimited
+                | AutomationActionStatus::ApprovalRequired
+        ) || (self.action.status == AutomationActionStatus::Unverified
+            && self.action.last_error.is_some())
+    }
+}
+
+fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
+    let action = &state.action;
+    if action.id.is_none()
+        || action.kind == Some(AutomationActionKind::PairVerify)
+        || !matches!(
+            action.status,
+            AutomationActionStatus::Failed
+                | AutomationActionStatus::Ambiguous
+                | AutomationActionStatus::Stalled
+                | AutomationActionStatus::Interference
+                | AutomationActionStatus::ApprovalRequired
+                | AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::RateLimited
+        )
+    {
+        return None;
+    }
+    if action.send_accepted != Some(true)
+        && (action.status == AutomationActionStatus::Failed
+            || (action.send_accepted == Some(false)
+                && !matches!(
+                    action.status,
+                    AutomationActionStatus::Ambiguous | AutomationActionStatus::Stalled
+                ))
+            || (action.status == AutomationActionStatus::Interference
+                && action.last_error.as_deref()
+                    == Some("The shared ChatGPT conversation is already generating")))
+    {
+        return Some("retry");
+    }
+    if state.goal.as_ref().is_some_and(|goal| {
+        goal.status == GoalStatus::Active && action.goal_revision == Some(goal.revision)
+    }) && (action.kind == Some(AutomationActionKind::OfflineGoal)
+        || (action.kind == Some(AutomationActionKind::OfflineCombined)
+            && action.send_accepted == Some(true)
+            && action.messages_fenced))
+    {
+        return Some("continue_goal");
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentAutomationStore {
     root: PathBuf,
     pairing_index_root: PathBuf,
+    notifications: Option<crate::markdown_chat::NotificationsConfig>,
+    notification_workspace: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +384,7 @@ impl AgentAutomationStore {
         let root = crate::memory::memory_dir(config).join("chats");
         let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
+            .map(|store| store.with_notifications(config))
     }
 
     pub fn for_state_root(config: &AppConfig, state_root: &Path) -> Result<Self, String> {
@@ -262,6 +394,7 @@ impl AgentAutomationStore {
         let root = state_root.join("chats");
         let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
+            .map(|store| store.with_notifications(config))
     }
 
     pub fn new(root: PathBuf) -> Result<Self, String> {
@@ -288,7 +421,38 @@ impl AgentAutomationStore {
         Ok(Self {
             root,
             pairing_index_root,
+            notifications: None,
+            notification_workspace: "Agent chat".into(),
         })
+    }
+
+    fn with_notifications(mut self, config: &AppConfig) -> Self {
+        self.notifications = config.markdown_chat.notifications.clone();
+        self.notification_workspace = config
+            .work_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self
+    }
+
+    pub(crate) async fn notify_state(
+        &self,
+        chat: &Arc<crate::markdown_chat::ChatFile>,
+        state: &AutomationTaskState,
+    ) {
+        if let Some(config) = &self.notifications
+            && let Err(error) = crate::markdown_chat::notification::notify_automation(
+                chat,
+                config,
+                &self.notification_workspace,
+                state,
+            )
+            .await
+        {
+            tracing::warn!(%error, "could not claim automation notification");
+        }
     }
 
     pub fn task_directory(&self, task: &ConversationIdentity) -> Result<PathBuf, String> {
@@ -298,6 +462,65 @@ impl AgentAutomationStore {
 
     pub fn load(&self, task: &ConversationIdentity) -> Result<AutomationTaskState, String> {
         self.with_locked_task(task, load_state)
+    }
+
+    pub fn sync_goal_presence(
+        &self,
+        task: &ConversationIdentity,
+        last_call_at_ms: Option<u64>,
+        waiting_until_ms: Option<u64>,
+        stopped: bool,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            let Some(goal) = state
+                .goal
+                .as_mut()
+                .filter(|goal| goal.status == GoalStatus::Active)
+            else {
+                return Ok(());
+            };
+            let previous = goal.clone();
+            let until = (!stopped)
+                .then(|| {
+                    last_call_at_ms
+                        .map(|last| last.saturating_add(crate::markdown_chat::OFFLINE_AFTER_MS))
+                        .into_iter()
+                        .chain(waiting_until_ms)
+                        .max()
+                })
+                .flatten();
+            if let Some(old_until) = goal.timer_until_ms {
+                let continuous = last_call_at_ms.is_some_and(|last| last <= old_until);
+                if until.is_none()
+                    || (!continuous && now_ms >= old_until)
+                    || (old_until > now_ms && until.is_some_and(|until| until <= now_ms))
+                {
+                    goal.pause_timer(now_ms);
+                }
+            }
+            if let Some(until) = until {
+                if goal.active_since_ms.is_none() && until > now_ms {
+                    goal.active_since_ms = Some(
+                        last_call_at_ms
+                            .unwrap_or(now_ms)
+                            .max(goal.updated_at_ms)
+                            .min(now_ms),
+                    );
+                }
+                if goal.active_since_ms.is_some() {
+                    goal.timer_until_ms = Some(until);
+                    if until <= now_ms {
+                        goal.pause_timer(now_ms);
+                    }
+                }
+            }
+            if *goal != previous {
+                persist_state(path, &state)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn set_selection(
@@ -322,9 +545,10 @@ impl AgentAutomationStore {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
             let account_changed = state
-                .selection
+                .pairing
                 .account_fingerprint
                 .as_deref()
+                .or(state.selection.account_fingerprint.as_deref())
                 .is_some_and(|current| current != account_fingerprint);
             let selection_changed = state.selection.model.as_deref() != Some(model)
                 || state.selection.effort.as_deref() != Some(effort)
@@ -345,6 +569,11 @@ impl AgentAutomationStore {
                 catalog_revision: Some(catalog_revision.to_string()),
                 account_fingerprint: Some(account_fingerprint.to_string()),
             };
+            if state.pairing.account_fingerprint.is_none()
+                && state.pairing.verified_owner_generation.is_some()
+            {
+                state.pairing.account_fingerprint = state.selection.account_fingerprint.clone();
+            }
             if account_changed {
                 state.pairing.pending = None;
                 state.pairing.verified_owner_generation = None;
@@ -356,7 +585,10 @@ impl AgentAutomationStore {
                     updated_at_ms: Some(now_ms),
                     ..Default::default()
                 };
-            } else if selection_changed && state.action.status == AutomationActionStatus::Queued {
+            } else if selection_changed
+                && state.action.status == AutomationActionStatus::Queued
+                && state.action.kind != Some(AutomationActionKind::PairVerify)
+            {
                 state.action = AutomationActionState::default();
             }
             validate_state(&state)?;
@@ -365,6 +597,47 @@ impl AgentAutomationStore {
                 let _ = self.remove_pairing_index(&previous_digest);
             }
             Ok(state.selection)
+        })
+    }
+
+    pub fn clear_selection(&self, task: &ConversationIdentity) -> Result<SelectionState, String> {
+        self.mutate(task, |state| {
+            if state.pairing.account_fingerprint.is_none() {
+                state.pairing.account_fingerprint = state.selection.account_fingerprint.clone();
+            }
+            state.selection = SelectionState::default();
+            if state.action.status == AutomationActionStatus::Queued
+                && state.action.kind != Some(AutomationActionKind::PairVerify)
+            {
+                state.action = AutomationActionState::default();
+            }
+            Ok(state.selection.clone())
+        })
+    }
+
+    pub fn bind_pairing_account(
+        &self,
+        task: &ConversationIdentity,
+        generation: u64,
+        fingerprint: &str,
+    ) -> Result<(), String> {
+        if !valid_opaque(fingerprint) {
+            return Err("Agent automation account fingerprint is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.pairing.generation != generation || state.pairing.pending.is_none() {
+                return Err("The agent-chat pairing request is stale".into());
+            }
+            state.pairing.account_fingerprint = Some(fingerprint.to_owned());
+            if state
+                .selection
+                .account_fingerprint
+                .as_deref()
+                .is_some_and(|saved| saved != fingerprint)
+            {
+                state.selection = SelectionState::default();
+            }
+            Ok(())
         })
     }
 
@@ -390,6 +663,11 @@ impl AgentAutomationStore {
                 finished_at_ms: None,
                 summary: None,
                 blocked_reason: None,
+                elapsed_active_ms: 0,
+                active_since_ms: None,
+                timer_until_ms: None,
+                turn_count: 1,
+                completed_chat_end: None,
             };
             state.goal = Some(goal.clone());
             state.goal_wake = GoalWakeState::default();
@@ -406,30 +684,7 @@ impl AgentAutomationStore {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<GoalRecord, String> {
-        self.mutate(task, |state| {
-            let result = {
-                let goal = exact_goal_mut(state, expected_revision)?;
-                match goal.status {
-                    GoalStatus::Configured => {
-                        goal.status = GoalStatus::Active;
-                        goal.updated_at_ms = now_ms;
-                        goal.finished_at_ms = None;
-                        goal.summary = None;
-                        goal.blocked_reason = None;
-                    }
-                    GoalStatus::Active => {}
-                    GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error => {
-                        return Err(
-                            "Only a configured agent-chat goal can be started; create a new revision first"
-                                .into(),
-                        );
-                    }
-                }
-                goal.clone()
-            };
-            state.goal_wake = GoalWakeState::default();
-            Ok(result)
-        })
+        self.mutate(task, |state| start_goal(state, expected_revision, now_ms))
     }
 
     pub fn stop_goal(
@@ -443,6 +698,7 @@ impl AgentAutomationStore {
                 let goal = exact_goal_mut(state, expected_revision)?;
                 match goal.status {
                     GoalStatus::Active => {
+                        goal.pause_timer(now_ms);
                         goal.status = GoalStatus::Configured;
                         goal.updated_at_ms = now_ms;
                         goal.finished_at_ms = None;
@@ -490,6 +746,58 @@ impl AgentAutomationStore {
         command: OwnerGoalCommand,
         now_ms: u64,
     ) -> Result<OwnerGoalCommandReceipt, String> {
+        self.owner_goal_command(task, request_id, command, now_ms, false, None)
+    }
+
+    /// Agent mutations share the owner's activation rules and durable receipts,
+    /// but must compare the revision under the same lock as the mutation.
+    pub fn apply_agent_goal_command(
+        &self,
+        task: &ConversationIdentity,
+        request_id: &str,
+        expected_revision: u64,
+        command: OwnerGoalCommand,
+        now_ms: u64,
+    ) -> Result<OwnerGoalCommandReceipt, String> {
+        if !valid_opaque(request_id) {
+            return Err("Agent-chat goal command request ID is invalid".into());
+        }
+        if !matches!(
+            command,
+            OwnerGoalCommand::Set { .. } | OwnerGoalCommand::Run
+        ) {
+            return Err("Agents can only set or resume a goal with this operation".into());
+        }
+        // Keep agent retry identifiers separate from owner UI request identifiers.
+        let request_id = format!("agent-goal-{:x}", Sha256::digest(request_id.as_bytes()));
+        self.owner_goal_command(
+            task,
+            &request_id,
+            command,
+            now_ms,
+            false,
+            Some(expected_revision),
+        )
+    }
+
+    pub fn pause_goal_for_agent_stop(
+        &self,
+        task: &ConversationIdentity,
+        request_id: &str,
+        now_ms: u64,
+    ) -> Result<OwnerGoalCommandReceipt, String> {
+        self.owner_goal_command(task, request_id, OwnerGoalCommand::Stop, now_ms, true, None)
+    }
+
+    fn owner_goal_command(
+        &self,
+        task: &ConversationIdentity,
+        request_id: &str,
+        command: OwnerGoalCommand,
+        now_ms: u64,
+        agent_stop: bool,
+        expected_revision: Option<u64>,
+    ) -> Result<OwnerGoalCommandReceipt, String> {
         if !valid_opaque(request_id) {
             return Err("Agent-chat goal command request ID is invalid".into());
         }
@@ -501,10 +809,23 @@ impl AgentAutomationStore {
                 kind: OwnerGoalCommandKind::Status,
                 goal: self.load(task)?.goal,
                 replayed: false,
+                updated_active_goal: false,
             });
         }
         let request_digest = owner_goal_request_digest(request_id);
-        let command_digest = owner_goal_command_digest(&command)?;
+        let command_digest = if let Some(revision) = expected_revision {
+            format!(
+                "{:x}",
+                Sha256::digest(format!(
+                    "agent-goal-v1\0{revision}\0{}",
+                    owner_goal_command_digest(&command)?
+                ))
+            )
+        } else if agent_stop {
+            format!("{:x}", Sha256::digest(b"pause_goal_for_agent_stop"))
+        } else {
+            owner_goal_command_digest(&command)?
+        };
         self.mutate(task, move |state| {
             if let Some(record) = state
                 .owner_goal_requests
@@ -513,8 +834,7 @@ impl AgentAutomationStore {
             {
                 if record.command_digest != command_digest {
                     return Err(
-                        "This goal command request ID already belongs to a different command"
-                            .into(),
+                        "This goal command request ID already belongs to a different command".into(),
                     );
                 }
                 let mut receipt = record.receipt.clone();
@@ -522,6 +842,16 @@ impl AgentAutomationStore {
                 return Ok(receipt);
             }
 
+            if let Some(expected_revision) = expected_revision {
+                let current_revision = state.goal.as_ref().map_or(0, |goal| goal.revision);
+                if current_revision != expected_revision {
+                    return Err(format!(
+                        "Agent-chat goal revision changed (expected {expected_revision}, current {current_revision}); call goal_read before changing it"
+                    ));
+                }
+            }
+
+            let mut updated_active_goal = false;
             let (kind, goal) = match command {
                 OwnerGoalCommand::Set { markdown } => {
                     let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
@@ -529,15 +859,25 @@ impl AgentAutomationStore {
                             .checked_add(1)
                             .ok_or("Agent-chat goal revision overflow")
                     })?;
+                    let previous = state
+                        .goal
+                        .as_ref()
+                        .filter(|goal| goal.status == GoalStatus::Active);
+                    updated_active_goal = previous.is_some();
                     let goal = GoalRecord {
                         revision,
                         markdown,
-                        status: GoalStatus::Configured,
-                        created_at_ms: now_ms,
+                        status: GoalStatus::Active,
+                        created_at_ms: previous.map_or(now_ms, |goal| goal.created_at_ms),
                         updated_at_ms: now_ms,
                         finished_at_ms: None,
                         summary: None,
                         blocked_reason: None,
+                        elapsed_active_ms: previous.map_or(0, |goal| goal.elapsed_active_ms),
+                        active_since_ms: previous.and_then(|goal| goal.active_since_ms),
+                        timer_until_ms: previous.and_then(|goal| goal.timer_until_ms),
+                        turn_count: previous.map_or(1, |goal| goal.turn_count.max(1)),
+                        completed_chat_end: None,
                     };
                     state.goal = Some(goal.clone());
                     state.goal_wake = GoalWakeState::default();
@@ -552,26 +892,17 @@ impl AgentAutomationStore {
                         .as_ref()
                         .ok_or("No agent-chat goal is configured")?
                         .revision;
-                    let goal = exact_goal_mut(state, revision)?;
-                    match goal.status {
-                        GoalStatus::Configured => {
-                            goal.status = GoalStatus::Active;
-                            goal.updated_at_ms = now_ms;
-                            goal.finished_at_ms = None;
-                            goal.summary = None;
-                            goal.blocked_reason = None;
-                        }
-                        GoalStatus::Active => {}
-                        GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error => {
-                            return Err(
-                                "Only a configured agent-chat goal can be started; create a new revision first"
-                                    .into(),
-                            );
-                        }
-                    }
-                    let goal = goal.clone();
-                    state.goal_wake = GoalWakeState::default();
+                    let goal = start_goal(state, revision, now_ms)?;
                     (OwnerGoalCommandKind::Run, Some(goal))
+                }
+                OwnerGoalCommand::Stop
+                    if agent_stop
+                        && state
+                            .goal
+                            .as_ref()
+                            .is_none_or(|goal| goal.status != GoalStatus::Active) =>
+                {
+                    (OwnerGoalCommandKind::Stop, state.goal.clone())
                 }
                 OwnerGoalCommand::Stop => {
                     let revision = state
@@ -582,6 +913,7 @@ impl AgentAutomationStore {
                     let goal = exact_goal_mut(state, revision)?;
                     match goal.status {
                         GoalStatus::Active => {
+                            goal.pause_timer(now_ms);
                             goal.status = GoalStatus::Configured;
                             goal.updated_at_ms = now_ms;
                             goal.finished_at_ms = None;
@@ -620,6 +952,7 @@ impl AgentAutomationStore {
                 kind,
                 goal,
                 replayed: false,
+                updated_active_goal,
             };
             state.owner_goal_requests.push(OwnerGoalRequestRecord {
                 request_digest,
@@ -641,6 +974,7 @@ impl AgentAutomationStore {
         now_ms: u64,
     ) -> Result<GoalRecord, String> {
         let normalized = normalize_goal_finish(finish)?;
+        let transcript = self.task_directory(task)?.join("CHAT.md");
         self.mutate(task, |state| {
             let result = {
                 let goal = exact_goal_mut(state, expected_revision)?;
@@ -650,16 +984,22 @@ impl AgentAutomationStore {
                 if goal.status != GoalStatus::Active {
                     return Err("Only an active agent-chat goal can be finished".into());
                 }
+                goal.pause_timer(now_ms);
                 match &normalized {
                     GoalFinish::Completed { summary } => {
                         goal.status = GoalStatus::Completed;
                         goal.summary = summary.clone();
                         goal.blocked_reason = None;
+                        goal.completed_chat_end = std::fs::metadata(&transcript)
+                            .ok()
+                            .filter(|metadata| metadata.is_file())
+                            .map(|metadata| metadata.len());
                     }
                     GoalFinish::Blocked { reason } => {
                         goal.status = GoalStatus::Blocked;
                         goal.summary = None;
                         goal.blocked_reason = Some(reason.clone());
+                        goal.completed_chat_end = None;
                     }
                 }
                 goal.updated_at_ms = now_ms;
@@ -702,11 +1042,14 @@ impl AgentAutomationStore {
                 .checked_add(PAIRING_REFERENCE_TTL_MS)
                 .ok_or("Agent-chat pairing expiry overflow")?;
             state.pairing = PairingState {
+                creating_chat: false,
+                last_attempted_url: conversation_url_for_retry(&candidate_url).map(str::to_owned),
                 candidate_url: Some(candidate_url),
                 canonical_url: None,
                 generation,
                 verified_owner_generation: None,
                 verified_at_ms: None,
+                account_fingerprint: state.selection.account_fingerprint.clone(),
                 pending: Some(PendingPairing {
                     generation,
                     owner_generation,
@@ -756,6 +1099,7 @@ impl AgentAutomationStore {
                 .ok_or("Agent-chat pairing generation overflow")?;
             state.pairing = PairingState {
                 generation,
+                last_attempted_url: state.pairing.last_attempted_url.take(),
                 ..Default::default()
             };
             state.action = AutomationActionState {
@@ -770,6 +1114,83 @@ impl AgentAutomationStore {
                 let _ = self.remove_pairing_index(&previous_digest);
             }
             Ok(state.pairing)
+        })
+    }
+
+    pub(crate) fn activate_queued_pairing(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        generation: u64,
+        owner_generation: u64,
+        reference: &str,
+        now_ms: u64,
+    ) -> Result<PairingState, String> {
+        validate_reference(reference)?;
+        let digest = reference_digest(reference);
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id)
+                || state.action.kind != Some(AutomationActionKind::PairVerify)
+                || state.action.status != AutomationActionStatus::Queued
+                || state.pairing.generation != generation
+            {
+                return Err(invalid_pairing_reference());
+            }
+            let pending = state
+                .pairing
+                .pending
+                .as_mut()
+                .ok_or_else(invalid_pairing_reference)?;
+            if pending.generation != generation
+                || pending.owner_generation != owner_generation
+                || pending.reference_digest != digest
+            {
+                return Err(invalid_pairing_reference());
+            }
+            pending.expires_at_ms = now_ms
+                .checked_add(PAIRING_REFERENCE_TTL_MS)
+                .ok_or("Pairing expiry overflow")?;
+            Ok(state.pairing.clone())
+        })
+    }
+
+    pub fn record_creation_request(
+        &self,
+        task: &ConversationIdentity,
+        digest: &str,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state
+                .creation_request_digest
+                .as_deref()
+                .is_some_and(|previous| previous != digest)
+            {
+                return Err("New chat request ID belongs to different options".into());
+            }
+            state.creation_request_digest = Some(digest.to_owned());
+            Ok(())
+        })
+    }
+
+    pub fn record_creation_send(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        accepted: bool,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() == Some(action_id) {
+                state.action.send_accepted =
+                    Some(state.action.send_accepted == Some(true) || accepted);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn mark_creating_chat(&self, task: &ConversationIdentity) -> Result<(), String> {
+        self.mutate(task, |state| {
+            state.pairing.creating_chat = true;
+            Ok(())
         })
     }
 
@@ -795,6 +1216,10 @@ impl AgentAutomationStore {
             if now_ms > pending.expires_at_ms {
                 state.pairing.pending = None;
                 return Err("The agent-chat pairing reference expired".into());
+            }
+            if state.pairing.creating_chat || state.pairing.last_attempted_url.is_none() {
+                state.pairing.last_attempted_url =
+                    conversation_url_for_retry(&canonical_url).map(str::to_owned);
             }
             state.pairing.canonical_url = Some(canonical_url);
             state.action.updated_at_ms = Some(now_ms);
@@ -866,6 +1291,7 @@ impl AgentAutomationStore {
                 );
             }
             state.pairing.pending = None;
+            state.pairing.creating_chat = false;
             state.pairing.candidate_url = None;
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
@@ -899,6 +1325,17 @@ impl AgentAutomationStore {
             if pending.reference_digest != supplied_digest {
                 return Ok(PairingReferenceOutcome::Rejected);
             }
+            if state.pairing.creating_chat
+                && now_ms <= pending.expires_at_ms
+                && actual_matches
+                && pending.owner_generation == owner_generation
+                && state.pairing.canonical_url.is_none()
+            {
+                return Err(
+                    "ChatGPT conversation creation is not ready; retry pairing verification shortly"
+                        .into(),
+                );
+            }
             let valid = now_ms <= pending.expires_at_ms
                 && actual_matches
                 && state.pairing.generation == pending.generation
@@ -911,6 +1348,7 @@ impl AgentAutomationStore {
                 return Ok(PairingReferenceOutcome::Rejected);
             }
             state.pairing.pending = None;
+            state.pairing.creating_chat = false;
             state.pairing.candidate_url = None;
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
@@ -984,6 +1422,17 @@ impl AgentAutomationStore {
         })
     }
 
+    pub(crate) fn record_interrupted_pairing(
+        &self,
+        task: &ConversationIdentity,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            state.action.last_error =
+                Some("Pairing verification was interrupted; pair this conversation again".into());
+            Ok(())
+        })
+    }
+
     pub fn queue_action(
         &self,
         task: &ConversationIdentity,
@@ -1042,6 +1491,8 @@ impl AgentAutomationStore {
                 pairing_generation: Some(pairing_generation),
                 goal_revision,
                 updated_at_ms: Some(now_ms),
+                send_accepted: Some(false),
+                automatic_retry_attempts: state.action.automatic_retry_attempts,
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -1074,6 +1525,8 @@ impl AgentAutomationStore {
                 goal_revision: failure.goal_revision,
                 last_error: Some(failure.message.to_string()),
                 updated_at_ms: Some(failure.now_ms),
+                send_accepted: Some(false),
+                automatic_retry_attempts: state.action.automatic_retry_attempts,
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -1100,11 +1553,17 @@ impl AgentAutomationStore {
                 return Err("Agent automation action changed before its status update".into());
             }
             state.action.status = status;
+            if status == AutomationActionStatus::Ambiguous {
+                state.action.send_accepted = Some(true);
+            }
             state.action.last_error = error.map(str::to_string);
             if let Some(answer) = stable_answer {
                 state.action.last_stable_answer = Some(answer.to_string());
             }
             state.action.updated_at_ms = Some(now_ms);
+            if status == AutomationActionStatus::Idle {
+                state.action.automatic_retry_attempts = 0;
+            }
             Ok(state.action.clone())
         })
     }
@@ -1122,7 +1581,7 @@ impl AgentAutomationStore {
             if state.action.id.as_deref() != Some(expected_action_id) {
                 return Err("The browser action changed before it could be retried".into());
             }
-            if state.action.status != AutomationActionStatus::Failed {
+            if action_retry_mode(state).is_none() {
                 return Err("Only a browser action that failed before Send can be retried".into());
             }
             if state.action.kind == Some(AutomationActionKind::PairVerify) {
@@ -1130,11 +1589,113 @@ impl AgentAutomationStore {
                     "Pairing verification cannot be replayed; start a new pairing request".into(),
                 );
             }
+            if action_retry_mode(state) == Some("continue_goal") {
+                state.goal_wake = GoalWakeState::default();
+            }
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 ..Default::default()
             };
             Ok(state.action.clone())
+        })
+    }
+
+    pub(crate) fn reset_automatic_failure_for_retry(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationActionState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != *expected
+                || state
+                    .automatic_retry_at_ms()
+                    .is_none_or(|deadline| now_ms < deadline)
+            {
+                return Ok(false);
+            }
+            state.action = AutomationActionState {
+                updated_at_ms: Some(now_ms),
+                automatic_retry_attempts: state.action.automatic_retry_attempts + 1,
+                ..Default::default()
+            };
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn expire_unobserved_action(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationActionState,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != *expected || !matches!(state.action.status, AutomationActionStatus::Navigating | AutomationActionStatus::Sending | AutomationActionStatus::Generating) {
+                return Ok(false);
+            }
+            state.action.status = AutomationActionStatus::Ambiguous;
+            state.action.last_error = Some("Saved browser action exceeded its time limit; completion could not be confirmed. Check ChatGPT before restarting it.".into());
+            // Preserve the original start time for a later retained-receipt reconciliation.
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn reconcile_completed_goal_action(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        activity_epoch: &str,
+        activity_sequence: u64,
+        made_progress: bool,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.goal != expected.goal
+                || state.action.kind != Some(AutomationActionKind::OfflineGoal)
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                        | AutomationActionStatus::Ambiguous
+                )
+                || state.goal.as_ref().is_none_or(|goal| {
+                    goal.status != GoalStatus::Active
+                        || Some(goal.revision) != state.action.goal_revision
+                })
+            {
+                return Ok(false);
+            }
+            let goal = state.goal.as_mut().expect("checked active goal");
+            if !state.action.goal_turn_counted
+                && state
+                    .action
+                    .updated_at_ms
+                    .is_some_and(|started| started >= goal.updated_at_ms)
+            {
+                goal.turn_count = goal.turn_count.saturating_add(1);
+                state.action.goal_turn_counted = true;
+            }
+            state.action.status = if made_progress {
+                AutomationActionStatus::Idle
+            } else {
+                AutomationActionStatus::Stalled
+            };
+            state.action.last_error = None;
+            state.action.updated_at_ms = Some(now_ms);
+            state.goal_wake = if made_progress {
+                GoalWakeState::default()
+            } else {
+                GoalWakeState {
+                    activity_epoch: Some(activity_epoch.to_owned()),
+                    activity_sequence: Some(activity_sequence),
+                    nudged_epoch: Some(activity_epoch.to_owned()),
+                    nudged_sequence: Some(activity_sequence),
+                    last_nudged_at_ms: Some(now_ms),
+                }
+            };
+            Ok(true)
         })
     }
 
@@ -1193,6 +1754,41 @@ impl AgentAutomationStore {
         })
     }
 
+    pub fn record_goal_turn(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() == Some(action_id) {
+                state.action.send_accepted = Some(true);
+            }
+            if state.action.id.as_deref() != Some(action_id)
+                || state.action.goal_turn_counted
+                || state.action.kind == Some(AutomationActionKind::PairVerify)
+            {
+                return Ok(());
+            }
+            let Some(goal) = state
+                .goal
+                .as_mut()
+                .filter(|goal| goal.status == GoalStatus::Active)
+            else {
+                return Ok(());
+            };
+            if state
+                .action
+                .goal_revision
+                .is_some_and(|revision| revision != goal.revision)
+            {
+                return Ok(());
+            }
+            goal.turn_count = goal.turn_count.saturating_add(1);
+            state.action.goal_turn_counted = true;
+            Ok(())
+        })
+    }
+
     pub fn record_accepted_batch(
         &self,
         task: &ConversationIdentity,
@@ -1224,6 +1820,7 @@ impl AgentAutomationStore {
                 batch.message_ids,
                 batch.transcript_revision,
             )?;
+            state.action.messages_fenced = true;
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.chat_mirror.clone())
         })
@@ -1501,6 +2098,51 @@ fn exact_goal_mut(
     Ok(goal)
 }
 
+fn start_goal(
+    state: &mut AutomationTaskState,
+    expected_revision: u64,
+    now_ms: u64,
+) -> Result<GoalRecord, String> {
+    let goal = exact_goal_mut(state, expected_revision)?;
+    let was_blocked = goal.status == GoalStatus::Blocked;
+    match goal.status {
+        GoalStatus::Configured | GoalStatus::Blocked => {
+            goal.active_since_ms = None;
+            goal.timer_until_ms = None;
+            goal.status = GoalStatus::Active;
+            goal.updated_at_ms = now_ms;
+            goal.finished_at_ms = None;
+            goal.summary = None;
+            goal.blocked_reason = None;
+        }
+        GoalStatus::Active => {}
+        GoalStatus::Completed | GoalStatus::Error => {
+            return Err(
+                "Only a paused or blocked agent-chat goal can be started; create a new revision first"
+                    .into(),
+            );
+        }
+    }
+    let result = goal.clone();
+    state.goal_wake = GoalWakeState::default();
+    if was_blocked
+        && state.action.goal_revision == Some(expected_revision)
+        && state.action.kind == Some(AutomationActionKind::OfflineGoal)
+        && !matches!(
+            state.action.status,
+            AutomationActionStatus::Queued
+                | AutomationActionStatus::Navigating
+                | AutomationActionStatus::Sending
+                | AutomationActionStatus::Generating
+        )
+    {
+        // Play requests a new goal turn. Release the previous goal-only failure,
+        // while retaining user-message actions whose submission may be uncertain.
+        state.action = AutomationActionState::default();
+    }
+    Ok(result)
+}
+
 fn normalize_goal_finish(finish: GoalFinish) -> Result<GoalFinish, String> {
     match finish {
         GoalFinish::Completed { summary } => {
@@ -1639,9 +2281,60 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Agent automation state is too large".into());
     }
-    let state: AutomationTaskState = serde_json::from_slice(&bytes)
+    let raw: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| "Agent automation state is invalid JSON".to_string())?;
+    let legacy_goal = raw
+        .get("goal")
+        .is_some_and(|goal| goal.is_object() && goal.get("elapsedActiveMs").is_none());
+    let legacy_receipts = raw
+        .get("ownerGoalRequests")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|requests| {
+            requests.iter().any(|request| {
+                request
+                    .pointer("/receipt/goal")
+                    .is_some_and(|goal| goal.is_object() && goal.get("elapsedActiveMs").is_none())
+            })
+        });
+    let legacy_presence_timer = raw
+        .get("goal")
+        .is_some_and(|goal| goal.is_object() && goal.get("timerUntilMs").is_none());
+    let legacy_receipt_timers = raw
+        .get("ownerGoalRequests")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|requests| {
+            requests.iter().any(|request| {
+                request
+                    .pointer("/receipt/goal")
+                    .is_some_and(|goal| goal.is_object() && goal.get("timerUntilMs").is_none())
+            })
+        });
+    let mut state: AutomationTaskState = serde_json::from_value(raw)
+        .map_err(|_| "Agent automation state is invalid JSON".to_string())?;
+    if (legacy_goal || legacy_presence_timer)
+        && let Some(goal) = state.goal.as_mut()
+    {
+        let now = crate::markdown_chat::now_ms();
+        // Preserve the previously reported total. Earlier offline gaps cannot be
+        // reconstructed from the old aggregate; presence accounting starts here.
+        goal.pause_timer(now);
+        if goal.status == GoalStatus::Active {
+            goal.updated_at_ms = now;
+        }
+    }
+    if legacy_receipts || legacy_receipt_timers {
+        for record in &mut state.owner_goal_requests {
+            if let Some(goal) = record.receipt.goal.as_mut()
+                && goal.status == GoalStatus::Active
+            {
+                goal.pause_timer(goal.updated_at_ms);
+            }
+        }
+    }
     validate_state(&state)?;
+    if legacy_goal || legacy_receipts || legacy_presence_timer || legacy_receipt_timers {
+        persist_state(path, &state)?;
+    }
     Ok(state)
 }
 
@@ -1787,7 +2480,7 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
                 OwnerGoalCommandKind::Set | OwnerGoalCommandKind::Run | OwnerGoalCommandKind::Stop,
                 Some(goal),
             ) => validate_goal(goal)?,
-            (OwnerGoalCommandKind::Clear, None) => {}
+            (OwnerGoalCommandKind::Clear | OwnerGoalCommandKind::Stop, None) => {}
             (OwnerGoalCommandKind::Status, _)
             | (_, None)
             | (OwnerGoalCommandKind::Clear, Some(_)) => {
@@ -1799,10 +2492,11 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
 }
 
 fn validate_action(action: &AutomationActionState) -> Result<(), String> {
-    if action
-        .id
-        .as_deref()
-        .is_some_and(|value| !valid_opaque(value))
+    if action.automatic_retry_attempts as usize > AUTOMATIC_RETRY_DELAYS_MS.len()
+        || action
+            .id
+            .as_deref()
+            .is_some_and(|value| !valid_opaque(value))
         || action
             .last_error
             .as_deref()
@@ -1879,9 +2573,17 @@ fn validate_goal_wake(wake: &GoalWakeState) -> Result<(), String> {
 }
 
 fn validate_pairing(pairing: &PairingState) -> Result<(), String> {
+    if pairing
+        .account_fingerprint
+        .as_deref()
+        .is_some_and(|value| !valid_opaque(value))
+    {
+        return Err("Agent automation pairing account fingerprint is invalid".into());
+    }
     for url in [
         pairing.candidate_url.as_deref(),
         pairing.canonical_url.as_deref(),
+        pairing.last_attempted_url.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1932,6 +2634,12 @@ fn validate_selection(selection: &SelectionState) -> Result<(), String> {
 
 fn validate_goal(goal: &GoalRecord) -> Result<(), String> {
     if goal.revision == 0
+        || (goal.status != GoalStatus::Active && goal.active_since_ms.is_some())
+        || goal.active_since_ms.is_some() != goal.timer_until_ms.is_some()
+        || goal
+            .active_since_ms
+            .zip(goal.timer_until_ms)
+            .is_some_and(|(since, until)| since > until)
         || goal.markdown.trim().is_empty()
         || goal.markdown.len() > MAX_GOAL_BYTES
         || goal
@@ -2027,6 +2735,13 @@ fn merge_accepted_batch(
     mirror.message_ids = accepted;
     mirror.transcript_revision_at_start = Some(transcript_revision.to_string());
     Ok(())
+}
+
+pub(crate) fn conversation_url_for_retry(value: &str) -> Option<&str> {
+    super::companion::canonical_chatgpt_conversation_url(value)
+        .ok()
+        .filter(|canonical| canonical.starts_with("https://chatgpt.com/c/"))
+        .map(|_| value)
 }
 
 fn normalize_chatgpt_url(value: &str) -> Result<String, String> {

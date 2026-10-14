@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { insertPlainTextIntoComposer, verifyOwnedComposerText } from "../src/composer";
+import { insertPlainTextIntoComposer, isPairingVerificationDraft, verifyOwnedComposerText } from "../src/composer";
+import { renderActionPrompt } from "../src/protocol";
 
 interface FakeSelection {
   isCollapsed: boolean;
@@ -62,4 +63,12 @@ test("composer verification preserves exact whitespace and rejects connector-onl
   expect(verifyOwnedComposerText("Prompt with two spaces", "Prompt with  two spaces")).toBeFalse();
   expect(verifyOwnedComposerText("Codexify", "")).toBeFalse();
   expect(verifyOwnedComposerText("old request", "new request")).toBeFalse();
+});
+
+test("pairing replacement recognizes only the complete unchanged verification template", () => {
+  const draft = renderActionPrompt({kind:"pair_verify",reference:"A".repeat(43)});
+  expect(isPairingVerificationDraft(draft)).toBeTrue();
+  for (const text of ["my own draft", draft + " edited", draft.replace("Do not inspect", "Please inspect"), draft.replace("A".repeat(43), "short"), draft.replaceAll("\n", " ")]) {
+    expect(isPairingVerificationDraft(text)).toBeFalse();
+  }
 });

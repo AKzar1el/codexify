@@ -13,6 +13,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { SingleWindowCoordinator } from "./browser-window";
+import {validateNewChatProjectUrl} from "./new-chat";
 import { asCompanionError } from "./errors";
 import {
   COMPANION_KIND,
@@ -160,28 +161,46 @@ async function route(
   if (!loopback(request.socket.remoteAddress)) throw new ClientError(403, "Loopback requests only");
   if (request.headers.authorization !== `Bearer ${token}`) throw new ClientError(401, "Unauthorized");
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  const operation = new AbortController();
+  request.once("aborted",()=>operation.abort());
+  response.once("close",()=>{ if(!response.writableEnded)operation.abort(); });
   if (request.method === "GET" && url.pathname === "/v1/health") {
     json(response, 200, await coordinator.health());
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/session/login") {
     z.strictObject({}).parse(await readJson(request));
-    json(response, 200, await coordinator.login());
+    json(response, 200, await coordinator.login(operation.signal));
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/session/capabilities") {
     z.strictObject({}).parse(await readJson(request));
-    json(response, 200, await coordinator.capabilities());
+    json(response, 200, await coordinator.capabilities(operation.signal));
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/v1/account/plan") {
+    const body=z.strictObject({epoch:z.string().min(1).max(128)}).parse(await readJson(request));
+    try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal));}
+    catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
+  }
+  if (request.method === "POST" && url.pathname === "/v1/connectors/refresh") {
+    const body=z.strictObject({name:z.string().min(1).max(256)}).parse(await readJson(request));
+    try {json(response,200,await coordinator.refreshConnector(body.name,operation.signal));}
+    catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
+  }
+  if (request.method === "POST" && url.pathname === "/v1/new-chat/capabilities") {
+    const body = z.strictObject({projectUrl:z.string().nullable()}).parse(await readJson(request));
+    json(response, 200, await coordinator.newChatCapabilities(validateNewChatProjectUrl(body.projectUrl),operation.signal));
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/window/reveal") {
     const body = revealWindowRequestSchema.parse(await readJson(request));
-    json(response, 200, await coordinator.reveal(body.url));
+    json(response, 200, await coordinator.reveal(body.url,operation.signal));
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/actions/execute") {
     const body = executeActionRequestSchema.parse(await readJson(request));
-    json(response, 200, await coordinator.execute(body));
+    json(response, 200, await coordinator.execute(body,operation.signal));
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/actions/cancel") {

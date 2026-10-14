@@ -1,28 +1,601 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
-import { chatHtml } from "./chat-widget-source.mjs";
+import { ownerHtml } from "./owner-chat-source.mjs";
 
 const { chromium, webkit } = createRequire(import.meta.url)("playwright");
 const META = "io.github.devnoname120/codexify/markdown-chat";
-const section = (text, opening, closing) => text.split(opening)[1].split(closing)[0];
-const style = section(chatHtml, "<style>", "</style>")
-  .replace(':root:not([data-theme="light"])', ':host(:not([data-theme="light"]))')
-  .replace(':root[data-theme="dark"]', ':host([data-theme="dark"])')
-  .replaceAll(":root", ":host")
-  .replace("body {", ":host { display:block;");
-const widgetBody = section(chatHtml, "<body>", "<script>");
-const widgetScript = section(chatHtml, "<script>", "</script>");
-const ownerHtml = readFileSync(new URL("../src/owner_chat.html", import.meta.url), "utf8")
-  .replace("<!-- CHAT_TEMPLATE -->", `<template id="chat-template"><style>${style}\n#chat { max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; } #panel { display:flex; flex:1; min-height:0; flex-direction:column; } #panel[hidden] { display:none; } #messages { flex:1; max-height:none; min-height:0; }\n</style>${widgetBody}</template>`)
-  .replace("/* CHAT_SCRIPT */", widgetScript);
+
+async function ownerTestPage(browser, options) {
+  const page=await browser.newPage(options);
+  const register=page.route.bind(page);
+  page.route=(pattern,handler,settings)=>register(pattern,route=>{
+    if(new URL(route.request().url()).pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:null,latest:{updateAvailable:false},settingsAvailable:false,restartAvailable:false}});
+    return handler(route);
+  },settings);
+  return page;
+}
+
+test("owner presence changes at exactly three and five minutes", () => {
+  const source = ownerHtml.match(/function presence\([^)]*\) \{[\s\S]*?\n  \}/)?.[0];
+  assert(source);
+  const presence = Function(`return (${source})`)();
+  assert.equal(presence(1000, 1000 + 179999, null), "online");
+  assert.equal(presence(1000, 1000 + 180000, null), "away");
+  assert.equal(presence(1000, 1000 + 299999, null), "away");
+  assert.equal(presence(1000, 1000 + 300000, null), "offline");
+});
+
+test("goal elapsed time uses compact day/hour/minute/second labels", () => {
+  const source = ownerHtml.match(/function goalDuration\([^)]*\) \{[\s\S]*?\n    \}/)?.[0];
+  assert(source); const duration = Function(`return (${source})`)();
+  for (const [seconds, expected] of [[0,"0s"],[3,"3s"],[252,"4m 12s"],[83434,"23h 10m 34s"],[213819,"2d 11h 23m 39s"]]) assert.equal(duration(seconds * 1000), expected);
+});
+
+test("pairing stays pending through submission and queue waits, then exposes expired or failed attempts", () => {
+  const source=ownerHtml.match(/function pairingPhase\([^)]*\) \{[\s\S]*?\n  \}/)?.[0];
+  assert(source);const phase=Function(`return (${source})`)();
+  const now=10000;
+  assert.equal(phase({pairing:{status:'unpaired'},action:{status:'idle'}},now),'unpaired');
+  assert.equal(phase({pairing:{status:'unpaired',creatingChat:true,expiresAtMs:now+1000},action:{kind:'pair_verify',status:'queued'}},now),'pairing');
+  assert.equal(phase({pairing:{status:'unverified',expiresAtMs:now-1},action:{kind:'pair_verify',status:'queued'}},now),'pairing','queued work receives a new deadline when executed');
+  for(const status of ['navigating','sending','generating','idle']) {
+    assert.equal(phase({pairing:{status:'unverified',expiresAtMs:now+1000},action:{kind:'pair_verify',status}},now),'pairing');
+  }
+  for(const status of ['failed','ambiguous','stalled','approval_required','authentication_required','rate_limited','interference']) {
+    assert.equal(phase({pairing:{status:'unverified',expiresAtMs:now+1000},action:{kind:'pair_verify',status}},now),'failed');
+  }
+  assert.equal(phase({pairing:{status:'unverified',expiresAtMs:now-1},action:{kind:'pair_verify',status:'idle'}},now),'failed');
+  assert.equal(phase({pairing:{status:'unverified'},action:{status:'idle'}},now),'failed');
+  assert.equal(phase({pairing:{status:'verified'},action:{kind:'offline_chat',status:'failed'}},now),'verified','a chat send failure does not turn into a pairing retry');
+});
 
 for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
+test(`${engineName}: multiline drafts keep message history stable across background refreshes`, {timeout:45000}, async () => {
+  const browser=await engine.launch();
+  try {
+    const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
+    const now=Date.now(),id='9'.repeat(64),errors=[];let historyRequests=0;
+    page.on('pageerror',error=>errors.push(error.message));
+    const messages=Array.from({length:40},(_,i)=>({id:`message-${i}`,role:'agent',markdown:`Progress ${i}. ${'Some details from the ongoing work. '.repeat(15)}`,start:i*100,end:(i+1)*100,created_at_ms:now,tool_call_count:i+1}));
+    const goal={status:'completed',markdown:'Completed goal',revision:1,elapsedActiveMs:3600000,turnCount:1,finishedAtMs:now-1000};
+    await page.route('http://127.0.0.1:43221/**',route=>{
+      const url=new URL(route.request().url());
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Multiline draft',workspace:'scrolling',lastEntryEnd:4000,lastEntryAtMs:now,lastAgentCallAtMs:now,totalToolCalls:40,goalStatus:'completed',goalCompletionDismissed:true}],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,pairing:{status:'verified'},action:{status:'idle'},selection:{model:'gpt-6-astra',effort:'max'},companion:{authenticated:true,status:'idle'},catalog:{models:[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}]},presence:{lastAgentCallAtMs:now},serverTimeMs:Date.now()}});
+      historyRequests++;
+      return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/multiline/CHAT.md',revision:'4000',delivered_through:0,read_through:0,last_agent_call_at_ms:now,total_tool_calls:40+historyRequests,server_time_ms:Date.now(),messages,has_more:false,unchanged:historyRequests>1}}}});
+    });
+    await page.goto(`http://127.0.0.1:43221/?chat=${id}#test-token`);
+    const host=page.locator('#chat-host'),history=host.locator('#messages'),input=host.getByRole('textbox',{name:'Message the agent',exact:true});
+    await history.locator('.message').last().waitFor();await host.locator('#goal-bar').waitFor();
+    for(const draft of ['first\nsecond\nthird\nfourth\nfifth','first\nsecond\n\nfourth']) {
+      await input.fill(draft);
+      for(const reading of [false,true]) {
+        await history.evaluate((node,reading)=>{node.scrollTop=node.scrollHeight-node.clientHeight-(reading?250:0);},reading);
+        const samples=await history.evaluate(async history=>{
+          const root=history.getRootNode(),draft=root.querySelector('#draft'),composer=root.querySelector('#composer');
+          const result=[];const until=performance.now()+4200;
+          do {
+            await new Promise(requestAnimationFrame);
+            result.push({top:history.scrollTop,height:history.clientHeight,composerY:composer.getBoundingClientRect().y,draftHeight:draft.getBoundingClientRect().height,draftText:draft.value,pageTop:scrollY});
+          }while(performance.now()<until);
+          return result;
+        });
+        const range=key=>Math.max(...samples.map(s=>s[key]))-Math.min(...samples.map(s=>s[key]));
+        assert(range('height')<1&&range('composerY')<1&&range('draftHeight')<1,'the final layout remains unchanged between refreshes');
+        assert(range('top')<1,`${reading?'reading older replies':'at bottom'}: history jumped ${range('top')}px with no input`);
+        assert(samples.every(s=>s.draftText===draft),'background refreshes preserve the draft');
+        assert(range('pageTop')<1,'the outer page must remain fixed');
+      }
+    }
+    assert(historyRequests>3,'the observation must include repeated history refreshes');
+    assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+});
+
+test(`${engineName}: unpaired composer offers Pair chat until verification completes`, {timeout:30000}, async () => {
+  const browser=await engine.launch();
+  try {
+    const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
+    const id="e".repeat(64),errors=[],operations=[];
+    page.on('pageerror',error=>errors.push(error.message));
+    const chat={id,title:'Unpaired chat',workspace:'test',lastEntryEnd:1,lastEntryAtMs:Date.now(),lastAgentCallAtMs:Date.now(),totalToolCalls:1};
+    const state={enabled:true,pairing:{status:'unpaired'},goal:null,action:{status:'idle'},selection:{model:'gpt-6-astra',effort:'max'},companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:chat.lastAgentCallAtMs}};
+    await page.route('http://127.0.0.1:43220/**',route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(request.method()!=='GET') {operations.push(url.pathname);return route.fulfill({status:405});}
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[chat],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith('/automation'))return route.fulfill({json:{...state,serverTimeMs:Date.now()}});
+      return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/unpaired/CHAT.md',revision:'1',delivered_through:0,read_through:0,last_agent_call_at_ms:chat.lastAgentCallAtMs,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+    });
+    for(const width of [1280,375]) {
+      state.pairing={status:'unpaired'};state.action={status:'idle'};delete state.catalog;
+      await page.setViewportSize({width,height:900});
+      await page.goto(`http://127.0.0.1:43220/?chat=${id}&viewport=${width}#test-token`);
+      const host=page.locator('#chat-host'),pair=host.getByRole('button',{name:'Pair chat',exact:true});
+      await pair.waitFor();
+      for(const control of ['automation-add-goal','automation-model','automation-effort']) assert.equal(await host.locator('#'+control).isVisible(),false);
+      assert.equal(await host.locator('#automation-settings').isVisible(),false);
+      await host.getByRole('button',{name:'Stop agent',exact:true}).waitFor();
+      const box=await pair.boundingBox(),send=await host.locator('#send').boundingBox();
+      assert(box&&send&&box.x+box.width<=send.x&&box.x>=0,`${width}px: Pair chat must fit beside Send/Stop`);
+      if(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS) {
+        mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS,{recursive:true});
+        await page.screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-unpaired-${width}.png`,fullPage:true});
+      }
+      await pair.click();
+      await host.getByLabel('ChatGPT conversation URL').waitFor();
+      assert.equal(await host.getByLabel('ChatGPT conversation URL').evaluate(node=>node===node.getRootNode().activeElement),true);
+      assert.equal(await host.locator('#automation-settings').evaluate(node=>node.open),true,'Pair chat opens a modal connection dialog');
+      state.pairing={status:'unverified',candidateUrl:'https://chatgpt.com/c/pending-fixture'};
+      state.action={status:'queued',kind:'pair_verify'};
+      await host.getByText('Pairing verification queued',{exact:true}).waitFor();
+      await host.getByRole('button',{name:'Close connection settings',exact:true}).click();
+      const pairing=host.getByRole('button',{name:'Pairing…',exact:true});
+      await pairing.waitFor();
+      assert.equal(await pairing.isDisabled(),true,'a pending pairing cannot be started again from the composer');
+      assert.equal(await host.locator('#automation-model').isVisible(),false);
+      state.pairing={status:'verified',canonicalUrl:'https://chatgpt.com/c/pending-fixture'};
+      state.action={status:'idle'};
+      state.catalog={models:[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}]};
+      await host.locator('#automation-pair-chat').waitFor({state:'hidden'});
+      for(const control of ['automation-add-goal','automation-model','automation-effort']) await host.locator('#'+control).waitFor();
+      assert.equal(await host.locator('#automation-model').inputValue(),'gpt-6-astra');
+      assert.equal(await host.locator('#automation-effort').inputValue(),'max');
+      state.pairing={status:'unpaired'};
+      await pair.waitFor();
+      for(const control of ['automation-add-goal','automation-model','automation-effort']) assert.equal(await host.locator('#'+control).isVisible(),false);
+    }
+    assert.deepEqual(operations,[],'opening pairing must not submit a request or scan models');
+    assert.deepEqual(errors,[]);
+  } finally {await browser.close();}
+});
+
+test(`${engineName}: pairing failures open a prefilled retry box and submit one new request`, {timeout:30000}, async () => {
+  const browser=await engine.launch();
+  let releasePost,releasePoll;
+  try {
+    const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);await page.clock.install();
+    const id='f'.repeat(64),errors=[],submitted=[];
+    const chat={id,title:'Pairing retry',workspace:'test',lastEntryEnd:0,lastEntryAtMs:Date.now(),lastAgentCallAtMs:null,totalToolCalls:0};
+    const oldUrl='https://chatgpt.com/g/project/c/previous-attempt';
+    const state={enabled:true,pairing:{status:'unverified',lastTriedUrl:oldUrl},goal:null,action:{kind:'pair_verify',status:'failed',lastError:'Pairing failed before Send'},selection:{},companion:{authenticated:true,status:'idle'},presence:{}};
+    let holdNextPoll=false,pollStarted,postStarted,rejectReceipt=false;
+    const postReady=new Promise(resolve=>{postStarted=resolve;});
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.route('http://127.0.0.1:43226/**',async route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+      assert.equal(request.headers().authorization,'Bearer test-token');
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[chat],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith('/automation/pair')) {
+        submitted.push(request.postDataJSON());postStarted();
+        await new Promise(resolve=>{releasePost=resolve;});
+        state.pairing={status:'unverified',lastTriedUrl:submitted.at(-1).url,candidateUrl:submitted.at(-1).url,expiresAtMs:Date.now()+600000};
+        state.action={kind:'pair_verify',status:'queued'};
+        if(rejectReceipt)return route.fulfill({status:503,body:'Pairing response was lost'});
+        return route.fulfill({json:{pairing:state.pairing,action:state.action}});
+      }
+      if(url.pathname.endsWith('/automation')) {
+        const snapshot=structuredClone({...state,serverTimeMs:Date.now()});
+        if(holdNextPoll) {holdNextPoll=false;pollStarted();await new Promise(resolve=>{releasePoll=resolve;});}
+        return route.fulfill({json:snapshot});
+      }
+      return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/retry/CHAT.md',revision:'0',delivered_through:0,read_through:0,last_agent_call_at_ms:null,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+    });
+    await page.goto(`http://127.0.0.1:43226/?chat=${id}#test-token`);
+    const host=page.locator('#chat-host'),retry=host.getByRole('button',{name:'Retry chat pairing',exact:true});
+    const editor=host.locator('#pairing-editor'),field=editor.getByLabel('ChatGPT URL'),pair=editor.getByRole('button',{name:'Pair',exact:true});
+    await retry.waitFor();await retry.click();
+    assert.equal(await field.inputValue(),oldUrl);
+    assert.equal(await pair.isEnabled(),true);
+    const editedUrl='https://chatgpt.com/c/edited-retry';
+    await field.fill(editedUrl);await page.clock.fastForward(1600);
+    assert.equal(await field.inputValue(),editedUrl,'status polling must not overwrite an edited retry URL');
+    assert.equal(submitted.length,0,'opening the box is not a pairing submission');
+    const pollReady=new Promise(resolve=>{pollStarted=resolve;});
+    holdNextPoll=true;await page.clock.fastForward(1600);await pollReady;
+    await pair.click();
+    const pending=host.getByRole('button',{name:'Pairing…',exact:true});
+    await pending.waitFor();assert.equal(await pending.isDisabled(),true);
+    assert.equal(await editor.isVisible(),false);
+    await postReady;
+    assert.equal(submitted.length,1);assert.equal(submitted[0].url,editedUrl);
+    releasePost();releasePost=null;
+    await host.getByText('Pairing verification queued',{exact:true}).waitFor({state:'attached'});
+    const oldPollResponse=page.waitForResponse(response=>new URL(response.url()).pathname.endsWith('/automation'));
+    releasePoll();releasePoll=null;
+    await oldPollResponse;
+    await page.clock.fastForward(1600);
+    assert.equal(await pending.isDisabled(),true,'a stale pre-submit poll must not bring back a retry button');
+
+    for(const width of [1280,375]) {
+      await page.setViewportSize({width,height:900});
+      state.pairing={status:'unpaired',creatingChat:true,lastTriedUrl:null,candidateUrl:'https://chatgpt.com/g/g-p-project/project'};
+      state.action={kind:'pair_verify',status:'failed',lastError:'Creation failed'};
+      await page.clock.fastForward(1600);await retry.waitFor();await retry.click();
+      assert.equal(await field.inputValue(),'','no created conversation means an empty prefill');
+      assert.equal(await pair.isDisabled(),true);
+      await field.fill('https://chatgpt.com/c/manual');assert.equal(await pair.isEnabled(),true);
+      const box=await editor.boundingBox();assert(box&&box.x>=0&&box.x+box.width<=width,`${width}px: retry box must fit in the viewport`);
+      await editor.getByRole('button',{name:'Close pairing',exact:true}).click();
+      state.pairing={status:'unverified',candidateUrl:oldUrl,expiresAtMs:Date.now()-1};state.action={kind:'pair_verify',status:'idle'};
+      await page.clock.fastForward(1600);await retry.waitFor();await retry.click();
+      assert.equal(await field.inputValue(),oldUrl,'legacy pairing state can still prefill its candidate URL');
+      await editor.getByRole('button',{name:'Close pairing',exact:true}).click();
+    }
+    await retry.click();rejectReceipt=true;
+    const retryPostReady=new Promise(resolve=>{postStarted=resolve;});
+    await pair.click();await retryPostReady;
+    releasePost();releasePost=null;
+    await page.clock.fastForward(1600);await pending.waitFor();
+    assert.equal(await pending.isDisabled(),true,'a failed HTTP receipt must not override a server-confirmed pending pairing');
+    assert.equal(submitted.length,2,'each explicit Pair click submits one request');
+    assert.deepEqual(errors,[]);
+  } finally {releasePost?.();releasePoll?.();await browser.close();}
+});
+
+test(`${engineName}: failed chats show an inline retry and a sidebar error without a goal`, {timeout:30000}, async () => {
+  const browser=await engine.launch();
+  try {
+    const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
+    const now=Date.now(),id="f".repeat(64),errors=[],operations=[];
+    page.on('pageerror',error=>errors.push(error.message));
+    const chat={id,title:"Failed message",workspace:"test",lastEntryEnd:1,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:1};
+    let action={id:"failed-action",kind:"offline_chat",status:"failed",lastError:"ChatGPT connector menu did not open",sendAccepted:false,retryMode:"retry",automaticRetryAtMs:null,automaticRetryAttempts:3};
+    await page.route('http://127.0.0.1:43219/**',route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:['failed','ambiguous'].includes(action.status)?action.lastError:null}],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal:null,action,catalog:{models:[]},pairing:{status:'verified'},companion:{authenticated:true,status:'idle'},serverTimeMs:Date.now(),presence:{lastAgentCallAtMs:null}}});
+      if(url.pathname.endsWith('/action/retry')) {
+        const body=request.postDataJSON();operations.push(body);
+        assert.equal(body.actionId,action.id);
+        action={...action,id:'retried-action',status:'queued',lastError:null,retryMode:null,automaticRetryAtMs:null,automaticRetryAttempts:0};
+        return route.fulfill({json:{action}});
+      }
+      return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/test/CHAT.md',revision:'1',delivered_through:0,read_through:0,last_agent_call_at_ms:null,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+    });
+    await page.goto(`http://127.0.0.1:43219/?chat=${id}#test-token`);
+    const host=page.locator('#chat-host'),inline=host.locator('#automation-retry-inline');
+    await inline.waitFor();
+    assert.equal(await host.locator('#goal-bar').isVisible(),false);
+    assert.equal(await host.locator('#automation-settings').isVisible(),false);
+    assert.equal(await inline.textContent(),'Retry');
+    assert((await host.locator('#automation-error').textContent()).includes('All three automatic retries failed'));
+    await page.locator('.conversation .presence.error').waitFor();
+    assert((await page.locator('.conversation .presence.error').getAttribute('aria-label')).includes('connector menu'));
+    assert.equal(await page.locator('.conversation .presence.error').evaluate(node=>getComputedStyle(node).color),'rgb(196, 49, 59)');
+    assert.equal(await host.locator('#presence .presence-label').textContent(),'offline');
+    await inline.click();
+    await inline.waitFor({state:'hidden'});
+    await page.locator('.conversation .presence.error').waitFor({state:'detached'});
+    assert.equal(operations.length,1);
+    action={id:'pending-retry',kind:'offline_chat',status:'failed',lastError:'Connector menu unavailable',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:Date.now()+30000,automaticRetryAttempts:0};
+    await host.locator('#automation-error').getByText(/Retrying automatically in \d+s \(retry 1 of 3\)/).waitFor();
+    await inline.waitFor();
+    await inline.click();await inline.waitFor({state:'hidden'});
+    assert.equal(operations.length,2,'manual Retry works during automatic backoff');
+    action={id:'uncertain-send',kind:'offline_chat',status:'ambiguous',lastError:'Send acceptance could not be confirmed',sendAccepted:true,retryMode:null,automaticRetryAtMs:null,automaticRetryAttempts:0};
+    await host.locator('#automation-error').getByText(/check whether the message was sent/).waitFor();
+    assert.equal(await inline.isVisible(),false,'an uncertain user message cannot be replayed');
+    await page.locator('.conversation .presence.error').waitFor();
+    await page.emulateMedia({colorScheme:'dark'});
+    assert.equal(await page.locator('.conversation .presence.error').evaluate(node=>getComputedStyle(node).color),'rgb(255, 133, 142)');
+    action={id:'recovered',kind:'offline_chat',status:'idle',lastError:null,sendAccepted:true,retryMode:null,automaticRetryAtMs:null,automaticRetryAttempts:0};
+    await page.locator('.conversation .presence.error').waitFor({state:'detached'});
+    assert.deepEqual(errors,[]);
+  } finally {await browser.close();}
+});
+
+test(`${engineName}: completed sidebar badges clear after follow-up and leave the goal bar completed`, { timeout:30000 }, async () => {
+  const browser=await engine.launch();
+  try {
+    const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
+    const now=Date.now(),id="c".repeat(64);
+    let goal={revision:1,markdown:"Completed objective",status:"completed",createdAtMs:now-5000,finishedAtMs:now-1000,elapsedActiveMs:4000,turnCount:1};
+    const chat={id,title:"Completed objective chat",workspace:"completed",goalStatus:"completed",goalCompletionDismissed:false,goalCompletedAtMs:goal.finishedAtMs,goalCompletedChatEnd:42,lastAgentCallAtMs:now,lastEntryEnd:42,lastEntryAtMs:now,totalToolCalls:1};
+    const errors=[];page.on('pageerror',error=>errors.push(error.message));
+    await page.route('http://127.0.0.1:43218/**',route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[chat],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,pairing:{status:'verified'},serverTimeMs:Date.now(),companion:{authenticated:false},presence:{lastAgentCallAtMs:chat.lastAgentCallAtMs}}});
+      if(url.pathname.endsWith('/send')){
+        const body=request.postDataJSON();
+        if(body.message==='/goal clear'){
+          goal=null;chat.goalStatus=null;chat.goalCompletionDismissed=false;
+          return route.fulfill({json:{_meta:{[META]:{localCommand:{},goal:null}}}});
+        }
+        if(body.message.startsWith('/goal set ')){
+          goal={revision:2,markdown:body.message.slice(10),status:'active',createdAtMs:Date.now(),elapsedActiveMs:0,turnCount:0};
+          chat.goalStatus='active';chat.goalCompletionDismissed=false;
+          return route.fulfill({json:{_meta:{[META]:{localCommand:{},goal}}}});
+        }
+        chat.goalCompletionDismissed=true;chat.lastEntryEnd=43;
+        return route.fulfill({json:{_meta:{[META]:{sent:{id:body.request_id,end:43,created_at_ms:Date.now(),tool_call_count:1}}}}});
+      }
+      return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/completed/CHAT.md',revision:'42',delivered_through:0,read_through:0,last_agent_call_at_ms:chat.lastAgentCallAtMs,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+    });
+    await page.goto(`http://127.0.0.1:43218/?chat=${id}#test-token`);
+    const host=page.locator('#chat-host');
+    await page.locator('.conversation .presence.goal-completed').waitFor();
+    await host.getByText('Goal completed',{exact:true}).waitFor();
+    const input=host.getByRole('textbox',{name:'Message the agent',exact:true});
+    await input.fill('Continue with the next request');await input.press('Enter');
+    await page.locator('.conversation .presence.online .presence-spinner').waitFor();
+    assert.equal(await host.locator('#goal-caption').textContent(),'Goal completed');
+    assert.equal(await host.locator('#goal-icon .goal-outer-ring').evaluate(node=>getComputedStyle(node).animationName),'none');
+    await page.reload();await page.locator('.conversation .presence.online .presence-spinner').waitFor();
+    chat.lastAgentCallAtMs=null;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator('.conversation .presence.offline').waitFor({state:'attached'});
+    assert.equal(await page.locator('.conversation .presence.offline').isVisible(),false);
+
+    chat.goalCompletionDismissed=false;await page.reload();
+    await page.locator('.conversation .presence.goal-completed').waitFor();
+    await host.getByRole('button',{name:'Clear goal',exact:true}).click();
+    await host.locator('#goal-bar').waitFor({state:'hidden'});
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator('.conversation .presence.offline').waitFor({state:'attached'});
+    assert.equal(await page.locator('.conversation .presence.offline').isVisible(),false);
+    await host.getByRole('button',{name:'Add goal',exact:true}).click();
+    await host.getByLabel('Goal Markdown').fill('Pursue a new objective');
+    chat.lastAgentCallAtMs=Date.now();
+    await host.getByRole('button',{name:'Set goal',exact:true}).click();
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator('.conversation .presence.goal-running').waitFor();
+    assert.deepEqual(errors,[]);
+  } finally {await browser.close();}
+});
+
+test(`${engineName}: reopening a running goal editor immediately enables its restored text`, { timeout:15000 }, async () => {
+  const browser=await engine.launch();
+  let releasePoll;
+  try {
+    const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
+    const now=Date.now(),id="e".repeat(64);
+    let goal={revision:1,markdown:"Continue the running goal.",status:"active",createdAtMs:now,elapsedActiveMs:1000,turnCount:1};
+    let stateRequests=0,holdPoll=true,pollStarted;
+    const started=new Promise(resolve=>{pollStarted=resolve;});
+    const held=new Promise(resolve=>{releasePoll=resolve;});
+    const submissions=[],errors=[];
+    page.on("pageerror",error=>errors.push(error.message));
+    await page.route("http://127.0.0.1:43217/**",async route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(url.pathname==="/")return route.fulfill({contentType:"text/html",body:ownerHtml});
+      if(url.pathname==="/api/chats")return route.fulfill({json:{chats:[{id,title:"Running goal",workspace:"goal-editor",lastAgentCallAtMs:now,lastEntryEnd:0,lastEntryAtMs:now,totalToolCalls:1,goalStatus:goal.status}],serverTimeMs:Date.now()}});
+      if(url.pathname.endsWith("/automation")){
+        if(++stateRequests>1&&holdPoll){pollStarted();await held;}
+        return route.fulfill({json:{enabled:true,goal,pairing:{status:"verified"},serverTimeMs:Date.now(),companion:{authenticated:true,status:"busy",activeActionId:"other-browser-action"},presence:{lastAgentCallAtMs:now},catalog:{models:[{id:"cached-model",label:"Cached model",efforts:[{id:"cached-effort",label:"Cached effort",available:true}]}]}}});
+      }
+      if(url.pathname.endsWith("/send")){
+        const body=request.postDataJSON();submissions.push(body.message);
+        goal={...goal,revision:goal.revision+1,markdown:body.message.slice(10)};
+        return route.fulfill({json:{_meta:{[META]:{goal}}}});
+      }
+      return route.fulfill({json:{_meta:{[META]:{chat_file:"/private/goal-editor/CHAT.md",revision:"0",delivered_through:0,read_through:0,last_agent_call_at_ms:now,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+    });
+    await page.goto(`http://127.0.0.1:43217/?chat=${id}#test-token`);
+    const host=page.locator("#chat-host"),edit=host.getByRole("button",{name:"Edit goal",exact:true});
+    const input=host.getByLabel("Goal Markdown"),save=host.getByRole("button",{name:"Set goal",exact:true});
+    await edit.waitFor();await started;
+    await edit.click();
+    await input.fill("");assert.equal(await save.isDisabled(),true);
+    await host.getByRole("button",{name:"Close goal editor",exact:true}).click();
+    await edit.click();
+    assert.equal(await input.inputValue(),goal.markdown);
+    assert.equal(await save.isDisabled(),false,"restoring nonempty goal text must immediately enable Set goal, even while the browser and status poll are busy");
+    await input.fill(" \n ");assert.equal(await save.isDisabled(),true);
+    await input.fill("Continue the updated running goal.");
+    assert.equal(await save.isDisabled(),false);
+    await save.click();
+    await host.locator("#goal-text").getByText("Continue the updated running goal.",{exact:true}).waitFor();
+    assert.equal(goal.status,"active");assert.equal(goal.revision,2);
+    assert.deepEqual(submissions,["/goal set Continue the updated running goal."]);
+    holdPoll=false;releasePoll();
+    await page.waitForTimeout(50);
+    assert.deepEqual(errors,[]);
+  }finally{releasePoll?.();await browser.close();}
+});
+
+test(`${engineName}: opening a goal chat stays at the bottom after controls load`, { timeout:45000 }, async () => {
+  const browser = await engine.launch();
+  try {
+    for (const width of [1280,390]) for (const order of ["history-first","goal-first"]) {
+      const page = await ownerTestPage(browser,{viewport:{width,height:900}});
+      page.setDefaultTimeout(5000);
+      const now = Date.now();
+      const chats = ["a","b"].map((letter,i) => ({id:letter.repeat(64),title:i ? "Other chat" : "Running goal chat",workspace:"scrolling",lastEntryEnd:5000,lastEntryAtMs:now-i,lastAgentCallAtMs:now,totalToolCalls:50}));
+      const messages = Array.from({length:50},(_,i) => ({id:`reply-${i}`,role:"agent",markdown:`Reply ${i}. ${"Details from the latest progress update. ".repeat(8)}`,start:i*100,end:(i+1)*100,created_at_ms:now,tool_call_count:i+1}));
+      const activeGoal = {status:"active",markdown:"Continue the running goal.",revision:1,elapsedActiveMs:1000,activeSinceMs:now,turnCount:1};
+      let goal = activeGoal, gateKind, releaseGate, gate;
+      const hold = kind => {gateKind=kind;gate=new Promise(resolve=>{releaseGate=resolve;});};
+      hold(order === "history-first" ? "automation" : "history");
+      const errors=[];
+      page.on("pageerror",error=>errors.push(error.message));
+      await page.route("http://127.0.0.1:43216/**",async route=>{
+        const url=new URL(route.request().url());
+        if(url.pathname==="/")return route.fulfill({contentType:"text/html",body:ownerHtml});
+        if(url.pathname==="/api/chats")return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
+        const isGoalChat=url.pathname.split("/")[3]===chats[0].id;
+        const kind=url.pathname.endsWith("/automation") ? "automation" : "history";
+        if(isGoalChat && gateKind===kind){gateKind=null;await gate;}
+        if(kind==="automation")return route.fulfill({json:{enabled:isGoalChat,goal:isGoalChat ? goal : null,serverTimeMs:Date.now(),companion:{authenticated:false},presence:{lastAgentCallAtMs:now}}});
+        return route.fulfill({json:{_meta:{[META]:{
+          chat_file:`/private/${isGoalChat ? "goal" : "other"}/CHAT.md`,revision:"5000",delivered_through:0,read_through:0,last_agent_call_at_ms:now,total_tool_calls:50,server_time_ms:Date.now(),messages:isGoalChat ? messages : messages.slice(-2),has_more:false,unchanged:false
+        }}}});
+      });
+      await page.goto("http://127.0.0.1:43216/#test-token");
+      await page.locator(".conversation").filter({ hasText:/Running goal chat/ }).click();
+      const history=page.locator("#chat-host #messages");
+      const goalBar=page.locator("#chat-host #goal-bar");
+      const bottomGap=()=>history.evaluate(node=>node.scrollHeight-node.clientHeight-node.scrollTop);
+      if(order==="history-first"){
+        await history.locator(".message").last().waitFor();
+        assert(await bottomGap()<1,"history initially reaches its bottom");
+      }else await goalBar.waitFor();
+      releaseGate();
+      await goalBar.waitFor();
+      await history.locator(".message").last().waitFor();
+      const sidebarFont=await page.locator('.conversation[aria-current="true"] .conversation-title').evaluate(node=>({size:getComputedStyle(node).fontSize,weight:getComputedStyle(node).fontWeight}));
+      for(const selector of ["#goal-caption","#goal-text"]){
+        assert.equal(await page.locator(`#chat-host ${selector}`).evaluate(node=>getComputedStyle(node).fontSize),sidebarFont.size,`${width}px: sidebar titles and goal text must use the same font size`);
+      }
+      assert.equal(await page.locator("#chat-host #goal-caption").evaluate(node=>getComputedStyle(node).fontWeight),sidebarFont.weight);
+      await page.waitForTimeout(100);
+      assert(await bottomGap()<1,`${width}px ${order}: loading goal controls must keep the last reply fully visible`);
+
+      await page.locator(".conversation").filter({ hasText:/Other chat/ }).click();
+      await page.locator("#chat-host #composer").waitFor();
+      hold("automation");
+      await page.locator(".conversation").filter({ hasText:/Running goal chat/ }).click();
+      await history.locator(".message").last().waitFor();
+      releaseGate();
+      await goalBar.waitFor();
+      await page.waitForTimeout(100);
+      assert(await bottomGap()<1,"returning to a running goal chat must also reach its bottom");
+
+      await history.evaluate(node=>{node.scrollTop-=300;});
+      const readingTop=await history.evaluate(node=>node.scrollTop);
+      goal=null;
+      await goalBar.waitFor({state:"hidden"});
+      goal=activeGoal;
+      await goalBar.waitFor();
+      assert(Math.abs(await history.evaluate(node=>node.scrollTop)-readingTop)<1,"goal controls must preserve the position when reading older replies");
+      assert(await bottomGap()>50);
+      assert.deepEqual(errors,[]);
+      await page.close();
+    }
+  }finally{await browser.close();}
+});
+
+test(`${engineName}: sidebar goal states and spinners leave header presence unchanged`, { timeout:30000 }, async () => {
+  const browser = await engine.launch();
+  try {
+    const page = await ownerTestPage(browser);
+    page.setDefaultTimeout(5000);
+    const now = Date.now();
+    const cases = [
+      [null, now, null, "online"],
+      ["active", now, null, "goal-running"],
+      ["active", now - 240000, null, "goal-running"],
+      ["configured", now, null, "goal-paused"],
+      ["configured", null, null, "goal-paused"],
+      ["blocked", now, null, "goal-blocked"],
+      ["blocked", null, null, "goal-blocked"],
+      ["active", null, null, "offline"],
+      [null, now, now + 60000, "waiting"],
+      [null, now - 240000, null, "away"],
+      ["completed", now, null, "goal-completed"],
+      ["completed", null, null, "goal-completed"],
+      ["completed", now, null, "online", true],
+      ["completed", null, null, "offline", true]
+    ];
+    const chats = cases.map(([goalStatus, lastAgentCallAtMs, agentWaitingUntilMs, , goalCompletionDismissed = false], i) => ({
+      id:i.toString(16).repeat(64), title:`Icon case ${i}`, workspace:"icons", goalStatus,
+      goalCompletionDismissed, goalCompletedAtMs:now-1000, goalCompletedChatEnd:0,
+      lastAgentCallAtMs, agentWaitingUntilMs, lastEntryEnd:0, lastEntryAtMs:now - i, totalToolCalls:1
+    }));
+    const errors = [];
+    page.on("pageerror", error => errors.push(error.message));
+    await page.route("http://127.0.0.1:43215/**", route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml });
+      if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats, serverTimeMs:Date.now() } });
+      if (url.pathname.endsWith("/automation")) return route.fulfill({ json:{ enabled:false } });
+      const chat = chats.find(chat => chat.id === url.pathname.split("/")[3]);
+      return route.fulfill({ json:{ _meta:{ [META]:{
+        chat_file:"/private/CHAT.md", revision:"0", delivered_through:0, read_through:0,
+        last_agent_call_at_ms:chat.lastAgentCallAtMs, agent_waiting_until_ms:chat.agentWaitingUntilMs,
+        total_tool_calls:1, server_time_ms:Date.now(), messages:[], has_more:false, unchanged:false
+      } } } });
+    });
+    await page.goto(`http://127.0.0.1:43215/?chat=${chats[0].id}#test-token`);
+    await page.locator(".conversation").last().waitFor();
+    const icons = page.locator(".conversation .presence");
+    assert.deepEqual(await icons.evaluateAll(nodes => nodes.map(node => [...node.classList].at(-1))), cases.map(row => row[3]));
+    assert.equal(await icons.nth(7).isVisible(),false,"offline sidebar icons are hidden");
+    for(const index of [10,11]) {
+      assert.equal(await icons.nth(index).locator('.goal-outer-ring').count(),1);
+      assert.equal(await icons.nth(index).locator('.goal-outer-ring').evaluate(node=>getComputedStyle(node).animationName),'none');
+      assert.equal(await icons.nth(index).getAttribute('title'),'Goal completed');
+      assert.equal(await icons.nth(index).evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)');
+    }
+    assert.equal(await icons.nth(12).locator('.presence-spinner').count(),1);
+    assert.equal(await icons.nth(13).isVisible(),false);
+    assert.equal(await icons.nth(0).locator(".presence-spinner").count(),1);
+    assert.equal(await icons.nth(0).locator("svg").evaluate(node => getComputedStyle(node).animationName),"presence-spin");
+    assert.equal(await icons.nth(3).locator("path").getAttribute("d"),"M9 8v8m6-8v8");
+    assert.equal(await icons.nth(3).locator("circle").getAttribute("r"),"9");
+    assert.equal(await icons.nth(1).locator(".goal-outer-ring").getAttribute("d"),"M22.5 12a10.5 10.5 0 1 1-10.5-10.5");
+    assert.equal(await icons.nth(1).locator("path:not(.goal-outer-ring)").getAttribute("d"),"M17.5 12a5.5 5.5 0 1 1-5.5-5.5M22.5 1.5 12 12m0-5v5h5");
+    assert.equal(await icons.nth(1).evaluate(node=>getComputedStyle(node).color),await icons.nth(0).evaluate(node=>getComputedStyle(node).color));
+    assert.equal(await icons.nth(1).locator("svg").evaluate(node=>getComputedStyle(node).strokeWidth),await icons.nth(7).locator("circle").evaluate(node=>getComputedStyle(node).strokeWidth));
+    const goalSize=await icons.nth(1).locator(".goal-outer-ring").evaluate(node=>{const box=node.getBBox();return {width:box.width,height:box.height};});
+    const spinnerSize=await icons.nth(0).locator("circle").evaluate(node=>{const box=node.getBBox();return {width:box.width,height:box.height};});
+    assert.deepEqual(spinnerSize,goalSize,"the standalone spinner matches the goal ring diameter");
+    assert.equal(await icons.nth(0).locator("svg").evaluate(node=>getComputedStyle(node).animationDuration),await icons.nth(1).locator(".goal-outer-ring").evaluate(node=>getComputedStyle(node).animationDuration));
+    const offlineSize=await icons.nth(7).locator("circle").evaluate(node=>{const box=node.getBBox();return {width:box.width,height:box.height};});
+    assert.deepEqual(goalSize,offlineSize);
+    assert.equal(await icons.nth(5).locator("svg").innerHTML(),await icons.nth(1).locator("svg").innerHTML());
+    assert.equal(await icons.nth(8).locator("circle").count(),3,"chat_await keeps its speech-bubble icon");
+    assert.equal(await icons.nth(5).evaluate(node => getComputedStyle(node).color),await icons.nth(8).evaluate(node => getComputedStyle(node).color));
+    assert.equal(await icons.nth(5).getAttribute("aria-label"),"Goal blocked");
+    const ring=icons.nth(1).locator(".goal-outer-ring");
+    assert.equal(await ring.evaluate(node=>getComputedStyle(node).animationName),"presence-spin");
+    const initialRotation=await ring.evaluate(node=>getComputedStyle(node).transform);
+    await page.waitForTimeout(150);
+    assert.notEqual(await ring.evaluate(node=>getComputedStyle(node).transform),initialRotation);
+    const phaseError=await page.evaluate(async()=>{
+      const sample=()=>{
+        const node=document.querySelector(".conversation .presence-spinner");
+        const matrix=new DOMMatrixReadOnly(getComputedStyle(node).transform);
+        return {time:performance.now(),angle:Math.atan2(matrix.b,matrix.a)};
+      };
+      const before=sample();
+      window.dispatchEvent(new StorageEvent("storage",{key:"owner-chat-seen-v1"}));
+      await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+      const after=sample();
+      const difference=after.angle-before.angle-(after.time-before.time)*2*Math.PI/2000;
+      return Math.abs(Math.atan2(Math.sin(difference),Math.cos(difference)));
+    });
+    assert(phaseError<.2,"sidebar redraws must preserve the standalone spinner's rotation phase");
+    assert.equal(await icons.nth(1).locator("path:not(.goal-outer-ring)").evaluate(node=>getComputedStyle(node).transform),"none");
+    assert.equal(await icons.nth(5).locator(".goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
+    await page.emulateMedia({colorScheme:"dark"});
+    assert.equal(await icons.nth(5).evaluate(node=>getComputedStyle(node).color),"rgb(255, 133, 142)");
+    await page.emulateMedia({colorScheme:"light"});
+    const header = page.locator("#chat-host #presence");
+    await page.locator('#chat-host #presence[data-state="online"]').waitFor();
+    assert.equal(await header.locator(".presence-spinner").count(),0);
+    await page.locator(".conversation").filter({ hasText:/Icon case 2/ }).click();
+    await page.locator('#chat-host #presence[data-state="away"]').waitFor();
+    await page.locator(".conversation").filter({ hasText:/Icon case 7/ }).click();
+    await page.locator('#chat-host #presence[data-state="offline"]').waitFor();
+    assert.equal(await page.locator('#chat-host #presence[data-state="offline"] svg').isVisible(),true,"the header offline icon stays visible");
+    chats[3].goalStatus = null;
+    chats[4].goalStatus = null;
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.locator(".conversation-row:nth-of-type(4) .conversation .presence.online .presence-spinner").waitFor();
+    await page.locator(".conversation-row:nth-of-type(5) .conversation .presence.offline").waitFor({state:"attached"});
+    assert.equal(await page.locator(".conversation-row:nth-of-type(5) .conversation .presence.offline").isVisible(),false);
+    if (process.env.CODEXIFY_WORKSPACE_SCREENSHOTS) {
+      mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS,{recursive:true});
+      await page.screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-goal-sidebar.png`,fullPage:true});
+    }
+    assert.deepEqual(errors,[]);
+  } finally { await browser.close(); }
+});
+
 test(`${engineName}: standalone owner view restores its URL selection`, { timeout:30000 }, async () => {
   const browser = await engine.launch();
   try {
-    const page = await browser.newPage();
+    const page = await ownerTestPage(browser);
     page.setDefaultTimeout(5000);
     const errors = [];
     const copied = [];
@@ -87,35 +660,41 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
       return route.fulfill({ status:404 });
     });
     await page.goto("http://127.0.0.1:43210/#test-token");
-    await page.getByRole("button", { name:/Fix tests/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Fix tests/ }).waitFor();
     assert.equal(new URL(page.url()).hash, "#test-token", "the access token must remain in the address bar");
     assert.deepEqual(await page.locator(".conversation-title").allTextContents(), ["Fix tests", "Review files", "Old task"]);
     assert.deepEqual(await page.locator(".presence").evaluateAll(nodes => nodes.map(node => [...node.classList].at(-1))), ["online", "away", "offline"]);
     assert.equal(await page.locator(".unread:not([hidden])").count(), 3);
     for (const size of await page.locator(".presence").evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().width))) assert(size <= 14);
     assert(!((await page.locator(".conversation-detail").allTextContents()).some(text => text.includes("No messages"))));
-    await page.getByRole("button", { name:/Fix tests/ }).click();
+    await page.locator(".conversation").filter({ hasText:/Fix tests/ }).click();
     assert.equal(await page.locator("#automation-panel:visible").count(), 0);
     chats[0].agentWaitingUntilMs = Date.now() + 120000;
-    await page.locator(".conversation:nth-of-type(1) .presence.waiting").waitFor();
+    await page.locator(".conversation-row:nth-of-type(1) .conversation .presence.waiting").waitFor();
     await page.locator('#chat-host #presence[data-state="waiting"]').waitFor();
-    assert.equal(await page.locator(".conversation:nth-of-type(1) .presence circle").count(), 3);
-    assert.equal(await page.locator(".conversation:nth-of-type(1) .presence path").getAttribute("fill"), "currentColor");
+    assert.equal(await page.locator(".conversation-row:nth-of-type(1) .conversation .presence circle").count(), 3);
+    assert.equal(await page.locator(".conversation-row:nth-of-type(1) .conversation .presence path").getAttribute("fill"), "currentColor");
     assert.equal(new URL(page.url()).searchParams.get("chat"), chats[0].id);
     assert.equal(new URL(page.url()).hash, "#test-token");
     const chatHost = page.locator("#chat-host");
     await chatHost.getByRole("button", { name:"Copy message Markdown", exact:true }).first().click();
     await page.waitForFunction(expected => window.__lastCopied === expected, rawSource);
     assert.equal(copied.at(-1), rawSource);
+    assert.equal(await chatHost.locator(".message-copy").first().getAttribute("data-copied"),"true");
     await chatHost.getByRole("button", { name:"Copy whole chat as Markdown", exact:true }).click();
     await page.waitForFunction(expected => window.__lastCopied === expected, wholeTranscript);
     assert.equal(markdownRequests.at(-1), `/api/chats/${chats[0].id}/markdown`);
     assert.equal(copied.at(-1), wholeTranscript);
+    assert.equal(await chatHost.locator("#copy-chat").getAttribute("data-copied"),"true");
+    await page.waitForTimeout(3100);
+    assert.equal(await chatHost.locator(".message-copy").first().getAttribute("data-copied"),null);
+    assert.equal(await chatHost.locator("#copy-chat").getAttribute("data-copied"),null);
     await page.evaluate(() => {
       navigator.clipboard.writeText = async () => { throw new Error("Clipboard denied"); };
     });
     await chatHost.getByRole("button", { name:"Copy message Markdown", exact:true }).first().click();
     await chatHost.getByText("Could not copy message Markdown.", { exact:true }).waitFor();
+    assert.equal(await chatHost.locator(".message-copy").first().getAttribute("data-copied"),null);
     await page.evaluate(() => {
       navigator.clipboard.writeText = text => window.__writeTestClipboard(text);
     });
@@ -125,12 +704,12 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     await chat.press("Enter");
     await page.locator("#chat-host").getByText("Please run the test suite").waitFor();
     await page.locator('#chat-host #presence[data-state="online"]').waitFor();
-    await page.locator(".conversation:nth-of-type(1) .presence.online").waitFor();
+    await page.locator(".conversation-row:nth-of-type(1) .conversation .presence.online").waitFor();
     if (process.env.CODEXIFY_WORKSPACE_SCREENSHOTS) {
       mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS, { recursive:true });
       await page.screenshot({ path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-sidebar.png`, fullPage:true });
     }
-    await page.getByRole("button", { name:/Review files/ }).click();
+    await page.locator(".conversation").filter({ hasText:/Review files/ }).click();
     assert.equal(new URL(page.url()).searchParams.get("chat"), chats[1].id);
     await page.locator("#chat-host").getByText("Please run the test suite").waitFor({ state:"hidden" });
     await page.goBack();
@@ -158,10 +737,10 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     await page.clock.install({ time:clock });
     chats[1].agentWaitingUntilMs = clock + 20000;
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await page.locator(".conversation:nth-of-type(2) .presence.waiting").waitFor();
+    await page.locator(".conversation-row:nth-of-type(2) .conversation .presence.waiting").waitFor();
     failPolling = true;
     await page.clock.fastForward(20000);
-    await page.locator(".conversation:nth-of-type(2) .presence.away").waitFor();
+    await page.locator(".conversation-row:nth-of-type(2) .conversation .presence.away").waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
@@ -169,7 +748,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
 test(`${engineName}: project grouping, transcript search, and persistent names`, { timeout:30000 }, async () => {
   const browser = await engine.launch();
   try {
-    const page = await browser.newPage();
+    const page = await ownerTestPage(browser);
     page.setDefaultTimeout(5000);
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -217,7 +796,7 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
 
     const search = page.getByRole("searchbox", { name:"Search chats" });
     await search.fill("buried text");
-    await page.getByRole("button", { name:/Middle beta/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Middle beta/ }).waitFor();
     assert.deepEqual(await page.locator(".conversation-title").allTextContents(), ["Middle beta"]);
     assert.equal(await page.locator("#chat-host #draft").count(), 1, "filtering must keep the selected conversation open");
     assert.equal(new URL(page.url()).searchParams.get("chat"), chats[0].id);
@@ -225,28 +804,36 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
     for (let attempts = 0; !releaseOldSearch && attempts < 50; attempts++) await page.waitForTimeout(20);
     assert(releaseOldSearch);
     await search.fill("Newest alpha");
-    await page.getByRole("button", { name:/Newest alpha/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Newest alpha/ }).waitFor();
     releaseOldSearch();
     await page.waitForTimeout(100);
     assert.deepEqual(await page.locator(".conversation-title").allTextContents(), ["Newest alpha"]);
     await search.fill("no matching content");
     await page.getByText("No matching chats.", { exact:true }).waitFor();
     await search.fill("");
-    await page.getByRole("button", { name:/Newest alpha/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Newest alpha/ }).waitFor();
 
     const panel = page.locator("#chat-host");
+    const assertHeaderMatchesSidebar = async () => {
+      const row = page.locator('.conversation[aria-current="true"]');
+      assert.equal(await panel.locator("#chat-title").textContent(), await row.locator(".conversation-title").textContent());
+      assert.equal(await panel.locator("#chat-subtitle").textContent(), await row.locator(".conversation-detail").textContent());
+    };
+    await assertHeaderMatchesSidebar();
     await panel.getByRole("button", { name:"Rename chat" }).click();
     await panel.getByLabel("Chat name").fill("Saved release name");
     await panel.getByRole("button", { name:"Save name" }).click();
-    await page.getByRole("button", { name:/Saved release name/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Saved release name/ }).waitFor();
+    await assertHeaderMatchesSidebar();
     chats[0].latestTitle = "Latest agent answer";
     await page.reload();
-    await page.getByRole("button", { name:/Saved release name/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Saved release name/ }).waitFor();
     await panel.getByRole("button", { name:"Rename chat" }).click();
     assert.equal(await panel.getByLabel("Chat name").inputValue(), "Saved release name");
     await panel.getByLabel("Chat name").fill("");
     await panel.getByRole("button", { name:"Save name" }).click();
-    await page.getByRole("button", { name:/Latest agent answer/ }).waitFor();
+    await page.locator(".conversation").filter({ hasText:/Latest agent answer/ }).waitFor();
+    await assertHeaderMatchesSidebar();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
@@ -254,7 +841,7 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
 test(`${engineName}: standalone automation controls drive only authenticated owner APIs`, { timeout:30000 }, async () => {
   const browser = await engine.launch();
   try {
-    const page = await browser.newPage({ viewport:{ width:1280, height:900 } });
+    const page = await ownerTestPage(browser,{ viewport:{ width:1280, height:900 } });
     page.setDefaultTimeout(5000);
     const errors = [];
     const operations = [];
@@ -270,7 +857,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     const automation = {
       enabled:true,
       ownerGeneration:0,
-      pairing:{ status:"unpaired", candidateUrl:null, canonicalUrl:null, generation:0, verifiedAtMs:null, expiresAtMs:null },
+      pairing:{ status:"verified", candidateUrl:null, canonicalUrl:"https://chatgpt.com/c/already-paired", generation:1, verifiedAtMs:now, expiresAtMs:null },
       selection:{ model:"gpt-6-astra", effort:"max", catalogRevision:"saved-catalog" },
       goal:null,
       action:{ id:null, kind:null, status:"idle", pairingGeneration:null, goalRevision:null, lastError:null, lastStableAnswer:null, updatedAtMs:null },
@@ -313,6 +900,8 @@ test(`${engineName}: standalone automation controls drive only authenticated own
           models:[
             { id:"gpt-6-astra", label:"GPT-6 Astra", efforts:[{ id:"max", label:"Pro", available:true, reason:null }] },
             { id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[
+              { id:"low", label:"Instant", available:true, reason:null },
+              { id:"medium", label:"Medium", available:true, reason:null },
               { id:"high", label:"High", available:true, reason:null },
               { id:"max", label:"Max", available:false, reason:"Not available for this account" }
             ] },
@@ -366,7 +955,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       if (url.pathname === `/api/chats/${chat.id}/send`) {
         const body = request.postDataJSON(); operations.push(["send", body.message]);
         if (body.message.startsWith("/goal set ")) automation.goal = {
-          revision:1, markdown:body.message.slice(10), status:"configured", createdAtMs:now,
+          revision:(automation.goal?.revision || 0) + 1, markdown:body.message.slice(10), status:"active", createdAtMs:now,
           updatedAtMs:Date.now(), finishedAtMs:null, summary:null, blockedReason:null
         };
         else if (body.message === "/goal run") automation.goal.status = "active";
@@ -400,11 +989,32 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await panel.getByRole("button", {name:"Close connection settings",exact:true}).click();
     await model.selectOption("gpt-6-sol");
     await panel.locator("#automation-model:enabled").waitFor();
-    assert.deepEqual(await effort.locator("option").allTextContents(), ["High"]);
+    assert.deepEqual(await effort.locator("option").allTextContents(), ["High", "Medium", "Instant"]);
+    assert.equal(await effort.inputValue(), "high", "model selection defaults to its highest available effort");
+    await effort.selectOption("medium");
+    await panel.locator("#automation-effort:enabled").waitFor();
+    await page.waitForTimeout(1600);
+    assert.equal(await effort.inputValue(), "medium", "background refresh preserves the user's explicit effort choice");
     assert.equal(await effort.locator('option[value="max"]').count(), 0);
+    assert.equal(await model.locator('option:has-text("Use conversation model")').count(),0);
     assert.equal(await panel.locator("#composer #automation-model").count(), 1);
     assert.equal(await panel.locator("#composer #automation-effort").count(), 1);
+    for (const picker of [model, effort]) {
+      const measured = await picker.evaluate(node => {
+        const style = getComputedStyle(node), label = document.createElement("span");
+        label.style.cssText = "position:absolute;white-space:pre;visibility:hidden";
+        for (const property of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "fontStretch", "fontVariant", "letterSpacing"]) label.style[property] = style[property];
+        label.textContent = node.selectedOptions[0].textContent; node.parentElement.append(label);
+        const text = label.getBoundingClientRect().width; label.remove();
+        return { text, width:node.getBoundingClientRect().width, padding:parseFloat(style.paddingLeft) + parseFloat(style.paddingRight), appearance:style.appearance };
+      });
+      assert.equal(measured.appearance, "none");
+      assert(measured.width - measured.padding >= measured.text, "the selected label must fit before the arrow");
+      assert(measured.width - measured.padding - measured.text < 3, "the arrow must remain close to the label");
+    }
 
+    automation.pairing = { status:"unpaired", candidateUrl:null, canonicalUrl:null, generation:0 };
+    await panel.locator("#automation-pair-chat").waitFor();
     await panel.getByRole("button", { name:"Connection settings", exact:true }).click();
     await panel.getByText("Offline", { exact:true }).waitFor();
     await panel.getByText(/Queue 2 of 3/).waitFor();
@@ -425,12 +1035,38 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     automation.companion.activeActionId = null;
     await panel.getByRole("button", { name:"Close connection settings" }).click();
 
+    automation.pairing = { ...automation.pairing, status:"verified", canonicalUrl:automation.pairing.candidateUrl, verifiedAtMs:Date.now() };
+    await panel.locator("#automation-pair-chat").waitFor({state:"hidden"});
     await panel.getByRole("button", { name:"Add goal", exact:true }).click();
     await panel.getByLabel("Goal Markdown").fill("Finish the standalone controls.");
     await panel.getByRole("button", { name:"Set goal", exact:true }).click();
     await panel.locator("#goal-bar").getByText("Finish the standalone controls.", { exact:true }).waitFor();
-    await panel.getByRole("button", { name:"Run goal" }).click();
     await panel.getByText("Pursuing goal", { exact:true }).waitFor();
+    assert.equal(await panel.locator("#goal-icon svg").count(),1);
+    assert.equal(await panel.locator("#goal-icon svg").evaluate(node => getComputedStyle(node).strokeWidth),await panel.locator("#automation-toggle-goal svg").evaluate(node => getComputedStyle(node).strokeWidth));
+    assert.equal(await panel.locator("#goal-icon").evaluate(node => getComputedStyle(node).color),"rgb(21, 155, 39)");
+    assert.equal(await panel.locator("#goal-icon .goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"stop-spin");
+    assert.equal(await panel.locator("#goal-icon path:not(.goal-outer-ring)").evaluate(node=>getComputedStyle(node).transform),"none");
+    automation.goal.status="blocked";
+    await panel.getByText("Goal blocked",{exact:true}).waitFor();
+    assert.equal(await panel.locator("#goal-icon").evaluate(node=>getComputedStyle(node).color),"rgb(196, 49, 59)");
+    assert.equal(await panel.locator("#goal-icon .goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
+    await page.emulateMedia({colorScheme:"dark"});
+    assert.equal(await panel.locator("#goal-icon").evaluate(node=>getComputedStyle(node).color),"rgb(255, 133, 142)");
+    await page.emulateMedia({colorScheme:"light"});
+    await panel.getByRole("button",{name:"Run goal",exact:true}).click();
+    await panel.getByText("Pursuing goal",{exact:true}).waitFor();
+    assert.equal(await panel.locator("#goal-icon").evaluate(node=>getComputedStyle(node).color),"rgb(21, 155, 39)");
+    automation.presence.lastAgentCallAtMs = Date.now();
+    await panel.getByRole("button", { name:"Edit goal", exact:true }).click();
+    const updatedGoal = "Finish the updated standalone controls while the agent keeps working.";
+    await panel.getByLabel("Goal Markdown").fill(updatedGoal);
+    await panel.getByRole("button", { name:"Set goal", exact:true }).click();
+    await panel.locator("#goal-bar").getByText(updatedGoal, {exact:true}).waitFor();
+    assert.equal(automation.goal.status,"active");
+    assert.equal(automation.goal.revision,2);
+    assert(operations.some(operation => Array.isArray(operation) && operation[0] === "send" && operation[1] === `/goal set ${updatedGoal}`));
+    automation.presence.lastAgentCallAtMs = null;
     const goalBox = await panel.locator("#goal-bar").boundingBox();
     const composerBox = await panel.locator("#composer").boundingBox();
     assert(goalBox && composerBox && goalBox.y < composerBox.y && goalBox.y + goalBox.height <= composerBox.y + 12);
@@ -438,24 +1074,56 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS, { recursive:true });
       await page.screenshot({ path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-composer.png`, fullPage:true });
     }
+    automation.action = {id:"automatic-stop-retry",kind:"offline_goal",status:"failed",goalRevision:2,lastError:"ChatGPT did not stop the previous response; the new message was not sent",retryMode:"retry",sendAccepted:false,automaticRetryAtMs:Date.now()+30000};
+    await panel.getByRole("button",{name:"Connection settings",exact:true}).click();
+    await panel.locator("#automation-action").getByText("Retrying automatically",{exact:true}).waitFor();
+    assert.equal(await panel.locator("#goal-retry").isVisible(),false);
+    assert.equal(await panel.locator("#automation-error").isVisible(),true);
+    assert((await panel.locator("#automation-error").textContent()).includes("Retrying automatically in"));
+    assert.equal(await panel.locator("#goal-caption").textContent(),"Pursuing goal");
+    await panel.getByRole("button",{name:"Close connection settings",exact:true}).click();
+    automation.action = { id:"pre-send-attention", kind:"offline_combined", status:"interference", goalRevision:1, lastError:"Clear the draft before retrying", retryMode:"retry", sendAccepted:false };
+    await panel.locator("#goal-retry").getByText("Retry", {exact:true}).waitFor();
+    assert((await panel.locator("#automation-error").textContent()).includes("The message was not sent"));
+    await panel.locator("#goal-retry").click();
+    await panel.locator("#goal-retry").waitFor({state:"hidden"});
+    automation.action = { id:"goal-attention", kind:"offline_goal", status:"ambiguous", goalRevision:1, lastError:"The previous turn could not be confirmed", retryMode:"continue_goal", sendAccepted:true };
+    await panel.locator("#goal-retry").getByText("Continue", {exact:true}).waitFor();
+    assert((await panel.locator("#automation-error").textContent()).includes("will not be resent"));
+    await panel.locator("#goal-retry").click();
+    await panel.locator("#goal-retry").waitFor({state:"hidden"});
+    automation.action = { id:"message-attention", kind:"offline_chat", status:"ambiguous", goalRevision:null, lastError:"Message submission could not be confirmed", retryMode:null, sendAccepted:true };
+    await panel.locator("#goal-retry").getByText("ChatGPT", {exact:true}).waitFor();
+    assert.equal(await panel.locator("#automation-retry-action").isDisabled(),true);
+    assert((await panel.locator("#automation-error").textContent()).includes("check whether the message was sent"));
+    automation.action = { status:"idle", lastError:null, retryMode:null };
+    await panel.locator("#goal-retry").waitFor({state:"hidden"});
     await panel.getByRole("button", { name:"Pause goal" }).click();
+    await panel.getByRole("button", {name:"Run goal",exact:true}).waitFor();
+    assert.equal(await panel.locator("#goal-icon .goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
     await panel.getByRole("button", { name:"Clear goal" }).click();
     await panel.locator("#goal-bar").waitFor({ state:"hidden" });
     assert.equal(messages.length, 0, "local goal controls must not enter chat history");
 
     automation.presence.lastAgentCallAtMs = Date.now();
-    await panel.locator("#automation-model:disabled").waitFor();
-    assert.equal(await effort.isDisabled(), true);
-    await panel.getByText("Model and effort can be changed when the agent is offline.", { exact:true }).waitFor();
-    automation.presence.lastAgentCallAtMs = Date.now() - 240000;
     await page.waitForTimeout(1600);
-    assert.equal(await model.isDisabled(), true, "away agents must also lock model changes");
-    automation.presence.lastAgentCallAtMs = Date.now() - 360000;
-    automation.presence.agentWaitingUntilMs = Date.now() + 30000;
-    await page.waitForTimeout(1600);
-    assert.equal(await model.isDisabled(), true, "waiting agents must also lock model changes");
-    automation.presence.agentWaitingUntilMs = null;
+    assert.equal(await model.isDisabled(),false,"online agents may choose cached preferences for future turns");
+    assert.equal(await effort.isDisabled(),false);
+    await model.selectOption("gpt-5.6-sol");
     await panel.locator("#automation-model:enabled").waitFor();
+    assert.equal(await model.inputValue(),"gpt-5.6-sol");
+    const pickerSize=await model.evaluate(node=>({width:node.getBoundingClientRect().width,label:node.selectedOptions[0].textContent,font:getComputedStyle(node).font}));
+    assert(pickerSize.width<150,"picker width must follow the selected label rather than the longest option");
+    automation.companion.status="busy";automation.companion.activeActionId="running-action";
+    await page.waitForTimeout(1600);
+    assert.equal(await model.isDisabled(),false,"cached preferences do not need an idle browser");
+    assert.equal(await panel.locator("#automation-capabilities").isDisabled(),true);
+    automation.companion.status="idle";automation.companion.activeActionId=null;
+    automation.presence.agentWaitingUntilMs=Date.now()+30000;
+    await page.waitForTimeout(1600);
+    assert.equal(await model.isDisabled(),false);
+    assert.equal(await panel.locator("#automation-capabilities").isDisabled(),false,"live refresh requires an idle browser, not an offline agent");
+    automation.presence.agentWaitingUntilMs=null;
     await panel.getByRole("button", { name:"Connection settings", exact:true }).click();
     automation.action = { id:"failed-action", kind:"offline_chat", status:"failed", pairingGeneration:1, goalRevision:null, lastError:"Selector verification failed before Send", lastStableAnswer:null, updatedAtMs:Date.now() };
     automation.queue = null;
@@ -483,7 +1151,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     assert(operations.some(entry => Array.isArray(entry) && entry[0] === "cancel"));
     assert(operations.some(entry => Array.isArray(entry) && entry[0] === "retry"));
     assert.deepEqual(operations.filter(entry => Array.isArray(entry) && entry[0] === "send").map(entry => entry[1]), [
-      "/goal set Finish the standalone controls.", "/goal run", "/goal stop", "/goal clear"
+      "/goal set Finish the standalone controls.", "/goal run", `/goal set ${updatedGoal}`, "/goal stop", "/goal clear"
     ]);
     const bodyText = await page.locator("body").textContent();
     assert(!bodyText.includes("owner_account_1"));
@@ -497,3 +1165,198 @@ test(`${engineName}: standalone automation controls drive only authenticated own
   } finally { await browser.close(); }
 });
 }
+
+for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
+  test(`${engineName}: goal time ticks locally, pauses, and resumes without counting messages as turns`, { timeout:30000 }, async () => {
+    const browser = await engine.launch();
+    try {
+      const page = await ownerTestPage(browser); page.setDefaultTimeout(5000);
+      let clock = Date.now(); await page.clock.install({ time:clock });
+      const chat = { id:"f".repeat(64), title:"Timed goal", workspace:"timer-project", lastEntryEnd:0, lastEntryAtMs:clock, lastAgentCallAtMs:null, totalToolCalls:0 };
+      const goal = { markdown:"Keep making progress", status:"active", elapsedActiveMs:0, activeSinceMs:clock - 3000, timerUntilMs:clock - 3000 + 300000, turnCount:1392 };
+      let failState = false;
+      await page.route("http://127.0.0.1:43213/**", async route => {
+        const request = route.request(), url = new URL(request.url());
+        if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml });
+        if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats:[chat], serverTimeMs:clock } });
+        if (url.pathname.endsWith("/automation")) return route.fulfill(failState ? { status:503 } : { json:{ enabled:true, goal, serverTimeMs:clock, companion:{ authenticated:false }, presence:{} } });
+        if (url.pathname.endsWith("/send")) {
+          failState = false;
+          const body = request.postDataJSON();
+          if (body.message === "/goal stop") { goal.elapsedActiveMs += clock - goal.activeSinceMs; goal.activeSinceMs = null; goal.status = "configured"; }
+          if (body.message === "/goal run") { goal.activeSinceMs = clock; goal.status = "active"; }
+          return route.fulfill({ json:{ _meta:{ [META]:{ goal } } } });
+        }
+        return route.fulfill({ json:{ _meta:{ [META]:{ chat_file:"/private/timer/CHAT.md", revision:"0", delivered_through:0, read_through:0, last_agent_call_at_ms:null, total_tool_calls:0, server_time_ms:clock, messages:[], unchanged:false, has_more:false } } } });
+      });
+      await page.goto(`http://127.0.0.1:43213/?chat=${chat.id}#test-token`);
+      const metrics = page.locator("#goal-metrics");
+      await metrics.getByText("3s (1392 turns)", { exact:true }).waitFor();
+      failState = true; clock += 1000; await page.clock.fastForward(1000);
+      await metrics.getByText("4s (1392 turns)", { exact:true }).waitFor();
+      clock += 60000; await page.clock.fastForward(60000);
+      await metrics.getByText("1m 4s (1392 turns)", { exact:true }).waitFor();
+      await page.getByRole("button", { name:"Pause goal", exact:true }).click();
+      await page.getByRole("button", { name:"Run goal", exact:true }).waitFor();
+      failState = true; clock += 10000; await page.clock.fastForward(10000);
+      assert.equal(await metrics.textContent(), "1m 4s (1392 turns)");
+      await page.getByRole("button", { name:"Run goal", exact:true }).click();
+      await page.getByRole("button", { name:"Pause goal", exact:true }).waitFor();
+      failState = true; clock += 3000; await page.clock.fastForward(3000);
+      await metrics.getByText("1m 7s (1392 turns)", { exact:true }).waitFor();
+      goal.elapsedActiveMs += clock - goal.activeSinceMs;
+      goal.activeSinceMs = null; goal.status = "blocked"; goal.blockedReason = "Waiting for input";
+      failState = false; clock += 2000; await page.clock.fastForward(2000);
+      await page.getByText("Goal blocked", { exact:true }).waitFor();
+      assert.equal(await metrics.textContent(), "1m 7s (1392 turns)");
+      const play = page.getByRole("button", { name:"Run goal", exact:true });
+      assert.equal(await play.isEnabled(), true, "blocked goals must allow Play");
+      await play.click();
+      await page.getByText("Pursuing goal", { exact:true }).waitFor();
+      failState = true; clock += 3000; await page.clock.fastForward(3000);
+      await metrics.getByText("1m 10s (1392 turns)", { exact:true }).waitFor();
+      const remaining = goal.timerUntilMs - clock;
+      clock += remaining; await page.clock.fastForward(remaining);
+      const atOffline = await metrics.textContent();
+      clock += 60000; await page.clock.fastForward(60000);
+      assert.equal(await metrics.textContent(), atOffline, "offline time must not increase even while polling fails");
+      goal.elapsedActiveMs += goal.timerUntilMs - goal.activeSinceMs;
+      goal.activeSinceMs = clock; goal.timerUntilMs = clock + 300000;
+      failState = false; await page.clock.fastForward(2000);
+      await metrics.getByText(atOffline, {exact:true}).waitFor();
+      failState = true; clock += 3000; await page.clock.fastForward(3000);
+      assert.notEqual(await metrics.textContent(), atOffline, "fresh agent activity resumes the timer");
+      failState = false; goal.turnCount = 0;
+      await page.clock.fastForward(2000);
+      await metrics.getByText(/\(1 turn\)$/).waitFor();
+    } finally { await browser.close(); }
+  });
+}
+
+for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
+  test(`${engineName}: new chats discover models and preserve workspace choices`,{timeout:30000},async()=>{
+    const browser=await engine.launch();
+    try {
+      const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
+      const chats=[], submitted=[], errors=[];let preparations=0;
+      page.on('pageerror',error=>errors.push(error.message));
+      await page.route('http://127.0.0.1:43215/**',async route=>{
+        const request=route.request(),url=new URL(request.url());
+        if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+        assert.equal(request.headers().authorization,'Bearer test-token');
+        if(url.pathname==='/api/new-chat'){
+          const efforts=[{id:'low',label:'Instant',available:true},{id:'medium',label:'Medium',available:true},{id:'high',label:'High',available:true},{id:'xhigh',label:'Extra High',available:true},{id:'max',label:'Pro',available:true}];
+          preparations++;return route.fulfill({json:{catalogRevision:'fresh-project-models',chatgptProjectUrl:'https://chatgpt.com/g/g-p-fixture/project',models:[
+            {id:'live-model',label:'Live model',efforts},
+            {id:'limited-model',label:'Limited model',efforts:efforts.map(effort=>({...effort,available:effort.id!=='max'}))},
+            {id:'future-model',label:'Future model',efforts:[{id:'variable',label:'Variable choice',available:true},{id:'expanded',label:'Expanded choice',available:true}]}
+          ]}});
+        }
+        if(url.pathname==='/api/projects')return route.fulfill({json:{createWorktree:true,catalog:{projects:[{selector:'repo',name:'Existing repo'}],total:1,warnings:[]}}});
+        if(url.pathname==='/api/projects/worktrees')return route.fulfill({json:{worktrees:[{name:'Saved worktree',path:'/workspace/saved'}]}});
+        if(url.pathname==='/api/chats'&&request.method()==='POST'){
+          const body=request.postDataJSON();submitted.push(body);
+          const id=String(submitted.length).repeat(64);chats.push({id,title:'New conversation',workspace:'repo',projectId:'repo',projectPath:'/workspace/repo',lastEntryEnd:0,lastEntryAtMs:Date.now(),lastAgentCallAtMs:null,totalToolCalls:0});
+          return route.fulfill({json:{id,queued:true}});
+        }
+        if(url.pathname==='/api/chats')return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
+        if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:false,serverTimeMs:Date.now()}});
+        return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/new/CHAT.md',workspace_path:'/workspace/repo',messages:[],revision:'0',delivered_through:0,read_through:0,last_agent_call_at_ms:null,agent_waiting_until_ms:null,total_tool_calls:0,server_time_ms:Date.now(),has_more:false,before:null,unchanged:false}}}});
+      });
+      await page.goto('http://127.0.0.1:43215/#test-token');
+      const dialog=page.getByRole('dialog',{name:'New chat'});
+      const open=async()=>{
+        await page.getByRole('button',{name:'New chat',exact:true}).click();
+        await dialog.getByRole('button',{name:'Existing repo',exact:true}).waitFor();
+        await dialog.locator('#new-chat-model:enabled').waitFor();
+        assert.deepEqual(await dialog.getByLabel('Reasoning effort').locator('option').allTextContents(),['Pro','Extra High','High','Medium','Instant']);
+        assert.equal(await dialog.getByLabel('Reasoning effort').inputValue(),'max');
+      };
+      await open();
+      const model=dialog.getByLabel('ChatGPT model'),effort=dialog.getByLabel('Reasoning effort');
+      await effort.selectOption('medium');
+      await model.selectOption('limited-model');
+      assert.equal(await effort.inputValue(),'xhigh','default skips the locked highest option');
+      assert.equal(await effort.locator('option[value="max"]').isDisabled(),true);
+      await model.selectOption('future-model');
+      assert.deepEqual(await effort.locator('option').allTextContents(),['Expanded choice','Variable choice']);
+      assert.equal(await effort.inputValue(),'expanded','new effort labels follow the discovered slider order');
+      await model.selectOption('live-model');
+      assert.equal(await effort.inputValue(),'max','switching models resets the default to the highest available effort');
+      const url=dialog.getByLabel('Project path or Git URL'),create=dialog.getByRole('button',{name:'Create chat',exact:true});
+      assert.equal(await create.isDisabled(),true,'a workspace or nonempty path is required');
+      await url.fill('https://github.com/example/ignored.git');
+      assert.equal(await create.isEnabled(),true,'typing a path enables creation without confirmation');
+      const checkbox=dialog.getByRole('checkbox',{name:'Create a worktree for the selected project'});
+      assert.equal(await checkbox.isChecked(),true);await checkbox.uncheck();
+      await dialog.getByLabel('Search projects').fill('existing');await page.waitForTimeout(350);
+      assert.equal(await checkbox.isChecked(),false,'searching must preserve an explicit worktree override');
+      await dialog.getByRole('button',{name:'Existing repo',exact:true}).click();
+      await effort.selectOption('medium');
+      await dialog.getByRole('button',{name:'Create chat',exact:true}).click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[0].path,'repo');assert.equal(submitted[0].createWorktree,false);assert.equal(submitted[0].effort,'medium');
+      await open();await url.fill('https://github.com/example/ignored.git');await dialog.getByRole('button',{name:'Chat without a project',exact:true}).click();
+      await dialog.getByRole('button',{name:'Create chat',exact:true}).click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[1].withoutProject,true);assert.equal(submitted[1].effort,'max');assert(!Object.hasOwn(submitted[1],'createWorktree'));assert(!Object.hasOwn(submitted[1],'path'));
+      await open();await url.fill('https://github.com/example/project/pull/42');
+      await url.fill('   ');assert.equal(await create.isDisabled(),true,'clearing an unselected path disables creation');
+      await url.fill('  https://github.com/example/project/pull/42  ');
+      await dialog.getByRole('button',{name:'Create chat',exact:true}).click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[2].path,'https://github.com/example/project/pull/42');assert.equal(submitted[2].createWorktree,true);
+      await open();await url.fill('https://github.com/example/ignored.git');await dialog.getByRole('button',{name:'Existing worktrees for Existing repo',exact:true}).click();await dialog.getByRole('button',{name:'Saved worktree',exact:true}).click();
+      await dialog.getByRole('button',{name:'Create chat',exact:true}).click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[3].path,'repo');assert.equal(submitted[3].worktreePath,'/workspace/saved');assert(!Object.hasOwn(submitted[3],'createWorktree'));
+      await open();await dialog.getByRole('button',{name:'Existing repo',exact:true}).click();
+      await url.fill('https://github.com/example/override.git');
+      await dialog.getByRole('button',{name:'Confirm',exact:true}).click();
+      await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[4].path,'https://github.com/example/override.git','Confirm explicitly overrides the selected project');
+      assert.equal(submitted[4].createWorktree,true);
+      await open();await url.fill('/workspace/local-project');await checkbox.uncheck();
+      await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[5].path,'/workspace/local-project','filesystem paths also submit directly');
+      assert.equal(submitted[5].createWorktree,false);
+      await open();await dialog.getByRole('button',{name:'Existing worktrees for Existing repo',exact:true}).click();await dialog.getByRole('button',{name:'Saved worktree',exact:true}).click();
+      assert.equal(await checkbox.isDisabled(),true);
+      await url.fill('/workspace/confirmed');await dialog.getByRole('button',{name:'Confirm',exact:true}).click();
+      assert.equal(await checkbox.isEnabled(),true,'Confirm releases the selected existing worktree');
+      await url.fill('/workspace/latest');
+      await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[6].path,'/workspace/latest','the path field stays current after confirmation');
+      assert(!Object.hasOwn(submitted[6],'worktreePath'));assert.equal(submitted[6].createWorktree,true);
+      assert.equal(preparations,7,'every New chat must freshly discover its destination-specific models');
+      assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+}
+
+test('verified pairing skips away after its short presence lease while normal activity retains the normal timeout',()=>{
+ const source=ownerHtml.match(/function presence\([^)]*\) \{[\s\S]*?\n  \}/)?.[0];const presence=Function(`return (${source})`)();
+ assert.equal(presence(1000,5999,null,6000),'online');assert.equal(presence(1000,6000,null,6000),'offline');
+ assert.equal(presence(1000,180000,null,6000),'offline');assert.equal(presence(1000,6000,9000,6000),'waiting');
+ assert.equal(presence(2000,6000,null,null),'online');
+});
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: verified pairing becomes offline after five seconds and resumes on real activity`,{timeout:30000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);const now=Date.now();await page.clock.install({time:now});
+  const id='d'.repeat(64),errors=[];let serverNow=now,lastCall=now,until=now+5000;page.on('pageerror',error=>errors.push(error.message));
+  await page.route('http://127.0.0.1:43232/**',route=>{
+   const path=new URL(route.request().url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Just paired',workspace:'pairing',lastEntryEnd:0,lastEntryAtMs:now,lastAgentCallAtMs:lastCall,agentPresenceUntilMs:until,totalToolCalls:2}],serverTimeMs:serverNow}});
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},goal:null,action:{status:'idle'},selection:{},companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:lastCall,agentPresenceUntilMs:until},serverTimeMs:serverNow}});
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/pairing/CHAT.md',revision:'0',delivered_through:0,read_through:0,last_agent_call_at_ms:lastCall,agent_presence_until_ms:until,total_tool_calls:2,server_time_ms:serverNow,messages:[],has_more:false,unchanged:true}}}});
+  });
+  await page.goto(`http://127.0.0.1:43232/?chat=${id}#test-token`);const host=page.locator('#chat-host');
+  await host.locator('#presence .presence-label').getByText('online',{exact:true}).waitFor();await page.locator('.conversation .presence.online').waitFor();
+  serverNow=now+4000;await page.clock.fastForward(4000);assert.equal(await host.locator('#presence .presence-label').textContent(),'online');
+  serverNow=now+5000;await page.clock.fastForward(1000);await host.locator('#presence .presence-label').getByText('offline',{exact:true}).waitFor();
+  assert.equal(await page.locator('.conversation .presence.away').count(),0);await page.locator('.conversation .presence.offline').waitFor({state:'attached'});
+  assert.equal(await host.locator('#tool-total').textContent(),'2 tool calls');
+  // A new working turn clears the special deadline on the next metadata update.
+  lastCall=now+5000;until=null;serverNow=now+7500;await page.clock.fastForward(2500);
+  await host.locator('#presence .presence-label').getByText('online',{exact:true}).waitFor();await page.locator('.conversation .presence.online').waitFor();
+  assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
+});

@@ -24,6 +24,7 @@ const request = (id: string): ExecuteActionRequest => ({
   url:`https://chatgpt.com/c/${id}`,
   pairingGeneration:1,
   connectorName:"Codexify",
+  expectedAccountFingerprint:"account-1",
   model:"gpt-6-sol",
   effort:"high",
   prompt:{ kind:"offline_chat", batchId:`batch-${id}`, messages:[{ id:`message-${id}`, markdown:"Continue." }] },
@@ -61,7 +62,7 @@ class DeferredDriver implements BrowserDriver {
     this.runs.push(execution.request.actionId);
     execution.emit({ type:"navigating" });
     execution.emit({ type:"composer_ready" });
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({ type:"answer_delta", markdown:`answer-${execution.request.actionId}`, continuation:false });
@@ -90,7 +91,7 @@ class SlowHealthDriver extends DeferredDriver {
 
 class OversizedDeltaDriver extends DeferredDriver {
   override async execute(execution: DriverExecution): Promise<void> {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({
@@ -109,7 +110,7 @@ class OversizedDeltaDriver extends DeferredDriver {
 class LargeFinalDriver extends DeferredDriver {
   override async execute(execution: DriverExecution): Promise<void> {
     const chunks = ["a".repeat(60 * 1024), "b".repeat(60 * 1024), "c".repeat(60 * 1024)];
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     for (const [index, markdown] of chunks.entries()) {
@@ -125,7 +126,7 @@ class LargeFinalDriver extends DeferredDriver {
 
 class EventFloodDriver extends DeferredDriver {
   override async execute(execution: DriverExecution): Promise<void> {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     for (let index = 0; index < 300; index += 1) {
@@ -160,7 +161,7 @@ class LingeringTerminalDriver extends DeferredDriver {
 
   override async execute(execution: DriverExecution): Promise<void> {
     this.runs.push(execution.request.actionId);
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({
@@ -185,7 +186,7 @@ class AbortableLingeringTerminalDriver extends DeferredDriver {
   }
 
   override async execute(execution: DriverExecution): Promise<void> {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({
@@ -230,7 +231,7 @@ class JsonExpandingAnswerDriver extends DeferredDriver {
   readonly markdown = "\\".repeat(MAX_DELTA_BYTES);
 
   override async execute(execution: DriverExecution): Promise<void> {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({ type:"answer_delta", markdown:this.markdown, continuation:false });
@@ -244,7 +245,7 @@ class JsonExpandingAnswerDriver extends DeferredDriver {
 
 class ApprovalDriver extends DeferredDriver {
   override async execute(execution: DriverExecution): Promise<void> {
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({ type:"approval_required", message:"Approve once" });
@@ -257,7 +258,7 @@ async function collect(coordinator: SingleWindowCoordinator, actionId: string): 
   return events;
 }
 
-test("one companion window refuses a second task while a response is generating", async () => {
+test("one companion window refuses a second task while its submission operation is unsettled", async () => {
   const driver = new DeferredDriver();
   const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
   const first = await coordinator.execute(request("first"));
@@ -591,4 +592,147 @@ test("post-Send attention snapshots retain the verified conversation URL", async
   expect(snapshot?.state).toBe("approval_required");
   expect(snapshot?.sendAccepted).toBeTrue();
   expect(snapshot?.canonicalUrl).toBe(submitted.expectedUrl);
+});
+
+test("pairing and default conversation actions need no model verification but still require connector and account proof", async () => {
+  class ConversationDriver extends DeferredDriver {
+    override async execute(execution: DriverExecution) {
+      this.runs.push(execution.request.actionId);
+      execution.emit({type:"navigating"});execution.emit({type:"composer_ready"});
+      execution.emit({type:"connector_verified"});execution.emit({type:"send_accepted"});
+      execution.emit({type:"generation_complete",finalMarkdown:"Verified.",canonicalUrl:execution.request.expectedUrl});
+    }
+  }
+  const driver = new ConversationDriver();
+  const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
+  const pair = {...request("no-model-pair"),model:null,effort:null,prompt:{kind:"pair_verify" as const,reference:"A".repeat(43)}};
+  await coordinator.execute(pair);
+  let snapshot;
+  for (let attempt=0;attempt<20;attempt++) {snapshot=await coordinator.action(pair.actionId);if(snapshot?.state==="idle")break;await Bun.sleep(5);}
+  expect(snapshot?.sendAccepted).toBeTrue();expect(snapshot?.selected).toBeNull();
+  const wrongAccount = {...pair,actionId:"wrong-account-pair",idempotencyKey:"wrong-account-idem",expectedAccountFingerprint:"different-account"};
+  let failure: unknown;try {await coordinator.execute(wrongAccount);} catch(error){failure=error;}
+  expect((failure as Error).message).toContain("account changed");
+  expect(driver.runs).toEqual(["no-model-pair"]);
+  await coordinator.close();
+});
+
+
+test("automatic pairing verifies conversation preferences after acceptance and before completion",async()=>{
+  for(const restore of [true,false]){
+    class PairingDriver extends DeferredDriver {
+      override async execute(execution:DriverExecution):Promise<void>{
+        execution.emit({type:"connector_verified"});execution.emit({type:"send_accepted"});
+        if(restore)execution.emit({type:"model_verified",model:execution.request.model!,effort:execution.request.effort!});
+        execution.emit({type:"submission_complete",canonicalUrl:"https://chatgpt.com/c/created-pairing"});
+      }
+    }
+    const coordinator=new SingleWindowCoordinator(new PairingDriver(),TEST_BUILD);
+    const automatic:ExecuteActionRequest={...request(`automatic-${restore}`),url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",prompt:{kind:"create_chat",reference:"A".repeat(43),continuationToken:Buffer.alloc(32,2).toString("base64url"),setupReference:null}};
+    await coordinator.execute(automatic);const events=[];for await(const event of coordinator.events(automatic.actionId,0))events.push(event);
+    expect(events.some(event=>event.type==="send_accepted")).toBeTrue();
+    if(restore){expect(events.at(-1)?.type).toBe("submission_complete");expect((await coordinator.action(automatic.actionId))?.selected).toEqual({model:automatic.model!,effort:automatic.effort!});}
+    else{expect(events.at(-1)?.type).toBe("ambiguous_send");const last=events.at(-1);expect(last&&"message" in last?last.message:"").toContain("before restoring its requested model and effort");}
+  }
+});
+
+test("ordinary sends still require model verification before connector verification",async()=>{
+  class UnverifiedDriver extends DeferredDriver {
+    override async execute(execution:DriverExecution):Promise<void>{execution.emit({type:"connector_verified"});execution.emit({type:"send_accepted"});}
+  }
+  const coordinator=new SingleWindowCoordinator(new UnverifiedDriver(),TEST_BUILD),ordinary=request("unverified-ordinary");
+  await coordinator.execute(ordinary);const events=[];for await(const event of coordinator.events(ordinary.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe("failed");expect((await coordinator.action(ordinary.actionId))?.sendAccepted).toBeFalse();
+});
+
+
+test("a stopped browser is not reported as a ChatGPT authentication failure",async()=>{
+  const driver=new DeferredDriver();driver.authenticated=false;driver.status="unavailable";
+  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  const failure=await coordinator.execute(request("browser-closed")).then(()=>undefined,error=>error);
+  expect(failure).toBeInstanceOf(Error);expect(failure.message).not.toContain("authentication");expect(driver.runs).toEqual([]);
+});
+
+const shortBudget = {operationMs:45,cleanupMs:40,hardStopMs:30};
+class TimedSubmissionDriver extends DeferredDriver {
+  attempted = false;
+  constructor(private readonly phase:'before-send'|'attempted'|'accepted') { super(); }
+  submissionMayHaveBeenAccepted(id:string) { return this.attempted && id==='timed-submission'; }
+  override async execute(execution:DriverExecution) {
+    this.runs.push(execution.request.actionId);
+    execution.emit({type:'navigating'});
+    if(execution.request.model!==null&&execution.request.effort!==null)execution.emit({type:'model_verified',model:execution.request.model,effort:execution.request.effort});
+    execution.emit({type:'connector_verified'});
+    if(execution.request.actionId!=='timed-submission') {execution.emit({type:'send_accepted'});execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});return;}
+    this.attempted=this.phase!=='before-send';
+    if(this.phase==='accepted')execution.emit({type:'send_accepted'});
+    await new Promise<void>((resolve,reject)=>{
+      this.releases.set(execution.request.actionId,resolve);
+      execution.signal.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError')),{once:true});
+    });
+    execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});
+  }
+}
+for(const phase of ['before-send','attempted','accepted'] as const)test(`action deadline releases ownership and preserves ${phase} Send uncertainty`,async()=>{
+ const driver=new TimedSubmissionDriver(phase),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
+ await coordinator.execute(request('timed-submission'));
+ const events=await collect(coordinator,'timed-submission');
+ expect(events.at(-1)?.type).toBe(phase==='before-send'?'failed':'ambiguous_send');
+ expect((events.at(-1) as any).message).toContain('timed out');
+ expect((await coordinator.health()).activeActionId).toBeNull();
+ const snapshot=await coordinator.action('timed-submission');
+ expect((await coordinator.execute(request('timed-submission'))).state).toBe(snapshot!.state);
+ await coordinator.execute(request('next-submission'));await collect(coordinator,'next-submission');
+ expect(driver.runs).toEqual(['timed-submission','next-submission']);
+ expect((await coordinator.action('timed-submission'))?.state).toBe(snapshot!.state);
+ await coordinator.close();
+});
+
+test('maintenance deadlines abort their work and release the window operation queue',async()=>{
+ const driver=new DeferredDriver();let signalSeen:AbortSignal|undefined;
+ (driver as BrowserDriver).refreshConnector=async(_name,signal)=>{
+  signalSeen=signal;
+  await new Promise<void>((_resolve,reject)=>signal!.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError')),{once:true}));
+  throw Error('unreachable');
+ };
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
+ const stalled=coordinator.refreshConnector('Fixture connector');
+ const next=coordinator.capabilities();
+ await expect(stalled).rejects.toThrow('timed out');
+ expect(signalSeen!.aborted).toBeTrue();
+ expect((await next).accountFingerprint).toBe('account-1');
+ expect(driver.capabilityCalls).toBe(1);
+ await coordinator.close();
+});
+
+test('a driver that ignores cancellation is retired before its tab can be reused',async()=>{
+ const driver=new DeferredDriver();let closed=0;
+ (driver as BrowserDriver).refreshConnector=async()=>new Promise(()=>{});
+ (driver as BrowserDriver).close=async()=>{closed++;};
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
+ await expect(coordinator.refreshConnector('Fixture connector')).rejects.toThrow('timed out');
+ expect(closed).toBe(1);
+ expect((await coordinator.health()).status).toBe('unavailable');
+ await expect(coordinator.capabilities()).rejects.toThrow('recovery is required');
+ expect(driver.capabilityCalls).toBe(0);
+ await coordinator.close();expect(closed).toBe(1);
+});
+
+test('multi-step maintenance yields the UI lease to already queued work between steps',async()=>{
+ const driver=new DeferredDriver(),order:string[]=[];let entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
+ const original=driver.capabilities.bind(driver);
+ driver.capabilities=async()=>{order.push('other-operation');return original();};
+ (driver as BrowserDriver).refreshConnectorSteps=async(_name,run,signal)=>{
+  await run(async()=>{order.push('first-step');entered();await gate;},signal);
+  await run(async()=>{order.push('second-step');},signal);
+  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false};
+ };
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
+ const refresh=coordinator.refreshConnector('Fixture connector');await started;
+ expect((await coordinator.health()).status).toBe('busy');
+ const other=coordinator.capabilities();release();
+ await refresh;await other;
+ expect(order).toEqual(['first-step','other-operation','second-step']);
+ expect((await coordinator.health()).status).toBe('idle');await coordinator.close();
 });

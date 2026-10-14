@@ -2,6 +2,7 @@
 
 pub mod apply_patch;
 pub mod automation_pair;
+pub mod chat_attachments;
 pub mod check_for_updates;
 pub mod clock_curr_time;
 pub mod clock_sleep;

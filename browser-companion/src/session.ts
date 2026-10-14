@@ -39,7 +39,7 @@ export function parseChatGptModelAnnouncement(text: string): {
   version: string; name?: string; mode: string;
 } | undefined {
   const normalized = text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
-  const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^\p{P}]+)(?:\p{P}|$)/iu.exec(normalized);
+  const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Luna|Astra))?\s+([^\p{P}]+)(?:\p{P}|$)/iu.exec(normalized);
   if (!match) return undefined;
   return { version: match[1]!, ...(match[2] ? { name: match[2].toLowerCase() } : {}), mode: match[3]!.trim() };
 }
@@ -179,18 +179,20 @@ async function clearGhostEffortState(page: Page, control: Locator): Promise<void
 export async function activateChatGptEffortMenu(
   page: Page,
   control: Locator,
-  options: { settleMs?: number } = {},
+  options: { settleMs?: number; signal?:AbortSignal } = {},
 ): Promise<ChatGptEffortActivation> {
   const openSurface = await visibleEffortSurface(page, control);
   if (openSurface) return { method: "already-open", ...openSurface };
 
   const settleMs = options.settleMs ?? 3_000;
   await clearGhostEffortState(page, control);
-  await control.click({ force: true, timeout: Math.max(1, settleMs) });
+  options.signal?.throwIfAborted();
+  await control.click({ force: true, timeout: Math.max(1, settleMs),signal:options.signal });
   const clickedSurface = await waitForEffortSurface(page, control, settleMs);
   if (clickedSurface) return { method: "click", ...clickedSurface };
 
   await clearGhostEffortState(page, control);
+  options.signal?.throwIfAborted();
   await control.dispatchEvent("pointerdown", {
     button: 0,
     buttons: 1,
@@ -269,7 +271,7 @@ export function chatGptEffortLabelFromAnnouncement(text: string, state: ChatGptE
   return label.trim() || undefined;
 }
 
-async function readCurrentEffortLabel(menu: ChatGptEffortActivation): Promise<string> {
+export async function readCurrentEffortLabel(menu: ChatGptEffortActivation): Promise<string> {
   const deadline = Date.now() + 1_000;
   do {
     const state = await readChatGptEffortSnapshot(menu.sliderContainer);
@@ -317,22 +319,24 @@ export async function moveChatGptEffortSlider(
   }
 }
 
-export async function discoverChatGptEfforts(menu: ChatGptEffortActivation): Promise<DiscoveredBrowserEffort[]> {
+export async function discoverChatGptEfforts(menu: ChatGptEffortActivation, signal?:AbortSignal): Promise<DiscoveredBrowserEffort[]> {
   const initial = await readChatGptEffortSnapshot(menu.sliderContainer);
   const efforts: DiscoveredBrowserEffort[] = [];
   try {
     for (let index = 0; index < initial.available.length; index += 1) {
+      signal?.throwIfAborted();
       const available = initial.available[index]!;
       let label = initial.labels[index];
       if (available) {
-        await moveChatGptEffortSlider(menu, initial.min + index);
+        await moveChatGptEffortSlider(menu, initial.min + index,signal);
         label = await readCurrentEffortLabel(menu);
       }
       // An unlabeled locked tick does not establish an effort name. Do not invent one.
       if (!label) continue;
       const id = browserEffortIdFromLabel(label);
       if (efforts.some(effort => effort.id === id)) throw new Error("ChatGPT exposed duplicate effort labels");
-      efforts.push({ id, label, index, available, reason:available ? null : "not_available_for_account" });
+      const observedModelName=available?(await readChatGptModelAnnouncements(menu.slider)).map(parseChatGptModelAnnouncement).find(model=>model?.name)?.name:undefined;
+      efforts.push({ id, label, index, available, reason:available ? null : "not_available_for_account",...(observedModelName?{observedModelName}:{}) });
     }
   } finally { await moveChatGptEffortSlider(menu, initial.value); }
   if (efforts.length === 0) throw new Error("ChatGPT did not expose any discoverable effort labels");
@@ -371,7 +375,7 @@ export async function assertNewChatPage(page: Page, useSavedChats = false): Prom
 
 export async function detectChatGptAccountCapabilities(
   page: Page,
-  options: { selectorTimeoutMs?: number; stableAbsenceMs?: number } = {},
+  options: { selectorTimeoutMs?: number; stableAbsenceMs?: number; signal?:AbortSignal } = {},
 ): Promise<AccountCapabilities> {
   const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
   const composer = composers;
@@ -382,6 +386,7 @@ export async function detectChatGptAccountCapabilities(
   let absenceSince: number | undefined;
   let presenceObservations = 0;
   while (true) {
+    options.signal?.throwIfAborted();
     const effortVisible = await effortButton.isVisible();
     if (effortVisible) {
       presenceObservations += 1;
@@ -410,7 +415,7 @@ export async function detectChatGptAccountCapabilities(
     await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
   }
   if ((await composerText(composer)).trim()) throw new Error("ChatGPT capability discovery requires an empty composer");
-  let menu = await activateChatGptEffortMenu(page, effortButton);
+  let menu = await activateChatGptEffortMenu(page, effortButton,{signal:options.signal});
   let originalFamily: BrowserModelFamily | undefined;
   let originalValue: number | undefined;
   try {
@@ -424,8 +429,10 @@ export async function detectChatGptAccountCapabilities(
     originalValue = (await readChatGptEffortSnapshot(menu.sliderContainer)).value;
     const models: AccountCapabilities["models"][number][] = [];
     for (const family of modelFamilies) {
-      menu = await selectChatGptModelFamily(menu, family, () => activateChatGptEffortMenu(page, effortButton));
-      models.push(...modelsFromDiscoveredEfforts(family, await discoverChatGptEfforts(menu)));
+      options.signal?.throwIfAborted();
+      menu = await selectChatGptModelFamily(menu, family, () => activateChatGptEffortMenu(page, effortButton,{signal:options.signal}),options.signal);
+      const familyLabel=(await menu.menu.getByRole("menuitemradio",{includeHidden:true}).allTextContents()).find(label=>browserModelFamilyFromLabel(label)===family);
+      models.push(...modelsFromDiscoveredEfforts(family, await discoverChatGptEfforts(menu,options.signal),familyLabel));
     }
     return { models };
   } finally {

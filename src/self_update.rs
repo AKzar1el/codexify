@@ -886,6 +886,8 @@ async fn trigger_from(
         ),
     )?;
 
+    crate::global_settings::record_refresh_intent(&workspace.id, &latest.version.to_string())
+        .map_err(anyhow::Error::msg)?;
     if let Err(error) = schedule_worker(&workspace.worker_path, &workspace.id, service_restart) {
         let failed = UpdateStatusRecord {
             state: UpdatePhase::Failed,
@@ -1477,7 +1479,7 @@ write_status() {{
 }}
 
 finish() {{
-    status=$?
+    worker_exit_code=$?
     trap - 0 HUP INT TERM
     set +e
 
@@ -1490,7 +1492,7 @@ finish() {{
             FAILURE_CODE=rollback_failed
             FAILURE_DETAIL='The previous Codexify executable could not be restored.'
             log 'failed to restore the previous Codexify executable'
-            status=1
+            worker_exit_code=1
         fi
     fi
 
@@ -1508,29 +1510,29 @@ finish() {{
                     FAILURE_CODE=service_restart_failed
                     FAILURE_DETAIL='The Codexify service did not restart and become healthy.'
                     log 'the restarted Codexify service did not become healthy; run `codexify service enable` manually'
-                    status=1
+                    worker_exit_code=1
                 fi
             else
                 FAILURE_CODE=service_restart_failed
                 FAILURE_DETAIL='The Codexify service could not be restarted.'
                 log 'failed to restart the Codexify service; run `codexify service enable` manually'
-                status=1
+                worker_exit_code=1
             fi
         else
             FAILURE_CODE=executable_missing
             FAILURE_DETAIL='No Codexify executable was available to restart the service.'
             log 'cannot restart the Codexify service because no executable is available'
-            status=1
+            worker_exit_code=1
         fi
     fi
 
-    if [ "$UPDATED" -eq 1 ] && [ "$status" -eq 0 ]; then
+    if [ "$UPDATED" -eq 1 ] && [ "$worker_exit_code" -eq 0 ]; then
         rm -f "$BACKUP"
     elif [ "$UPDATED" -eq 1 ] && [ -e "$BACKUP" ]; then
         log "previous executable retained at $BACKUP"
     fi
     rm -f "$STAGED" "$LOCK" "$SCRIPT"
-    if [ "$status" -eq 0 ]; then
+    if [ "$worker_exit_code" -eq 0 ]; then
         write_status succeeded '' ''
         log "Codexify $VERSION self-update completed"
     elif [ "$ROLLED_BACK" -eq 1 ] && [ "$FAILURE_CODE" != service_restart_failed ]; then
@@ -1544,7 +1546,7 @@ finish() {{
     if [ -n "$LAUNCHD_LABEL" ]; then
         launchctl remove "$LAUNCHD_LABEL" >/dev/null 2>&1
     fi
-    exit "$status"
+    exit "$worker_exit_code"
 }}
 trap finish 0 HUP INT TERM
 
@@ -1561,6 +1563,10 @@ if [ "$RESTART_SERVICE" -eq 1 ]; then
         exit 1
     fi
     log 'stopped the Codexify service'
+    # Use the old executable while its browser protocol still matches the running companion.
+    if ! "$TARGET" browser stop >> "$LOG" 2>&1; then
+        log 'optional browser companion could not be stopped; connector maintenance will report its state after restart'
+    fi
 fi
 
 if ! rm -f "$BACKUP"; then
@@ -1713,6 +1719,7 @@ try {{
         $FailureDetail = 'The Codexify service could not be stopped.'
         & $Target service disable *>> $Log
         if ($LASTEXITCODE -ne 0) {{ throw 'failed to stop the Codexify service' }}
+        try {{ & $Target browser stop *>> $Log }} catch {{ Write-UpdateLog 'optional browser companion could not be stopped before update' }}
         Write-UpdateLog 'stopped the Codexify service'
     }}
 
@@ -1827,7 +1834,7 @@ fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn schedule_worker(worker: &Path, id: &str, supervised: bool) -> anyhow::Result<()> {
+pub(crate) fn schedule_worker(worker: &Path, id: &str, supervised: bool) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         match schedule_systemd(worker, id) {

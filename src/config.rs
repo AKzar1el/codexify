@@ -377,6 +377,79 @@ fn default_exec() -> ExecConfig {
     }
 }
 
+/// Defaults for the settings editor, resolved through the same sources as startup.
+/// The example document describes field types; its sample values are not defaults.
+pub(crate) fn settings_defaults(
+    config: &AppConfig,
+    document: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::json;
+    let work_dir = document["workDir"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.work_dir.clone());
+    let mut defaults = default_config(work_dir);
+    let cli = Cli::try_parse_from(["codexify"]).expect("default settings CLI");
+    defaults.worktrees = resolve_worktree_config(None, &cli, false);
+    // This fallback depends on whether explicit user skill directories exist.
+    defaults.skills.dirs = document["skills"]["dirs"].as_array().map(|dirs| {
+        dirs.iter()
+            .filter_map(|dir| dir.as_str().map(String::from))
+            .collect()
+    });
+    let files = crate::output_budget::file_budget(&defaults);
+    let logging = &defaults.tool_logging;
+    let audit = &defaults.audit;
+    let codex_mcp = CodexMcpConfig::default();
+    let notifications: crate::markdown_chat::NotificationsConfig =
+        serde_json::from_value(json!({"urls":[]})).expect("notification defaults");
+    let mut chat = serde_json::to_value(&defaults.markdown_chat).expect("chat defaults");
+    chat["notifications"] = serde_json::to_value(notifications).expect("notification defaults");
+    json!({
+        "workDir":null,"debug":defaults.debug,"uiWidgets":defaults.ui_widgets,
+        "experimental":{"agentTickets":defaults.experimental.agent_tickets,
+            "forceReadOnlyToolAnnotations":defaults.experimental.force_read_only_tool_annotations,
+            "forceDestructiveToolAnnotations":defaults.experimental.force_destructive_tool_annotations,
+            "forceIdempotentToolAnnotations":defaults.experimental.force_idempotent_tool_annotations,
+            "forceOpenWorldToolAnnotations":defaults.experimental.force_open_world_tool_annotations,
+            "claudeSkills":defaults.experimental.claude_skills},
+        "apiKey":null,"conversationAuthToken":null,"port":defaults.port,
+        "multiProject":defaults.multi_project,"projectCloneDir":defaults.project_clone_dir,
+        "worktrees":{"mode":defaults.worktrees.mode.as_str(),"root":defaults.worktrees.root,
+            "upstreamRefreshMode":defaults.worktrees.upstream_refresh_mode.as_str(),
+            "autoCleanupEnabled":defaults.worktrees.auto_cleanup_enabled,
+            "keepCount":defaults.worktrees.keep_count,"allowSetupScript":defaults.worktrees.allow_setup_script},
+        "tree":defaults.tree,"command":defaults.command,
+        "exec":{"maxSessions":defaults.exec.max_sessions,"idleTimeoutMs":defaults.exec.idle_timeout_ms,
+            "defaultShell":crate::exec_sessions::resolve_shell(None)[0]},
+        "projectDoc":{"maxBytes":crate::project_doc::PROJECT_DOC_MAX_BYTES,
+            "fallbackFilenames":[],"rootMarkers":crate::project_doc::DEFAULT_ROOT_MARKERS},
+        "output":{"maxToolOutputTokens":crate::output_budget::tool_output_token_budget(&defaults),
+            "maxFileLines":files.max_lines,"maxFileBytes":files.max_bytes,
+            "maxEntries":crate::output_budget::entry_budget(&defaults),
+            "maxTreeNodes":crate::output_budget::tree_node_budget(&defaults)},
+        "filesystem":defaults.filesystem,"diff":defaults.diff,
+        "toolLogging":{"mode":logging.mode.as_str(),"level":logging.level.as_str(),
+            "maxRequestBytes":logging.max_request_bytes,"maxResponseBytes":logging.max_response_bytes,
+            "redactEnv":logging.redact_env},
+        "audit":{"logFile":audit.log_file,"includeCommandPreview":audit.include_command_preview,
+            "commandPreviewMaxBytes":audit.command_preview_max_bytes,"redactEnv":audit.redact_env},
+        "artifactIngress":defaults.artifact_ingress,"artifactEgress":defaults.artifact_egress,
+        "memory":{"enabled":crate::memory::memory_enabled(&defaults),"dir":crate::memory::memory_dir(&defaults),
+            "maxBytes":crate::memory::memory_max_bytes(&defaults)},
+        "agentChat":chat,
+        "skills":{"enabled":crate::skills::skills_enabled(&defaults),"dirs":null,
+            "includePlugins":crate::skills::plugins_enabled(&defaults)},
+        "ignore":{"useGitignore":crate::ignore_rules::use_gitignore(&defaults),
+            "useDefaultPatterns":crate::ignore_rules::use_default_patterns(&defaults),"customPatterns":[]},
+        "codexMcp":{"enabled":codex_mcp.enabled(),"useCli":codex_mcp.use_cli(),
+            "cliPath":codex_cli_command(&codex_mcp).to_string_lossy()},
+        "projectCatalog":{"codexConfig":{"enabled":defaults.project_catalog.codex_config.enabled,
+            "trustedOnly":defaults.project_catalog.codex_config.trusted_only},"entries":[]},
+        "allowedHosts":defaults.allowed_hosts,"openaiTunnel":null,"openaiTunnels":[],"mcpServers":{}
+    })
+}
+
 // ─── File config (all optional) ────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
@@ -623,6 +696,9 @@ impl PartialMcpServerSpec {
 struct PartialExperimental {
     agent_tickets: Option<bool>,
     force_read_only_tool_annotations: Option<bool>,
+    force_destructive_tool_annotations: Option<bool>,
+    force_idempotent_tool_annotations: Option<bool>,
+    force_open_world_tool_annotations: Option<bool>,
     claude_skills: Option<bool>,
 }
 
@@ -870,6 +946,7 @@ fn resolve_mcp_servers_from(
 /// embedding the server without a config file.
 pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
     AppConfig {
+        loaded_config_path: None,
         project_clone_dir: work_dir.clone(),
         work_dir,
         debug: false,
@@ -1709,6 +1786,7 @@ fn load_config_with_announcements(
         return Err("diff.commandTimeoutMs must be between 1 and 120000".into());
     }
     let config = AppConfig {
+        loaded_config_path: select_config_path(cli)?.path,
         work_dir,
         debug: file.debug.unwrap_or(false),
         ui_widgets: file.ui_widgets.unwrap_or(true),
@@ -1719,6 +1797,9 @@ fn load_config_with_announcements(
                 .or(file.force_read_only_tool_annotations)
                 .unwrap_or(false),
             claude_skills: experimental.claude_skills.unwrap_or(false),
+            force_destructive_tool_annotations: experimental.force_destructive_tool_annotations,
+            force_idempotent_tool_annotations: experimental.force_idempotent_tool_annotations,
+            force_open_world_tool_annotations: experimental.force_open_world_tool_annotations,
         },
         multi_project: cli.multi_project || file.multi_project.unwrap_or(false),
         project_clone_dir,
@@ -2074,6 +2155,53 @@ mod tests {
     }
 
     #[test]
+    fn experimental_annotation_overrides_preserve_explicit_false_and_reject_non_booleans() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let keys = [
+            "forceDestructiveToolAnnotations",
+            "forceIdempotentToolAnnotations",
+            "forceOpenWorldToolAnnotations",
+        ];
+        for value in [serde_json::Value::Null, json!(false), json!(true)] {
+            let mut document =
+                json!({"workDir":root.path(),"codexMcp":{"enabled":false},"experimental":{}});
+            for key in keys {
+                document["experimental"][key] = value.clone();
+            }
+            std::fs::write(&path, document.to_string()).unwrap();
+            let config = load_config(Cli::parse_from([
+                "codexify",
+                "--config",
+                path.to_str().unwrap(),
+            ]))
+            .unwrap();
+            assert_eq!(
+                config.experimental.force_destructive_tool_annotations,
+                value.as_bool()
+            );
+            assert_eq!(
+                config.experimental.force_idempotent_tool_annotations,
+                value.as_bool()
+            );
+            assert_eq!(
+                config.experimental.force_open_world_tool_annotations,
+                value.as_bool()
+            );
+        }
+        for key in keys {
+            for value in [json!("false"), json!(0), json!([]), json!({})] {
+                let mut document = json!({"experimental":{}});
+                document["experimental"][key] = value;
+                assert!(
+                    serde_json::from_value::<FileConfig>(document).is_err(),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn experimental_flags_override_legacy_annotation_hint() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");
@@ -2303,6 +2431,9 @@ mod tests {
                 &[
                     "agentTickets",
                     "forceReadOnlyToolAnnotations",
+                    "forceDestructiveToolAnnotations",
+                    "forceIdempotentToolAnnotations",
+                    "forceOpenWorldToolAnnotations",
                     "claudeSkills",
                 ][..],
             ),
@@ -2418,12 +2549,25 @@ mod tests {
                 "descriptorPath",
                 "enabled",
                 "maxQueuedActions",
+                "requestBlockList",
             ],
         );
         assert_keys(
             &example["agentChat"]["notifications"],
             "agentChat.notifications",
-            &["pythonPath", "timeoutMs", "urls"],
+            &["events", "pythonPath", "timeoutMs", "urls"],
+        );
+        assert_keys(
+            &example["agentChat"]["notifications"]["events"],
+            "agentChat.notifications.events",
+            &[
+                "completed",
+                "errors",
+                "goalBlocked",
+                "inputRequired",
+                "messages",
+                "offline",
+            ],
         );
         assert_keys(
             &example["projectCatalog"]["codexConfig"],

@@ -19,13 +19,14 @@ button:focus-visible,textarea:focus-visible,a:focus-visible { outline:2px solid 
 #chat { max-width:640px; margin:auto; overflow:hidden; border:1px solid var(--border); border-radius:18px; background:var(--bg); }
 .header { display:flex; align-items:center; gap:12px; padding:13px 16px; border-bottom:1px solid var(--border); }
 .heading { flex:1; min-width:0; }
-.header-actions { display:flex; align-items:center; gap:2px; }
+.header-actions { display:flex; align-items:center; gap:2px; flex:none; }
 h1 { display:flex; align-items:center; flex-wrap:wrap; gap:9px; font-size:15px; font-weight:650; margin:0; }
+#chat-title { min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #presence { display:inline-flex; align-items:center; gap:4px; color:var(--muted); font-size:11px; font-weight:400; }
 .presence-symbol { width:14px; height:14px; flex:none; }
 #presence[data-state="waiting"] { color:var(--waiting); }
 #tool-total { color:var(--muted); font-size:11px; font-weight:400; white-space:nowrap; font-variant-numeric:tabular-nums; }
-.subtitle { font-size:12px; color:var(--muted); }
+.subtitle { font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #workspace-label { font-size:11px; color:var(--muted); overflow-wrap:anywhere; }
 .icon-button { width:34px; height:34px; padding:6px; border:0; background:transparent; color:var(--muted); border-radius:50%; }
 svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
@@ -36,9 +37,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 .message.user { align-self:flex-end; background:var(--user); border-bottom-right-radius:4px; }
 .message.agent { border-bottom-left-radius:4px; }
 .warning-banner { align-self:stretch; min-width:0; background:#fff3c4; color:#694b00; border:1px solid #e8c75c; padding:9px 12px; border-radius:8px; }
-.message.copy-enabled,.warning-banner.copy-enabled { position:relative; padding-right:42px; }
+.message.copy-enabled,.warning-banner.copy-enabled { position:relative; }
 .message-tools { position:absolute; top:5px; right:6px; opacity:0; transition:opacity .12s ease; }
 .copy-enabled:hover .message-tools,.copy-enabled:focus-within .message-tools { opacity:1; }
+.message-tools:has([data-copied="true"]) { opacity:1; }
+.message-copy[data-copied="true"],#copy-chat[data-copied="true"] { color:var(--accent); }
 .message-copy { width:26px; height:26px; padding:5px; border:1px solid var(--border); border-radius:50%; background:var(--bg); color:var(--muted); }
 .message-copy:hover { color:var(--accent); }
 @media(hover:none) { .message-tools { opacity:1; } }
@@ -80,6 +83,31 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 #awaiting-hint { margin:0 4px 8px; color:var(--waiting); font-size:12px; font-weight:500; }
 #retired-hint { margin:0 4px 8px; color:var(--error); font-size:12px; font-weight:500; }
 #send { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:50%; background:var(--accent); color:var(--bg); padding:9px; }
+.draft-attachments,.message-attachments { display:flex; gap:10px; overflow-x:auto; padding:4px 2px; min-width:0; }
+.draft-attachments { flex:1 0 100%; grid-column:1/-1; grid-row:1; }
+#composer:has(.draft-attachments:not([hidden])) { flex-wrap:wrap; }
+#composer:has(.draft-attachments:not([hidden])) #draft { grid-row:2; }
+#composer:has(.draft-attachments:not([hidden])) #composer-tools,#composer:has(.draft-attachments:not([hidden])) #send { grid-row:3; }
+.message-attachments { margin:8px 0; }
+.draft-attachment { position:relative; flex:none; }
+.attachment-card { flex:none; width:160px; height:140px; display:flex; flex-direction:column; align-items:stretch; gap:3px; padding:8px; text-align:left; border:1px solid var(--border); border-radius:12px; color:var(--ink); background:var(--bg); font:inherit; cursor:pointer; }
+.attachment-visual { display:flex; align-items:center; justify-content:center; height:86px; flex:none; overflow:hidden; border-radius:7px; }
+.attachment-visual img { width:100%; height:100%; object-fit:cover; }
+.attachment-visual svg { width:34px; height:34px; color:var(--muted); }
+.attachment-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:600; }
+.attachment-size { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color:var(--muted); }
+.attachment-remove { position:absolute; top:3px; right:3px; width:23px; height:23px; border:1px solid var(--border); border-radius:50%; background:var(--surface); color:var(--ink); font-size:18px; line-height:1; cursor:pointer; }
+.attachment-upload-retry { position:absolute; left:8px; bottom:5px; border:0; background:var(--surface); color:var(--ink); font:inherit; font-size:11px; cursor:pointer; }
+.attach-button { flex:none; display:grid; place-items:center; }
+.attach-button svg { width:17px; height:17px; stroke-width:1.6; }
+.attachment-drop-overlay { position:fixed; inset:0; z-index:20000; display:grid; place-items:center; padding:24px; background:#102822df; color:#fff; outline:3px dashed #8ce4b4; outline-offset:-20px; pointer-events:none; font-size:24px; font-weight:600; text-align:center; }
+.attachment-viewer { position:fixed; inset:0; z-index:10001; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:65px 24px 24px; background:#000e; color:#fff; }
+.attachment-viewer img,.attachment-viewer video { flex:1; min-height:0; width:95vw; height:calc(100dvh - 140px); max-width:95vw; max-height:calc(100dvh - 140px); object-fit:contain; }
+.attachment-viewer-close { position:absolute; top:15px; right:20px; width:38px; height:38px; border:0; border-radius:50%; color:#fff; background:#ffffff20; font-size:28px; cursor:pointer; }
+.attachment-viewer-download { position:absolute; top:25px; left:24px; color:#fff; font-size:14px; }
+.attachment-viewer-name { max-width:90vw; overflow-wrap:anywhere; text-align:center; font-size:13px; }
+#send .stop-spinner { animation:stop-spin .8s linear infinite; }
+@keyframes stop-spin { to { transform:rotate(360deg); } }
 #status { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:11px; margin:7px 4px 0; }
 #status.error { color:var(--error); }
 #refresh { border:0; background:transparent; color:inherit; text-decoration:underline; padding:0 3px; font-size:11px; }
@@ -89,10 +117,9 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 <body>
 <section id="chat" aria-label="Markdown chat for this conversation">
   <header class="header">
-    <div class="heading"><h1>Agent <span id="presence" role="status"></span><span id="tool-total" hidden></span></h1><div class="subtitle">Markdown chat · This Codexify task</div><div id="workspace-label" hidden></div></div>
+    <div class="heading"><h1><span id="chat-title">Agent</span><span id="presence" role="status"></span><span id="tool-total" hidden></span></h1><div id="chat-subtitle" class="subtitle">Markdown chat · This Codexify task</div><div id="workspace-label" hidden></div></div>
     <div class="header-actions">
       <button id="copy-chat" class="icon-button" aria-label="Copy whole chat as Markdown" title="Copy whole chat as Markdown" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h11v13H8z"/><path d="M5 17H3V4h12v2"/></svg></button>
-      <button id="collapse" class="icon-button" aria-label="Collapse chat" aria-expanded="true" title="Collapse chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
     </div>
   </header>
   <div id="panel">
@@ -115,6 +142,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 <script>
 /* CODEXIFY_MARKDOWN_LIBRARY */
 /* CODEXIFY_MARKDOWN_RENDERER */
+/* CODEXIFY_ATTACHMENT_COMPOSER */
 (() => {
   "use strict";
   function mountChat(scope, bridge = null) {
@@ -125,10 +153,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   const canCopyChat = typeof bridge?.copyChat === "function";
   const records = new Map(), nodes = new Map(), markerNodes = new Map(), pendingSends = new Map(), rpcPending = new Map();
   let rpcId = 1, initialized = false, tornDown = false, pollTimer = null, saveTimer = null;
-  let refreshing = false, sending = false, loadingOlder = false, visible = true, collapsed = false;
+  let refreshing = false, sending = false, loadingOlder = false, visible = true;
   let revision = null, before = null, hasMore = false, delivered = 0, readThrough = 0, chatFile = null, failures = 0, snapshotEnd = 0;
   let lastAgentCall = null, totalToolCalls = null, clockOffset = 0, presenceTimer = null;
-  let agentWaitingUntil = null, waitingReplyEnd = 0;
+  let agentWaitingUntil = null, agentPresenceUntil = null, waitingReplyEnd = 0;
+  let agentStopped = false, stopping = false, stopRequestId = null;
   let messageClockTimer = null;
   let hostCapabilities = {};
   let statusKind = "normal";
@@ -136,8 +165,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let externalReadOnly = false, pageRetired = false;
   let workspace, generation = 0;
   const saved = (bridge?.getState?.() || window.openai?.widgetState)?.privateContent || {};
+  const attachments = typeof bridge?.uploadAttachment === "function" ? new window.CodexifyChatAttachments({
+    scope, bridge, saved:saved.draftAttachments, changed:() => { resizeInput(); save(); },
+    error:message => status(message,true,"action",false),
+    canOperate:() => !tornDown && available && !isReadOnly() && Boolean(chatFile) && !sending && !stopping,
+  }) : null;
   input.value = typeof saved.draft === "string" ? saved.draft : "";
-  collapsed = saved.collapsed === true;
   for (const message of Array.isArray(saved.pending) ? saved.pending : []) {
     if (typeof message.id === "string" && typeof message.markdown === "string") {
       pendingSends.set(message.id, { ...message, chat_file:message.chat_file || saved.chat_file || null, failed:true, pending:false });
@@ -210,7 +243,8 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (tornDown) return;
     clearTimeout(saveTimer);
     const current = (bridge?.getState?.() || window.openai?.widgetState)?.privateContent || {};
-    const state = { privateContent:{ ...current, draft:input.value, collapsed, chat_file:chatFile, pending:[...pendingSends.values()] } };
+    const state = { privateContent:{ ...current, draft:input.value, draftAttachments:attachments?.snapshot() || [], chat_file:chatFile, pending:[...pendingSends.values()] } };
+    delete state.privateContent.collapsed;
     try {
       if (bridge?.setState) bridge.setState(state);
       else Promise.resolve(window.openai?.setWidgetState?.(state)).catch(() => {});
@@ -233,16 +267,34 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function syncReadOnly() {
     const readOnly = isReadOnly();
     el("retired-hint").hidden = !readOnly;
-    input.placeholder = readOnly ? "This chat is read-only here." : "Message the agent...";
+    input.placeholder = readOnly ? "This chat is read-only here." : (bridge?.composerPlaceholder?.() || "Message the agent...");
     syncInputDescription();
     resizeInput();
   }
   function resizeInput() {
+    const historyTop = list.scrollTop;
+    const atBottom = list.scrollHeight - historyTop - list.clientHeight < 50;
+    // Measuring with auto height temporarily expands the history viewport.
+    // WebKit clamps its scroll position even when the final textarea height is unchanged.
     input.style.height = "auto";
     const borderHeight = input.offsetHeight - input.clientHeight;
     input.style.height = Math.min(150, input.scrollHeight + borderHeight) + "px";
-    input.disabled = !available || isReadOnly();
-    send.disabled = !available || isReadOnly() || !chatFile || sending || !input.value.trim();
+    input.disabled = !available || isReadOnly() || stopping;
+    const presence = presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil).state;
+    const active = presence === "online" || presence === "waiting";
+    const hasDraft = input.value.length > 0 || Boolean(attachments?.count());
+    const mode = stopping ? "stopping" : active && !hasDraft && !sending ? "stop" : "send";
+    if (send.dataset.mode !== mode) {
+      const label = mode === "stopping" ? "Stopping agent" : mode === "stop" ? "Stop agent" : "Send message";
+      const svg = icon(mode === "stopping" ? ["M12 3a9 9 0 1 1-9 9"] : mode === "stop" ? ["M7 7h10v10H7Z"] : ["M12 19V5m-6 6 6-6 6 6"], mode === "stopping" ? "stop-spinner" : "");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      if (mode === "stop") svg.querySelector("path").setAttribute("fill", "currentColor");
+      send.replaceChildren(svg); send.dataset.mode = mode;
+      send.setAttribute("aria-label", label); send.title = label;
+    }
+    send.disabled = !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
+    attachments?.update();
+    list.scrollTop = atBottom ? list.scrollHeight : historyTop;
     size();
   }
   function size() {
@@ -252,8 +304,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function theme(context) {
     if (context?.theme === "dark" || context?.theme === "light") (scope.host || document.documentElement).dataset.theme = context.theme;
   }
-  function presenceDetails(lastCall, now, waitingUntil = null) {
+  function presenceDetails(lastCall, now, waitingUntil = null, presenceUntil = null) {
     if (Number.isSafeInteger(waitingUntil) && now < waitingUntil) return { state:"waiting", label:"awaiting your reply", delay:waitingUntil - now };
+    if (Number.isSafeInteger(presenceUntil)) return now < presenceUntil
+      ? { state:"online", label:"online", delay:presenceUntil - now }
+      : { state:"offline", label:"offline", delay:null };
     if (!Number.isFinite(lastCall)) return { state:"offline", label:"offline", delay:null };
     const age = Math.max(0, now - lastCall);
     if (age < 180000) return { state:"online", label:"online", delay:180000 - age };
@@ -281,7 +336,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   function updatePresence() {
     clearTimeout(presenceTimer);
-    const { state, label, delay } = presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil);
+    const { state, label, delay } = stopping ? { state:"online", label:"online", delay:null } : presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil);
     const node = el("presence");
     const changed = node.dataset.state !== state, waiting = state === "waiting";
     if (changed) {
@@ -308,7 +363,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       resizeInput();
     }
     node.querySelector(".presence-label").textContent = label;
-    node.title = waiting ? "The agent is waiting for your message. Kept briefly between unanswered waits." : lastAgentCall === null ? "No agent tool call recorded for this task." : "Based on this task's last agent tool call, not a live connection or proof of ongoing work.";
+    node.title = agentStopped ? "Stopped by you. The goal stays paused until you press Play." : waiting ? "The agent is waiting for your message. Kept briefly between unanswered waits." : lastAgentCall === null ? "No agent tool call recorded for this task." : "Based on this task's last agent tool call, not a live connection or proof of ongoing work.";
     if (!tornDown && !document.hidden && delay !== null) presenceTimer = setTimeout(updatePresence, Math.max(1, delay));
   }
   function markdown(container, text) {
@@ -383,16 +438,34 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     mark.title = state === "read" ? "Acknowledged through chat_read, chat_write, or chat_await. This does not prove comprehension." : state === "delivered" ? "Returned in a tool response, but not yet acknowledged by a chat tool." : "Saved. Not yet returned to the agent.";
     mark.append(icon(state !== "sent" ? ["m1 9 4 4L16 2", "m10 12 2 2L23 3"] : ["m5 9 4 4L20 2"])); node.append(mark);
   }
+  const copyFeedback = new Map();
+  function resetCopyFeedback(button) {
+    const saved = copyFeedback.get(button);
+    if (!saved) return;
+    clearTimeout(saved.timer); button.replaceChildren(...saved.icon); button.title = saved.title;
+    delete button.dataset.copied; copyFeedback.delete(button);
+  }
+  function clearCopyFeedback() {
+    for (const button of copyFeedback.keys()) resetCopyFeedback(button);
+  }
+  function showCopyFeedback(button) {
+    if (!button?.isConnected) return;
+    const saved = copyFeedback.get(button) || { icon:[...button.childNodes].map(node => node.cloneNode(true)), title:button.title };
+    clearTimeout(saved.timer);
+    button.replaceChildren(icon(["m5 9 4 4L20 2"])); button.title = "Copied"; button.dataset.copied = "true";
+    saved.timer = setTimeout(() => resetCopyFeedback(button), 3000); copyFeedback.set(button, saved);
+  }
   async function copyMessageMarkdown(id) {
     if (!canCopyMessage || tornDown) return;
     const origin = generation;
     const message = records.get(id) || pendingSends.get(id);
+    const button = nodes.get(id)?.querySelector(".message-copy");
     if (!message || typeof message.markdown !== "string") return;
     try {
       await bridge.copyMessage(message.markdown);
-      if (currentGeneration(origin)) status("Message Markdown copied.");
+      if (currentGeneration(origin)) { showCopyFeedback(button); status("Message Markdown copied."); }
     } catch {
-      if (currentGeneration(origin)) status("Could not copy message Markdown.", true, "action", false);
+      if (currentGeneration(origin)) { resetCopyFeedback(button); status("Could not copy message Markdown.", true, "action", false); }
     }
   }
   async function copyWholeChat() {
@@ -402,9 +475,9 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     button.disabled = true;
     try {
       await bridge.copyChat();
-      if (currentGeneration(origin)) status("Whole chat Markdown copied.");
+      if (currentGeneration(origin)) { showCopyFeedback(button); status("Whole chat Markdown copied."); }
     } catch {
-      if (currentGeneration(origin)) status("Could not copy whole chat Markdown.", true, "action", false);
+      if (currentGeneration(origin)) { resetCopyFeedback(button); status("Could not copy whole chat Markdown.", true, "action", false); }
     } finally {
       if (currentGeneration(origin)) button.disabled = false;
     }
@@ -440,7 +513,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
           node.setAttribute("role", "alert");
           node.append(make("div", "markdown"), make("div", "receipt"));
         } else {
-          node.append(make("div", "author", message.role === "user" ? "You" : "Agent"), make("div", "markdown"), make("div", "receipt"));
+          node.append(make("div", "author", message.role === "user" ? "You" : "Agent"), make("div", "markdown"), make("div", "message-attachments"), make("div", "receipt"));
         }
         if (canCopyMessage) {
           node.classList.add("copy-enabled");
@@ -458,6 +531,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       }
       if (node._markdown !== message.markdown || node._generation !== generation) {
         const body = node.querySelector(".markdown"); body.replaceChildren(); markdown(body, message.markdown); node._markdown = message.markdown; node._generation = generation;
+      }
+      if (message.role !== "warning") {
+        const files=node.querySelector(".message-attachments");
+        if (attachments) attachments.renderMessage(files,message.attachments);
+        else files.hidden=true;
+        node.querySelector(".markdown").hidden=!message.markdown;
       }
       receipt(node.querySelector(".receipt"), message);
       if (previousNode.nextSibling !== node) list.insertBefore(node, previousNode.nextSibling);
@@ -496,6 +575,8 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (Number.isSafeInteger(page.read_through)) readThrough = Math.max(readThrough, page.read_through);
     if (!history) {
       lastAgentCall = Number.isSafeInteger(page.last_agent_call_at_ms) ? page.last_agent_call_at_ms : null;
+      agentStopped = page.agent_stop_requested === true;
+      agentPresenceUntil = Number.isSafeInteger(page.agent_presence_until_ms) ? page.agent_presence_until_ms : null;
       agentWaitingUntil = Number.isSafeInteger(page.agent_waiting_until_ms) && page.read_through >= waitingReplyEnd ? page.agent_waiting_until_ms : null;
       if (!Number.isSafeInteger(page.total_tool_calls) || page.total_tool_calls < 0) throw new Error("Invalid tool-call count from connector.");
       totalToolCalls = page.total_tool_calls;
@@ -547,8 +628,8 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function setAvailable(value) {
     if (tornDown || available === value) return;
     // A late callback must not resume polling or change a newer context's state.
-    generation++;
-    available = value; refreshing = false; sending = false; loadingOlder = false;
+    generation++; clearCopyFeedback();
+    available = value; refreshing = false; sending = false; stopping = false; stopRequestId = null; loadingOlder = false;
     clearTimeout(pollTimer); clearTimeout(messageClockTimer); clearTimeout(presenceTimer);
     if (!value) { agentWaitingUntil = null; updatePresence(); }
     resizeInput();
@@ -564,12 +645,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (tornDown) return;
     path = typeof path === "string" && path ? path : null;
     if (path === workspace) { setAvailable(Boolean(path) && enabled); return; }
-    generation++; workspace = path; available = Boolean(path) && enabled;
+    generation++; clearCopyFeedback(); workspace = path; available = Boolean(path) && enabled;
     clearTimeout(pollTimer); clearTimeout(messageClockTimer); clearTimeout(presenceTimer);
-    refreshing = false; sending = false; loadingOlder = false;
+    refreshing = false; sending = false; stopping = false; agentStopped = false; stopRequestId = null; loadingOlder = false;
     chatFile = null; revision = null; before = null; hasMore = false; failures = 0; snapshotEnd = 0;
     delivered = 0; readThrough = 0; lastAgentCall = null; totalToolCalls = null; clockOffset = 0;
-    agentWaitingUntil = null; waitingReplyEnd = 0; pageRetired = false;
+    agentWaitingUntil = null; agentPresenceUntil = null; waitingReplyEnd = 0; pageRetired = false;
     records.clear();
     for (const node of nodes.values()) node.remove();
     for (const node of markerNodes.values()) node.remove();
@@ -583,11 +664,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   function schedule() {
     clearTimeout(pollTimer);
-    if (!available || tornDown || collapsed || !visible || document.hidden) return;
+    if (!available || tornDown || !visible || document.hidden) return;
     pollTimer = setTimeout(() => { void refresh(); }, failures ? Math.min(30000, 2000 * 2 ** failures) : 2000);
   }
   async function refresh() {
-    if (!available || refreshing || tornDown || collapsed || !visible || document.hidden) return;
+    if (!available || refreshing || tornDown || !visible || document.hidden) return;
     const origin = generation;
     refreshing = true;
     try {
@@ -599,17 +680,19 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     finally { if (currentGeneration(origin)) { refreshing = false; schedule(); } }
   }
   async function deliver(message) {
-    if (!available || isReadOnly() || !chatFile || message.chat_file !== chatFile || sending || tornDown) return;
+    if (!available || isReadOnly() || !chatFile || message.chat_file !== chatFile || sending || stopping || tornDown) return;
     const origin = generation;
     sending = true; message.failed = false; message.pending = true;
     pendingSends.set(message.id, message); render(); resizeInput(); save();
     try {
-      const args = { request_id:message.id, message:message.markdown, expected_chat_file:message.chat_file };
+      const args = { request_id:message.id, message:message.markdown, expected_chat_file:message.chat_file,
+        ...(message.attachments?.length ? {attachment_ids:message.attachments.map(a=>a.id)} : {}) };
       if (message.workspace_path) args.expected_workspace = message.workspace_path;
       const payload = await call("chat_ui_send", args);
       if (payload.sent?.id !== message.id || !Number.isSafeInteger(payload.sent.end)) throw new Error("The send receipt was incomplete. Retry uses the same message ID.");
       pendingSends.delete(message.id);
       if (!currentGeneration(origin)) return;
+      agentStopped = false;
       if (payload.sent.end > readThrough) {
         waitingReplyEnd = Math.max(waitingReplyEnd, payload.sent.end);
         agentWaitingUntil = null;
@@ -627,10 +710,33 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       save();
     }
   }
+  async function stopAgent() {
+    if (!available || isReadOnly() || !chatFile || sending || stopping || tornDown) return;
+    const origin = generation;
+    stopRequestId ||= crypto.randomUUID();
+    stopping = true; resizeInput();
+    try {
+      const payload = await call("chat_ui_send", { ...requestDestination(), request_id:stopRequestId, message:"Stop the current agent turn.", stop_agent:true });
+      if (payload.stopped !== true) throw new Error("The stop request was not confirmed. Retry to check it.");
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      if (!currentGeneration(origin)) return;
+      agentStopped = true; lastAgentCall = null; agentWaitingUntil = null; agentPresenceUntil = null; stopRequestId = null;
+      status("Stop requested. The goal stays paused until you press Play.");
+      revision = null; void refresh();
+    } catch (error) {
+      if (currentGeneration(origin)) { status(error.message || "Could not request a stop. Try again.", true); workspaceMismatch(error); }
+    } finally {
+      if (currentGeneration(origin)) { stopping = false; updatePresence(); resizeInput(); input.focus(); }
+    }
+  }
+  send.addEventListener("click", event => {
+    if (send.dataset.mode === "stop") { event.preventDefault(); void stopAgent(); }
+  });
   el("composer").addEventListener("submit", event => {
     event.preventDefault();
-    if (!available || isReadOnly() || !chatFile || sending || !input.value.trim()) return;
-    const message = { id:crypto.randomUUID(), role:"user", markdown:input.value, pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
+    if (!available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
+    if (attachments?.blocked()) {status("Wait for uploads to finish, or remove failed attachments.",true,"action",false);return;}
+    const message = { id:crypto.randomUUID(), role:"user", markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
     input.value = ""; resizeInput(); void deliver(message); input.focus(); list.scrollTop = list.scrollHeight;
   });
   input.addEventListener("keydown", event => {
@@ -650,19 +756,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     catch (error) { if (currentGeneration(origin)) { status(error.message, true); workspaceMismatch(error); } }
     finally { if (currentGeneration(origin)) { loadingOlder = false; older.disabled = false; } }
   });
-  function setCollapsed() {
-    el("panel").hidden = collapsed;
-    el("collapse").setAttribute("aria-expanded", String(!collapsed));
-    el("collapse").setAttribute("aria-label", collapsed ? "Expand chat" : "Collapse chat");
-    el("collapse").title = collapsed ? "Expand chat" : "Collapse chat";
-    el("collapse").style.transform = collapsed ? "rotate(180deg)" : "";
-    save(); schedule(); size();
-  }
-  el("collapse").addEventListener("click", () => { collapsed = !collapsed; setCollapsed(); if (!collapsed) { render(); void refresh(); } });
   el("copy-chat").hidden = !canCopyChat;
   if (canCopyChat) el("copy-chat").addEventListener("click", () => { void copyWholeChat(); });
   el("refresh").addEventListener("click", () => { revision = null; void refresh(); });
   function teardown() {
+    attachments?.close();
+    clearCopyFeedback();
     tornDown = true; clearTimeout(pollTimer); clearTimeout(saveTimer); clearTimeout(presenceTimer); clearTimeout(messageClockTimer);
     for (const waiter of rpcPending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("Widget closed.")); }
     rpcPending.clear();
@@ -703,7 +802,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   const resize = typeof ResizeObserver === "function" ? new ResizeObserver(size) : null;
   intersection?.observe(el("chat"));
   resize?.observe(el("chat"));
-  theme(window.openai); setCollapsed(); render(); syncReadOnly(); updatePresence(); updateToolTotal();
+  theme(window.openai); save(); render(); syncReadOnly(); updatePresence(); updateToolTotal();
   if (!bridge) rpc("ui/initialize", { appInfo:{ name:"Codexify Markdown chat", version:"1" }, protocolVersion:"2026-01-26", appCapabilities:{} }, 5000)
     .then(result => { initialized = true; hostCapabilities = result?.hostCapabilities || {}; theme(result?.hostContext); post({ method:"ui/notifications/initialized", params:{} }); if (!chatFile) void refresh(); size(); })
     .catch(() => { if (!window.openai?.callTool) status("This host has not connected the chat widget.", true); });

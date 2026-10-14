@@ -9,6 +9,7 @@ import { startControlServer, type ControlServer } from "./control-server";
 import { ChromeSingleWindowSurface } from "./chrome-surface";
 import { privateChromeExecutable } from "./chrome-executable";
 import { PROTOCOL_VERSION, protocolBuild, validateProtocolBuild } from "./protocol";
+import {parseRequestBlockList} from "./request-block-list";
 
 if (process.platform === "darwin") app.setActivationPolicy("prohibited");
 
@@ -48,8 +49,9 @@ async function main(): Promise<void> {
     ? join(process.resourcesPath, "chrome")
     : resolve(import.meta.dirname, "../.browsers", `${process.platform}-${process.arch}`);
   const executablePath = await privateChromeExecutable(browserRoot);
-  surface = await ChromeSingleWindowSurface.create({ profilePath, executablePath });
-  const driver = new ChatGptBrowserDriver(surface, BUILD);
+  const requestBlockList=parseRequestBlockList(process.env.CODEXIFY_BROWSER_REQUEST_BLOCK_LIST);
+  surface = await ChromeSingleWindowSurface.create({ profilePath, executablePath, requestBlockList });
+  const driver = new ChatGptBrowserDriver(surface, BUILD,join(root,"connector-apps.json"));
   const coordinator = new SingleWindowCoordinator(driver, BUILD);
   server = await startControlServer(coordinator, descriptorPath);
   app.on("before-quit", event => {

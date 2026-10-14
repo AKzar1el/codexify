@@ -60,8 +60,8 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME !== "1")(
       const catalog = buildCapabilityCatalog(capabilities, "fixture-account");
       expect(catalog.models.map(model => [model.label, model.efforts.map(effort => [effort.label, effort.available])])).toEqual([
         ["GPT-6 Astra", [["Pro", true]]],
-        ["GPT-6 Sol", [["Instant", true], ["Deep", false]]],
-        ["GPT-5.5 Sol", [["Turbo", true], ["Instant", true], ["Balanced", false], ["Deep", true], ["Sustained", true], ["Pro", true]]],
+        ["GPT-6", [["Instant", true], ["Deep", false]]],
+        ["GPT-5.5", [["Turbo", true], ["Instant", true], ["Balanced", false], ["Deep", true], ["Sustained", true], ["Pro", true]]],
       ]);
       expect(await page.locator('[data-family="6"]').getAttribute("aria-checked")).toBe("true");
       expect(await page.locator('[role="slider"]').getAttribute("aria-valuenow")).toBe("2");

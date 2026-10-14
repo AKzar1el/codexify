@@ -89,6 +89,7 @@ impl Tool for GetAgentBrief {
                     }) =>
                 {
                     brief.push_str("\n\n## Active agent-chat goal\n\n- Call `goal_read` before goal work to obtain the exact current revision.\n- Continue using `chat_read`, `chat_write`, and `chat_await` for owner communication.\n- During each offline browser wake-up, evaluate the current goal in the same turn.\n- Call `goal_finish` only for the exact current revision when it is completed or genuinely blocked.\n- A blocked goal requires a concrete reason.\n- Do not request a separate turn merely to assess completion.\n- Do not treat an ordinary final answer as goal completion. A successful `goal_finish` receipt is the browser-driven turn's explicit terminal condition.\n");
+                    brief.push_str("- The read-only-tools and concurrent-work exceptions under Turn handoffs also authorize ending the turn; a turn handoff is not goal completion.\n");
                 }
                 Ok(_) => {}
                 Err(error) => {

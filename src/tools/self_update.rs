@@ -59,13 +59,13 @@ impl SelfUpdate {
             SelfUpdateStatus::Scheduled => {
                 if receipt.service_restart {
                     format!(
-                        "Codexify {} is verified and staged. Detached update {} will stop and restart the service after this response is delivered; the MCP connection will disconnect temporarily. Follow progress with `codexify service logs -f`. After Codexify restarts, open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh so ChatGPT reloads the connector tools.",
+                        "Codexify {} is verified and staged. Detached update {} will stop and restart the service after this response is delivered; the MCP connection will disconnect temporarily. Follow progress with `codexify service logs -f`. After server readiness returns, Codexify automatically refreshes the configured ChatGPT connector and selects Allow all tools through the signed-in browser companion. If that cannot complete, use Refresh connector in Codexify settings.",
                         receipt.target_version,
                         receipt.update_id.as_deref().unwrap_or("<unknown>")
                     )
                 } else {
                     format!(
-                        "Codexify {} is verified and staged. Detached update {} will replace the installed executable after this response is delivered. The current foreground process will continue running the previous version until it is restarted. After restarting Codexify, open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh so ChatGPT reloads the connector tools.",
+                        "Codexify {} is verified and staged. Detached update {} will replace the installed executable after this response is delivered. The current foreground process will continue running the previous version until it is restarted. After restarting Codexify, the signed-in browser companion automatically refreshes the configured ChatGPT connector and selects Allow all tools. If that cannot complete, use Refresh connector in Codexify settings.",
                         receipt.target_version,
                         receipt.update_id.as_deref().unwrap_or("<unknown>")
                     )
@@ -115,14 +115,14 @@ impl Tool for SelfUpdate {
     }
 
     fn description(&self) -> String {
-        "Update the installed Codexify executable to the latest verified GitHub release. Call only after the user explicitly requests an update and pass confirm=true. The release is downloaded, checksum-verified, extracted, and probed before a detached OS-managed worker is scheduled. The attached updater component receives checksum-bound changelog sections and monitors a durable status record across the expected MCP restart without adding the changelog to model-visible structured content. When Codexify is service-supervised, the worker runs outside the service kill boundary, waits for this tool response to be delivered, stops the service, atomically replaces the executable with rollback protection, starts the service again, and verifies server plus native-tunnel readiness before marking the durable update record successful. After a scheduled update, explicitly tell the user to open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh after Codexify restarts so ChatGPT reloads the connector tools.".to_string()
+        "Update the installed Codexify executable to the latest verified GitHub release. Call only after the user explicitly requests an update and pass confirm=true. The release is downloaded, checksum-verified, extracted, and probed before a detached OS-managed worker is scheduled. The attached updater component receives checksum-bound changelog sections and monitors a durable status record across the expected MCP restart without adding the changelog to model-visible structured content. When Codexify is service-supervised, the worker runs outside the service kill boundary, waits for this tool response to be delivered, stops the service, atomically replaces the executable with rollback protection, starts the service again, and verifies server plus native-tunnel readiness before marking the durable update record successful. After a scheduled update, report the expected service interruption. Once readiness returns, the signed-in browser companion automatically refreshes the configured ChatGPT connector and selects Allow all tools; an unavailable browser or unconfirmed refresh is reported in standalone settings for manual retry.".to_string()
     }
 
     fn describe(&self, config: &AppConfig) -> String {
         if config.ui_widgets {
             return self.description();
         }
-        "Update the installed Codexify executable to the latest verified GitHub release. Call only after the user explicitly requests an update and pass confirm=true. The release is downloaded, checksum-verified, extracted, and probed before a detached OS-managed worker is scheduled. With uiWidgets=false, no updater component or component-only changelog payload is emitted; progress remains available through `codexify service logs -f`. When Codexify is service-supervised, the worker runs outside the service kill boundary, waits for this tool response to be delivered, stops the service, atomically replaces the executable with rollback protection, starts the service again, and verifies server plus native-tunnel readiness before marking the durable update record successful. After a scheduled update, explicitly tell the user to open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh after Codexify restarts so ChatGPT reloads the connector tools."
+        "Update the installed Codexify executable to the latest verified GitHub release. Call only after the user explicitly requests an update and pass confirm=true. The release is downloaded, checksum-verified, extracted, and probed before a detached OS-managed worker is scheduled. With uiWidgets=false, no updater component or component-only changelog payload is emitted; progress remains available through `codexify service logs -f`. When Codexify is service-supervised, the worker runs outside the service kill boundary, waits for this tool response to be delivered, stops the service, atomically replaces the executable with rollback protection, starts the service again, and verifies server plus native-tunnel readiness before marking the durable update record successful. After a scheduled update, report the expected service interruption. Once readiness returns, the signed-in browser companion automatically refreshes the configured ChatGPT connector and selects Allow all tools; an unavailable browser or unconfirmed refresh is reported in standalone settings for manual retry."
             .to_string()
     }
 
@@ -181,7 +181,7 @@ mod tests {
         let tool = SelfUpdate;
         assert_eq!(tool.input_schema()["properties"]["confirm"]["const"], true);
         assert_eq!(tool.input_schema()["required"], json!(["confirm"]));
-        assert!(tool.description().contains("click Refresh"));
+        assert!(tool.description().contains("automatically refreshes"));
         let meta = tool.meta().expect("self_update must link its updater app");
         assert_eq!(
             meta.get("ui")
@@ -270,9 +270,11 @@ mod tests {
             Some("## [2.0.0]\n\n- New behavior.\n")
         );
         assert!(result.joined_text().contains("disconnect temporarily"));
-        assert!(result.joined_text().contains(
-            "open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh"
-        ));
+        assert!(
+            result
+                .joined_text()
+                .contains("automatically refreshes the configured ChatGPT connector")
+        );
 
         let without_widgets = SelfUpdate::result(receipt, false);
         assert!(without_widgets.meta.is_none());
@@ -289,6 +291,10 @@ mod tests {
             },
             true,
         );
-        assert!(foreground_result.joined_text().contains("click Refresh"));
+        assert!(
+            foreground_result
+                .joined_text()
+                .contains("automatically refreshes")
+        );
     }
 }

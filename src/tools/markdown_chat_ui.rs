@@ -27,6 +27,10 @@ struct FileArgs {
 struct SendArgs {
     request_id: String,
     message: String,
+    #[serde(default)]
+    stop_agent: bool,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
     expected_workspace: Option<String>,
     expected_chat_file: Option<String>,
 }
@@ -119,7 +123,9 @@ impl Tool for ChatUiTool {
         let mut schema = match self {
             Self::Send => json!({"type":"object", "properties":{
                 "request_id":{"type":"string", "pattern":"^[A-Za-z0-9_-]{1,80}$"},
-                "message":{"type":"string", "minLength":1, "writeOnly":true}
+                "stop_agent":{"type":"boolean", "description":"Request that the current turn stop on its next tool response, pause its goal, and show this agent offline. The message field is ignored for this action."},
+                "message":{"type":"string", "writeOnly":true},
+                "attachment_ids":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","pattern":"^[a-fA-F0-9]{32}$"}}
             }, "required":["request_id","message"], "additionalProperties":false}),
             Self::State => json!({"type":"object", "properties":{
                 "before":{"type":"integer", "minimum":0},
@@ -209,6 +215,8 @@ impl Tool for ChatUiTool {
                 let SendArgs {
                     request_id,
                     message,
+                    stop_agent,
+                    attachment_ids,
                     expected_workspace,
                     expected_chat_file,
                 } = match parse_tool_args(args) {
@@ -224,7 +232,41 @@ impl Tool for ChatUiTool {
                 ) {
                     return *error;
                 }
-                match chat.append_user(request_id, message).await {
+                if stop_agent {
+                    if request_id.is_empty()
+                        || request_id.len() > 80
+                        || !request_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                    {
+                        return ToolResult::error("Invalid agent stop request ID.");
+                    }
+                    if config.markdown_chat.automation.enabled {
+                        let Some(store) = context.agent_automation.as_ref() else {
+                            return ToolResult::error(
+                                "Agent automation state is unavailable; the turn was not stopped.",
+                            );
+                        };
+                        let Some(task) = context.task_conversation.as_ref() else {
+                            return ToolResult::error("Agent stop requires conversation context.");
+                        };
+                        if let Err(error) = store.pause_goal_for_agent_stop(
+                            task,
+                            &request_id,
+                            crate::markdown_chat::now_ms(),
+                        ) {
+                            return ToolResult::error(error);
+                        }
+                    }
+                    return match chat.request_agent_stop(request_id).await {
+                        Ok(()) => private_result(json!({"stopped":true})),
+                        Err(error) => ToolResult::error(error),
+                    };
+                }
+                match chat
+                    .append_user_with_attachments(request_id, message, attachment_ids)
+                    .await
+                {
                     Ok(receipt) => private_result(json!({"sent":receipt})),
                     Err(error) => ToolResult::error(error),
                 }

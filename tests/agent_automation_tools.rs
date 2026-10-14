@@ -90,15 +90,121 @@ fn payload(result: &codexify::types::ToolResult) -> &Value {
     result.structured_content.as_ref().unwrap()
 }
 
+#[tokio::test]
+#[ignore = "requires CODEXIFY_TEST_APPRISE_PYTHON; local notification receiver only"]
+async fn goal_finish_notifies_once_and_filters_blocked_and_completed_independently() {
+    use axum::{Router, routing::post};
+    let mut f = fixture("goal-notifications");
+    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new().route(
+        "/",
+        post(move |body: String| {
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(serde_json::from_str::<Value>(&body).unwrap())
+                    .unwrap();
+                axum::Json(json!({"id":"test","event":"message"}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    f.config.markdown_chat.notifications = Some(
+        serde_json::from_value(json!({
+            "urls":[format!("ntfy://{address}/test?image=no")],
+            "pythonPath":std::env::var("CODEXIFY_TEST_APPRISE_PYTHON").unwrap(),
+            "events":{"messages":false,"offline":false}
+        }))
+        .unwrap(),
+    );
+    f.automation = Arc::new(AgentAutomationStore::for_config(&f.config).unwrap());
+    f.context.agent_automation = Some(f.automation.clone());
+    let goal = f
+        .automation
+        .set_goal(&f.task, "Complete the task", 1)
+        .unwrap();
+    for (terminal, detail) in [
+        ("blocked", "Need a decision"),
+        ("completed", "Task finished"),
+    ] {
+        f.automation
+            .run_goal(&f.task, goal.revision, now_ms())
+            .unwrap();
+        let mut args = json!({"expectedRevision":goal.revision,"status":terminal});
+        args[if terminal == "blocked" {
+            "reason"
+        } else {
+            "summary"
+        }] = json!(detail);
+        let result = GoalTool::Finish
+            .call_with_context(args.clone(), &f.config, &f.session, &f.context)
+            .await;
+        assert!(!result.is_error, "{}", result.joined_text());
+        let alert = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(alert["message"].as_str().unwrap().contains(detail));
+        GoalTool::Finish
+            .call_with_context(args, &f.config, &f.session, &f.context)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            received.try_recv().is_err(),
+            "replayed goal_finish must not notify again"
+        );
+    }
+    let events = &mut f
+        .config
+        .markdown_chat
+        .notifications
+        .as_mut()
+        .unwrap()
+        .events;
+    events.goal_blocked = false;
+    events.completed = false;
+    f.context.agent_automation = Some(Arc::new(
+        AgentAutomationStore::for_config(&f.config).unwrap(),
+    ));
+    for terminal in ["blocked", "completed"] {
+        let goal = f
+            .automation
+            .set_goal(&f.task, "Another task", now_ms())
+            .unwrap();
+        f.automation
+            .run_goal(&f.task, goal.revision, now_ms())
+            .unwrap();
+        let mut args = json!({"expectedRevision":goal.revision,"status":terminal});
+        args[if terminal == "blocked" {
+            "reason"
+        } else {
+            "summary"
+        }] = json!("Filtered outcome");
+        let result = GoalTool::Finish
+            .call_with_context(args, &f.config, &f.session, &f.context)
+            .await;
+        assert!(!result.is_error, "{}", result.joined_text());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(received.try_recv().is_err());
+    server.abort();
+}
+
 #[test]
 fn tool_contracts_are_closed_bounded_and_classified() {
     let pair = AutomationVerifyPairing;
     let read = GoalTool::Read;
     let finish = GoalTool::Finish;
+    let set = GoalTool::Set;
+    let resume = GoalTool::Resume;
 
     assert!(!pair.behavior().read_only);
     assert!(read.behavior().read_only);
     assert!(!finish.behavior().read_only);
+    assert!(!set.behavior().read_only && set.behavior().idempotent);
+    assert!(!resume.behavior().read_only && resume.behavior().idempotent);
     assert_eq!(
         pair.input_schema()["properties"]["reference"]["minLength"],
         43
@@ -111,7 +217,7 @@ fn tool_contracts_are_closed_bounded_and_classified() {
         pair.input_schema()["properties"]["reference"]["writeOnly"],
         true
     );
-    for tool in [&pair as &dyn Tool, &read, &finish] {
+    for tool in [&pair as &dyn Tool, &read, &set, &resume, &finish] {
         assert_eq!(tool.input_schema()["additionalProperties"], false);
         let output = tool
             .output_schema()
@@ -131,6 +237,14 @@ async fn disabled_automation_returns_an_explicit_error_without_state_access() {
 
     for (tool, args) in [
         (&GoalTool::Read as &dyn Tool, json!({})),
+        (
+            &GoalTool::Set as &dyn Tool,
+            json!({"requestId":"set","expectedRevision":0,"markdown":"Goal"}),
+        ),
+        (
+            &GoalTool::Resume as &dyn Tool,
+            json!({"requestId":"resume","expectedRevision":1}),
+        ),
         (
             &GoalTool::Finish as &dyn Tool,
             json!({"expectedRevision":1,"status":"completed"}),
@@ -162,6 +276,14 @@ async fn automation_tools_require_physical_and_stable_task_identity() {
     for (tool, args) in [
         (&GoalTool::Read as &dyn Tool, json!({})),
         (
+            &GoalTool::Set as &dyn Tool,
+            json!({"requestId":"set","expectedRevision":0,"markdown":"Goal"}),
+        ),
+        (
+            &GoalTool::Resume as &dyn Tool,
+            json!({"requestId":"resume","expectedRevision":1}),
+        ),
+        (
             &GoalTool::Finish as &dyn Tool,
             json!({"expectedRevision":1,"status":"completed"}),
         ),
@@ -176,6 +298,274 @@ async fn automation_tools_require_physical_and_stable_task_identity() {
         assert!(result.is_error);
         assert!(result.joined_text().contains("stable ChatGPT conversation"));
     }
+}
+
+#[tokio::test]
+async fn goal_set_activates_updates_and_retries_without_chat_messages() {
+    let f = fixture("agent-goal-set");
+    let chat = f
+        .context
+        .markdown_chat
+        .chat(&f.config, Some(&f.task), &f.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    let original_chat = std::fs::read(chat.path()).unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    chat.request_agent_stop("stop-before-set".into())
+        .await
+        .unwrap();
+    let create = json!({"requestId":"create","expectedRevision":0,"markdown":"Initial goal"});
+    let result = GoalTool::Set
+        .call_with_context(create.clone(), &f.config, &f.session, &f.context)
+        .await;
+    assert!(!result.is_error, "{}", result.joined_text());
+    assert_eq!(payload(&result)["status"], "active");
+    assert_eq!(payload(&result)["revision"], 1);
+    assert_eq!(payload(&result)["terminal"], false);
+    assert!(!chat.agent_stop_requested().await.unwrap());
+    let before = f.automation.load(&f.task).unwrap().goal.unwrap();
+
+    let restarted = AgentAutomationStore::new(f._root.path().join("metadata/chats")).unwrap();
+    let mut context = f.context.clone();
+    context.agent_automation = Some(Arc::new(restarted));
+    let replay = GoalTool::Set
+        .call_with_context(create, &f.config, &f.session, &context)
+        .await;
+    assert!(!replay.is_error, "{}", replay.joined_text());
+    assert_eq!(payload(&replay)["revision"], 1);
+
+    let edit = json!({"requestId":"edit","expectedRevision":1,"markdown":"Updated goal"});
+    let edited = GoalTool::Set
+        .call_with_context(edit.clone(), &f.config, &f.session, &f.context)
+        .await;
+    assert!(!edited.is_error, "{}", edited.joined_text());
+    let after = f.automation.load(&f.task).unwrap().goal.unwrap();
+    assert_eq!(after.revision, 2);
+    assert_eq!(after.markdown, "Updated goal");
+    assert_eq!(after.status, GoalStatus::Active);
+    assert_eq!(after.created_at_ms, before.created_at_ms);
+    assert_eq!(after.elapsed_active_ms, before.elapsed_active_ms);
+    assert_eq!(after.turn_count, before.turn_count);
+
+    f.automation.stop_goal(&f.task, 2, now_ms()).unwrap();
+    chat.request_agent_stop("owner-stop-after-edit".into())
+        .await
+        .unwrap();
+    let paused = f.automation.load(&f.task).unwrap().goal.unwrap();
+    let replay = GoalTool::Set
+        .call_with_context(edit, &f.config, &f.session, &f.context)
+        .await;
+    assert!(!replay.is_error, "{}", replay.joined_text());
+    assert_eq!(
+        payload(&replay)["status"],
+        "configured",
+        "old retry must return current state"
+    );
+    assert_eq!(f.automation.load(&f.task).unwrap().goal.unwrap(), paused);
+    assert!(
+        chat.agent_stop_requested().await.unwrap(),
+        "old retry must not undo an owner stop"
+    );
+    assert_eq!(
+        std::fs::read(chat.path()).unwrap(),
+        original_chat,
+        "goal control must not fabricate user messages"
+    );
+}
+
+#[tokio::test]
+async fn goal_resume_preserves_paused_and_blocked_progress_and_refuses_completed() {
+    use codexify::agent_automation::{GoalFinish, OwnerGoalCommand};
+    let f = fixture("agent-goal-resume");
+    let chat = f
+        .context
+        .markdown_chat
+        .chat(&f.config, Some(&f.task), &f.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    f.automation
+        .apply_owner_goal_command(
+            &f.task,
+            "initial",
+            OwnerGoalCommand::Set {
+                markdown: "Keep this goal".into(),
+            },
+            1000,
+        )
+        .unwrap();
+    f.automation
+        .sync_goal_presence(&f.task, Some(1000), None, false, 1000)
+        .unwrap();
+    f.automation.stop_goal(&f.task, 1, 6000).unwrap();
+    let paused = f.automation.load(&f.task).unwrap().goal.unwrap();
+    assert_eq!(paused.elapsed_active_ms, 5000);
+    chat.request_agent_stop("pause".into()).await.unwrap();
+    let resume = json!({"requestId":"resume-paused","expectedRevision":1});
+    let result = GoalTool::Resume
+        .call_with_context(resume.clone(), &f.config, &f.session, &f.context)
+        .await;
+    assert!(!result.is_error, "{}", result.joined_text());
+    let active = f.automation.load(&f.task).unwrap().goal.unwrap();
+    assert_eq!(active.status, GoalStatus::Active);
+    assert_eq!(active.markdown, paused.markdown);
+    assert_eq!(active.revision, paused.revision);
+    assert_eq!(active.elapsed_active_ms, paused.elapsed_active_ms);
+    assert_eq!(active.turn_count, paused.turn_count);
+    assert!(!chat.agent_stop_requested().await.unwrap());
+    let replay = GoalTool::Resume
+        .call_with_context(resume, &f.config, &f.session, &f.context)
+        .await;
+    assert!(!replay.is_error);
+    assert_eq!(f.automation.load(&f.task).unwrap().goal.unwrap(), active);
+
+    f.automation
+        .finish_goal(
+            &f.task,
+            1,
+            GoalFinish::Blocked {
+                reason: "Need owner decision".into(),
+            },
+            now_ms(),
+        )
+        .unwrap();
+    let result = GoalTool::Resume
+        .call_with_context(
+            json!({"requestId":"resume-blocked","expectedRevision":1}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!result.is_error, "{}", result.joined_text());
+    assert_eq!(payload(&result)["status"], "active");
+    assert!(payload(&result)["blockedReason"].is_null());
+    assert_eq!(
+        f.automation
+            .load(&f.task)
+            .unwrap()
+            .goal
+            .unwrap()
+            .elapsed_active_ms,
+        5000
+    );
+    // A fresh operation on an active goal also preserves the current revision.
+    let result = GoalTool::Resume
+        .call_with_context(
+            json!({"requestId":"resume-active","expectedRevision":1}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!result.is_error);
+    assert_eq!(payload(&result)["revision"], 1);
+
+    f.automation
+        .finish_goal(
+            &f.task,
+            1,
+            GoalFinish::Completed { summary: None },
+            now_ms(),
+        )
+        .unwrap();
+    let result = GoalTool::Resume
+        .call_with_context(
+            json!({"requestId":"resume-completed","expectedRevision":1}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(result.is_error);
+    assert_eq!(
+        f.automation.load(&f.task).unwrap().goal.unwrap().status,
+        GoalStatus::Completed
+    );
+    let replacement = GoalTool::Set
+        .call_with_context(
+            json!({"requestId":"replace-completed","expectedRevision":1,"markdown":"New goal"}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!replacement.is_error, "{}", replacement.joined_text());
+    assert_eq!(payload(&replacement)["revision"], 2);
+    assert_eq!(payload(&replacement)["status"], "active");
+    assert_eq!(
+        f.automation
+            .load(&f.task)
+            .unwrap()
+            .goal
+            .unwrap()
+            .elapsed_active_ms,
+        0
+    );
+}
+
+#[tokio::test]
+async fn goal_control_rejects_stale_invalid_and_reused_requests_without_mutation() {
+    let f = fixture("agent-goal-validation");
+    let result = GoalTool::Set
+        .call_with_context(
+            json!({"requestId":"first","expectedRevision":0,"markdown":"Original"}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!result.is_error);
+    let original = f.automation.load(&f.task).unwrap();
+    for (tool, args) in [
+        (
+            GoalTool::Set,
+            json!({"requestId":"stale","expectedRevision":0,"markdown":"Wrong"}),
+        ),
+        (
+            GoalTool::Resume,
+            json!({"requestId":"stale-resume","expectedRevision":2}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"first","expectedRevision":1,"markdown":"Reused ID"}),
+        ),
+        (
+            GoalTool::Resume,
+            json!({"requestId":"first","expectedRevision":1}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"empty","expectedRevision":1,"markdown":" "}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"large","expectedRevision":1,"markdown":"a".repeat(10*1024+1)}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"","expectedRevision":1,"markdown":"Invalid ID"}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"bad\nID","expectedRevision":1,"markdown":"Invalid ID"}),
+        ),
+        (
+            GoalTool::Set,
+            json!({"requestId":"missing-revision","markdown":"No revision"}),
+        ),
+        (
+            GoalTool::Resume,
+            json!({"requestId":"unknown-field","expectedRevision":1,"markdown":"ignored?"}),
+        ),
+    ] {
+        let result = tool
+            .call_with_context(args, &f.config, &f.session, &f.context)
+            .await;
+        assert!(result.is_error, "{} unexpectedly succeeded", tool.name());
+        assert_eq!(f.automation.load(&f.task).unwrap(), original);
+    }
+    let other = ConversationIdentity::from_openai_session("other-goal").unwrap();
+    assert!(f.automation.load(&other).unwrap().goal.is_none());
 }
 
 #[tokio::test]
@@ -573,6 +963,11 @@ async fn active_goal_adds_browser_specific_guidance_to_the_agent_brief() {
     assert!(text.contains("## Active agent-chat goal"));
     assert!(text.contains("goal_read"));
     assert!(text.contains("goal_finish"));
+    assert!(text.contains("goal_set"));
+    assert!(text.contains("goal_resume"));
+    assert!(text.contains(codexify::instructions::COMMAND_REJECTION_INSTRUCTIONS));
+    assert!(text.contains(codexify::instructions::TURN_HANDOFF_INSTRUCTIONS));
+    assert!(text.contains("a turn handoff is not goal completion"));
     assert!(text.contains("exact current revision"));
     assert!(text.contains("concrete reason"));
     assert!(text.contains("Do not request a separate turn"));

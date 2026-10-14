@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Page } from "patchright";
 import {
-  assertCapabilityAccount,
   ChatGptBrowserDriver,
   type SingleBrowserSurface,
 } from "../src/chatgpt-driver";
@@ -34,14 +33,12 @@ test("browser infrastructure failures are unavailable rather than authentication
   });
 });
 
-test("a browser action refuses a capability cache from another account", () => {
-  expect(() => assertCapabilityAccount({ accountFingerprint:"account-one" }, "account-one"))
-    .not.toThrow();
-  expect(() => assertCapabilityAccount(undefined, "account-one")).toThrow(
-    "Refresh browser capabilities",
-  );
-  expect(() => assertCapabilityAccount({ accountFingerprint:"account-one" }, "account-two"))
-    .toThrow(
-    "ChatGPT account changed",
-  );
+
+test("a Chrome page closed during health inspection is unavailable rather than signed out",async()=>{
+  class ClosingSurface extends UnavailableSurface {
+    override async page():Promise<Page>{return {isClosed:()=>true,locator:()=>{throw new Error("Target closed");}} as unknown as Page;}
+  }
+  const driver=new ChatGptBrowserDriver(new ClosingSurface(),protocolBuild("test-build"));
+  const health=await driver.health();expect(health.status).toBe("unavailable");expect(health.authenticated).toBeFalse();
+  expect(health.detail).not.toContain("authentication");
 });

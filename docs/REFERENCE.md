@@ -1170,9 +1170,10 @@ resource support stays enabled for exported files and bridged resources.
 ## Experimental features
 
 The `experimental` section contains `agentTickets`,
-`forceReadOnlyToolAnnotations`, and `claudeSkills`; all default to `false`.
-Unknown experimental keys are rejected. Omitted or null flag values use the
-defaults (or the legacy fallback below); other non-boolean values are rejected.
+`forceReadOnlyToolAnnotations`, and `claudeSkills`, which default to `false`,
+plus the three optional tool annotation overrides below, which default to `null`.
+Unknown experimental keys are rejected. Omitted or null values use the defaults
+(or the legacy fallback below); other non-boolean values are rejected.
 
 `experimental.claudeSkills` enables automatic discovery of project/home
 `.claude/skills` directories and the installed Claude Code plugin registry.
@@ -1181,13 +1182,29 @@ Codex skill and plugin discovery does not require this flag. Explicit
 listed there. `skills.includePlugins` also applies to Claude plugin skills.
 
 `experimental.forceReadOnlyToolAnnotations` defaults to `false`. When enabled, every tool
-descriptor returned by `tools/list` declares `readOnlyHint: true`,
-`destructiveHint: false`, and `openWorldHint: false`. This is a testing-only
+descriptor returned by `tools/list` declares `readOnlyHint: true`. This is a testing-only
 schema override: it does not change tool implementations, dispatch,
 authorization, or side effects, and it preserves each tool's existing
-`idempotentHint` and other descriptor metadata. Ticketed model tools are separately
+`destructiveHint`, `idempotentHint`, `openWorldHint`, and other descriptor metadata.
+Ticketed model tools are separately
 marked non-idempotent. The former top-level `forceReadOnlyToolAnnotations` remains
 a compatibility fallback; an explicit nested value, including `false`, wins.
+
+The following overrides independently set the corresponding annotation on every
+advertised tool, including imported tools:
+
+| Experimental setting | Tool annotation |
+| --- | --- |
+| `forceDestructiveToolAnnotations` | `destructiveHint` |
+| `forceIdempotentToolAnnotations` | `idempotentHint` |
+| `forceOpenWorldToolAnnotations` | `openWorldHint` |
+
+Each accepts `true`, `false`, or `null`. Omitted or `null` preserves the existing
+hint; an explicit boolean replaces it. An explicit idempotent override also
+replaces the non-idempotent annotation normally advertised for ticketed tools.
+These are metadata overrides and do not change actual tool behavior. The settings
+GUI offers **Keep tool hints (default)**, **True**, and **False**, saves changes
+automatically, and requires a restart and connector tool refresh to apply them.
 
 ## Agent tickets
 
@@ -1802,14 +1819,52 @@ runtime:
 }
 ```
 
+The standalone **New chat** picker creates a corresponding ChatGPT conversation,
+attaches the selected workspace through a one-time task handoff, and verifies its
+pairing automatically. It uses the same project selection and worktree override
+rules as the setup widget, including scratch, Git/PR/branch/commit URLs, and saved
+worktrees. The picker discovers model and effort choices from a fresh ChatGPT
+chat at its destination before creation.
+
+Set optional `agentChat.automation.chatgptProjectUrl` to an HTTPS ChatGPT project
+URL ending in `/project` to place these chats inside that project. Omit it to
+create chats at the top level. Project URLs cannot contain credentials, query
+parameters, or fragments. The browser remains isolated from system Chrome.
+
 `agentChat.automation.enabled` requires `agentChat.enabled`. The descriptor path
 must be absolute or start with `~/`; the connector name is bounded visible text;
 `maxQueuedActions` accepts 1–1024; and `autoApproveToolCalls` defaults to `false`.
 The first release reuses agent chat's existing five-minute offline threshold and
 always uses one shared window rather than a configurable tab count.
 
-The three model-visible tools (`automation_verify_pairing`, `goal_read`, and
-`goal_finish`) and the `+agent-automation-v1` marker are advertised whenever
+`agentChat.automation.requestBlockList` is an optional array of case-sensitive
+RE2 regular expressions matched against complete browser request URLs. It defaults
+to `[]`. Matching requests are blocked by Chromium before transmission, including
+redirect destinations, frames, new tabs, and worker requests. Rules apply to all
+HTTP methods and resource types. Unsupported expressions prevent the companion
+from starting; patterns are never silently skipped. The list accepts up to 128
+patterns, each 1–4096 printable ASCII characters; Chromium additionally checks its
+regex syntax and compiled-memory limits. Non-ASCII URL characters must be matched
+in their URL-encoded or punycode form.
+
+For example, merge this into the existing `agentChat.automation` object:
+
+```json
+{
+  "requestBlockList": [
+    "^https?://(www\\.)?chatgpt\\.com/.*/rgstr",
+    "^https?://(www\\.)?chatgpt\\.com/backend-api/.*/conversations",
+    "^https?://(www\\.)?chatgpt\\.com/backend-api/conversations"
+  ]
+}
+```
+
+After changing the list, restart the browser companion with
+`codexify browser stop` followed by `codexify browser start`. The filter applies
+only to Codexify's dedicated browser, whose profile and sign-in are preserved.
+
+The five model-visible tools (`automation_verify_pairing`, `goal_read`, `goal_set`,
+`goal_resume`, and `goal_finish`) and the `+agent-automation-v2` marker are advertised whenever
 `agentChat.enabled` is true, independent of the local automation toggle. Therefore
 turning `agentChat.automation.enabled` on or off does not itself change the cached
 connector schema. Upgrading from a release that predates these tools still requires
@@ -1840,6 +1895,37 @@ The persistent profile, descriptor, install manifest, and runtime live under the
 private `~/.codexify/browser/` directory. The companion is a separate user-session
 process, so restarting the Codexify service does not intentionally stop it.
 
+Browser ownership covers actual UI work and ends after semantic Send acceptance
+and any required preference restoration. ChatGPT's Stop button and response
+lifetime do not hold the browser queue. Account and connector maintenance reuse
+the existing tab and restore its original URL, even while ChatGPT is responding.
+User drafts remain protected.
+
+Every browser UI operation has a **10-second deadline**. Timeout or cancellation
+aborts the operation, allows at most **2 seconds** for cleanup, and releases
+ownership. A driver that ignores cancellation is retired and its browser is
+closed, with a further **2-second** bound on shutdown, so late work cannot mutate
+a tab reused by another action. A possibly accepted Send remains ambiguous and
+is never automatically repeated. HTTP client disconnection also cancels pending
+UI work instead of leaving it holding the queue.
+
+Connector App IDs are cached locally by verified account and connector name.
+Refresh navigates directly to that connector's settings and identifies its
+controls using machine attributes and a validated card structure, without fixed
+translated button labels. Allow all is verified from the checked option in the
+four-choice permission group. Its summary is then remembered for that account
+and connector; matching the verified summary avoids a permissions visit. A
+different summary, including a UI language change, requires a new verification.
+Unknown identities are discovered once
+from an existing connector link or mention, with a separate bounded transaction
+as a fallback. The UI lease ends after clicking; observing this refresh's loading
+state for up to 60 seconds holds no browser ownership. Other actions can navigate
+normally during that wait. Maintenance restores the existing tab only if another
+action has not changed it; if it changed, refresh completion is left unconfirmed.
+Account identity is rechecked before tool refresh and permission changes. Updates
+record a pending refresh and perform it automatically after the replacement server
+becomes healthy.
+
 Pairing is explicit. In the standalone page, paste the exact ChatGPT conversation
 URL and choose **Pair**. Codexify stores it as an unverified candidate and queues a
 content-free verification message. The target conversation must call
@@ -1850,16 +1936,62 @@ does not create a replacement conversation, and does not transfer or retire task
 ownership. A later full task continuation invalidates the old pairing until the
 user verifies the new physical conversation.
 
-Online behavior is unchanged: ordinary messages remain unread in `CHAT.md` until
-the existing tool path returns or consumes them, and no browser action is queued.
-Once the same task is offline, a verified pairing can mirror a bounded batch of
-unread message Markdown, run an active goal, or combine both purposes in one
-prompt. The model is instructed to call `chat_read`, so browser mirroring itself
-does not acknowledge messages or advance the read cursor. New messages that arrive
-during generation wait for a later action.
+Pairing verification always uses a one-off **Medium** request. The companion reads the conversation's current model and effort, selects
+and verifies Medium before Send, then restores the original settings immediately
+after submission is confirmed. It does not wait for or monitor the verification
+response. The same override applies to new-chat initialization, after which the
+model and effort selected in Codexify's New chat picker are restored. Saved model
+and effort preferences are unchanged. If Medium cannot be verified or is locked,
+the request is not sent with a different effort. Cancellation and pre-Send failures
+also restore the original settings; settings changed externally are preserved.
 
-The standalone UI exposes model and effort choices from the companion's live,
-account-bound capability catalog. Before every physical Send, the companion
+Messages posted while the agent appears online remain pending in `CHAT.md` until
+a chat tool acknowledges them. Preparing an opportunistic tool response does not
+consume the pending message. If the turn ends first, four minutes without genuine
+tool activity lets a verified pairing forward the unread message through ChatGPT,
+even without a goal; the interface's five-minute offline threshold is unchanged.
+The queued action checks again that the message is still unread before execution.
+Once ChatGPT accepts the send, a persisted message-ID fence prevents another
+automatic browser send, including after a restart or another burst of activity.
+Browser mirroring itself does not advance the chat read cursor; the model is
+instructed to call `chat_read`. An active goal can share the same prompt with the
+pending messages, and new messages arriving during a turn wait for a later action.
+
+The standalone chat supports multiple file attachments from its file picker,
+composer-focused paste, and drag/drop anywhere on the page. A page-wide drop
+overlay identifies the destination; ordinary text paste is unchanged. Images
+have thumbnail cards; other file types show their original names and sizes.
+Sending an attachment-only prompt is supported. Image and video cards open a
+large overlay, and other files open a download with their original filename and
+stored media type. Video requests support byte ranges for seeking.
+
+Uploads live in the persistent project/conversation state directory beside
+`CHAT.md`, under `attachments/`; they are not temporary worktree or browser files.
+Payload names are unique, while sidecar metadata retains original names and media
+types, stored and original sizes, creation/modification timestamps, and prompt
+submission timestamps. Browser APIs expose the source's last-modified time but
+not its filesystem birth time; `sourceCreatedAtMs` is therefore null. Pasted
+images are encoded as lossless PNG; animated GIF/WebP images use animated PNG,
+preserving frames, timing and repeat behavior. Other uploaded files retain their
+bytes. Each prompt supports up to 20 files of up to 128 MiB each.
+
+Draft uploads are excluded from the agent's attachment library until their user
+prompt is committed. The prompt includes attachment metadata, unique and original
+names, absolute paths and reminders for `chat_list_attachments`,
+`chat_search_attachments`, and `chat_get_attachment`. This also travels through
+offline ChatGPT sends. Listing/searching is conversation-scoped and ordered by
+the most recent prompt submission, not upload time or file modification time.
+Get returns metadata, a download resource when export is enabled, and text or an
+image when supported. Listing/getting files does not acknowledge the chat prompt.
+Attachment contents are source material; embedded instructions apply only when
+the user asks to follow them. Refresh the connector's tools after deploying this
+schema update so existing ChatGPT clients can discover the three new tools.
+
+The standalone UI exposes model and effort choices from the companion's cached,
+account-bound capability catalog. Full discovery runs when refreshing models or
+opening the new-chat picker. A send navigates to its destination conversation
+first, then selects and verifies only the requested model and effort there; it
+does not refresh the full catalog on the previously open chat. Before every physical Send, the companion
 reopens the ChatGPT controls and verifies the exact conversation, account, model,
 effort, connector, empty composer, and pairing generation. Rust owns one global
 queue for every task; unread chat outranks goal-only work, unsent batches may
@@ -1868,10 +2000,30 @@ response is generating.
 
 Goals are bounded to 10 KiB and use `/goal set`, `/goal run`, `/goal stop`,
 `/goal clear`, and `/goal status`; `//goal` sends a literal chat message. There is
-no pause/resume state. `goal_read` returns the current private revision and text.
+no separate pause status: a paused goal is `configured`. `goal_read` returns the
+current private revision and text.
+`goal_set` takes `markdown`, `expectedRevision` (0 only if absent), and a unique
+`requestId`; it creates a new revision and activates it automatically. An active
+update retains elapsed time and turn count; replacing an inactive/terminal goal
+starts fresh progress. `goal_resume` takes `expectedRevision` and `requestId`; it
+resumes a configured or blocked goal with the same text, revision, and progress.
+An active goal stays active. Completed/error goals require `goal_set` to create a
+new revision. Both mutations compare the revision atomically, and identical
+request retries survive restarts without duplicating the operation or undoing a
+later owner pause/edit. Use a fresh ID for a new operation. These tools change
+goal state without inserting synthetic user messages in `CHAT.md`.
 Only `goal_finish` can mark that exact revision `completed` or `blocked`, and a
 blocked transition requires a concrete explanation. Goal evaluation is part of
 the same offline wake-up rather than a second judging prompt.
+
+The shared agent instructions require rejected vital commands to be diagnosed
+from the checker's reason and hardened in reviewable `safe-script-XXXX.sh`,
+`.py`, or `.js` files before resubmission through the same checker. Language
+changes must add clarity/checks rather than bypass a rejection. If substantive
+hardening cannot resolve the rejection, the agent must explain the command and
+reason with `chat_write` (`event: "input_required"`) and immediately `chat_await`,
+instead of marking the goal blocked for that rejection. Permission/policy
+boundaries remain in force.
 
 Stable visible browser status and answer Markdown are available only in the
 standalone page during an automated turn. At completion, `chat_write` output wins;
@@ -1879,6 +2031,14 @@ Codexify appends the stable browser final once only when no agent message was
 written after the action's transcript checkpoint. Status/commentary rows never
 become transcript messages, browser output does not make the agent appear online,
 and mirrored messages remain unread until the normal chat cursor advances.
+
+Confirmed pre-Send failures retry automatically after 30, 60, and 120 seconds.
+The attempt count survives service restarts; after three automatic retries, the
+chat waits for manual Retry. The failure banner exposes Retry even without a
+goal, and browser action errors appear as a red exclamation icon beside the
+sidebar title. Pending automatic retries stay quiet; exhausted retries produce
+one error notification per failure episode. Accepted or uncertain user messages,
+pairing requests, and cancelled actions are not replayed automatically.
 
 This is unofficial ChatGPT UI automation and deliberately fails closed. Selector
 drift, an inaccessible conversation, account changes, stale capabilities, a model
@@ -2158,6 +2318,14 @@ clock and ages the indicator locally even when history is unchanged or a poll
 fails. These labels describe recent tool activity, not a live connection or a
 guarantee that the agent is currently working.
 
+The sidebar shows a completed goal as a static green goal icon, rather than a
+pause icon. A later user message or deletion of the completed goal clears that
+completion badge. The sidebar then uses ordinary chat presence: an online
+spinner, an away indicator, or no icon while offline. Message history preserves
+this dismissal across reloads and read receipts. A newly set goal gets its own
+goal indicator. The goal bar retains its completed status until the goal is
+replaced or deleted.
+
 While `chat_await` is waiting for input, a filled red speech bubble replaces the normal
 presence icon in both the header and conversation list. The composer has a red
 outline and an explicit waiting hint above it; the ordinary grey "Message the
@@ -2169,7 +2337,7 @@ grace expires, the ordinary invocation-age rules above apply, rather than
 forcing online. Wait state is live and conversation-scoped, not persisted across
 server restarts. The UI also expires stale wait metadata locally if polling fails.
 
-When `agentChat.notifications` is configured, a server-side timer uses the same
+When `agentChat.notifications.events.offline` is enabled, a server-side timer uses the same
 5-minute threshold to attempt one offline alert for each period without an
 agent tool call. No alert is sent before the first call. A later agent call
 re-arms the alert; widget polling and user sends do not. The chat card can be
@@ -2223,8 +2391,8 @@ are detected. A 500 ms polling fallback handles unavailable watchers, with a
 2-second safety recheck even when native watching is available. The file is
 checked after watcher registration and once more at the deadline to avoid a
 missed wake-up. No background polling continues after the tool returns.
-The offline-alert timer is separate from `chat_await` and runs in the server
-when notifications are configured.
+The optional offline-alert timer is separate from `chat_await` and runs in the server
+when its notification category is enabled.
 
 The 55-second default is a configurable choice, **not a documented ChatGPT
 maximum**. A [first-hand report](https://community.openai.com/t/agentsdk-and-chatgpt-ui-fails-running-time-consuming-mcp-tool-with-typeerror-fetch-failed/1366562)
@@ -2252,6 +2420,58 @@ Set `agentChat.notifications.pythonPath` to that interpreter's absolute path.
 The default is `python3` on macOS/Linux and `python` on Windows. The interpreter
 runs in isolated mode, so user-site-only Python packages are not used. Codexify
 does not download packages or alter the Python installation at runtime.
+
+The optional `agentChat.notifications.events` object selects the categories to
+deliver. Each field defaults to `true` when omitted; old configurations retain
+their ordinary-message and offline alerts. Set unwanted categories to `false`.
+
+| Field | Alert |
+| --- | --- |
+| `messages` | Ordinary `chat_write` messages and progress updates. |
+| `completed` | A chat request explicitly reported complete with `chat_write` `event: "completed"`, or a goal completed through `goal_finish`. Offline inactivity alone is not completion. |
+| `inputRequired` | A question sent with `chat_write` `event: "input_required"`, a pending `chat_await`, or browser approval needed to continue. |
+| `goalBlocked` | An active goal marked blocked through `goal_finish`, including its reason. |
+| `errors` | A browser action cannot continue and has no automatic retry pending, such as a failed send, navigation, authentication, or ambiguous submission. |
+| `offline` | Five minutes without an agent tool call, independently of completion. |
+
+For completion and actionable alerts only:
+
+```json
+{
+  "agentChat": {
+    "notifications": {
+      "urls": ["ntfys://ntfy.example/your-topic?image=no"],
+      "pythonPath": "/absolute/path/to/notifications-venv/bin/python",
+      "events": {
+        "messages": false,
+        "completed": true,
+        "inputRequired": true,
+        "goalBlocked": true,
+        "errors": true,
+        "offline": false
+      }
+    }
+  }
+}
+```
+
+Restart the service after changing these settings. Filtering affects notification
+delivery only; all chat messages and goal state remain available in the interface.
+The optional `chat_write.event` defaults to `message`; `completed` and
+`input_required` classify the message without changing the turn or goal status.
+For a goal, use `goal_finish` for completion/blocking instead of duplicating that
+alert through a completed chat message.
+
+Input-alert claims are persisted before delivery and remain set until new user
+input is consumed. Repeated waits, timeout loops, additional progress messages,
+and server restarts do not resend the same pending input alert. An unread user
+reply or a stopped agent does not generate an input alert. Waiting after a
+completed chat report also does not generate an input alert. Goal alerts are
+deduplicated per terminal transition; resuming a blocked goal and hitting a new
+blocker can send a new alert. Identical chat errors stay one episode until the
+action recovers. A failed stop that is scheduled for an automatic retry does not
+send an error alert. Provider delivery failure does not resend the chat message
+or reset these claims.
 
 `notifications.urls` accepts 1 to 32 Apprise service URLs. For example:
 
@@ -2691,6 +2911,7 @@ For an upstream imported from Codex, the overlay alone is sufficient; an upstrea
 - `toolTimeoutSec` bounds the complete forwarded call, including queue and send time; the default is 60 seconds. Timeout/cancellation sends a bounded cancellation notification and reports upstream completion as unconfirmed.
 - `requestLimits` optionally configures one shared admission controller per upstream: `maxConcurrentRequests` (default 4), `maxPendingRequests` (16), `failureThreshold` (3), `recoveryDelayMs` (30000), and `slowCancellationMs` (60000). Full queues fail immediately. Repeated transport/deadline failures or prolonged unconfirmed cancellations pause new calls. After the pause, one newly requested recovery call is allowed; prior calls are never automatically retried.
 - Background protocol liveness probes run every 5 seconds with a 2-second bound. Any protocol response proves liveness, including an error when legacy ping is unsupported. Repeated missing responses mark the connection unresponsive and release active waits with completion-unconfirmed errors. A responding connection clears the pause. This does not kill shared upstream processes or database workers. `mcp_list_sources` and `/health` expose the cached state, active/queued counts, failures and retry delay.
+- Local stdio upstream diagnostics omit the SDK's routine `Processing request of type PingRequest` receipt. Health checks continue normally; other diagnostic output is forwarded.
 - `type` is inferred: `command` means `"stdio"`, while `url` means Streamable HTTP. Explicit HTTP aliases `"http"`, `"streamable-http"`, and `"streamable_http"` are accepted.
 - SSE and WebSocket transports are rejected; supported upstream transports are stdio and Streamable HTTP.
 

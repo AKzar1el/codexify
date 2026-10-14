@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2" as const;
+export const PROTOCOL_SCHEMA_HASH = "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -64,6 +64,10 @@ export function validateChatGptConversationUrl(value: string): string {
 export function canonicalChatGptConversationUrl(value: string): string {
   validateChatGptConversationUrl(value);
   const url = new URL(value);
+  // ChatGPT can rewrite or move the enclosing project/GPT route. The chat ID
+  // stays the same and identifies the paired conversation across those aliases.
+  const conversation = /^\/(?:g\/[^/]+\/)?c\/([^/]+)\/?$/.exec(url.pathname);
+  if (conversation) url.pathname = `/c/${conversation[1]}`;
   url.search = "";
   url.hash = "";
   return url.href;
@@ -105,6 +109,7 @@ export const unreadMessageSchema = z.strictObject({
 });
 
 export const actionPromptSchema = z.discriminatedUnion("kind", [
+  z.strictObject({kind:z.literal("create_chat"), continuationToken:companionTokenSchema, reference:companionTokenSchema, setupReference:boundedTextSchema(4096).nullable()}),
   z.strictObject({
     kind: z.literal("pair_verify"),
     reference: companionTokenSchema,
@@ -161,6 +166,9 @@ export function renderActionPrompt(raw: ActionPrompt): string {
   const prompt = actionPromptSchema.parse(raw);
   let rendered: string;
   switch (prompt.kind) {
+    case "create_chat":
+      rendered = `${prompt.setupReference ? `First call \`setup\` with ref \`${prompt.setupReference}\`.\n` : ""}Call \`continue_task\` with continuationToken \`${prompt.continuationToken}\` to attach this new conversation to the workspace already selected by the user. Then call \`automation_verify_pairing\` with the one-time reference \`${prompt.reference}\`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.`;
+      break;
     case "pair_verify":
       rendered = [
         "Verify that this ChatGPT conversation is paired with the intended Codexify task by",
@@ -188,12 +196,17 @@ export const executeActionRequestSchema = z.strictObject({
   url: chatGptUrlSchema,
   pairingGeneration: z.number().int().positive(),
   connectorName: boundedVisibleSchema(128),
-  model: opaqueIdSchema,
-  effort: opaqueIdSchema,
+  model: opaqueIdSchema.nullable(),
+  effort: opaqueIdSchema.nullable(),
+  expectedAccountFingerprint: opaqueIdSchema,
   prompt: actionPromptSchema,
   expectedUrl: chatGptUrlSchema,
   autoApproveToolCalls: z.boolean(),
 }).superRefine((value, context) => {
+  if ((value.model === null) !== (value.effort === null)
+    || (value.prompt.kind === "pair_verify" && value.model !== null)) {
+    context.addIssue({ code:"custom", message:"Model and effort must be supplied together; pairing does not change saved conversation settings" });
+  }
   try {
     renderActionPrompt(value.prompt);
   } catch (error) {
@@ -274,7 +287,7 @@ export type ActionSnapshot = z.infer<typeof actionSnapshotSchema>;
 
 export const ACTION_EVENT_TYPES = [
   "queued", "navigating", "composer_ready", "model_verified", "connector_verified",
-  "send_accepted", "status_delta", "commentary_delta", "answer_delta", "generation_complete",
+  "send_accepted", "status_delta", "commentary_delta", "answer_delta", "submission_complete", "generation_complete",
   "approval_required", "authentication_required", "rate_limited", "external_interference",
   "ambiguous_send", "failed",
 ] as const;
@@ -295,6 +308,7 @@ export const actionEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ ...eventBase, type:z.literal("status_delta"), text:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),
   z.strictObject({ ...eventBase, type:z.literal("commentary_delta"), markdown:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),
   z.strictObject({ ...eventBase, type:z.literal("answer_delta"), markdown:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),
+  z.strictObject({ ...eventBase, type:z.literal("submission_complete"), canonicalUrl:chatGptUrlSchema }),
   z.strictObject({ ...eventBase, type:z.literal("generation_complete"), finalMarkdown:boundedTextSchema(MAX_FINAL_ANSWER_BYTES).nullable(), canonicalUrl:chatGptUrlSchema.nullable() }),
   z.strictObject({ ...eventBase, type:z.literal("approval_required"), message:boundedTextSchema(MAX_DELTA_BYTES).nullable() }),
   z.strictObject({ ...eventBase, type:z.literal("authentication_required") }),

@@ -7,6 +7,8 @@ const PAGE_MESSAGES: usize = 50;
 const PAGE_BYTES: usize = 512 * 1024;
 const MAX_CLEAN_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
 
+pub const AGENT_STOP_MESSAGE: &str = "Write your current progress and status using chat_write if that tool is available, then immediately finish your turn without running any further tools. The user has stopped this turn and paused the goal; do not continue the goal unless the user explicitly resumes it.";
+
 #[derive(Debug, Serialize)]
 pub struct WidgetMessage {
     pub id: String,
@@ -16,6 +18,8 @@ pub struct WidgetMessage {
     pub end: u64,
     pub created_at_ms: Option<u64>,
     pub tool_call_count: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<super::super::attachments::Attachment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +29,8 @@ pub struct WidgetPage {
     pub delivered_through: u64,
     pub read_through: u64,
     pub last_agent_call_at_ms: Option<u64>,
+    pub agent_presence_until_ms: Option<u64>,
+    pub agent_stop_requested: bool,
     pub agent_waiting_until_ms: Option<u64>,
     pub total_tool_calls: u64,
     pub server_time_ms: u64,
@@ -46,11 +52,24 @@ pub struct UserSendReceipt {
 pub struct OwnerChatSummary {
     pub title: String,
     pub custom_title: Option<String>,
+    pub pinned_at_ms: Option<u64>,
+    pub archived_at_ms: Option<u64>,
     pub last_entry_end: u64,
     pub last_entry_at_ms: u64,
+    pub last_user_entry_end: u64,
+    pub last_user_entry_at_ms: Option<u64>,
     pub last_agent_call_at_ms: Option<u64>,
+    pub agent_presence_until_ms: Option<u64>,
+    pub agent_stop_requested: bool,
     pub agent_waiting_until_ms: Option<u64>,
     pub total_tool_calls: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerChatOrganization {
+    pub pinned_at_ms: Option<u64>,
+    pub archived_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +118,21 @@ struct Span {
     end: u64,
     created_at_ms: Option<u64>,
     tool_call_count: Option<u64>,
+}
+
+impl Span {
+    fn is_goal_update(&self) -> bool {
+        // Owner goal edits use this reserved ID with the SHA-256 of the request ID.
+        // Keep these control notices in CHAT.md for agent delivery, including old
+        // notices, but omit them from the displayed conversation. Do not match text.
+        self.role == "user"
+            && self.id.strip_prefix("goal-update-").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    }
 }
 
 fn valid_id(id: &str) -> bool {
@@ -235,7 +269,14 @@ fn spans(file: &mut File) -> Result<Vec<Span>, String> {
     Ok(result)
 }
 
-fn widget_message(file: &mut File, span: Span) -> Result<Option<WidgetMessage>, String> {
+fn widget_message(
+    file: &mut File,
+    span: Span,
+    store: &super::super::attachments::AttachmentStore,
+) -> Result<Option<WidgetMessage>, String> {
+    if span.is_goal_update() {
+        return Ok(None);
+    }
     let text = read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)?;
     let markdown = String::from_utf8(text).map_err(|_| "CHAT.md contains incomplete UTF-8")?;
     if markdown.trim().is_empty() {
@@ -245,11 +286,23 @@ fn widget_message(file: &mut File, span: Span) -> Result<Option<WidgetMessage>, 
         && markdown.starts_with("**Possible duplicate agent detected and blocked.**"))
         || (span.role == "warning"
             && markdown.trim() == "Duplicate agent detected. Its tool call was terminated.");
-    let (role, markdown) = if legacy_warning {
+    let (role, mut markdown) = if legacy_warning {
         ("warning", crate::agent_tickets::WARNING.to_string())
     } else {
         (span.role, markdown)
     };
+    let mut attachments = Vec::new();
+    if role == "user"
+        && let Some(plan) = store.message(&span.id)?
+        && plan.full_markdown == markdown
+    {
+        markdown = plan.text;
+        attachments = plan
+            .attachments
+            .iter()
+            .map(|a| store.observe(&a.id))
+            .collect::<Result<Vec<_>, _>>()?;
+    }
     Ok(Some(WidgetMessage {
         id: span.id,
         role: role.into(),
@@ -258,6 +311,7 @@ fn widget_message(file: &mut File, span: Span) -> Result<Option<WidgetMessage>, 
         end: span.end,
         created_at_ms: span.created_at_ms,
         tool_call_count: span.tool_call_count,
+        attachments,
     }))
 }
 
@@ -314,19 +368,50 @@ impl ChatFile {
                             .clone()
                             .unwrap_or_else(|| cached.title.clone()),
                         custom_title: cursor.custom_title.clone(),
+                        pinned_at_ms: cursor.pinned_at_ms,
+                        archived_at_ms: cursor.archived_at_ms,
                         last_entry_end: cached.last_entry_end,
                         last_entry_at_ms: cached.last_entry_at_ms,
-                        last_agent_call_at_ms: cursor.last_agent_call_at_ms,
-                        agent_waiting_until_ms: chat.agent_waiting_until_ms(),
+                        last_user_entry_end: cached.last_user_entry_end,
+                        last_user_entry_at_ms: cached.last_user_entry_at_ms,
+                        last_agent_call_at_ms: (!cursor.agent_stop_requested)
+                            .then_some(cursor.last_agent_call_at_ms)
+                            .flatten(),
+                        agent_stop_requested: cursor.agent_stop_requested,
+                        agent_waiting_until_ms: (!cursor.agent_stop_requested)
+                            .then(|| chat.agent_waiting_until_ms())
+                            .flatten(),
+                        agent_presence_until_ms: (!cursor.agent_stop_requested)
+                            .then_some(cursor.agent_presence_until_ms)
+                            .flatten(),
                         total_tool_calls: cursor.total_tool_calls,
                     });
                 }
-                let records = spans(file)?;
+                let records: Vec<_> = spans(file)?
+                    .into_iter()
+                    .filter(|span| !span.is_goal_update())
+                    .collect();
                 let title: String = records
                     .iter()
                     .rev()
                     .find(|span| matches!(span.role, "user" | "agent"))
                     .and_then(|span| {
+                        if span.role == "user"
+                            && let Ok(store) =
+                                super::super::attachments::AttachmentStore::for_chat(&chat.path)
+                            && let Ok(Some(plan)) = store.message(&span.id)
+                        {
+                            let title = if plan.text.trim().is_empty() {
+                                plan.attachments
+                                    .iter()
+                                    .map(|a| a.original_name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            } else {
+                                plan.text
+                            };
+                            return Some(title.into_bytes());
+                        }
                         read_range(
                             file,
                             span.body_start,
@@ -341,6 +426,7 @@ impl ChatFile {
                     .map(|text| text.chars().take(72).collect())
                     .unwrap_or_else(|| "Untitled conversation".into());
                 let last = records.last();
+                let last_user = records.iter().rev().find(|span| span.role == "user");
                 let modified_ms = modified
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -348,12 +434,30 @@ impl ChatFile {
                 let summary = OwnerChatSummary {
                     title: cursor.custom_title.clone().unwrap_or_else(|| title.clone()),
                     custom_title: cursor.custom_title.clone(),
+                    pinned_at_ms: cursor.pinned_at_ms,
+                    archived_at_ms: cursor.archived_at_ms,
                     last_entry_end: last.map_or(0, |span| span.end),
                     last_entry_at_ms: last
                         .and_then(|span| span.created_at_ms)
                         .unwrap_or(modified_ms),
-                    last_agent_call_at_ms: cursor.last_agent_call_at_ms,
-                    agent_waiting_until_ms: chat.agent_waiting_until_ms(),
+                    last_user_entry_end: last_user.map_or(0, |span| span.end),
+                    // Manual appends lack timestamps. Keep the last known user timestamp
+                    // so a legacy completed badge cannot reappear after such an append.
+                    last_user_entry_at_ms: records
+                        .iter()
+                        .rev()
+                        .filter(|span| span.role == "user")
+                        .find_map(|span| span.created_at_ms),
+                    last_agent_call_at_ms: (!cursor.agent_stop_requested)
+                        .then_some(cursor.last_agent_call_at_ms)
+                        .flatten(),
+                    agent_stop_requested: cursor.agent_stop_requested,
+                    agent_waiting_until_ms: (!cursor.agent_stop_requested)
+                        .then(|| chat.agent_waiting_until_ms())
+                        .flatten(),
+                    agent_presence_until_ms: (!cursor.agent_stop_requested)
+                        .then_some(cursor.agent_presence_until_ms)
+                        .flatten(),
                     total_tool_calls: cursor.total_tool_calls,
                 };
                 *cache = Some(OwnerSummaryCache {
@@ -362,6 +466,8 @@ impl ChatFile {
                     title,
                     last_entry_end: summary.last_entry_end,
                     last_entry_at_ms: summary.last_entry_at_ms,
+                    last_user_entry_end: summary.last_user_entry_end,
+                    last_user_entry_at_ms: summary.last_user_entry_at_ms,
                 });
                 Ok(summary)
             })
@@ -384,6 +490,34 @@ impl ChatFile {
                     sequence,
                 };
                 persist_agent_activity(chat, cursor, activity)
+            })
+        })
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn finish_pairing_verification(
+        self: &Arc<Self>,
+        epoch: &str,
+        sequence: u64,
+        verified_at_ms: u64,
+    ) -> Result<bool, String> {
+        let epoch = epoch.to_string();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                if cursor.agent_stop_requested
+                    || cursor.tool_call_epoch.as_deref() != Some(epoch.as_str())
+                    || cursor.tool_call_sequence != sequence
+                    || cursor.last_agent_call_at_ms.is_none()
+                {
+                    return Ok(false);
+                }
+                let mut next = cursor.clone();
+                next.agent_presence_until_ms =
+                    Some(verified_at_ms.saturating_add(super::super::PAIRING_PRESENCE_GRACE_MS));
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                Ok(true)
             })
         })
         .await
@@ -425,8 +559,16 @@ impl ChatFile {
                     revision,
                     delivered_through: cursor.delivered_through,
                     read_through: cursor.offset,
-                    last_agent_call_at_ms: cursor.last_agent_call_at_ms,
-                    agent_waiting_until_ms: chat.agent_waiting_until_ms(),
+                    last_agent_call_at_ms: (!cursor.agent_stop_requested)
+                        .then_some(cursor.last_agent_call_at_ms)
+                        .flatten(),
+                    agent_stop_requested: cursor.agent_stop_requested,
+                    agent_waiting_until_ms: (!cursor.agent_stop_requested)
+                        .then(|| chat.agent_waiting_until_ms())
+                        .flatten(),
+                    agent_presence_until_ms: (!cursor.agent_stop_requested)
+                        .then_some(cursor.agent_presence_until_ms)
+                        .flatten(),
                     total_tool_calls: cursor.total_tool_calls,
                     server_time_ms: super::super::now_ms(),
                     messages: Vec::new(),
@@ -445,6 +587,7 @@ impl ChatFile {
                 for span in records
                     .into_iter()
                     .rev()
+                    .filter(|span| !span.is_goal_update())
                     .filter(|span| before.is_none_or(|end| span.start < end))
                 {
                     if page.messages.len() >= PAGE_MESSAGES
@@ -453,7 +596,12 @@ impl ChatFile {
                         page.has_more = true;
                         break;
                     }
-                    let Some(message) = widget_message(file, span)? else {
+                    let Some(message) = widget_message(
+                        file,
+                        span,
+                        &super::super::attachments::AttachmentStore::for_chat(&chat.path)?,
+                    )?
+                    else {
                         continue;
                     };
                     bytes += message.markdown.len();
@@ -474,7 +622,12 @@ impl ChatFile {
                 let mut sections = Vec::new();
                 let mut total = 0usize;
                 for span in spans(file)? {
-                    let Some(message) = widget_message(file, span)? else {
+                    let Some(message) = widget_message(
+                        file,
+                        span,
+                        &super::super::attachments::AttachmentStore::for_chat(&chat.path)?,
+                    )?
+                    else {
                         continue;
                     };
                     let label = match message.role.as_str() {
@@ -483,7 +636,12 @@ impl ChatFile {
                         "warning" => "Warning",
                         _ => return Err("CHAT.md contains an unsupported message role".into()),
                     };
-                    let section = format!("## {label}\n\n{}", message.markdown);
+                    let files = message
+                        .attachments
+                        .iter()
+                        .map(|a| format!("\n\nAttachment: {} ({})", a.original_name, a.path))
+                        .collect::<String>();
+                    let section = format!("## {label}\n\n{}{files}", message.markdown);
                     total = total
                         .saturating_add(section.len())
                         .saturating_add(usize::from(!sections.is_empty()) * 2);
@@ -674,10 +832,20 @@ impl ChatFile {
         id: String,
         message: String,
     ) -> Result<UserSendReceipt, String> {
+        self.append_user_with_attachments(id, message, Vec::new())
+            .await
+    }
+
+    pub async fn append_user_with_attachments(
+        self: &Arc<Self>,
+        id: String,
+        message: String,
+        attachment_ids: Vec<String>,
+    ) -> Result<UserSendReceipt, String> {
         if !valid_id(&id) {
             return Err("Invalid chat message request ID.".into());
         }
-        if message.trim().is_empty() {
+        if message.trim().is_empty() && attachment_ids.is_empty() {
             return Err("User message must not be blank.".into());
         }
         if message.len() > MAX_UNREAD_BYTES {
@@ -687,6 +855,13 @@ impl ChatFile {
         }
         self.run(move |chat| chat.with_cursor(|cursor, file| {
             check_cursor(file, cursor)?;
+            let created_at_ms = super::super::now_ms();
+            let message = if attachment_ids.is_empty() {message} else {
+                let committed = spans(file)?.into_iter().filter(|s| s.role=="user").map(|s|s.id).collect();
+                super::super::attachments::AttachmentStore::for_chat(&chat.path)?
+                    .prepare_message(&id,&message,&attachment_ids,&committed,created_at_ms)?.full_markdown
+            };
+            if message.len()>MAX_UNREAD_BYTES {return Err("Message and attachment metadata exceed the chat size limit".into());}
             for span in spans(file)? {
                 if span.role == "user" && span.id == id {
                     if read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)? != message.as_bytes() {
@@ -696,7 +871,6 @@ impl ChatFile {
                     return Ok(UserSendReceipt { id, end: span.end, created_at_ms: span.created_at_ms, tool_call_count: span.tool_call_count });
                 }
             }
-            let created_at_ms = super::super::now_ms();
             let tool_call_count = cursor.total_tool_calls;
             let block = format!("{USER_START}{id}\" created_at_ms=\"{created_at_ms}\" tool_call_count=\"{tool_call_count}\" -->\n\n## User\n\n{message}\n\n<!-- codexify-user-message:v1:end id=\"{id}\" -->\n");
             file.write_all(block.as_bytes()).map_err(io_error)?;
@@ -706,9 +880,146 @@ impl ChatFile {
                 .and_then(|handle| same_file::Handle::from_path(&chat.path).map(|current| current == handle))
                 .map_err(io_error)?;
             if !same { return Err("CHAT.md changed during send; reload and retry with the same request ID.".into()); }
+            resume_agent(chat, cursor)?;
             chat.clear_agent_waiting();
             Ok(UserSendReceipt { id, end, created_at_ms: Some(created_at_ms), tool_call_count: Some(tool_call_count) })
         })).await
+    }
+
+    pub async fn list_attachments(
+        self: &Arc<Self>,
+    ) -> Result<Vec<super::super::attachments::Attachment>, String> {
+        self.run(|chat| {
+            chat.with_cursor(|_, file| {
+                let store = super::super::attachments::AttachmentStore::for_chat(&chat.path)?;
+                let mut result = Vec::new();
+                for span in spans(file)?.into_iter().filter(|s| s.role == "user") {
+                    if let Some(plan) = store.message(&span.id)? {
+                        let body =
+                            read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)?;
+                        if body != plan.full_markdown.as_bytes() {
+                            continue;
+                        }
+                        for a in plan.attachments {
+                            let current = store.observe(&a.id)?;
+                            if current.message_id.as_deref() == Some(span.id.as_str()) {
+                                result.push(current);
+                            }
+                        }
+                    }
+                }
+                result.sort_by(|a, b| {
+                    b.submitted_at_ms
+                        .cmp(&a.submitted_at_ms)
+                        .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+                Ok(result)
+            })
+        })
+        .await
+    }
+
+    pub async fn get_attachment(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<super::super::attachments::Attachment, String> {
+        self.list_attachments()
+            .await?
+            .into_iter()
+            .find(|a| a.id == id || a.unique_name == id)
+            .ok_or_else(|| "Submitted attachment not found in this conversation".into())
+    }
+    pub async fn uploaded_attachment(
+        self: &Arc<Self>,
+        id: String,
+    ) -> Result<super::super::attachments::Attachment, String> {
+        self.run(move |chat| {
+            chat.with_cursor(|_, _| {
+                super::super::attachments::AttachmentStore::for_chat(&chat.path)?.observe(&id)
+            })
+        })
+        .await
+    }
+
+    pub async fn set_owner_organization(
+        self: &Arc<Self>,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<OwnerChatOrganization, String> {
+        if pinned.is_some() == archived.is_some() {
+            return Err("Change either pinning or archiving, one at a time.".into());
+        }
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                let mut next = cursor.clone();
+                if let Some(pinned) = pinned {
+                    if pinned && next.archived_at_ms.is_some() {
+                        return Err("Restore the archived chat before pinning it.".into());
+                    }
+                    next.pinned_at_ms = if pinned {
+                        Some(next.pinned_at_ms.unwrap_or_else(super::super::now_ms))
+                    } else {
+                        None
+                    };
+                }
+                if let Some(archived) = archived {
+                    next.archived_at_ms = if archived {
+                        Some(next.archived_at_ms.unwrap_or_else(super::super::now_ms))
+                    } else {
+                        None
+                    };
+                    if archived {
+                        next.pinned_at_ms = None;
+                    }
+                }
+                if next.pinned_at_ms != cursor.pinned_at_ms
+                    || next.archived_at_ms != cursor.archived_at_ms
+                {
+                    chat.save_cursor(&next)?;
+                    *cursor = next;
+                }
+                Ok(OwnerChatOrganization {
+                    pinned_at_ms: cursor.pinned_at_ms,
+                    archived_at_ms: cursor.archived_at_ms,
+                })
+            })
+        })
+        .await
+    }
+
+    pub async fn request_agent_stop(self: &Arc<Self>, request_id: String) -> Result<(), String> {
+        if !valid_id(&request_id) {
+            return Err("Invalid agent stop request ID.".into());
+        }
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, _| {
+                if cursor.agent_stop_requests.contains(&request_id) {
+                    return Ok(());
+                }
+                let mut next = cursor.clone();
+                next.agent_stop_requested = true;
+                next.agent_stop_requests.push(request_id);
+                if next.agent_stop_requests.len() > 32 {
+                    next.agent_stop_requests.remove(0);
+                }
+                chat.save_cursor(&next)?;
+                *cursor = next;
+                chat.clear_agent_waiting();
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    pub async fn agent_stop_requested(self: &Arc<Self>) -> Result<bool, String> {
+        self.run(|chat| chat.with_cursor(|cursor, _| Ok(cursor.agent_stop_requested)))
+            .await
+    }
+
+    pub async fn resume_agent(self: &Arc<Self>) -> Result<(), String> {
+        self.run(|chat| chat.with_cursor(|cursor, _| resume_agent(chat, cursor)))
+            .await
     }
 
     pub async fn mark_delivered(self: &Arc<Self>, end: u64) -> Result<(), String> {
@@ -731,17 +1042,24 @@ impl ChatFile {
     }
 }
 
+fn resume_agent(chat: &ChatFile, cursor: &mut Cursor) -> Result<(), String> {
+    if cursor.agent_stop_requested {
+        let mut next = cursor.clone();
+        next.agent_stop_requested = false;
+        next.last_agent_call_at_ms = None;
+        next.agent_presence_until_ms = None;
+        chat.save_cursor(&next)?;
+        *cursor = next;
+    }
+    Ok(())
+}
+
 fn persist_agent_activity(
     chat: &ChatFile,
     cursor: &mut Cursor,
     activity: super::super::AgentActivity,
 ) -> Result<(), String> {
     let mut next = cursor.clone();
-    next.last_agent_call_at_ms = Some(
-        next.last_agent_call_at_ms
-            .unwrap_or_default()
-            .max(activity.at_ms),
-    );
     let sequence_delta = if next.tool_call_epoch.as_deref() == Some(activity.epoch.as_str()) {
         activity.sequence.saturating_sub(next.tool_call_sequence)
     } else {
@@ -751,8 +1069,14 @@ fn persist_agent_activity(
     if next.tool_call_epoch.as_deref() != Some(activity.epoch.as_str())
         || activity.sequence > next.tool_call_sequence
     {
+        next.last_agent_call_at_ms = Some(
+            next.last_agent_call_at_ms
+                .unwrap_or_default()
+                .max(activity.at_ms),
+        );
         next.tool_call_epoch = Some(activity.epoch);
         next.tool_call_sequence = activity.sequence;
+        next.agent_presence_until_ms = None;
     }
     if next.last_agent_call_at_ms != cursor.last_agent_call_at_ms
         || next.total_tool_calls != cursor.total_tool_calls
@@ -811,6 +1135,80 @@ pub(super) fn user_text(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pairing_presence_lease_survives_reopen_and_expires_without_waiting_five_minutes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("chats/pair/CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.record_agent_call(1000).await.unwrap();
+        assert!(
+            chat.finish_pairing_verification("direct", 1, 1000)
+                .await
+                .unwrap()
+        );
+        let reopened = Arc::new(ChatFile::new(path, true));
+        let activity = reopened.offline_activity().await.unwrap();
+        assert!(activity.is_online(5999, super::super::super::AUTOMATION_OFFLINE_AFTER_MS));
+        assert!(!activity.is_online(6000, super::super::super::AUTOMATION_OFFLINE_AFTER_MS));
+        assert!(activity.last_call_for_presence(6000).is_none());
+        let summary = reopened.owner_summary().await.unwrap();
+        assert_eq!(summary.last_agent_call_at_ms, Some(1000));
+        assert_eq!(summary.agent_presence_until_ms, Some(6000));
+        assert_eq!(summary.total_tool_calls, 1);
+        assert!(
+            !reopened
+                .claim_offline_automation_goal(5999, 240000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .claim_offline_automation_goal(6000, 240000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .claim_offline_automation_goal(6001, 240000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .claim_offline_notification(6000, 300000)
+                .await
+                .unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn normal_activity_cancels_pairing_expiry_and_a_late_verification_cannot_replace_it() {
+        let root = tempfile::tempdir().unwrap();
+        let chat = Arc::new(ChatFile::new(root.path().join("chats/pair/CHAT.md"), true));
+        chat.record_agent_call(1000).await.unwrap();
+        assert!(
+            chat.finish_pairing_verification("direct", 1, 1000)
+                .await
+                .unwrap()
+        );
+        // Same-millisecond calls still have distinct activity sequences.
+        chat.record_agent_call(1000).await.unwrap();
+        assert!(
+            !chat
+                .finish_pairing_verification("direct", 1, 1000)
+                .await
+                .unwrap()
+        );
+        let summary = chat.owner_summary().await.unwrap();
+        assert!(summary.agent_presence_until_ms.is_none());
+        assert_eq!(summary.total_tool_calls, 2);
+        assert!(
+            chat.offline_activity()
+                .await
+                .unwrap()
+                .is_online(6000, 240000)
+        );
+    }
 
     fn activity(epoch: &str, sequence: u64, at_ms: u64) -> super::super::super::AgentActivity {
         super::super::super::AgentActivity {
@@ -916,6 +1314,191 @@ mod tests {
         chat.ensure().await.unwrap();
 
         assert_eq!(chat.clean_markdown_transcript().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn owner_pin_and_archive_are_durable_and_leave_agent_state_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append_user("pending-user".into(), "Keep working".into())
+            .await
+            .unwrap();
+        chat.record_agent_call(1000).await.unwrap();
+        let transcript = std::fs::read(&path).unwrap();
+        let unread = chat.unread_snapshot().await.unwrap();
+        let before = chat.owner_summary().await.unwrap();
+        let pin = chat.set_owner_organization(Some(true), None).await.unwrap();
+        assert!(pin.pinned_at_ms.is_some());
+        assert!(pin.archived_at_ms.is_none());
+        assert_eq!(
+            chat.set_owner_organization(Some(true), None)
+                .await
+                .unwrap()
+                .pinned_at_ms,
+            pin.pinned_at_ms
+        );
+        assert_eq!(
+            chat.owner_summary().await.unwrap().pinned_at_ms,
+            pin.pinned_at_ms,
+            "cached summaries include changed organization"
+        );
+        let archived = chat.set_owner_organization(None, Some(true)).await.unwrap();
+        assert!(archived.pinned_at_ms.is_none());
+        assert!(archived.archived_at_ms.is_some());
+        assert_eq!(
+            chat.set_owner_organization(None, Some(true))
+                .await
+                .unwrap()
+                .archived_at_ms,
+            archived.archived_at_ms
+        );
+        assert!(chat.set_owner_organization(Some(true), None).await.is_err());
+        assert!(
+            chat.set_owner_organization(Some(true), Some(true))
+                .await
+                .is_err()
+        );
+        assert!(chat.set_owner_organization(None, None).await.is_err());
+        let reopened = Arc::new(ChatFile::new(path.clone(), true));
+        let after = reopened.owner_summary().await.unwrap();
+        assert_eq!(after.archived_at_ms, archived.archived_at_ms);
+        assert!(after.pinned_at_ms.is_none());
+        assert_eq!(after.last_agent_call_at_ms, before.last_agent_call_at_ms);
+        assert_eq!(after.total_tool_calls, before.total_tool_calls);
+        assert_eq!(after.last_entry_end, before.last_entry_end);
+        assert_eq!(reopened.unread_snapshot().await.unwrap(), unread);
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        let restored = reopened
+            .set_owner_organization(None, Some(false))
+            .await
+            .unwrap();
+        assert!(restored.pinned_at_ms.is_none());
+        assert!(restored.archived_at_ms.is_none());
+        reopened
+            .set_owner_organization(Some(true), None)
+            .await
+            .unwrap();
+        reopened
+            .set_owner_organization(Some(false), None)
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .owner_summary()
+                .await
+                .unwrap()
+                .pinned_at_ms
+                .is_none()
+        );
+        assert_eq!(reopened.unread_snapshot().await.unwrap(), unread);
+    }
+
+    #[tokio::test]
+    async fn goal_update_notices_are_hidden_without_rewriting_or_consuming_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append_user("actual-user-message".into(), "Keep working".into())
+            .await
+            .unwrap();
+        let before = chat.owner_summary().await.unwrap();
+        let notice = "The goal has changed (revision 2). The new goal is:\n\nUpdated goal.\n\nCall `goal_read` for the current revision and continue toward the updated goal.";
+        let notice_id = format!("goal-update-{:064x}", 1);
+        let receipt = chat
+            .append_user(notice_id.clone(), notice.into())
+            .await
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        // Existing notices are hidden on reopen without changing CHAT.md or its cursor.
+        let reopened = Arc::new(ChatFile::new(path.clone(), true));
+        let page = reopened.widget_page(None, None).await.unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].id, "actual-user-message");
+        let summary = reopened.owner_summary().await.unwrap();
+        assert_eq!(summary.title, before.title);
+        assert_eq!(summary.last_entry_end, before.last_entry_end);
+        assert_eq!(summary.last_entry_at_ms, before.last_entry_at_ms);
+        assert_eq!(summary.last_user_entry_end, before.last_user_entry_end);
+        assert_eq!(summary.last_user_entry_at_ms, before.last_user_entry_at_ms);
+        assert_eq!(
+            reopened.clean_markdown_transcript().await.unwrap(),
+            "## You\n\nKeep working"
+        );
+        let pending = reopened.unread_snapshot().await.unwrap();
+        assert_eq!(pending.messages.len(), 2);
+        assert_eq!(pending.messages[1].id, notice_id);
+        assert_eq!(pending.messages[1].markdown, notice);
+        assert_eq!(pending.messages[1].end, receipt.end);
+        assert_eq!(page.read_through, pending.read_through);
+        assert!(reopened.read(false).await.unwrap().text.contains(notice));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        // A user can type the exact same text. Similar IDs are also ordinary messages.
+        reopened
+            .append_user("goal-update-user-text".into(), notice.into())
+            .await
+            .unwrap();
+        let visible = reopened.widget_page(None, None).await.unwrap();
+        assert_eq!(visible.messages.len(), 2);
+        assert_eq!(visible.messages[1].markdown, notice);
+        assert!(
+            reopened
+                .clean_markdown_transcript()
+                .await
+                .unwrap()
+                .contains(notice)
+        );
+        reopened.read(true).await.unwrap();
+        assert!(
+            reopened
+                .unread_snapshot()
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_update_notices_do_not_take_up_history_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let chat = Arc::new(ChatFile::new(directory.path().join("CHAT.md"), true));
+        chat.append_user(format!("goal-update-{:064x}", 1), "Old goal update".into())
+            .await
+            .unwrap();
+        let only_notice = chat.widget_page(None, None).await.unwrap();
+        assert!(only_notice.messages.is_empty());
+        assert!(!only_notice.has_more);
+        assert_eq!(
+            chat.owner_summary().await.unwrap().title,
+            "Untitled conversation"
+        );
+        for number in 0..50 {
+            chat.append(format!("Reply {number}")).await.unwrap();
+            chat.append_user(
+                format!("goal-update-{:064x}", number + 2),
+                "Updated goal".into(),
+            )
+            .await
+            .unwrap();
+        }
+        let page = chat.widget_page(None, None).await.unwrap();
+        assert_eq!(page.messages.len(), 50);
+        assert!(
+            !page.has_more,
+            "hidden notices must not create an empty older page"
+        );
+        chat.append("Reply 50".into()).await.unwrap();
+        let latest = chat.widget_page(None, None).await.unwrap();
+        assert_eq!(latest.messages.len(), 50);
+        assert_eq!(latest.messages.first().unwrap().markdown, "Reply 1");
+        assert!(latest.has_more);
+        let older = chat.widget_page(latest.before, None).await.unwrap();
+        assert_eq!(older.messages.len(), 1);
+        assert_eq!(older.messages[0].markdown, "Reply 0");
+        assert!(!older.has_more);
     }
 
     #[tokio::test]

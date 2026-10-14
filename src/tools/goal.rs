@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agent_automation::{GoalFinish, GoalRecord, GoalStatus, MAX_GOAL_BYTES};
+use crate::agent_automation::{
+    GoalFinish, GoalRecord, GoalStatus, MAX_GOAL_BYTES, OwnerGoalCommand,
+};
 use crate::exec_sessions::SessionState;
 use crate::tool::{Tool, ToolBehavior, ToolRequestContext, empty_object_schema, parse_tool_args};
 use crate::types::{AppConfig, ToolResult};
@@ -12,7 +14,24 @@ const MAX_GOAL_RESULT_BYTES: usize = 4096;
 #[derive(Clone, Copy)]
 pub enum GoalTool {
     Read,
+    Set,
+    Resume,
     Finish,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SetArgs {
+    request_id: String,
+    expected_revision: u64,
+    markdown: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ResumeArgs {
+    request_id: String,
+    expected_revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +55,8 @@ impl Tool for GoalTool {
     fn name(&self) -> &'static str {
         match self {
             Self::Read => "goal_read",
+            Self::Set => "goal_set",
+            Self::Resume => "goal_resume",
             Self::Finish => "goal_finish",
         }
     }
@@ -43,6 +64,8 @@ impl Tool for GoalTool {
     fn title(&self) -> String {
         match self {
             Self::Read => "Read agent-chat goal",
+            Self::Set => "Set and start agent-chat goal",
+            Self::Resume => "Resume agent-chat goal",
             Self::Finish => "Finish agent-chat goal",
         }
         .into()
@@ -52,6 +75,12 @@ impl Tool for GoalTool {
         match self {
             Self::Read => {
                 "Read the current standalone agent-chat automation goal, revision, and status without changing it."
+            }
+            Self::Set => {
+                "Create or update this standalone agent-chat goal and activate it immediately. Read goal_read first; pass expectedRevision=0 only when no goal exists, otherwise its current revision. Updating an active goal retains its elapsed time and turn count. Use a fresh requestId for each operation and reuse it only to retry identical arguments."
+            }
+            Self::Resume => {
+                "Resume the exact current paused or blocked standalone agent-chat goal without changing its text, revision, elapsed time, or turn count. An already active goal remains active. A completed goal requires goal_set to create a new revision. Use a fresh requestId for each operation and reuse it only to retry identical arguments."
             }
             Self::Finish => {
                 "Mark the exact current standalone agent-chat goal revision completed or blocked. A blocked goal requires a concrete reason; an ordinary final answer does not finish a goal."
@@ -76,12 +105,53 @@ impl Tool for GoalTool {
                 false,
                 "Changes only private task goal state and is idempotent for the same terminal receipt.",
             ),
+            Self::Set | Self::Resume => ToolBehavior::new(
+                false,
+                false,
+                true,
+                false,
+                "Activates private task goal state with an atomic revision check and durable request deduplication.",
+            ),
         }
     }
 
     fn input_schema(&self) -> Value {
         match self {
             Self::Read => empty_object_schema(),
+            Self::Set | Self::Resume => {
+                let mut schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "requestId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512,
+                            "description": "Unique operation identifier (for example a UUID). Reuse only for an identical retry.",
+                            "writeOnly": true
+                        },
+                        "expectedRevision": {
+                            "type": "integer",
+                            "minimum": if matches!(self, Self::Set) { 0 } else { 1 },
+                            "description": "Revision returned by goal_read; goal_set uses 0 if the goal is absent."
+                        }
+                    },
+                    "required": ["requestId", "expectedRevision"],
+                    "additionalProperties": false
+                });
+                if matches!(self, Self::Set) {
+                    schema["properties"]["markdown"] = json!({
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_GOAL_BYTES,
+                        "writeOnly": true
+                    });
+                    schema["required"]
+                        .as_array_mut()
+                        .expect("array")
+                        .push(json!("markdown"));
+                }
+                schema
+            }
             Self::Finish => json!({
                 "type": "object",
                 "properties": {
@@ -186,6 +256,75 @@ impl Tool for GoalTool {
                 Ok(state) => goal_result(state.goal.as_ref(), false),
                 Err(error) => ToolResult::error(error),
             },
+            Self::Set | Self::Resume => {
+                let (request_id, revision, command) = if matches!(self, Self::Set) {
+                    let args = match parse_tool_args::<SetArgs>(args) {
+                        Ok(args) => args,
+                        Err(error) => return *error,
+                    };
+                    (
+                        args.request_id,
+                        args.expected_revision,
+                        OwnerGoalCommand::Set {
+                            markdown: args.markdown,
+                        },
+                    )
+                } else {
+                    let args = match parse_tool_args::<ResumeArgs>(args) {
+                        Ok(args) => args,
+                        Err(error) => return *error,
+                    };
+                    (
+                        args.request_id,
+                        args.expected_revision,
+                        OwnerGoalCommand::Run,
+                    )
+                };
+                // Resolve the chat before changing the goal so unavailable chat state
+                // cannot leave an activated goal behind as a side effect of resolution.
+                let chat = match store.task_directory(task).and_then(|path| {
+                    context
+                        .markdown_chat
+                        .chat_at_path(path.join("CHAT.md"), true)
+                }) {
+                    Ok(chat) => chat,
+                    Err(error) => return ToolResult::error(error),
+                };
+                let receipt = match store.apply_agent_goal_command(
+                    task,
+                    &request_id,
+                    revision,
+                    command,
+                    crate::markdown_chat::now_ms(),
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) => return ToolResult::error(error),
+                };
+                if !receipt.replayed {
+                    if let Err(error) = chat.resume_agent().await {
+                        return ToolResult::error(error);
+                    }
+                    let activity = match chat.offline_activity().await {
+                        Ok(activity) => activity,
+                        Err(error) => return ToolResult::error(error),
+                    };
+                    if let Err(error) = store.sync_goal_presence(
+                        task,
+                        activity.last_call_at_ms,
+                        activity.agent_waiting_until_ms,
+                        activity.agent_stop_requested,
+                        crate::markdown_chat::now_ms(),
+                    ) {
+                        return ToolResult::error(error);
+                    }
+                }
+                // A retry may arrive after an owner edit/pause. Return current state,
+                // and never reapply the old activation or fabricate a user message.
+                match store.load(task) {
+                    Ok(state) => goal_result(state.goal.as_ref(), false),
+                    Err(error) => ToolResult::error(error),
+                }
+            }
             Self::Finish => {
                 let args = match parse_tool_args::<FinishArgs>(args) {
                     Ok(args) => args,
@@ -227,7 +366,20 @@ impl Tool for GoalTool {
                     finish,
                     crate::markdown_chat::now_ms(),
                 ) {
-                    Ok(goal) => goal_result(Some(&goal), true),
+                    Ok(goal) => {
+                        // Notify the durable terminal receipt immediately; the supervisor also
+                        // checks it after restarts, using the same persisted deduplication claim.
+                        if let Ok(path) = store.task_directory(task)
+                            && let Ok(chat) = context
+                                .markdown_chat
+                                .chat_at_path(path.join("CHAT.md"), true)
+                        {
+                            let mut state = crate::agent_automation::AutomationTaskState::default();
+                            state.goal = Some(goal.clone());
+                            store.notify_state(&chat, &state).await;
+                        }
+                        goal_result(Some(&goal), true)
+                    }
                     Err(error) => ToolResult::error(error),
                 }
             }
@@ -342,6 +494,10 @@ mod tests {
         let schema = GoalTool::Finish.input_schema();
         assert_eq!(schema["properties"]["summary"]["writeOnly"], true);
         assert_eq!(schema["properties"]["reason"]["writeOnly"], true);
+        assert_eq!(
+            GoalTool::Set.input_schema()["properties"]["markdown"]["writeOnly"],
+            true
+        );
 
         let goal = GoalRecord {
             revision: 1,
@@ -352,6 +508,11 @@ mod tests {
             finished_at_ms: Some(2),
             summary: None,
             blocked_reason: Some("private blocker".into()),
+            elapsed_active_ms: 0,
+            active_since_ms: None,
+            timer_until_ms: None,
+            turn_count: 0,
+            completed_chat_end: None,
         };
         let result = goal_result(Some(&goal), true);
         assert!(result.audit.sensitive_output);

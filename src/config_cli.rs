@@ -211,7 +211,7 @@ fn backup_migration(
     Ok(())
 }
 
-fn write_document(path: &Path, document: &Map<String, Value>) -> anyhow::Result<()> {
+pub(crate) fn write_document(path: &Path, document: &Map<String, Value>) -> anyhow::Result<()> {
     refuse_unsafe_target(path)?;
     let parent = config_parent(path);
     fs::create_dir_all(parent)

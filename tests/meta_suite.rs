@@ -80,7 +80,13 @@ fn agent_chat_always_advertises_the_automation_contract() {
             .into_iter()
             .map(|tool| tool.name())
             .collect::<Vec<_>>();
-        for expected in ["automation_verify_pairing", "goal_read", "goal_finish"] {
+        for expected in [
+            "automation_verify_pairing",
+            "goal_read",
+            "goal_set",
+            "goal_resume",
+            "goal_finish",
+        ] {
             assert!(
                 names.contains(&expected),
                 "missing {expected} when enabled={enabled}"

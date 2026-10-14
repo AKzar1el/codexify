@@ -500,6 +500,18 @@ async fn lifecycle_status_distinguishes_disabled_missing_stopped_and_live_states
         BrowserLifecycleState::AuthenticationRequired
     );
 
+    for authenticated in [false, true] {
+        *body.lock().unwrap() = json!({
+            "protocolVersion": PROTOCOL_VERSION, "kind": "codexify-browser-companion",
+            "build": manager.expected_build(), "status": "unavailable", "authenticated": authenticated,
+            "accountFingerprint": if authenticated { Some("account-1") } else { None }, "activeActionId": null
+        });
+        assert_eq!(
+            manager.status().await.state,
+            BrowserLifecycleState::Unavailable
+        );
+    }
+
     *body.lock().unwrap() = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "kind": "codexify-browser-companion",
@@ -592,6 +604,7 @@ import sys
 
 descriptor = os.environ["CODEXIFY_BROWSER_DESCRIPTOR"]
 build = os.environ["CODEXIFY_BROWSER_BUILD"]
+assert json.loads(os.environ["CODEXIFY_BROWSER_REQUEST_BLOCK_LIST"]) == [r"^https?://example\.invalid/blocked"]
 token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -676,9 +689,11 @@ server.serve_forever()
 
     let root = tempfile::tempdir().unwrap();
     let browser_root = root.path().join("browser");
+    let mut launch_config = enabled_config(&browser_root.join("descriptor.json"));
+    launch_config.request_block_list = vec![r"^https?://example\.invalid/blocked".into()];
     let manager = BrowserCompanionManager::for_test(
         browser_root.clone(),
-        enabled_config(&browser_root.join("descriptor.json")),
+        launch_config,
         "1.7.0",
         "macos",
         "aarch64",

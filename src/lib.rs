@@ -29,6 +29,7 @@ pub mod doctor;
 pub mod environment;
 pub mod exec_sessions;
 pub mod filesystem;
+pub mod global_settings;
 pub mod ignore_rules;
 pub mod instructions;
 pub mod legacy_migration;

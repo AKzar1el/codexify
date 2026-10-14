@@ -6,9 +6,9 @@ export type BrowserEffort = string;
 export type BrowserModelFamily = "5.5" | "5.6" | "6";
 
 export const MODEL_FAMILY_LABELS: Record<BrowserModelFamily, RegExp> = {
-  "5.5": /^GPT[-\s]?5\.5(?:\s+Sol)?(?:\s*Leaving on\s+.+)?$/i,
-  "5.6": /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i,
-  "6": /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+(?:Sol|Astra))?(?:\s+Pro)?)$/i,
+  "5.5": /^GPT[-\s]?5\.5(?:\s+(?:Sol|Luna))?(?:\s*Leaving on\s+.+)?$/i,
+  "5.6": /^GPT[-\s]?5\.6(?:\s+(?:Sol|Luna))?(?:\s+Pro)?$/i,
+  "6": /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+(?:Sol|Luna|Astra))?(?:\s+Pro)?)$/i,
 };
 
 export function browserModelFamilyFromLabel(label: string): BrowserModelFamily | undefined {
@@ -23,6 +23,7 @@ export interface AccountCapabilities {
 export interface DiscoveredBrowserEffort extends EffortCapability {
   index: number | null;
   lunaThink?: boolean;
+  observedModelName?: string;
 }
 
 export interface DiscoveredBrowserModel {
@@ -58,15 +59,21 @@ export function browserEffortIdFromLabel(label: string): string {
 export function modelsFromDiscoveredEfforts(
   family: BrowserModelFamily,
   efforts: readonly DiscoveredBrowserEffort[],
+  pickerLabel?:string,
 ): DiscoveredBrowserModel[] {
+  const observed=/\b(Sol|Luna|Astra)\b/i.exec(pickerLabel||"")?.[1];
+  const label=(choices:readonly DiscoveredBrowserEffort[])=>{
+    const name=choices.find(effort=>effort.observedModelName)?.observedModelName||observed;
+    return `GPT-${family}${name?` ${name[0]!.toUpperCase()}${name.slice(1).toLowerCase()}`:""}`;
+  };
   // ChatGPT's GPT-6 Pro option uses Astra. This is the explicit naming exception.
   if (family === "6") {
     return [
       { id:"gpt-6-astra", label:"GPT-6 Astra", family, efforts:efforts.filter(effort => /^Pro$/i.test(effort.label)) },
-      { id:"gpt-6-sol", label:"GPT-6 Sol", family, efforts:efforts.filter(effort => !/^Pro$/i.test(effort.label)) },
+      { id:"gpt-6-sol", label:label(efforts.filter(effort => !/^Pro$/i.test(effort.label))), family, efforts:efforts.filter(effort => !/^Pro$/i.test(effort.label)) },
     ].filter(model => model.efforts.length > 0) as DiscoveredBrowserModel[];
   }
-  return [{ id:`gpt-${family}-sol`, label:`GPT-${family} Sol`, family, efforts }];
+  return [{ id:`gpt-${family}-sol`, label:label(efforts), family, efforts }];
 }
 
 function catalogRevision(accountFingerprint: string, models: readonly ModelCapability[]): string {
@@ -82,12 +89,13 @@ export function buildCapabilityCatalog(
   capabilities: AccountCapabilities,
   accountFingerprint: string,
   build = protocolBuild("development"),
+  planKind: "free" | "go" | "pro" | "unknown" = "unknown",
 ): CapabilityCatalog {
   if (!/^[A-Za-z0-9_.-]{1,256}$/.test(accountFingerprint)) {
     throw new Error("ChatGPT account fingerprint is invalid");
   }
   const models: ModelCapability[] = capabilities.models.map(model => ({
-    id:model.id, label:model.label,
+    id:model.id, label:capabilityModelLabel(model, planKind),
     efforts:model.efforts.map(({ id, label, available, reason }) => ({ id, label, available, reason })),
   }));
   return capabilityCatalogSchema.parse({
@@ -97,6 +105,14 @@ export function buildCapabilityCatalog(
     catalogRevision:catalogRevision(accountFingerprint, models),
     models,
   });
+}
+
+/** Prefer picker names; only unnamed families need the verified account-plan fallback. */
+export function capabilityModelLabel(model: DiscoveredBrowserModel, planKind: "free" | "go" | "pro" | "unknown"): string {
+  if (model.id === "gpt-6-astra") return "GPT-6 Astra";
+  if (/\b(?:Sol|Luna|Astra)\b/i.test(model.label)) return model.label;
+  const suffix = planKind === "free" || planKind === "go" ? " Luna" : planKind === "pro" ? " Sol" : "";
+  return model.label.replace(/^(GPT[-\s]?\d+(?:\.\d+)?)/i, "$1" + suffix);
 }
 
 export function resolveBrowserModel(

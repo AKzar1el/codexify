@@ -16,6 +16,7 @@ const base = {
   url: "https://chatgpt.com/c/example",
   pairingGeneration: 3,
   connectorName: "Codexify",
+  expectedAccountFingerprint:"fixture-account",
   model: "gpt-6-sol",
   effort: "high",
   expectedUrl: "https://chatgpt.com/c/example",
@@ -38,7 +39,7 @@ describe("protocol identity and URL boundaries", () => {
       expect(validateChatGptConversationUrl(url)).toBe(url);
     }
     expect(canonicalChatGptConversationUrl("https://chatgpt.com/g/g-project/c/thread?model=gpt-6"))
-      .toBe("https://chatgpt.com/g/g-project/c/thread");
+      .toBe("https://chatgpt.com/c/thread");
   });
 
   test("rejects alternate origins, credentials, ports, fragments, root, and oversized URLs", () => {
@@ -53,6 +54,19 @@ describe("protocol identity and URL boundaries", () => {
     ]) {
       expect(() => validateChatGptConversationUrl(url)).toThrow();
     }
+  });
+
+  test("conversation identity follows the chat ID across ordinary, project, and GPT routes", () => {
+    const project = "g-p-0123456789abcdef0123456789abcdef";
+    const conversation = "12345678-1234-4321-8765-123456789abc";
+    const canonical = `https://chatgpt.com/c/${conversation}`;
+    for (const suffix of ["", "-original-project", "-renamed-project"]) {
+      expect(canonicalChatGptConversationUrl(`https://chatgpt.com/g/${project}${suffix}/c/${conversation}?model=gpt-6`)).toBe(canonical);
+    }
+    expect(canonicalChatGptConversationUrl(`https://chatgpt.com/g/${project}-original-project/c/other`)).not.toBe(canonical);
+    expect(canonicalChatGptConversationUrl(`https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-original-project/c/${conversation}`)).toBe(canonical);
+    expect(canonicalChatGptConversationUrl(`https://chatgpt.com/c/${conversation}/`)).toBe(canonical);
+    expect(canonicalChatGptConversationUrl(`https://chatgpt.com/g/g-custom-gpt/c/${conversation}`)).toBe(canonical);
   });
 });
 
@@ -106,7 +120,7 @@ test("events are strict, bounded, and enumerate the Rust surface", () => {
   expect(ACTION_EVENT_TYPES).toEqual([
     "queued", "navigating", "composer_ready", "model_verified", "connector_verified",
     "send_accepted", "status_delta", "commentary_delta", "answer_delta",
-    "generation_complete", "approval_required", "authentication_required", "rate_limited",
+    "submission_complete", "generation_complete", "approval_required", "authentication_required", "rate_limited",
     "external_interference", "ambiguous_send", "failed",
   ]);
   expect(validateActionEvent({

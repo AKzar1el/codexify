@@ -12,7 +12,10 @@
     "POST /v1/actions/execute",
     "POST /v1/actions/cancel",
     "GET /v1/actions/{actionId}",
-    "GET /v1/actions/{actionId}/events?after={sequence}"
+    "GET /v1/actions/{actionId}/events?after={sequence}",
+    "POST /v1/new-chat/capabilities",
+    "POST /v1/account/plan",
+    "POST /v1/connectors/refresh"
   ],
   "sessionStatuses": [
     "idle",
@@ -37,10 +40,26 @@
     "failed"
   ],
   "promptKinds": {
-    "pair_verify": ["reference"],
-    "offline_chat": ["batchId", "messages"],
-    "offline_goal": ["goalRevision"],
-    "offline_combined": ["batchId", "messages", "goalRevision"]
+    "pair_verify": [
+      "reference"
+    ],
+    "offline_chat": [
+      "batchId",
+      "messages"
+    ],
+    "offline_goal": [
+      "goalRevision"
+    ],
+    "offline_combined": [
+      "batchId",
+      "messages",
+      "goalRevision"
+    ],
+    "create_chat": [
+      "continuationToken",
+      "reference",
+      "setupReference"
+    ]
   },
   "fieldLimits": {
     "opaqueIdBytes": 256,
@@ -61,6 +80,7 @@
     "status_delta",
     "commentary_delta",
     "answer_delta",
+    "submission_complete",
     "generation_complete",
     "approval_required",
     "authentication_required",
@@ -79,5 +99,45 @@
     "promptBytes": 262144,
     "unreadMessages": 128,
     "chatGptUrlBytes": 4096
+  },
+  "modelSelection": {
+    "model": "nullable opaque ID",
+    "effort": "nullable opaque ID",
+    "nullSelection": "use the conversation settings",
+    "pairVerify": "null selection required",
+    "expectedAccountFingerprint": "required opaque ID"
+  },
+  "newChat": {
+    "continuationTokenBytes": 43,
+    "setupReferenceMaxBytes": 4096,
+    "destination": "configured ChatGPT project or top-level new chat",
+    "completion": "confirmed new conversation URL after Send acceptance"
+  },
+  "accountPlan": {
+    "request": {
+      "epoch": "opaque server-start identifier"
+    },
+    "response": {
+      "label": "bounded display name",
+      "sourceLabel": "billing plan name",
+      "kind": [
+        "free",
+        "go",
+        "pro",
+        "unknown"
+      ],
+      "accountFingerprint": "opaque verified account identifier"
+    },
+    "cache": "one successful billing inspection per server epoch and account"
+  },
+  "connectorRefresh": {
+    "request": {
+      "name": "exact connector display name"
+    },
+    "completion": "observed refresh control busy/idle cycle and Allow all tools selected",
+    "schemaVerified": false
+  },
+  "launchConfiguration": {
+    "requestBlockList": "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST: JSON array of RE2 URL patterns; verified browser-wide before navigation"
   }
 }

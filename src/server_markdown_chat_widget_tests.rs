@@ -392,6 +392,7 @@ async fn only_model_visible_calls_start_offline_notification_monitors() {
         urls: vec!["ntfys://ntfy.example/topic?image=no".into()],
         python_path: root.path().join("missing-python").display().to_string(),
         timeout_ms: 1000,
+        events: Default::default(),
     });
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
@@ -529,6 +530,119 @@ async fn markdown_chat_private_selection_does_not_deliver_or_fake_activity() {
     assert_eq!(page["total_tool_calls"], 0);
     assert_eq!(page["delivered_through"], 0);
     assert!(page["read_through"].as_u64().unwrap() < page["messages"][0]["end"].as_u64().unwrap());
+    client.cancel().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::default_config(root.path().into());
+    config.markdown_chat.enabled = true;
+    config.markdown_chat.automation.enabled = true;
+    config.memory.dir = Some(root.path().join("metadata").display().to_string());
+    let mut handler = handler_with_tools(
+        root.path(),
+        crate::registry::load_tools_for_config(&config),
+        crate::types::ToolLogLevel::Info,
+    );
+    handler.config = Arc::new(config.clone());
+    let identity = ConversationIdentity::from_openai_session("stop-widget-owner").unwrap();
+    let chat = handler
+        .markdown_chat
+        .chat(&config, Some(&identity), &handler.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    let store = crate::agent_automation::AgentAutomationStore::for_config(&config).unwrap();
+    store
+        .apply_owner_goal_command(
+            &identity,
+            "initial-goal",
+            crate::agent_automation::OwnerGoalCommand::Set {
+                markdown: "Finish this goal".into(),
+            },
+            1000,
+        )
+        .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(32 * 1024);
+    let task = tokio::spawn(async move {
+        handler
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    let request = |name: &str, args: Value| {
+        let mut req = CallToolRequestParams::new(name.to_owned())
+            .with_arguments(args.as_object().unwrap().clone());
+        req.meta =
+            Some(serde_json::from_value(json!({"openai/session":"stop-widget-owner"})).unwrap());
+        req
+    };
+    let stop = client
+        .call_tool(request(
+            "chat_ui_send",
+            json!({"request_id":"stop-once", "message":"ignored", "stop_agent":true}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(stop.is_error, Some(true));
+    assert_eq!(
+        store.load(&identity).unwrap().goal.unwrap().status,
+        crate::agent_automation::GoalStatus::Configured
+    );
+    assert!(
+        stop.structured_content
+            .as_ref()
+            .unwrap()
+            .get(crate::markdown_chat::USER_MESSAGE_FIELD)
+            .is_none()
+    );
+    assert!(chat.clean_markdown_transcript().await.unwrap().is_empty());
+    let result = client
+        .call_tool(request(
+            "chat_write",
+            json!({"message":"My current progress and status."}),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()[crate::markdown_chat::USER_MESSAGE_FIELD],
+        crate::markdown_chat::AGENT_STOP_MESSAGE
+    );
+    for _ in 0..2 {
+        let result = client
+            .call_tool(request("chat_ui_state", json!({})))
+            .await
+            .unwrap();
+        let page = &result.meta.as_ref().unwrap()[crate::markdown_chat_ui::CHAT_WIDGET_META];
+        assert!(page["last_agent_call_at_ms"].is_null());
+        assert_eq!(page["agent_stop_requested"], true);
+        assert_eq!(page["total_tool_calls"], 1);
+    }
+    client
+        .call_tool(request(
+            "chat_ui_send",
+            json!({"request_id":"resume-message", "message":"Another instruction"}),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let result = client
+            .call_tool(request("chat_ui_state", json!({})))
+            .await
+            .unwrap();
+        let page = &result.meta.as_ref().unwrap()[crate::markdown_chat_ui::CHAT_WIDGET_META];
+        assert!(
+            page["last_agent_call_at_ms"].is_null(),
+            "old activity replay must not restore online after the user resumes"
+        );
+        assert_eq!(page["agent_stop_requested"], false);
+    }
     client.cancel().await.unwrap();
     task.await.unwrap();
 }

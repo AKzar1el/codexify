@@ -6,12 +6,14 @@ import { chromium, type BrowserContext, type Page } from "patchright";
 import type { SingleBrowserSurface } from "./chatgpt-driver";
 import { BrowserCompanionError } from "./errors";
 import { backgroundChromeArgs } from "./background-chrome";
+import {prepareRequestBlockList,requestBlockListArgs,verifyRequestBlockList} from "./request-block-list";
 
 const CHATGPT_HOME = "https://chatgpt.com/";
 
 export interface ChromeSurfaceOptions {
   profilePath: string;
   executablePath: string;
+  requestBlockList?: readonly string[];
 }
 
 export class ChromeSingleWindowSurface implements SingleBrowserSurface {
@@ -21,26 +23,33 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
 
   private constructor(private readonly context: BrowserContext, private readonly sharedPage: Page) {
     this.closed = new Promise(resolveClosed => {
-      context.once("close", () => {
-        this.contextClosed = true;
-        resolveClosed();
-      });
+      const closed = () => { this.contextClosed = true; resolveClosed(); };
+      context.once("close", closed);
+      const pageClosed = () => {
+        // Closing the last window can leave Chrome's background process alive.
+        // Let the launcher exit so the next action can start a fresh window.
+        if (context.pages().every(page => page.isClosed())) closed();
+      };
+      sharedPage.once("close", pageClosed);
+      context.on("page", page => page.once("close", pageClosed));
     });
   }
 
   static async create(options: ChromeSurfaceOptions): Promise<ChromeSingleWindowSurface> {
     const profilePath = resolve(options.profilePath);
     await mkdir(profilePath, { recursive:true, mode:0o700 });
+    const policy=await prepareRequestBlockList(profilePath,options.requestBlockList||[]);
     const context = await chromium.launchPersistentContext(profilePath, {
       channel:"chrome",
       executablePath:resolve(options.executablePath),
       headless:false,
       viewport:null,
       ignoreDefaultArgs:true,
-      args:await backgroundChromeArgs(profilePath),
+      args:requestBlockListArgs(await backgroundChromeArgs(profilePath),policy),
       // Keep Chrome's own browser headers and user agent.
     });
     try {
+      await verifyRequestBlockList(context,policy);
       let page = context.pages()[0];
       if (!page) {
         const browser = context.browser();
@@ -85,9 +94,9 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     const target = new URL(url);
     if (target.protocol !== "https:") throw new Error("Browser window navigation requires HTTPS");
     const page = await this.page();
-    await page.goto(target.href, { waitUntil:"domcontentloaded", timeout:60_000 });
+    await page.goto(target.href, { waitUntil:"domcontentloaded", timeout:60_000,signal });
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
-    await page.waitForLoadState("domcontentloaded", { timeout:30_000 }).catch(() => {});
+    await page.waitForLoadState("domcontentloaded", { timeout:30_000,signal }).catch(error => { if(signal?.aborted)throw error; });
     return page;
   }
 

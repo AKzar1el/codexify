@@ -76,8 +76,13 @@ fn load_tools_with_options(
         all.push(Box::new(tools::markdown_chat::ChatTool::Read));
         all.push(Box::new(tools::markdown_chat::ChatTool::Write));
         all.push(Box::new(tools::markdown_chat::ChatTool::Await));
+        all.push(Box::new(tools::chat_attachments::ChatAttachments::List));
+        all.push(Box::new(tools::chat_attachments::ChatAttachments::Search));
+        all.push(Box::new(tools::chat_attachments::ChatAttachments::Get));
         all.push(Box::new(tools::automation_pair::AutomationVerifyPairing));
         all.push(Box::new(tools::goal::GoalTool::Read));
+        all.push(Box::new(tools::goal::GoalTool::Set));
+        all.push(Box::new(tools::goal::GoalTool::Resume));
         all.push(Box::new(tools::goal::GoalTool::Finish));
     }
     if conversation_auth {

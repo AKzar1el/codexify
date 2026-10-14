@@ -35,6 +35,8 @@ use crate::process_env::scrub_untrusted_child_env;
 use crate::tool::{Tool, ToolBehavior, ToolCallIdentity, ToolRequestContext};
 use crate::types::{AppConfig, McpToolExposure, ToolContent, ToolResult};
 
+mod stderr;
+
 /// How long to wait for an upstream to start up and answer `tools/list` before
 /// giving up on it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1140,8 +1142,18 @@ async fn connect_one_with_env(
             }
             scrub_untrusted_child_env(&mut command, config);
 
-            let transport = TokioChildProcess::new(command)
+            let (transport, diagnostics) = TokioChildProcess::builder(command)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .map_err(|error| format!("could not launch '{command_path}': {error}"))?;
+            if let Some(diagnostics) = diagnostics {
+                let server = server_name.to_owned();
+                tokio::spawn(async move {
+                    if let Err(error) = stderr::forward(diagnostics, tokio::io::stderr()).await {
+                        tracing::warn!(%server, %error, "could not forward upstream MCP diagnostics");
+                    }
+                });
+            }
             let connect = async {
                 let service = ().serve(transport).await.map_err(|error| error.to_string())?;
                 let tools = service

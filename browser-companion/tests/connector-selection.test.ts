@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createDocument } from "@mixmark-io/domino";
-import { connectorSelectionSelector, normalizeConnectorRowTitles, selectConnector } from "../src/connector-selection";
+import { connectorSelectionSelector, SELECTED_CONNECTOR_SELECTOR, normalizeConnectorRowTitles, selectConnector } from "../src/connector-selection";
 import { CHATGPT_COMPOSER_SELECTOR } from "../src/session";
 
 test("selected connector selector matches only one exact configured identity", () => {
@@ -38,7 +38,7 @@ test("connector selection searches for the configured name and verifies its exac
       .includes((editor.textContent ?? "").slice(1).toLowerCase()));
     const selected = {
       filter() { return this; },
-      evaluateAll: async (read: (elements: Element[]) => unknown) => read(editor.contains(pill) ? [pill] : []),
+      evaluateAll: async (read: (elements: Element[], useIdentity?: boolean) => unknown, useIdentity?: boolean) => read(editor.contains(pill) ? [pill] : [], useIdentity),
       waitFor: async () => { expect(editor.contains(pill)).toBeTrue(); },
     };
     const composer = {
@@ -46,7 +46,7 @@ test("connector selection searches for the configured name and verifies its exac
       count: async () => 1, isEditable: async () => true,
       evaluate: async (read: (element: Element) => unknown) => read(editor),
       locator: (selector: string) => {
-        expect(selector).toBe(connectorSelectionSelector(name));
+        expect([connectorSelectionSelector(name), SELECTED_CONNECTOR_SELECTOR, '[data-id="plugin:test-connector"], [app-mention-path="plugin:test-connector"][contenteditable="false"]']).toContain(selector);
         return selected;
       },
       focus: async () => {},
@@ -82,7 +82,7 @@ test("connector selection searches for the configured name and verifies its exac
       getByText: (text: string) => text,
       keyboard: { press: async () => {} },
     };
-    expect(await selectConnector(page as never, name)).toBe(composer as never);
+    expect(await selectConnector(page as never, name)).toEqual({composer:composer as never,identity:"plugin:test-connector"});
     expect(queries).toEqual([`@${name}`]);
     expect(editor.querySelector('[data-keyword]')?.getAttribute("data-keyword")).toBe(name);
   }

@@ -76,8 +76,9 @@ fn contract_request(action_id: &str, idempotency_key: &str) -> ExecuteActionRequ
         url: "https://chatgpt.com/c/contract".into(),
         pairing_generation: 7,
         connector_name: "Codexify".into(),
-        model: "gpt-6-sol".into(),
-        effort: "high".into(),
+        expected_account_fingerprint: "contract-account".into(),
+        model: Some("gpt-6-sol".into()),
+        effort: Some("high".into()),
         prompt: ActionPrompt::OfflineCombined {
             batch_id: "contract-batch".into(),
             messages: vec![CompanionUnreadMessage {
@@ -144,8 +145,9 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
         url: "https://chatgpt.com/c/fixture".into(),
         pairing_generation: 7,
         connector_name: "Codexify".into(),
-        model: "gpt-6-sol".into(),
-        effort: "high".into(),
+        expected_account_fingerprint: "fixture-account".into(),
+        model: (!matches!(&prompt, ActionPrompt::PairVerify { .. })).then(|| "gpt-6-sol".into()),
+        effort: (!matches!(&prompt, ActionPrompt::PairVerify { .. })).then(|| "high".into()),
         prompt,
         expected_url: "https://chatgpt.com/c/fixture".into(),
         auto_approve_tool_calls: false,
@@ -240,6 +242,27 @@ async fn rust_client_round_trips_the_real_typescript_protocol() {
         .unwrap();
     assert!(revealed.revealed);
     assert!(revealed.active_action_id.is_none());
+
+    let mut pairing_request = contract_request("model-free-pair", "model-free-pair-execute");
+    pairing_request.model = None;
+    pairing_request.effort = None;
+    pairing_request.prompt = ActionPrompt::PairVerify {
+        reference: "A".repeat(43),
+    };
+    client
+        .execute(&pairing_request, &cancellation)
+        .await
+        .unwrap();
+    client
+        .stream_action_events(&pairing_request.action_id, 0, &cancellation, |_| Ok(()))
+        .await
+        .unwrap();
+    let paired_snapshot = client
+        .action(&pairing_request.action_id, &cancellation)
+        .await
+        .unwrap();
+    assert!(paired_snapshot.send_accepted);
+    assert!(paired_snapshot.selected.is_none());
 
     let request = contract_request("contract-action", "contract-execute");
     let accepted = client.execute(&request, &cancellation).await.unwrap();

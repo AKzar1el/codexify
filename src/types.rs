@@ -869,6 +869,10 @@ pub struct ExperimentalConfig {
     pub agent_tickets: bool,
     /// The real tool behavior remains authoritative for dispatch and authorization.
     pub force_read_only_tool_annotations: bool,
+    /// None preserves existing hints; explicit values override advertised metadata only.
+    pub force_destructive_tool_annotations: Option<bool>,
+    pub force_idempotent_tool_annotations: Option<bool>,
+    pub force_open_world_tool_annotations: Option<bool>,
     pub claude_skills: bool,
 }
 
@@ -879,6 +883,8 @@ pub struct ExperimentalConfig {
 /// `ignore`, `toolLogging` and `audit` carry their resolved/defaultable module settings.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    /// The selected global configuration file; effective project configs retain it.
+    pub loaded_config_path: Option<std::path::PathBuf>,
     pub work_dir: std::path::PathBuf,
     /// Expose bounded operational timing metadata to MCP App widgets.
     pub debug: bool,

@@ -70,6 +70,7 @@ class ChatBackend {
   chatEnabled = true;
   downloadsSupported = true;
   retired = false;
+  agentStopped = false;
   add(role, markdown, id = `fixture-${this.messages.length}`) {
     const start = this.end;
     this.end += markdown.length + 150;
@@ -89,6 +90,11 @@ class ChatBackend {
       return { structuredContent:{ mode:scratch ? "without_project" : "project", active_root:this.setup.project.activePath, project_name:this.setup.project.name, managed_worktree:!scratch } };
     }
     if (name === "chat_ui_send") {
+      if (args.stop_agent) {
+        this.agentStopped = true; this.lastAgentCall = null; this.agentWaitingUntil = null;
+        return { _meta:{ [META]:{ stopped:true } } };
+      }
+      this.agentStopped = false;
       if (this.toolErrorSends-- > 0) return { isError:true, content:[{ type:"text", text:"The message was not saved." }] };
       if (this.failSends-- > 0) throw new Error("Temporary send failure");
       let message = this.messages.find(message => message.id === args.request_id);
@@ -108,7 +114,7 @@ class ChatBackend {
       _meta:{ [META]:{
         chat_file:"/private/project/chats/conversation/CHAT.md", revision,
         delivered_through:this.delivered, read_through:this.read,
-        last_agent_call_at_ms:this.lastAgentCall, agent_waiting_until_ms:this.agentWaitingUntil, total_tool_calls:this.totalToolCalls, server_time_ms:this.serverTime ?? Date.now(), retired:this.retired, messages,
+        agent_stop_requested:this.agentStopped, last_agent_call_at_ms:this.lastAgentCall, agent_waiting_until_ms:this.agentWaitingUntil, total_tool_calls:this.totalToolCalls, server_time_ms:this.serverTime ?? Date.now(), retired:this.retired, messages,
         has_more:all.length > messages.length && !unchanged,
         before:messages[0]?.start ?? null, unchanged
       } }
@@ -656,22 +662,22 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
         assert.equal(await frame.locator(".message").count(), 12);
         assert.deepEqual(errors, []); await page.close();
       });
-      await t.test("collapse and teardown stop polling; saved drafts survive remount", async () => {
+      await t.test("legacy collapsed state stays visible; teardown stops polling and drafts survive remount", async () => {
         const backend = new ChatBackend();
-        const { page, frames:[frame], widgetStates } = await mount(browser, backend);
+        const { page, frames:[frame], widgetStates } = await mount(browser, backend, { saved:{privateContent:{collapsed:true}} });
+        await frame.getByRole("textbox").waitFor();
+        assert.equal(await frame.locator("#collapse").count(), 0);
         await frame.getByRole("textbox").fill("Draft retained");
-        await frame.getByRole("button", { name:"Collapse chat", exact:true }).click();
         const calls = backend.calls.length; await sleep(2300);
-        assert.equal(backend.calls.length, calls);
+        assert(backend.calls.length > calls, "old collapsed state must not suspend polling");
         const saved = widgetStates.at(-1);
         assert.equal(saved.privateContent.draft, "Draft retained");
-        await frame.getByRole("button", { name:"Expand chat", exact:true }).click();
-        await frame.getByRole("textbox").waitFor();
+        assert.equal(Object.hasOwn(saved.privateContent, "collapsed"), false);
         await page.evaluate(() => document.querySelector("iframe").contentWindow.postMessage({ jsonrpc:"2.0", id:9999, method:"ui/resource-teardown", params:{} }, "*"));
         await sleep(150); const stopped = backend.calls.length; await sleep(2300);
         assert.equal(backend.calls.length, stopped);
         await page.close();
-        const mounted = await mount(browser, backend, { saved:{ privateContent:{ ...saved.privateContent, collapsed:false } } });
+        const mounted = await mount(browser, backend, { saved:{ privateContent:{ ...saved.privateContent, collapsed:true } } });
         assert.equal(await mounted.frames[0].getByRole("textbox").inputValue(), "Draft retained");
         await mounted.page.close();
       });
@@ -735,7 +741,7 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
           await frame.getByRole("button", { name:"Check for updates", exact:true }).waitFor();
           assert.equal(await frame.locator("#draft").inputValue(), "Keep this draft");
           assert.equal(await frame.locator("#draft").getAttribute("data-original"), "yes");
-          await frame.getByRole("button", { name:"Send message", exact:true }).click();
+          await frame.getByRole("textbox", { name:"Message the agent" }).press("Enter");
           await frame.getByRole("img", { name:"Saved to CHAT.md", exact:true }).waitFor();
           backend.delivered = backend.messages[0].end;
           await refresh(frame);
@@ -969,3 +975,68 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
     } finally { await browser.close(); }
   });
 }
+
+for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
+  test(`${engineName}: Stop uses an empty composer, spins for three seconds, and restores Send offline`, { timeout:30000 }, async () => {
+    const browser = await engine.launch();
+    try {
+      const backend = new ChatBackend(); backend.lastAgentCall = Date.now();
+      const { page, frames:[frame], errors } = await mount(browser, backend);
+      const input = frame.getByRole("textbox", { name:"Message the agent" });
+      const stop = frame.getByRole("button", { name:"Stop agent", exact:true });
+      await stop.waitFor(); assert.equal(await stop.isEnabled(), true, "Stop must work with an empty draft");
+      await input.fill("Keep my typed draft");
+      await frame.getByRole("button",{name:"Send message",exact:true}).waitFor();
+      await input.fill("");await stop.waitFor();
+      const clickedAt = Date.now(); await stop.click();
+      await frame.getByRole("button", { name:"Stopping agent", exact:true }).waitFor();
+      assert.equal(await input.inputValue(), "");
+      assert.equal(await input.isDisabled(), true);
+      await page.waitForTimeout(2000);
+      assert.equal(await frame.getByRole("button", { name:"Stopping agent", exact:true }).count(), 1);
+      await frame.getByRole("button", { name:"Send message", exact:true }).waitFor();
+      assert(Date.now() - clickedAt >= 2900);
+      await frame.locator('#presence[data-state="offline"]').waitFor();
+      assert.equal(await input.isEnabled(), true);
+      assert.equal(await input.inputValue(), "");
+      assert.equal(backend.messages.length, 0, "Stop must not send the draft");
+      assert.equal(backend.calls.filter(call => call.args.stop_agent).length, 1);
+      await input.fill("Keep my typed draft");await input.press("Enter");
+      await frame.getByText("Keep my typed draft", { exact:true }).waitFor();
+      assert.equal(backend.messages.length, 1);
+      assert(!backend.agentStopped);
+      assert.deepEqual(errors, []); await page.close();
+    } finally { await browser.close(); }
+  });
+}
+
+test('presence: pairing expiry skips away, preserves the last call, and lets normal activity resume',()=>{
+ assert.equal(presenceDetails(1000,5999,null,6000).state,'online');
+ assert.equal(presenceDetails(1000,5999,null,6000).delay,1);
+ assert.equal(presenceDetails(1000,6000,null,6000).state,'offline');
+ assert.equal(presenceDetails(1000,6000,null,6000).delay,null);
+ assert.equal(presenceDetails(1000,6000,9000,6000).state,'waiting');
+ assert.equal(presenceDetails(2000,6000,null,null).state,'online');
+});
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: composer action follows active presence and keeps Send until the reply is accepted`,{timeout:30000},async t=>{
+ const browser=await engine.launch();
+ try {
+  for(const waiting of [false,true])await t.test(waiting?'awaiting reply':'online',async()=>{
+   const backend=new ChatBackend(),now=Date.now();backend.lastAgentCall=waiting?now-360000:now;backend.agentWaitingUntil=waiting?now+120000:null;
+   let release;const gate=new Promise(resolve=>{release=resolve;});let sendStarted;const started=new Promise(resolve=>{sendStarted=resolve;});
+   const original=backend.call.bind(backend);backend.call=async(name,args)=>{if(name==='chat_ui_send'&&!args.stop_agent){sendStarted();await gate;}return original(name,args);};
+   const {page,frames:[frame],errors}=await mount(browser,backend);
+   const input=frame.getByRole('textbox',{name:'Message the agent',exact:true}),button=frame.locator('#send');
+   await frame.getByRole('button',{name:'Stop agent',exact:true}).waitFor();assert.equal(await button.isEnabled(),true);
+   await input.fill('Reply');await frame.getByRole('button',{name:'Send message',exact:true}).waitFor();assert.equal(await button.isEnabled(),true);
+   await input.fill('');await frame.getByRole('button',{name:'Stop agent',exact:true}).waitFor();
+   await input.fill(' ');await frame.getByRole('button',{name:'Send message',exact:true}).waitFor();assert.equal(await button.isDisabled(),true,'Whitespace is a draft, but cannot be sent');
+   await input.fill('Please continue');await button.click();await started;
+   assert.equal(await input.inputValue(),'');assert.equal(await button.getAttribute('aria-label'),'Send message');assert.equal(await button.isDisabled(),true);
+   backend.lastAgentCall=Date.now();release();await frame.getByRole('button',{name:'Stop agent',exact:true}).waitFor();assert.equal(await button.isEnabled(),true);
+   assert.equal(backend.calls.filter(call=>call.name==='chat_ui_send'&&!call.args.stop_agent).length,1);assert.equal(backend.calls.filter(call=>call.args.stop_agent).length,0);
+   assert.equal(backend.messages[0].markdown,'Please continue');assert.deepEqual(errors,[]);await page.close();
+  });
+ }finally{await browser.close();}
+});

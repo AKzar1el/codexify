@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
+    "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
+    "+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -136,8 +136,9 @@ pub struct ExecuteActionRequest {
     pub url: String,
     pub pairing_generation: u64,
     pub connector_name: String,
-    pub model: String,
-    pub effort: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub expected_account_fingerprint: String,
     pub prompt: ActionPrompt,
     pub expected_url: String,
     pub auto_approve_tool_calls: bool,
@@ -150,6 +151,11 @@ pub struct ExecuteActionRequest {
     rename_all_fields = "camelCase"
 )]
 pub enum ActionPrompt {
+    CreateChat {
+        continuation_token: String,
+        reference: String,
+        setup_reference: Option<String>,
+    },
     PairVerify {
         reference: String,
     },
@@ -265,6 +271,9 @@ pub enum CompanionEventKind {
     },
     ConnectorVerified,
     SendAccepted,
+    SubmissionComplete {
+        canonical_url: String,
+    },
     StatusDelta {
         text: String,
         continuation: bool,
@@ -323,7 +332,8 @@ impl CompanionEventKind {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::GenerationComplete { .. }
+            Self::SubmissionComplete { .. }
+                | Self::GenerationComplete { .. }
                 | Self::ApprovalRequired { .. }
                 | Self::AuthenticationRequired
                 | Self::RateLimited { .. }
@@ -424,6 +434,46 @@ impl BrowserCompanionClient {
         Ok(health)
     }
 
+    pub async fn account_plan(
+        &self,
+        epoch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, String> {
+        let response = self
+            .send_json_with_timeout(
+                Method::POST,
+                "/v1/account/plan",
+                Some(&serde_json::json!({"epoch":epoch})),
+                cancellation,
+                Some(Duration::from_secs(75)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response.status()));
+        }
+        self.decode_json_response(response, cancellation).await
+    }
+
+    pub async fn refresh_connector(
+        &self,
+        name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, String> {
+        let response = self
+            .send_json_with_timeout(
+                Method::POST,
+                "/v1/connectors/refresh",
+                Some(&serde_json::json!({"name":name})),
+                cancellation,
+                Some(Duration::from_secs(150)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response.status()));
+        }
+        self.decode_json_response(response, cancellation).await
+    }
+
     pub async fn capabilities(
         &self,
         cancellation: &CancellationToken,
@@ -438,6 +488,29 @@ impl BrowserCompanionClient {
             .await?;
         self.validate_envelope(catalog.protocol_version, &catalog.build)?;
         validate_catalog(&catalog)?;
+        Ok(catalog)
+    }
+
+    pub async fn new_chat_capabilities(
+        &self,
+        project_url: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<CapabilityCatalog, String> {
+        let response = self
+            .send_json_with_timeout(
+                Method::POST,
+                "/v1/new-chat/capabilities",
+                Some(&serde_json::json!({"projectUrl":project_url})),
+                cancellation,
+                Some(Duration::from_secs(180)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(status_error(response.status()));
+        }
+        let catalog: CapabilityCatalog = self.decode_json_response(response, cancellation).await?;
+        validate_catalog(&catalog)?;
+        self.validate_envelope(catalog.protocol_version, &catalog.build)?;
         Ok(catalog)
     }
 
@@ -1141,6 +1214,24 @@ fn validate_catalog(catalog: &CapabilityCatalog) -> Result<(), String> {
     Ok(())
 }
 
+impl BrowserCompanionClient {
+    pub(crate) fn validate_cached_catalog(catalog: &CapabilityCatalog) -> Result<(), String> {
+        if catalog.protocol_version != PROTOCOL_VERSION {
+            return Err("Cached browser catalog protocol is invalid".into());
+        }
+        validate_build(&catalog.build)?;
+        validate_catalog(catalog)
+    }
+
+    pub(crate) fn catalog_cache_path(config: &AgentAutomationConfig) -> Result<PathBuf, String> {
+        let descriptor = expand_descriptor_path(&config.descriptor_path)?;
+        Ok(descriptor
+            .parent()
+            .ok_or("Browser descriptor has no parent directory")?
+            .join("catalog-cache.json"))
+    }
+}
+
 fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String> {
     validate_opaque(&request.action_id, "browser action ID")?;
     validate_opaque(&request.idempotency_key, "browser action idempotency key")?;
@@ -1150,8 +1241,18 @@ fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String
         return Err("Browser action pairing generation must be positive".into());
     }
     validate_visible(&request.connector_name, 128, "browser connector name")?;
-    validate_opaque(&request.model, "browser model ID")?;
-    validate_opaque(&request.effort, "browser effort ID")?;
+    validate_opaque(
+        &request.expected_account_fingerprint,
+        "browser account fingerprint",
+    )?;
+    match (&request.model, &request.effort) {
+        (Some(model), Some(effort)) if !matches!(request.prompt, ActionPrompt::PairVerify { .. }) => {
+            validate_opaque(model, "browser model ID")?;
+            validate_opaque(effort, "browser effort ID")?;
+        }
+        (None, None) => {}
+        _ => return Err("Browser model and effort must be supplied together; pairing uses the conversation settings".into()),
+    }
     validate_prompt(&request.prompt)?;
     let encoded = serde_json::to_vec(request)
         .map_err(|_| "Could not encode browser action request".to_string())?;
@@ -1163,7 +1264,7 @@ fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String
 
 fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
     match prompt {
-        ActionPrompt::PairVerify { reference } => {
+        ActionPrompt::PairVerify { reference } | ActionPrompt::CreateChat { reference, .. } => {
             if reference.len() != 43
                 || URL_SAFE_NO_PAD
                     .decode(reference)
@@ -1190,6 +1291,23 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
             if *goal_revision == 0 {
                 return Err("Browser goal revision must be positive".into());
             }
+        }
+    }
+    if let ActionPrompt::CreateChat {
+        continuation_token,
+        setup_reference,
+        ..
+    } = prompt
+    {
+        if continuation_token.len() != 43
+            || !continuation_token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err("Invalid new-chat continuation token".into());
+        }
+        if let Some(reference) = setup_reference {
+            validate_text(reference, 4096, "setup reference")?;
         }
     }
     if rendered_action_prompt_bytes(prompt) > MAX_PROMPT_BYTES {
@@ -1270,6 +1388,20 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
     }
 
     match prompt {
+        ActionPrompt::CreateChat {
+            continuation_token,
+            reference,
+            setup_reference,
+        } => format!(
+            "{}Call `continue_task` with continuationToken `{}` to attach this new conversation to the workspace already selected by the user. Then call `automation_verify_pairing` with the one-time reference `{}`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.",
+            setup_reference
+                .as_ref()
+                .map(|reference| format!("First call `setup` with ref `{reference}`.\n"))
+                .unwrap_or_default(),
+            continuation_token,
+            reference,
+        ),
+
         ActionPrompt::PairVerify { reference } => format!(
             concat!(
                 "Verify that this ChatGPT conversation is paired with the intended Codexify task by\n",
@@ -1325,6 +1457,9 @@ fn validate_event(
                 validate_chatgpt_url(url)?;
             }
         }
+        CompanionEventKind::SubmissionComplete { canonical_url } => {
+            validate_chatgpt_url(canonical_url)?;
+        }
         CompanionEventKind::ApprovalRequired { message }
         | CompanionEventKind::RateLimited { message }
         | CompanionEventKind::ExternalInterference { message }
@@ -1347,6 +1482,44 @@ fn validate_event(
         | CompanionEventKind::AuthenticationRequired => {}
     }
     Ok(())
+}
+
+pub(crate) fn canonical_chatgpt_conversation_url(value: &str) -> Result<String, String> {
+    validate_chatgpt_url(value)?;
+    let mut url =
+        Url::parse(value).map_err(|_| "ChatGPT conversation URL is invalid".to_string())?;
+    let parts = url.path().split('/').collect::<Vec<_>>();
+    let conversation = if (parts.len() == 3 || (parts.len() == 4 && parts[3].is_empty()))
+        && parts[1] == "c"
+        && !parts[2].is_empty()
+    {
+        Some(parts[2])
+    } else if (parts.len() == 5 || (parts.len() == 6 && parts[5].is_empty()))
+        && parts[1] == "g"
+        && !parts[2].is_empty()
+        && parts[3] == "c"
+        && !parts[4].is_empty()
+    {
+        Some(parts[4])
+    } else {
+        None
+    };
+    if let Some(conversation) = conversation {
+        let path = format!("/c/{conversation}");
+        url.set_path(&path);
+    }
+    url.set_query(None);
+    Ok(url.to_string())
+}
+
+pub(crate) fn same_chatgpt_conversation_url(left: &str, right: &str) -> bool {
+    match (
+        canonical_chatgpt_conversation_url(left),
+        canonical_chatgpt_conversation_url(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn validate_chatgpt_url(value: &str) -> Result<(), String> {
@@ -1447,4 +1620,43 @@ fn status_error(status: StatusCode) -> String {
 
 fn cancelled_error() -> String {
     "Browser companion request was cancelled".into()
+}
+
+#[cfg(test)]
+mod conversation_url_tests {
+    use super::{canonical_chatgpt_conversation_url, same_chatgpt_conversation_url};
+
+    #[test]
+    fn chat_id_identity_ignores_project_and_gpt_routes() {
+        let project = "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/c/12345678-1234-4321-8765-123456789abc";
+        let friendly = project.replace(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef-original-project",
+        );
+        let plain = "https://chatgpt.com/c/12345678-1234-4321-8765-123456789abc";
+        assert_eq!(
+            canonical_chatgpt_conversation_url(&friendly).unwrap(),
+            plain
+        );
+        for alias in [
+            project.to_string(),
+            friendly.clone(),
+            format!("{plain}/?model=gpt-6"),
+            project.replace(
+                "0123456789abcdef0123456789abcdef",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            "https://chatgpt.com/g/g-custom-gpt/c/12345678-1234-4321-8765-123456789abc".into(),
+        ] {
+            assert!(same_chatgpt_conversation_url(&alias, plain));
+        }
+        assert!(!same_chatgpt_conversation_url(
+            &friendly,
+            &project.replace("12345678-1234-4321-8765-123456789abc", "other-conversation")
+        ));
+        assert!(!same_chatgpt_conversation_url(
+            &friendly,
+            "https://example.com/c/12345678-1234-4321-8765-123456789abc"
+        ));
+    }
 }

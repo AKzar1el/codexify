@@ -37,7 +37,7 @@ class ContractDriver implements BrowserDriver {
   async execute(execution: DriverExecution) {
     execution.emit({ type:"navigating" });
     execution.emit({ type:"composer_ready" });
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     execution.emit({ type:"status_delta", text:"Working", continuation:false });
@@ -54,7 +54,7 @@ class ContractDriver implements BrowserDriver {
 class BlockingContractDriver extends ContractDriver {
   override async execute(execution: DriverExecution) {
     execution.emit({ type:"navigating" });
-    execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+    if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });
     execution.emit({ type:"send_accepted" });
     await new Promise<void>((_resolve, reject) => {

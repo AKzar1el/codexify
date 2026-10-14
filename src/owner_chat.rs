@@ -1,6 +1,10 @@
 //! Local-only owner view of the persisted agent chats. This is deliberately not
 //! nested under `/mcp` and never shares the connector's tunnel listener.
 
+mod attachments;
+mod creation;
+mod settings;
+
 use std::io::{Read, Write};
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::Arc;
@@ -78,11 +82,141 @@ fn parse_owner_message(message: &str) -> Result<OwnerMessage, String> {
 struct OwnerState {
     config: Arc<AppConfig>,
     chats: Arc<MarkdownChatStore>,
+    project_bindings: Arc<crate::project_bindings::ProjectBindingStore>,
+    creation_lock: Arc<tokio::sync::Mutex<()>>,
     artifacts: Arc<ArtifactEgressStore>,
     continuations: Arc<ConversationContinuationStore>,
     automation: Option<Arc<AgentAutomationSupervisor>>,
     open_browser: BrowserOpener,
+    catalog_cache: Arc<tokio::sync::Mutex<Option<OwnerCatalogCache>>>,
+    global: Arc<tokio::sync::Mutex<settings::GlobalRuntime>>,
     token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerCatalogCache {
+    key: String,
+    catalog: crate::agent_automation::CapabilityCatalog,
+}
+
+fn catalog_context(health: &crate::agent_automation::CompanionHealth) -> String {
+    catalog_key(&health.build, health.account_fingerprint.as_deref())
+}
+
+fn catalog_key(build: &str, account: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(build);
+    digest.update([0]);
+    digest.update(account.unwrap_or(""));
+    format!("{:x}", digest.finalize())
+}
+
+fn read_catalog_cache(state: &OwnerState, key: &str) -> Option<OwnerCatalogCache> {
+    let path =
+        BrowserCompanionClient::catalog_cache_path(&state.config.markdown_chat.automation).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let entry: OwnerCatalogCache = serde_json::from_reader(file.take(1024 * 1024 + 1)).ok()?;
+    if entry.key != key
+        || catalog_key(
+            &entry.catalog.build,
+            Some(&entry.catalog.account_fingerprint),
+        ) != key
+        || BrowserCompanionClient::validate_cached_catalog(&entry.catalog).is_err()
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+fn write_catalog_cache(state: &OwnerState, entry: &OwnerCatalogCache) -> anyhow::Result<()> {
+    let path = BrowserCompanionClient::catalog_cache_path(&state.config.markdown_chat.automation)
+        .map_err(anyhow::Error::msg)?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(path.parent().context("catalog cache has no parent")?)?;
+    serde_json::to_writer(&mut temporary, entry)?;
+    temporary.flush()?;
+    temporary.persist(path)?;
+    Ok(())
+}
+
+async fn cached_owner_catalog(
+    state: &OwnerState,
+    key: &str,
+) -> Option<crate::agent_automation::CapabilityCatalog> {
+    let mut cached = state.catalog_cache.lock().await;
+    if cached.as_ref().is_none_or(|entry| entry.key != key) {
+        *cached = read_catalog_cache(state, key);
+    }
+    cached
+        .as_ref()
+        .filter(|entry| entry.key == key)
+        .map(|entry| entry.catalog.clone())
+}
+
+async fn owner_catalog(
+    state: &OwnerState,
+    force: bool,
+) -> Result<
+    (
+        crate::agent_automation::CompanionHealth,
+        crate::agent_automation::CapabilityCatalog,
+    ),
+    (StatusCode, String),
+> {
+    let client = companion_client(state)?;
+    let cancellation = CancellationToken::new();
+    let health = client.health(&cancellation).await.map_err(internal_error)?;
+    if !health.authenticated {
+        return Err(internal_error("ChatGPT authentication is required"));
+    }
+    let key = catalog_context(&health);
+    if !force && let Some(catalog) = cached_owner_catalog(state, &key).await {
+        return Ok((health, catalog));
+    }
+    if health.status != crate::agent_automation::CompanionSessionStatus::Idle
+        || health.active_action_id.is_some()
+    {
+        return Err(internal_error(
+            "Finish the current browser action before refreshing models",
+        ));
+    }
+    let catalog = client
+        .capabilities(&cancellation)
+        .await
+        .map_err(internal_error)?;
+    if health.account_fingerprint.as_deref() != Some(catalog.account_fingerprint.as_str()) {
+        return Err(internal_error(
+            "Browser companion account changed during capability discovery",
+        ));
+    }
+    let entry = OwnerCatalogCache {
+        key,
+        catalog: catalog.clone(),
+    };
+    if write_catalog_cache(state, &entry).is_err() {
+        tracing::warn!("could not persist the browser model catalog cache");
+    }
+    *state.catalog_cache.lock().await = Some(entry);
+    Ok((health, catalog))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -351,6 +485,8 @@ struct ChatListing {
     id: String,
     title: String,
     custom_title: Option<String>,
+    pinned_at_ms: Option<u64>,
+    archived_at_ms: Option<u64>,
     workspace: String,
     project_id: String,
     project_path: String,
@@ -358,6 +494,12 @@ struct ChatListing {
     last_entry_at_ms: u64,
     last_agent_call_at_ms: Option<u64>,
     agent_waiting_until_ms: Option<u64>,
+    agent_presence_until_ms: Option<u64>,
+    goal_status: Option<crate::agent_automation::GoalStatus>,
+    goal_completion_dismissed: bool,
+    goal_completed_at_ms: Option<u64>,
+    goal_completed_chat_end: Option<u64>,
+    automation_error: Option<String>,
     total_tool_calls: u64,
 }
 
@@ -470,11 +612,17 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         let OwnerChatSummary {
             title,
             custom_title,
+            pinned_at_ms,
+            archived_at_ms,
             last_entry_end,
             last_entry_at_ms,
+            last_user_entry_end,
+            last_user_entry_at_ms,
             last_agent_call_at_ms,
             agent_waiting_until_ms,
+            agent_presence_until_ms,
             total_tool_calls,
+            ..
         } = match chat.owner_summary().await {
             Ok(summary) => summary,
             Err(error) => {
@@ -483,6 +631,8 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                 OwnerChatSummary {
                     title: "Conversation unavailable".into(),
                     custom_title: None,
+                    pinned_at_ms: None,
+                    archived_at_ms: None,
                     last_entry_end: metadata.len(),
                     last_entry_at_ms: metadata
                         .modified()
@@ -491,7 +641,11 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                         .map(|duration| duration.as_millis() as u64)
                         .unwrap_or_default(),
                     last_agent_call_at_ms: None,
+                    last_user_entry_end: 0,
+                    last_user_entry_at_ms: None,
+                    agent_stop_requested: false,
                     agent_waiting_until_ms: None,
+                    agent_presence_until_ms: None,
                     total_tool_calls: 0,
                 }
             }
@@ -508,10 +662,45 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             .to_string_lossy()
             .into_owned();
         let project_id = format!("{:x}", Sha256::digest(project_path.as_bytes()));
+        // Read persisted goal/action state without registering browser work.
+        let goal_task = automation_task(&located)?;
+        let goal_config = state.config.clone();
+        let goal_root = located.state_root.clone();
+        let automation = tokio::task::spawn_blocking(move || {
+            AgentAutomationStore::for_state_root(&goal_config, &goal_root)?.load(&goal_task)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+        let automation_error = automation.action_needs_attention().then(|| {
+            automation
+                .action
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Browser action needs attention".into())
+        });
+        let goal = automation.goal;
+        let goal_status = goal.as_ref().map(|goal| goal.status);
+        let goal_completion_dismissed = goal.as_ref().is_some_and(|goal| {
+            goal.status == crate::agent_automation::GoalStatus::Completed
+                && goal.completed_chat_end.map_or_else(
+                    || {
+                        last_user_entry_at_ms
+                            .zip(goal.finished_at_ms)
+                            .is_some_and(|(message, completed)| message > completed)
+                    },
+                    |completed_end| last_user_entry_end > completed_end,
+                )
+        });
+        let completed_goal = goal
+            .as_ref()
+            .filter(|goal| goal.status == crate::agent_automation::GoalStatus::Completed);
         list.push(ChatListing {
             id: located.id,
             title,
             custom_title,
+            pinned_at_ms,
+            archived_at_ms,
             workspace: located.workspace,
             project_id,
             project_path,
@@ -519,6 +708,12 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             last_entry_at_ms,
             last_agent_call_at_ms,
             agent_waiting_until_ms,
+            agent_presence_until_ms,
+            goal_status,
+            goal_completion_dismissed,
+            goal_completed_at_ms: completed_goal.and_then(|goal| goal.finished_at_ms),
+            goal_completed_chat_end: completed_goal.and_then(|goal| goal.completed_chat_end),
+            automation_error,
             total_tool_calls,
         });
     }
@@ -561,6 +756,38 @@ async fn rename_chat(
 struct PageQuery {
     before: Option<u64>,
     revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrganizationBody {
+    pinned: Option<bool>,
+    archived: Option<bool>,
+}
+
+async fn organize_chat(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<OrganizationBody>,
+) -> ApiResult {
+    if body.pinned.is_some() == body.archived.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Change either pinning or archiving, one at a time.".into(),
+        ));
+    }
+    let located = selected(&state.config, &id)?;
+    let chat = state
+        .chats
+        .chat_at_path(located.path, true)
+        .map_err(internal_error)?;
+    let organization = chat
+        .set_owner_organization(body.pinned, body.archived)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(
+        serde_json::to_value(organization).expect("chat organization"),
+    ))
 }
 
 async fn chat_state(
@@ -609,22 +836,57 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             .map(|(position, total)| json!({"position": position, "total": total})),
         None => None,
     };
+    let mut catalog = None;
+    let mut public_action = serde_json::to_value(&automation.action).map_err(internal_error)?;
+    let retry_mode = automation.retry_mode().or_else(|| {
+        (automation.action.status == crate::agent_automation::AutomationActionStatus::Interference
+            && automation.action.kind
+                != Some(crate::agent_automation::AutomationActionKind::PairVerify)
+            && automation.action.send_accepted != Some(true)
+            && live.as_ref().is_some_and(|live| {
+                live.action_id == automation.action.id
+                    && live.status.as_deref()
+                        == Some("The shared ChatGPT conversation is already generating")
+            }))
+        .then_some("retry")
+    });
+    public_action["retryMode"] = json!(retry_mode);
+    public_action["automaticRetryAtMs"] = json!(automation.automatic_retry_at_ms());
+    if public_action["lastError"].is_null()
+        && let Some(message) = live.as_ref().and_then(|live| live.status.as_ref())
+        && matches!(
+            automation.action.status,
+            crate::agent_automation::AutomationActionStatus::Interference
+                | crate::agent_automation::AutomationActionStatus::Failed
+                | crate::agent_automation::AutomationActionStatus::Ambiguous
+                | crate::agent_automation::AutomationActionStatus::RateLimited
+                | crate::agent_automation::AutomationActionStatus::ApprovalRequired
+        )
+    {
+        public_action["lastError"] = json!(message);
+    }
     let companion = match companion_client(&state) {
         Ok(client) => match client.health(&CancellationToken::new()).await {
-            Ok(health) => public_companion_health(&health),
-            Err(_) => json!({
-                "status": "unavailable",
-                "authenticated": false,
-                "activeActionId": null,
-                "detail": "Browser companion is unavailable"
-            }),
+            Ok(health) => {
+                let key = catalog_context(&health);
+                if health.authenticated
+                    && let Some(cached) = cached_owner_catalog(&state, &key).await
+                {
+                    catalog = Some(
+                        json!({"catalogRevision":cached.catalog_revision,"models":cached.models}),
+                    );
+                }
+                let mut public = public_companion_health(&health);
+                public["catalogContext"] = json!(key);
+                public
+            }
+            Err(_) => {
+                json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
+            }
         },
-        Err(_) => json!({
-            "status": "unavailable",
-            "authenticated": false,
-            "activeActionId": null,
-            "detail": "Browser companion is unavailable"
-        }),
+        Err(_) => {
+            json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
+        }
     };
     Ok(Json(json!({
         "enabled": true,
@@ -636,13 +898,15 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             "catalogRevision": automation.selection.catalog_revision
         },
         "goal": automation.goal,
-        "action": automation.action,
+        "action": public_action,
         "live": live,
         "queue": queue,
         "companion": companion,
+        "catalog": catalog,
         "presence": {
             "lastAgentCallAtMs": summary.last_agent_call_at_ms,
             "agentWaitingUntilMs": summary.agent_waiting_until_ms,
+            "agentPresenceUntilMs": summary.agent_presence_until_ms,
             "totalToolCalls": summary.total_tool_calls
         },
         "serverTimeMs": crate::markdown_chat::now_ms()
@@ -652,38 +916,28 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
 async fn automation_capabilities(
     State(state): State<OwnerState>,
     Path(id): Path<String>,
-    Json(_): Json<Value>,
+    Json(body): Json<Value>,
 ) -> ApiResult {
     let located = selected(&state.config, &id)?;
     let _ = automation_context(&state, &located).await?;
-    let client = companion_client(&state)?;
-    let cancellation = CancellationToken::new();
-    let health = client.health(&cancellation).await.map_err(internal_error)?;
-    if !health.authenticated {
-        return Err(internal_error("ChatGPT authentication is required"));
-    }
-    let catalog = client
-        .capabilities(&cancellation)
-        .await
-        .map_err(internal_error)?;
-    if health.account_fingerprint.as_deref() != Some(catalog.account_fingerprint.as_str()) {
-        return Err(internal_error(
-            "Browser companion account changed during capability discovery",
-        ));
-    }
-    Ok(Json(json!({
-        "companion": public_companion_health(&health),
-        "catalogRevision": catalog.catalog_revision,
-        "models": catalog.models
-    })))
+    let (health, catalog) = owner_catalog(
+        &state,
+        body.get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+    .await?;
+    Ok(Json(
+        json!({"companion":public_companion_health(&health),"catalogRevision":catalog.catalog_revision,"models":catalog.models}),
+    ))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SelectionBody {
     request_id: String,
-    model: String,
-    effort: String,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 async fn automation_selection(
@@ -694,20 +948,27 @@ async fn automation_selection(
     validate_owner_request_id(&body.request_id)?;
     let located = selected(&state.config, &id)?;
     let context = automation_context(&state, &located).await?;
-    ensure_selection_offline(&context.chat).await?;
-    let catalog = companion_client(&state)?
-        .capabilities(&CancellationToken::new())
-        .await
-        .map_err(internal_error)?;
+    if body.model.is_none() && body.effort.is_none() {
+        let selection = context
+            .store
+            .clear_selection(&context.task)
+            .map_err(internal_error)?;
+        if let Some(supervisor) = state.automation.as_ref() {
+            supervisor.discard_queued_work(&context.task).await;
+            supervisor.notify();
+        }
+        return Ok(Json(json!({"selection":selection})));
+    }
+    let (_, catalog) = owner_catalog(&state, false).await?;
     let model = catalog
         .models
         .iter()
-        .find(|model| model.id == body.model)
+        .find(|model| Some(&model.id) == body.model.as_ref())
         .ok_or_else(|| internal_error("The selected ChatGPT model is unavailable"))?;
     let effort = model
         .efforts
         .iter()
-        .find(|effort| effort.id == body.effort)
+        .find(|effort| Some(&effort.id) == body.effort.as_ref())
         .ok_or_else(|| internal_error("The selected ChatGPT effort is unavailable"))?;
     if !effort.available {
         return Err(internal_error(
@@ -717,8 +978,6 @@ async fn automation_selection(
                 .unwrap_or("The selected ChatGPT effort is unavailable"),
         ));
     }
-    // Capability inspection can take time; check presence again before committing.
-    ensure_selection_offline(&context.chat).await?;
     let selection = context
         .store
         .set_selection(
@@ -731,7 +990,7 @@ async fn automation_selection(
         )
         .map_err(internal_error)?;
     if let Some(supervisor) = state.automation.as_ref() {
-        supervisor.discard_queued_actions(&context.task).await;
+        supervisor.discard_queued_work(&context.task).await;
         supervisor.notify();
     }
     Ok(Json(json!({
@@ -741,25 +1000,6 @@ async fn automation_selection(
             "catalogRevision": selection.catalog_revision
         }
     })))
-}
-
-async fn ensure_selection_offline(
-    chat: &Arc<crate::markdown_chat::ChatFile>,
-) -> Result<(), (StatusCode, String)> {
-    let summary = chat.owner_summary().await.map_err(internal_error)?;
-    let now = crate::markdown_chat::now_ms();
-    if summary
-        .last_agent_call_at_ms
-        .is_some_and(|last| now.saturating_sub(last) < crate::markdown_chat::OFFLINE_AFTER_MS)
-        || summary
-            .agent_waiting_until_ms
-            .is_some_and(|until| now < until)
-    {
-        return Err(internal_error(
-            "Model and effort can only be changed while the agent is offline",
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -777,16 +1017,14 @@ async fn automation_pair(
     validate_owner_request_id(&body.request_id)?;
     let located = selected(&state.config, &id)?;
     let context = automation_context(&state, &located).await?;
-    let current = context.store.load(&context.task).map_err(internal_error)?;
-    if current.selection.model.is_none()
-        || current.selection.effort.is_none()
-        || current.selection.catalog_revision.is_none()
-        || current.selection.account_fingerprint.is_none()
-    {
-        return Err(internal_error(
-            "Select a verified ChatGPT model and effort before pairing",
-        ));
-    }
+    let health = companion_client(&state)?
+        .health(&CancellationToken::new())
+        .await
+        .map_err(internal_error)?;
+    let fingerprint = health
+        .account_fingerprint
+        .filter(|_| health.authenticated)
+        .ok_or_else(|| internal_error("Sign in to ChatGPT before pairing"))?;
     let supervisor = state
         .automation
         .as_ref()
@@ -797,11 +1035,15 @@ async fn automation_pair(
         .store
         .issue_pairing(&context.task, &body.url, context.owner_generation, now_ms)
         .map_err(internal_error)?;
+    context
+        .store
+        .bind_pairing_account(&context.task, issue.generation, &fingerprint)
+        .map_err(internal_error)?;
     if let Err(error) = supervisor
         .queue_pair_verification(&context.task, &issue.reference, issue.generation, now_ms)
         .await
     {
-        let _ = context.store.unlink_pairing(&context.task, now_ms);
+        let _ = context.store.invalidate_pairing(&context.task, now_ms);
         return Err(internal_error(error));
     }
     supervisor.notify();
@@ -850,6 +1092,7 @@ async fn automation_login(
         .login(&CancellationToken::new())
         .await
         .map_err(internal_error)?;
+    state.global.lock().await.reset_plan();
     Ok(Json(json!({"companion": public_companion_health(&health)})))
 }
 
@@ -990,6 +1233,10 @@ async fn chat_markdown(
 struct SendBody {
     request_id: String,
     message: String,
+    #[serde(default)]
+    stop_agent: bool,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
 }
 
 fn automation_task(
@@ -1017,14 +1264,21 @@ async fn automation_context(
         return Err(internal_error("Agent-chat browser automation is disabled"));
     }
     let task = automation_task(located)?;
-    let owner_generation = state
-        .continuations
-        .owner_generation_for_task_key(task.stable_key())
-        .map_err(internal_error)?;
     let store = Arc::new(
         AgentAutomationStore::for_state_root(&state.config, &located.state_root)
             .map_err(internal_error)?,
     );
+    let mut owner_generation = state
+        .continuations
+        .owner_generation_for_task_key(task.stable_key())
+        .map_err(internal_error)?;
+    let pairing = store.load(&task).map_err(internal_error)?.pairing;
+    if pairing.creating_chat
+        && let Some(pending) = pairing.pending
+        && pending.owner_generation == owner_generation.saturating_add(1)
+    {
+        owner_generation = pending.owner_generation;
+    }
     let chat = state
         .chats
         .chat_at_path(located.path.clone(), true)
@@ -1088,10 +1342,19 @@ fn pairing_status(
 }
 
 fn public_pairing(pairing: &crate::agent_automation::PairingState, owner_generation: u64) -> Value {
-    json!({
+    let last_tried_url = [
+        pairing.last_attempted_url.as_deref(),
+        pairing.candidate_url.as_deref(),
+        pairing.canonical_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(crate::agent_automation::conversation_url_for_retry);
+    json!({"creatingChat":pairing.creating_chat,
         "status": pairing_status(pairing, owner_generation),
         "candidateUrl": pairing.candidate_url,
         "canonicalUrl": pairing.canonical_url,
+        "lastTriedUrl": last_tried_url,
         "generation": pairing.generation,
         "verifiedAtMs": pairing.verified_at_ms,
         "expiresAtMs": pairing.pending.as_ref().map(|pending| pending.expires_at_ms)
@@ -1104,21 +1367,75 @@ async fn chat_send(
     Json(body): Json<SendBody>,
 ) -> ApiResult {
     let located = selected(&state.config, &id)?;
-    match parse_owner_message(&body.message).map_err(|error| (StatusCode::BAD_REQUEST, error))? {
+    if body.stop_agent {
+        if body.request_id.is_empty()
+            || body.request_id.len() > 80
+            || !body
+                .request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid agent stop request ID".into(),
+            ));
+        }
+        let chat = state
+            .chats
+            .chat_at_path(located.path.clone(), true)
+            .map_err(internal_error)?;
+        let goal = if state.config.markdown_chat.automation.enabled {
+            let context = automation_context(&state, &located).await?;
+            let receipt = context
+                .store
+                .pause_goal_for_agent_stop(
+                    &context.task,
+                    &body.request_id,
+                    crate::markdown_chat::now_ms(),
+                )
+                .map_err(internal_error)?;
+            if let Some(supervisor) = state.automation.as_ref() {
+                supervisor.discard_queued_work(&context.task).await;
+            }
+            receipt.goal
+        } else {
+            None
+        };
+        chat.request_agent_stop(body.request_id)
+            .await
+            .map_err(internal_error)?;
+        return Ok(wrap(json!({"stopped":true,"goal":goal})));
+    }
+    let message = if body.attachment_ids.is_empty() {
+        parse_owner_message(&body.message).map_err(|error| (StatusCode::BAD_REQUEST, error))?
+    } else {
+        OwnerMessage::Chat(body.message.clone())
+    };
+    match message {
         OwnerMessage::Chat(message) => {
+            if state.config.markdown_chat.automation.enabled {
+                let _ = automation_context(&state, &located).await?;
+            }
             let chat = state
                 .chats
                 .chat_at_path(located.path, true)
                 .map_err(internal_error)?;
             let sent = chat
-                .append_user(body.request_id, message)
+                .append_user_with_attachments(body.request_id, message, body.attachment_ids)
                 .await
                 .map_err(internal_error)?;
-            Ok(wrap(json!({"sent": sent})))
+            let organization = chat
+                .set_owner_organization(None, Some(false))
+                .await
+                .map_err(internal_error)?;
+            if let Some(supervisor) = state.automation.as_ref() {
+                supervisor.notify();
+            }
+            Ok(wrap(json!({"sent": sent, "organization": organization})))
         }
         OwnerMessage::Goal(command) => {
             let context = automation_context(&state, &located).await?;
-            let receipt = context
+            let mut receipt = context
                 .store
                 .apply_owner_goal_command(
                     &context.task,
@@ -1127,6 +1444,46 @@ async fn chat_send(
                     crate::markdown_chat::now_ms(),
                 )
                 .map_err(internal_error)?;
+            if receipt.updated_active_goal {
+                let goal = receipt.goal.as_ref().expect("updated active goal receipt");
+                let notification_id = format!(
+                    "goal-update-{:x}",
+                    Sha256::digest(body.request_id.as_bytes())
+                );
+                context.chat.append_user(notification_id, format!(
+                    "The goal has changed (revision {}). The new goal is:\n\n{}\n\nCall `goal_read` for the current revision and continue toward the updated goal.",
+                    goal.revision, goal.markdown,
+                )).await.map_err(internal_error)?;
+            }
+            if !receipt.replayed
+                && matches!(
+                    receipt.kind,
+                    crate::agent_automation::OwnerGoalCommandKind::Set
+                        | crate::agent_automation::OwnerGoalCommandKind::Run
+                )
+            {
+                context.chat.resume_agent().await.map_err(internal_error)?;
+                let activity = context
+                    .chat
+                    .offline_activity()
+                    .await
+                    .map_err(internal_error)?;
+                context
+                    .store
+                    .sync_goal_presence(
+                        &context.task,
+                        activity.last_call_for_presence(crate::markdown_chat::now_ms()),
+                        activity.agent_waiting_until_ms,
+                        activity.agent_stop_requested,
+                        crate::markdown_chat::now_ms(),
+                    )
+                    .map_err(internal_error)?;
+                receipt.goal = context
+                    .store
+                    .load(&context.task)
+                    .map_err(internal_error)?
+                    .goal;
+            }
             if let Some(supervisor) = state.automation.as_ref() {
                 supervisor.notify();
             }
@@ -1154,7 +1511,8 @@ async fn chat_file(
         return Err((StatusCode::BAD_REQUEST, "Invalid file reference".into()));
     }
     let located = selected(&state.config, &id)?;
-    let work_dir = crate::project_bindings::ProjectBindingStore::for_current_user()
+    let work_dir = state
+        .project_bindings
         .owner_chat_work_dirs(&state.config)
         .remove(&located.owner)
         .or(located.work_dir)
@@ -1218,6 +1576,7 @@ async fn authorize(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let content_request = attachments::is_content_path(request.uri().path());
     let host_ok = request
         .headers()
         .get(header::HOST)
@@ -1226,6 +1585,16 @@ async fn authorize(
     if !host_ok {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let bearer_authenticated = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        == Some(format!("Bearer {}", state.token).as_str());
+    let secure_cookie = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        == Some("https");
     if request.uri().path() != "/" {
         let expected = format!("Bearer {}", state.token);
         if request
@@ -1233,11 +1602,23 @@ async fn authorize(
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             != Some(&expected)
+            && !attachments::authorized_cookie(&request, &state.token)
         {
             return StatusCode::UNAUTHORIZED.into_response();
         }
     }
     let mut response = next.run(request).await;
+    if bearer_authenticated {
+        let secure = if secure_cookie { "; Secure" } else { "" };
+        if let Ok(value) = format!(
+            "codexify-attachment={}; Path=/api/chats/; HttpOnly; SameSite=Strict{secure}",
+            state.token
+        )
+        .parse()
+        {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
@@ -1252,7 +1633,9 @@ async fn authorize(
     );
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src blob: data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"),
+        header::HeaderValue::from_static(if content_request {
+            "sandbox; default-src 'none'; img-src 'self' blob: data:; media-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
+        }else{"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}),
     );
     response
 }
@@ -1289,6 +1672,7 @@ static OWNER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     include_str!("owner_chat.html")
         .replace("<!-- CHAT_TEMPLATE -->", &format!("<template id=\"chat-template\"><style>{style}\n#chat {{ max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; }} #panel {{ display:flex; flex:1; min-height:0; flex-direction:column; }} #panel[hidden] {{ display:none; }} #messages {{ flex:1; max-height:none; min-height:0; }}\n</style>{body}</template>"))
         .replace("/* CHAT_SCRIPT */", script)
+        .replace("/* GLOBAL_SETTINGS_SCRIPT */", include_str!("global_settings_ui.js"))
 });
 
 pub async fn start(
@@ -1313,14 +1697,21 @@ pub(crate) async fn start_with_automation(
     let port = listener.local_addr()?.port();
     let info = load_or_create_runtime(&runtime_path(), port)?;
     let state = OwnerState {
+        project_bindings: Arc::new(
+            crate::project_bindings::ProjectBindingStore::for_current_user(),
+        ),
+        creation_lock: Arc::default(),
         config,
         chats,
         artifacts,
         continuations,
         automation,
         open_browser: Arc::new(|url| open::that(url)),
+        catalog_cache: Arc::default(),
+        global: Arc::default(),
         token: info.token,
     };
+    settings::start(state.clone());
     let app = router(state);
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
@@ -1343,9 +1734,27 @@ async fn bind_owner_listener(config: &AppConfig) -> anyhow::Result<tokio::net::T
 fn router(state: OwnerState) -> Router {
     Router::new()
         .route("/", get(page))
-        .route("/api/chats", get(list_chats))
+        .route("/api/health", get(settings::health))
+        .route("/api/global", get(settings::status))
+        .route("/api/settings", get(settings::read).post(settings::save))
+        .route("/api/settings/restart", post(settings::restart))
+        .route("/api/settings/update", post(settings::update))
+        .route(
+            "/api/settings/refresh-connector",
+            post(settings::refresh_connector),
+        )
+        .route("/api/chats", get(list_chats).post(creation::create_chat))
+        .route("/api/new-chat", post(creation::prepare_chat))
+        .route("/api/new-chat/login", post(creation::login))
+        .route("/api/projects", get(creation::projects))
+        .route("/api/projects/worktrees", get(creation::worktrees))
+        .route(
+            "/api/chats/{id}/automation/create/retry",
+            post(creation::retry_creation),
+        )
         .route("/api/chats/{id}", get(chat_state))
         .route("/api/chats/{id}/title", post(rename_chat))
+        .route("/api/chats/{id}/organization", post(organize_chat))
         .route("/api/chats/{id}/automation", get(automation_state))
         .route(
             "/api/chats/{id}/automation/capabilities",
@@ -1373,6 +1782,15 @@ fn router(state: OwnerState) -> Router {
         )
         .route("/api/chats/{id}/markdown", get(chat_markdown))
         .route("/api/chats/{id}/send", post(chat_send))
+        .route("/api/chats/{id}/attachments", post(attachments::upload))
+        .route(
+            "/api/chats/{id}/attachments/{attachment}",
+            get(attachments::metadata),
+        )
+        .route(
+            "/api/chats/{id}/attachments/{attachment}/content",
+            get(attachments::content),
+        )
         .route("/api/chats/{id}/file", get(chat_file))
         .route("/api/files", get(download))
         // A 16 MiB chat entry may expand sixfold when JSON-escaped.
@@ -1431,7 +1849,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
 
     #[derive(Clone, Default)]
     struct OwnerCompanionState {
@@ -1734,12 +2152,18 @@ mod tests {
                 .unwrap(),
         );
         let state = OwnerState {
+            project_bindings: Arc::new(
+                crate::project_bindings::ProjectBindingStore::for_current_user(),
+            ),
+            creation_lock: Arc::default(),
             config: Arc::new(config),
             chats,
             artifacts,
             continuations,
             automation: None,
             open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1959,7 +2383,354 @@ mod tests {
             .unwrap();
         assert_eq!(active["chats"][0]["totalToolCalls"], 1);
         assert!(active["chats"][0]["lastAgentCallAtMs"].as_u64().unwrap() > 0);
+        let unauthorized_organization = client
+            .post(format!("{base}/api/chats/{id}/organization"))
+            .json(&json!({"pinned":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized_organization.status(), StatusCode::UNAUTHORIZED);
+        let malformed_organization = client
+            .post(format!("{base}/api/chats/{id}/organization"))
+            .bearer_auth("test-token")
+            .json(&json!({"pinned":true,"archived":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed_organization.status(), StatusCode::BAD_REQUEST);
+        let original = std::fs::read(chat.path()).unwrap();
+        let unread = chat.unread_snapshot().await.unwrap();
+        let pinned: Value = client
+            .post(format!("{base}/api/chats/{id}/organization"))
+            .bearer_auth("test-token")
+            .json(&json!({"pinned":true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(pinned["pinnedAtMs"].as_u64().is_some());
+        let archived: Value = client
+            .post(format!("{base}/api/chats/{id}/organization"))
+            .bearer_auth("test-token")
+            .json(&json!({"archived":true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(archived["pinnedAtMs"].is_null());
+        assert!(archived["archivedAtMs"].as_u64().is_some());
+        let listing: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listing["chats"][0]["archivedAtMs"],
+            archived["archivedAtMs"]
+        );
+        assert!(listing["chats"][0]["pinnedAtMs"].is_null());
+        let cannot_pin = client
+            .post(format!("{base}/api/chats/{id}/organization"))
+            .bearer_auth("test-token")
+            .json(&json!({"pinned":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cannot_pin.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(chat.path()).unwrap(), original);
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        let failed_send = client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"failed-restore","message":""}))
+            .send()
+            .await
+            .unwrap();
+        assert!(!failed_send.status().is_success());
+        assert!(chat.owner_summary().await.unwrap().archived_at_ms.is_some());
+        let restored: Value = client.post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token").json(&json!({"request_id":"restore-with-message","message":"Continue this conversation"})).send().await.unwrap().json().await.unwrap();
+        assert!(restored["_meta"][CHAT_WIDGET_META]["organization"]["archivedAtMs"].is_null());
+        assert!(chat.owner_summary().await.unwrap().archived_at_ms.is_none());
+        assert!(chat.owner_summary().await.unwrap().pinned_at_ms.is_none());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn completed_sidebar_badge_is_dismissed_by_later_user_messages_and_survives_reopen() {
+        crate::tls::ensure_crypto_provider();
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(temp.path().into());
+        config.markdown_chat.enabled = true;
+        config.memory.dir = Some(temp.path().join("state").display().to_string());
+        let identity = ConversationIdentity::from_openai_session("completed-sidebar").unwrap();
+        let chats = Arc::new(MarkdownChatStore::default());
+        let chat = chats
+            .chat(&config, Some(&identity), &SessionState::new())
+            .unwrap();
+        chat.append_user("original".into(), "Complete this task".into())
+            .await
+            .unwrap();
+        chat.append("Task finished".into()).await.unwrap();
+        let store = AgentAutomationStore::for_config(&config).unwrap();
+        let goal = store
+            .set_goal(&identity, "Finish the task", crate::markdown_chat::now_ms())
+            .unwrap();
+        store
+            .run_goal(&identity, goal.revision, crate::markdown_chat::now_ms())
+            .unwrap();
+        let finish = crate::agent_automation::GoalFinish::Completed {
+            summary: Some("Finished".into()),
+        };
+        let completed = store
+            .finish_goal(
+                &identity,
+                goal.revision,
+                finish.clone(),
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            completed.completed_chat_end,
+            Some(std::fs::metadata(chat.path()).unwrap().len())
+        );
+        let make_state = |chats| OwnerState {
+            project_bindings: Arc::new(
+                crate::project_bindings::ProjectBindingStore::for_current_user(),
+            ),
+            creation_lock: Arc::default(),
+            config: Arc::new(config.clone()),
+            chats,
+            artifacts: Arc::new(ArtifactEgressStore::new_at(
+                config.artifact_egress.clone(),
+                temp.path().join("artifacts"),
+            )),
+            continuations: Arc::new(
+                ConversationContinuationStore::new(temp.path().join("continuations.json")).unwrap(),
+            ),
+            automation: None,
+            open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
+            token: "test-token".into(),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = make_state(chats.clone());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let client = reqwest::Client::new();
+        let listing = || async {
+            client
+                .get(format!("{base}/api/chats"))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["chats"][0]
+                .clone()
+        };
+        let first = listing().await;
+        assert_eq!(first["goalStatus"], "completed");
+        assert_eq!(first["goalCompletionDismissed"], false);
+        let id = first["id"].as_str().unwrap();
+        chat.append("Wrapping up the completion report".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            listing().await["goalCompletionDismissed"],
+            false,
+            "agent updates do not dismiss the completion badge"
+        );
+        let sent = client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"follow-up","message":"Fix the rendering now"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(sent.status().is_success());
+        assert_eq!(listing().await["goalCompletionDismissed"], true);
+        assert_eq!(
+            listing().await["goalStatus"],
+            "completed",
+            "a follow-up does not restart or stop the completed goal"
+        );
+        chat.read(true).await.unwrap();
+        chat.append("Continuing the follow-up".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            listing().await["goalCompletionDismissed"],
+            true,
+            "read receipts and later agent updates preserve dismissal"
+        );
+        let replay = store
+            .finish_goal(
+                &identity,
+                goal.revision,
+                finish,
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            replay.completed_chat_end, completed.completed_chat_end,
+            "replaying goal_finish must not move the completion boundary"
+        );
+        assert_eq!(listing().await["goalCompletionDismissed"], true);
+        let reopened = MarkdownChatStore::default()
+            .chat(&config, Some(&identity), &SessionState::new())
+            .unwrap();
+        let summary = reopened.owner_summary().await.unwrap();
+        assert!(summary.last_user_entry_end > replay.completed_chat_end.unwrap());
+        let fresh_listing = list_chats(
+            State(make_state(Arc::new(MarkdownChatStore::default()))),
+            Query(ListQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh_listing.0["chats"][0]["goalCompletionDismissed"], true);
+
+        // Older saved goals have timestamps but no transcript boundary.
+        let path = store
+            .task_directory(&identity)
+            .unwrap()
+            .join("automation.json");
+        let mut legacy: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["goal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("completedChatEnd");
+        legacy["goal"]["finishedAtMs"] = json!(summary.last_user_entry_at_ms.unwrap() - 1);
+        std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(listing().await["goalCompletionDismissed"], true);
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(chat.path())
+                .unwrap();
+            file.write_all(b"\nAnother manual follow-up\n").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert_eq!(
+            listing().await["goalCompletionDismissed"],
+            true,
+            "an untimestamped append cannot revive a dismissed legacy badge"
+        );
+
+        let replacement = store
+            .set_goal(&identity, "New goal", crate::markdown_chat::now_ms())
+            .unwrap();
+        store
+            .run_goal(
+                &identity,
+                replacement.revision,
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        assert_eq!(listing().await["goalStatus"], "active");
+        let completed = store
+            .finish_goal(
+                &identity,
+                replacement.revision,
+                crate::agent_automation::GoalFinish::Completed { summary: None },
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        assert!(completed.completed_chat_end.is_some());
+        assert_eq!(
+            listing().await["goalCompletionDismissed"],
+            false,
+            "a new completed goal gets a new badge"
+        );
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(chat.path())
+                .unwrap();
+            file.write_all(b"\nManual follow-up without a timestamp\n")
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+        assert_eq!(
+            listing().await["goalCompletionDismissed"],
+            true,
+            "manual chat appends also dismiss the badge"
+        );
+        store.clear_goal(&identity, replacement.revision).unwrap();
+        assert!(listing().await["goalStatus"].is_null());
+        assert!(listing().await["automationError"].is_null());
+        let pairing = store
+            .issue_pairing(&identity, "https://chatgpt.com/c/sidebar-error", 0, 1)
+            .unwrap();
+        store
+            .record_pairing_canonical_url(
+                &identity,
+                pairing.generation,
+                "https://chatgpt.com/c/sidebar-error",
+                2,
+            )
+            .unwrap();
+        store
+            .verify_pairing(&identity, pairing.generation, 0, &pairing.reference, 3)
+            .unwrap();
+        store
+            .queue_action(
+                &identity,
+                "sidebar-error",
+                crate::agent_automation::AutomationActionKind::OfflineChat,
+                pairing.generation,
+                None,
+                4,
+            )
+            .unwrap();
+        store
+            .update_action_status(
+                &identity,
+                "sidebar-error",
+                crate::agent_automation::AutomationActionStatus::Failed,
+                Some("Connector menu unavailable"),
+                None,
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            listing().await["automationError"],
+            "Connector menu unavailable",
+            "ordinary chats expose browser failures in the sidebar"
+        );
+        store
+            .reset_failed_action_for_retry(&identity, "sidebar-error", 6)
+            .unwrap();
+        store
+            .queue_action(
+                &identity,
+                "sidebar-retry",
+                crate::agent_automation::AutomationActionKind::OfflineChat,
+                pairing.generation,
+                None,
+                7,
+            )
+            .unwrap();
+        assert!(
+            listing().await["automationError"].is_null(),
+            "retrying clears the stale error indicator"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1992,12 +2763,18 @@ mod tests {
             Arc::new(OwnerNoopExecutor),
         );
         let state = OwnerState {
+            project_bindings: Arc::new(
+                crate::project_bindings::ProjectBindingStore::for_current_user(),
+            ),
+            creation_lock: Arc::default(),
             config: Arc::new(config),
             chats,
             artifacts,
             continuations,
             automation: Some(supervisor),
             open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2061,10 +2838,73 @@ mod tests {
         assert_eq!(automation["goal"]["revision"], 1);
         assert_eq!(automation["goal"]["status"], "active");
         assert_eq!(automation["pairing"]["status"], "unpaired");
+        let listed: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["chats"][0]["goalStatus"], "active");
         let serialized = automation.to_string();
         assert!(!serialized.contains("descriptorPath"));
         assert!(!serialized.contains("test-token"));
         assert!(!serialized.contains("Bearer"));
+
+        chat.record_agent_call(crate::markdown_chat::now_ms())
+            .await
+            .unwrap();
+        let edit_goal = || {
+            client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"edit-active-goal", "message":"/goal set Finish the updated goal while this turn continues."}))
+            .send()
+        };
+        let edited: Value = edit_goal().await.unwrap().json().await.unwrap();
+        assert_eq!(edited["_meta"][CHAT_WIDGET_META]["goal"]["revision"], 2);
+        assert_eq!(
+            edited["_meta"][CHAT_WIDGET_META]["goal"]["status"],
+            "active"
+        );
+        let pending = chat.unread_snapshot().await.unwrap();
+        assert_eq!(pending.messages.len(), 1);
+        assert!(pending.messages[0].id.starts_with("goal-update-"));
+        let visible: Value = client
+            .get(format!("{base}/api/chats/{id}"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            visible["_meta"][CHAT_WIDGET_META]["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(chat.clean_markdown_transcript().await.unwrap().is_empty());
+        let notice = chat.read(true).await.unwrap().text;
+        assert!(notice.contains("The goal has changed (revision 2)"));
+        assert!(notice.contains("Finish the updated goal while this turn continues."));
+        assert!(notice.contains("`goal_read`"));
+        let repeated_edit: Value = edit_goal().await.unwrap().json().await.unwrap();
+        assert_eq!(
+            repeated_edit["_meta"][CHAT_WIDGET_META]["goal"]["revision"],
+            2
+        );
+        assert!(chat.unread_snapshot().await.unwrap().messages.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(chat.path())
+                .unwrap()
+                .matches("The goal has changed")
+                .count(),
+            1
+        );
 
         let literal: Value = client
             .post(format!("{base}/api/chats/{id}/send"))
@@ -2086,7 +2926,210 @@ mod tests {
                 .unwrap()
                 .contains("/goal status")
         );
+        let stop = || {
+            client
+                .post(format!("{base}/api/chats/{id}/send"))
+                .bearer_auth("test-token")
+                .json(&json!({"request_id":"stop-turn", "message":"ignored draft", "stop_agent":true}))
+                .send()
+        };
+        let stopped: Value = stop().await.unwrap().json().await.unwrap();
+        assert_eq!(stopped["_meta"][CHAT_WIDGET_META]["stopped"], true);
+        assert_eq!(
+            stopped["_meta"][CHAT_WIDGET_META]["goal"]["status"],
+            "configured"
+        );
+        assert!(chat.agent_stop_requested().await.unwrap());
+        assert!(
+            !chat
+                .clean_markdown_transcript()
+                .await
+                .unwrap()
+                .contains("ignored draft")
+        );
+        let sent: Value = client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"after-stop", "message":"An independent message"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(sent["_meta"][CHAT_WIDGET_META]["sent"].is_object());
+        assert!(!chat.agent_stop_requested().await.unwrap());
+        let paused: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            paused["goal"]["status"], "configured",
+            "sending must not enable the goal"
+        );
+        client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"play-after-stop", "message":"/goal run"}))
+            .send()
+            .await
+            .unwrap();
+        stop().await.unwrap();
+        let active: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            active["goal"]["status"], "active",
+            "repeating an old stop must not undo Play"
+        );
+        assert!(!chat.agent_stop_requested().await.unwrap());
+        client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"while-active", "message":"An additional instruction"}))
+            .send()
+            .await
+            .unwrap();
+        let active: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            active["goal"]["status"], "active",
+            "sending must not stop an enabled goal"
+        );
+
+        chat.record_agent_call(crate::markdown_chat::now_ms())
+            .await
+            .unwrap();
+        client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"stop-before-new-goal", "message":"", "stop_agent":true}))
+            .send()
+            .await
+            .unwrap();
+        assert!(chat.agent_stop_requested().await.unwrap());
+        let replacement_goal = || {
+            client
+                .post(format!("{base}/api/chats/{id}/send"))
+                .bearer_auth("test-token")
+                .json(&json!({
+                    "request_id":"replacement-goal",
+                    "message":"/goal set Complete the replacement goal."
+                }))
+                .send()
+        };
+        let replacement: Value = replacement_goal().await.unwrap().json().await.unwrap();
+        assert_eq!(
+            replacement["_meta"][CHAT_WIDGET_META]["goal"]["revision"],
+            3
+        );
+        assert_eq!(
+            replacement["_meta"][CHAT_WIDGET_META]["goal"]["status"],
+            "active"
+        );
+        assert!(
+            !chat.agent_stop_requested().await.unwrap(),
+            "setting a new active goal must clear an earlier agent stop"
+        );
+        assert!(
+            chat.offline_activity()
+                .await
+                .unwrap()
+                .last_call_at_ms
+                .is_none(),
+            "the new goal must be eligible for immediate submission after Stop"
+        );
+
+        client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"stop-replacement-goal", "message":"", "stop_agent":true}))
+            .send()
+            .await
+            .unwrap();
+        let replayed: Value = replacement_goal().await.unwrap().json().await.unwrap();
+        assert_eq!(replayed["_meta"][CHAT_WIDGET_META]["replayed"], true);
+        assert!(
+            chat.agent_stop_requested().await.unwrap(),
+            "replaying an old Set must not undo a later Stop"
+        );
+        let paused: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(paused["goal"]["revision"], 3);
+        assert_eq!(paused["goal"]["status"], "configured");
+        let listed: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed["chats"][0]["goalStatus"], "configured");
+        client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"clear-goal-for-sidebar", "message":"/goal clear"}))
+            .send()
+            .await
+            .unwrap();
+        let listed: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listed["chats"][0]["goalStatus"].is_null());
         task.abort();
+    }
+
+    #[test]
+    fn public_pairing_prefills_only_the_last_known_conversation_url() {
+        let mut pairing = crate::agent_automation::PairingState {
+            creating_chat: true,
+            candidate_url: Some("https://chatgpt.com/g/g-p-project/project".into()),
+            ..crate::agent_automation::PairingState::default()
+        };
+        assert!(public_pairing(&pairing, 0)["lastTriedUrl"].is_null());
+        pairing.canonical_url = Some("https://chatgpt.com/c/created".into());
+        assert_eq!(
+            public_pairing(&pairing, 0)["lastTriedUrl"],
+            "https://chatgpt.com/c/created"
+        );
+        pairing.last_attempted_url = Some("https://chatgpt.com/g/alias/c/attempted".into());
+        assert_eq!(
+            public_pairing(&pairing, 0)["lastTriedUrl"],
+            "https://chatgpt.com/g/alias/c/attempted"
+        );
     }
 
     #[tokio::test]
@@ -2124,6 +3167,10 @@ mod tests {
         let opened_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record_urls = opened_urls.clone();
         let state = OwnerState {
+            project_bindings: Arc::new(
+                crate::project_bindings::ProjectBindingStore::for_current_user(),
+            ),
+            creation_lock: Arc::default(),
             config: Arc::new(config),
             chats,
             artifacts,
@@ -2133,6 +3180,8 @@ mod tests {
                 record_urls.lock().unwrap().push(url.to_owned());
                 Ok(())
             }),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
             token: "test-token".into(),
         };
         let open_state = state.clone();
@@ -2173,6 +3222,18 @@ mod tests {
         assert_eq!(unpaired_open.status(), StatusCode::CONFLICT);
         assert!(opened_urls.lock().unwrap().is_empty());
 
+        let pair_without_selection: Value = client.post(format!("{base}/api/chats/{id}/automation/pair")).bearer_auth("test-token").json(&json!({"requestId":"pair-no-selection","url":"https://chatgpt.com/c/no-selection"})).send().await.unwrap().json().await.unwrap();
+        assert_eq!(pair_without_selection["pairing"]["status"], "unverified");
+        assert_eq!(supervisor.queued_count().await, 1);
+        client
+            .post(format!("{base}/api/chats/{id}/automation/unlink"))
+            .bearer_auth("test-token")
+            .json(&json!({"requestId":"unlink-no-selection"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+
         let unauthorized = client
             .post(format!("{base}/api/chats/{id}/automation/capabilities"))
             .send()
@@ -2193,6 +3254,29 @@ mod tests {
         assert_eq!(capabilities["catalogRevision"], "owner_catalog_1");
         assert_eq!(capabilities["models"][0]["id"], "gpt-6-sol");
         assert!(capabilities.get("accountFingerprint").is_none());
+
+        let cached_state: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cached_state["catalog"]["models"][0]["id"], "gpt-6-sol");
+        let cached_again: Value = client
+            .post(format!("{base}/api/chats/{id}/automation/capabilities"))
+            .bearer_auth("test-token")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cached_again["catalogRevision"], "owner_catalog_1");
+        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
 
         let login: Value = client
             .post(format!("{base}/api/chats/{id}/automation/login"))
@@ -2400,13 +3484,13 @@ mod tests {
         assert!(!joined.contains("owner_account_1"));
         assert!(!joined.contains(&descriptor.display().to_string()));
         assert_eq!(companion_state.login_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
         assert_eq!(companion_state.reveal_calls.load(Ordering::SeqCst), 0);
         for age in [0, 240_000] {
             chat.record_agent_call(crate::markdown_chat::now_ms() - age)
                 .await
                 .unwrap();
-            let denied = client
+            let selected = client
                 .post(format!("{base}/api/chats/{id}/automation/selection"))
                 .bearer_auth("test-token")
                 .json(
@@ -2415,13 +3499,25 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(denied.status(), StatusCode::CONFLICT);
-            assert!(denied.text().await.unwrap().contains("offline"));
+            assert_eq!(selected.status(), StatusCode::OK);
         }
         assert_eq!(
             companion_state.capabilities_calls.load(Ordering::SeqCst),
-            2,
-            "online selection must be rejected before inspecting the browser"
+            1,
+            "online preferences must use the cached catalog without changing the browser"
+        );
+        let mut restarted = open_state.clone();
+        restarted.catalog_cache = Arc::default();
+        let (health, restored) = owner_catalog(&restarted, false).await.unwrap();
+        assert_eq!(restored.catalog_revision, "owner_catalog_1");
+        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            cached_owner_catalog(
+                &restarted,
+                &catalog_key(&health.build, Some("other-account"))
+            )
+            .await
+            .is_none()
         );
         owner_task.abort();
         companion_task.abort();
@@ -2513,12 +3609,18 @@ mod tests {
                 .unwrap(),
         );
         let state = OwnerState {
+            project_bindings: Arc::new(
+                crate::project_bindings::ProjectBindingStore::for_current_user(),
+            ),
+            creation_lock: Arc::default(),
             config: Arc::new(config),
             chats,
             artifacts,
             continuations,
             automation: Some(supervisor.clone()),
             open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
             token: "test-token".into(),
         };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

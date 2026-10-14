@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -7,15 +8,18 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::companion::{MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES, rendered_action_prompt_bytes};
+use super::companion::{
+    MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES, rendered_action_prompt_bytes,
+    same_chatgpt_conversation_url,
+};
 use super::store::{MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure};
 use super::{
     AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AutomationActionKind,
-    AutomationActionStatus, BrowserCompanionClient, CapabilityCatalog, CompanionActionSnapshot,
-    CompanionActionState, CompanionEvent, CompanionEventKind, CompanionSessionStatus,
-    CompanionUnreadMessage, ExecuteActionRequest, GoalStatus,
+    AutomationActionStatus, BrowserCompanionClient, CompanionActionSnapshot, CompanionActionState,
+    CompanionEvent, CompanionEventKind, CompanionSessionStatus, CompanionUnreadMessage,
+    ExecuteActionRequest, GoalStatus,
 };
-use crate::markdown_chat::{AgentAutomationConfig, ChatFile, OFFLINE_AFTER_MS};
+use crate::markdown_chat::{AUTOMATION_OFFLINE_AFTER_MS, AgentAutomationConfig, ChatFile};
 use crate::project_bindings::ConversationIdentity;
 
 #[derive(Clone)]
@@ -74,6 +78,28 @@ pub struct AutomationLiveState {
 
 #[async_trait]
 pub trait AutomationExecutor: Send + Sync {
+    async fn prepare_new_chat(
+        &self,
+        _project_url: Option<&str>,
+        _cancellation: CancellationToken,
+    ) -> Result<super::CapabilityCatalog, String> {
+        Err("New chat preparation is unavailable".into())
+    }
+    async fn timed_out_action(
+        &self,
+        _execution: &AutomationExecution,
+        message: &str,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        Err(execution_error(message.into(), true))
+    }
+    async fn retained_action(
+        &self,
+        _action_id: &str,
+        _account_fingerprint: &str,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        Ok(None)
+    }
+
     async fn execute(
         &self,
         execution: AutomationExecution,
@@ -85,28 +111,154 @@ pub trait AutomationExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct BrowserAutomationExecutor {
     config: AgentAutomationConfig,
+    startup_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserAutomationExecutor {
     pub fn new(config: AgentAutomationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            startup_lock: Arc::new(Mutex::new(())),
+        }
     }
+
+    async fn ready_client(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<BrowserCompanionClient, String> {
+        companion_client_or_start(&self.config, &self.startup_lock, cancellation, || async {
+            super::BrowserCompanionManager::from_config(&self.config)?
+                .start()
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+async fn companion_client_or_start<F, Fut>(
+    config: &AgentAutomationConfig,
+    startup_lock: &Mutex<()>,
+    cancellation: &CancellationToken,
+    start: F,
+) -> Result<BrowserCompanionClient, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if cancellation.is_cancelled() {
+        return Err("Browser action was cancelled before startup".into());
+    }
+    if let Ok(client) = BrowserCompanionClient::from_config(config) {
+        return Ok(client);
+    }
+    let _guard = startup_lock.lock().await;
+    if cancellation.is_cancelled() {
+        return Err("Browser action was cancelled before startup".into());
+    }
+    // A concurrent action may have already launched the installed companion.
+    if let Ok(client) = BrowserCompanionClient::from_config(config) {
+        return Ok(client);
+    }
+    start().await?;
+    BrowserCompanionClient::from_config(config)
 }
 
 #[async_trait]
 impl AutomationExecutor for BrowserAutomationExecutor {
+    async fn prepare_new_chat(
+        &self,
+        project_url: Option<&str>,
+        cancellation: CancellationToken,
+    ) -> Result<super::CapabilityCatalog, String> {
+        let client = self.ready_client(&cancellation).await?;
+        client
+            .new_chat_capabilities(project_url, &cancellation)
+            .await
+    }
+    async fn timed_out_action(
+        &self,
+        execution: &AutomationExecution,
+        message: &str,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        let uncertain = |error: String| execution_error(format!("{message}; {error}"), true);
+        let client = BrowserCompanionClient::from_config(&self.config).map_err(uncertain)?;
+        let cancellation = CancellationToken::new();
+        let health = client.health(&cancellation).await.map_err(uncertain)?;
+        if !health.authenticated
+            || health.account_fingerprint.as_deref() != Some(execution.account_fingerprint.as_str())
+        {
+            return Err(uncertain(
+                "Browser action status could not be verified for the same account".into(),
+            ));
+        }
+        let snapshot = client
+            .action(&execution.request.action_id, &cancellation)
+            .await
+            .map_err(uncertain)?;
+        if action_is_terminal(snapshot.state) {
+            validate_terminal_snapshot(execution, &snapshot)?;
+            return Ok(snapshot);
+        }
+        if !snapshot.send_accepted {
+            // Cancel an unaccepted action so it cannot submit later after the queue moves on.
+            client
+                .cancel(
+                    &execution.request.action_id,
+                    &format!("timeout-{}", execution.request.action_id),
+                    &cancellation,
+                )
+                .await
+                .map_err(uncertain)?;
+            let cancelled = client
+                .action(&execution.request.action_id, &cancellation)
+                .await
+                .map_err(uncertain)?;
+            if !cancelled.send_accepted && cancelled.state == CompanionActionState::Failed {
+                return Err(execution_error(message.into(), false));
+            }
+        }
+        Err(execution_error(message.into(), true))
+    }
+    async fn retained_action(
+        &self,
+        action_id: &str,
+        account_fingerprint: &str,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        let client = BrowserCompanionClient::from_config(&self.config)?;
+        let cancellation = CancellationToken::new();
+        let health = client.health(&cancellation).await?;
+        if !health.authenticated
+            || health.account_fingerprint.as_deref() != Some(account_fingerprint)
+        {
+            return Err("Browser action recovery could not verify the signed-in account".into());
+        }
+        if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() {
+            return Ok(None);
+        }
+        client.action(action_id, &cancellation).await.map(Some)
+    }
+
     async fn execute(
         &self,
         execution: AutomationExecution,
         events: mpsc::UnboundedSender<CompanionEvent>,
         cancellation: CancellationToken,
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
-        let client = BrowserCompanionClient::from_config(&self.config)
+        let client = self
+            .ready_client(&cancellation)
+            .await
             .map_err(|message| execution_error(message, false))?;
         let health = client
             .health(&cancellation)
             .await
             .map_err(|message| execution_error(message, false))?;
+        if health.status == CompanionSessionStatus::Unavailable {
+            return Err(execution_error(
+                "Browser companion is unavailable; its Chrome window is not ready".into(),
+                false,
+            ));
+        }
         if !health.authenticated {
             return Err(execution_error(
                 "Browser companion authentication is required".into(),
@@ -120,20 +272,33 @@ impl AutomationExecutor for BrowserAutomationExecutor {
                 false,
             ));
         }
-        if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() {
+        if health.active_action_id.is_some() {
             return Err(execution_error(
                 "Browser companion is busy with another action".into(),
                 false,
             ));
         }
-        let catalog = client
-            .capabilities(&cancellation)
-            .await
-            .map_err(|message| execution_error(message, false))?;
-        validate_execution_catalog(&execution, &catalog)
-            .map_err(|message| execution_error(message, false))?;
+        // Only the companion can prove and replace an unchanged verification draft.
+        // Let it perform that check for pairing; ordinary work still requires an idle window.
+        let replacing_pairing = matches!(
+            execution.request.prompt,
+            ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. }
+        );
+        if health.status != CompanionSessionStatus::Idle
+            && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
+            && !(replacing_pairing && health.status == CompanionSessionStatus::Busy)
+        {
+            return Err(execution_error(
+                "The shared ChatGPT window is not ready; check for an unsent draft or an ongoing response".into(),
+                false,
+            ));
+        }
+        // Selection is verified by the companion after navigating to the target.
+        // A full catalog refresh here would operate on the previous conversation.
 
-        if let Some(commit) = &execution.pairing_commit {
+        if let Some(commit) = &execution.pairing_commit
+            && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
+        {
             commit
                 .store
                 .record_pairing_canonical_url(
@@ -303,6 +468,13 @@ pub struct AgentAutomationSupervisor {
     run_lock: Mutex<()>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
+    action_timeouts: ActionTimeouts,
+}
+
+struct ActionTimeouts {
+    start: Duration,
+    progress: Duration,
+    total: Duration,
 }
 
 pub struct AutomationSupervisorWorker {
@@ -317,6 +489,23 @@ impl Drop for AutomationSupervisorWorker {
 
 impl AgentAutomationSupervisor {
     pub fn new(config: AgentAutomationConfig, executor: Arc<dyn AutomationExecutor>) -> Arc<Self> {
+        Self::new_with_action_timeouts(
+            config,
+            executor,
+            Duration::from_secs(120),
+            Duration::from_secs(180),
+            Duration::from_secs(32 * 60),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_action_timeouts(
+        config: AgentAutomationConfig,
+        executor: Arc<dyn AutomationExecutor>,
+        start: Duration,
+        progress: Duration,
+        total: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             executor,
@@ -326,6 +515,11 @@ impl AgentAutomationSupervisor {
             run_lock: Mutex::new(()),
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
+            action_timeouts: ActionTimeouts {
+                start,
+                progress,
+                total,
+            },
         })
     }
 
@@ -374,7 +568,13 @@ impl AgentAutomationSupervisor {
                 .as_ref()
                 .is_some_and(|pending| pending.owner_generation != task.owner_generation);
         let orphaned_pairing = first_registration
-            && state.action.status == AutomationActionStatus::Queued
+            && matches!(
+                state.action.status,
+                AutomationActionStatus::Queued
+                    | AutomationActionStatus::Navigating
+                    | AutomationActionStatus::Sending
+                    | AutomationActionStatus::Generating
+            )
             && state.action.kind == Some(AutomationActionKind::PairVerify);
         let orphaned_action = (first_registration
             && state.action.status == AutomationActionStatus::Queued
@@ -386,6 +586,9 @@ impl AgentAutomationSupervisor {
                 &task.task,
                 crate::markdown_chat::now_ms(),
             )?;
+            if orphaned_pairing {
+                task.store.record_interrupted_pairing(&task.task)?;
+            }
             self.queue
                 .lock()
                 .await
@@ -404,12 +607,38 @@ impl AgentAutomationSupervisor {
             self.live.write().await.remove(task.task.stable_key());
         }
         task.chat.ensure().await?;
+        let activity = task.chat.offline_activity().await?;
+        task.store.sync_goal_presence(
+            &task.task,
+            activity.last_call_for_presence(crate::markdown_chat::now_ms()),
+            activity.agent_waiting_until_ms,
+            activity.agent_stop_requested,
+            crate::markdown_chat::now_ms(),
+        )?;
         self.tasks
             .write()
             .await
             .insert(task.task.stable_key().to_string(), task);
         self.notify();
         Ok(())
+    }
+
+    pub async fn prepare_new_chat(
+        &self,
+        project_url: Option<&str>,
+    ) -> Result<super::CapabilityCatalog, String> {
+        let cancellation = CancellationToken::new();
+        let result = tokio::time::timeout(Duration::from_secs(180), async {
+            let _guard = self.run_lock.lock().await;
+            self.executor
+                .prepare_new_chat(project_url, cancellation.clone())
+                .await
+        })
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| {
+            "New-chat preparation timed out; retry when the browser is available".to_string()
+        })?
     }
 
     pub async fn queued_count(&self) -> usize {
@@ -436,6 +665,19 @@ impl AgentAutomationSupervisor {
             self.wake.notify_one();
         }
         removed
+    }
+
+    pub async fn discard_queued_work(&self, task: &ConversationIdentity) -> usize {
+        let mut queue = self.queue.lock().await;
+        let before = queue.len();
+        queue.retain(|execution| {
+            execution.task_key != task.stable_key()
+                || matches!(
+                    execution.request.prompt,
+                    ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. }
+                )
+        });
+        before.saturating_sub(queue.len())
     }
 
     pub async fn cancel_queued_action(
@@ -500,6 +742,28 @@ impl AgentAutomationSupervisor {
             .get(task.stable_key())
             .cloned()
             .ok_or("Browser automation task is not registered")?;
+        // An older companion rejected this exact condition before touching Send.
+        // Preserve the evidence so the authenticated owner can retry that saved action.
+        if let Some(live) = self.live_state(task).await
+            && live.action_id.as_deref() == Some(expected_action_id)
+            && live.status.as_deref()
+                == Some("The shared ChatGPT conversation is already generating")
+        {
+            let saved = handle.store.load(&handle.task)?;
+            if saved.action.id.as_deref() == Some(expected_action_id)
+                && saved.action.status == AutomationActionStatus::Interference
+                && saved.action.send_accepted != Some(true)
+            {
+                handle.store.update_action_status(
+                    &handle.task,
+                    expected_action_id,
+                    AutomationActionStatus::Interference,
+                    live.status.as_deref(),
+                    None,
+                    now_ms,
+                )?;
+            }
+        }
         handle
             .store
             .reset_failed_action_for_retry(&handle.task, expected_action_id, now_ms)?;
@@ -521,6 +785,37 @@ impl AgentAutomationSupervisor {
         generation: u64,
         now_ms: u64,
     ) -> Result<(), String> {
+        self.queue_pair_request(task, reference, generation, now_ms, None)
+            .await
+    }
+
+    pub async fn queue_new_chat(
+        &self,
+        task: &ConversationIdentity,
+        reference: &str,
+        generation: u64,
+        now_ms: u64,
+        continuation_token: String,
+        setup_reference: Option<String>,
+    ) -> Result<(), String> {
+        self.queue_pair_request(
+            task,
+            reference,
+            generation,
+            now_ms,
+            Some((continuation_token, setup_reference)),
+        )
+        .await
+    }
+
+    async fn queue_pair_request(
+        &self,
+        task: &ConversationIdentity,
+        reference: &str,
+        generation: u64,
+        now_ms: u64,
+        creation: Option<(String, Option<String>)>,
+    ) -> Result<(), String> {
         let handle = self
             .tasks
             .read()
@@ -539,13 +834,27 @@ impl AgentAutomationSupervisor {
             .candidate_url
             .ok_or("Agent automation pairing has no candidate URL")?;
         let state = handle.store.load(&handle.task)?;
-        let (Some(model), Some(effort), Some(catalog_revision), Some(account_fingerprint)) = (
-            state.selection.model,
-            state.selection.effort,
-            state.selection.catalog_revision,
-            state.selection.account_fingerprint,
-        ) else {
-            return Err("Select a browser model and effort before pairing".into());
+        let account_fingerprint = state
+            .pairing
+            .account_fingerprint
+            .or(state.selection.account_fingerprint)
+            .ok_or("Sign in to ChatGPT before pairing")?;
+        let catalog_revision = if creation.is_some() {
+            state
+                .selection
+                .catalog_revision
+                .clone()
+                .ok_or("Select a model and effort for the new chat")?
+        } else {
+            "conversation-current".to_owned()
+        };
+        let (model, effort) = if creation.is_some() {
+            (
+                state.selection.model.clone(),
+                state.selection.effort.clone(),
+            )
+        } else {
+            (None, None)
         };
         let mut queue = self.queue.lock().await;
         if let Some(position) = queue
@@ -569,7 +878,7 @@ impl AgentAutomationSupervisor {
         queue.push_back(AutomationExecution {
             task_key: handle.task.stable_key().to_string(),
             owner_generation: handle.owner_generation,
-            account_fingerprint,
+            account_fingerprint: account_fingerprint.clone(),
             catalog_revision,
             activity_epoch: "pair-verification".into(),
             activity_sequence: generation,
@@ -589,8 +898,16 @@ impl AgentAutomationSupervisor {
                 connector_name: self.config.connector_name.clone(),
                 model,
                 effort,
-                prompt: ActionPrompt::PairVerify {
-                    reference: reference.to_string(),
+                expected_account_fingerprint: account_fingerprint,
+                prompt: match creation {
+                    Some((continuation_token, setup_reference)) => ActionPrompt::CreateChat {
+                        continuation_token,
+                        setup_reference,
+                        reference: reference.to_string(),
+                    },
+                    None => ActionPrompt::PairVerify {
+                        reference: reference.to_string(),
+                    },
                 },
                 expected_url: candidate_url,
                 auto_approve_tool_calls: self.config.auto_approve_tool_calls,
@@ -623,30 +940,169 @@ impl AgentAutomationSupervisor {
             .collect::<Vec<_>>();
         for task in tasks {
             let activity = task.chat.offline_activity().await?;
-            let Some(last_call_at_ms) = activity.last_call_at_ms else {
-                continue;
-            };
-            if now_ms.saturating_sub(last_call_at_ms) < OFFLINE_AFTER_MS {
+            task.store.sync_goal_presence(
+                &task.task,
+                activity.last_call_for_presence(now_ms),
+                activity.agent_waiting_until_ms,
+                activity.agent_stop_requested,
+                now_ms,
+            )?;
+            let mut state = task.store.load(&task.task)?;
+            task.store.notify_state(&task.chat, &state).await;
+            if !activity.agent_stop_requested
+                && state.action.goal_turn_counted
+                && state.action.kind == Some(AutomationActionKind::OfflineGoal)
+                && state.action.updated_at_ms.is_some_and(|started| {
+                    activity.last_call_at_ms.is_some_and(|last| last >= started)
+                })
+            {
+                // Tool activity proves the submitted goal has reached the agent. Browser
+                // ownership is no longer needed, even if the model is still working.
+                let epoch = activity
+                    .activity_epoch
+                    .as_deref()
+                    .unwrap_or("legacy-activity");
+                let sequence = if activity.activity_sequence == 0 {
+                    activity.tool_call_count
+                } else {
+                    activity.activity_sequence
+                };
+                if task.store.reconcile_completed_goal_action(
+                    &task.task, &state, epoch, sequence, true, now_ms,
+                )? {
+                    self.live.write().await.remove(task.task.stable_key());
+                    state = task.store.load(&task.task)?;
+                }
+            }
+            if activity.agent_stop_requested
+                || activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+                || activity
+                    .agent_waiting_until_ms
+                    .is_some_and(|until| now_ms < until)
+            {
                 continue;
             }
-            let state = task.store.load(&task.task)?;
             let Some(url) = state.pairing.canonical_url.clone() else {
                 continue;
             };
             if state.pairing.verified_owner_generation != Some(task.owner_generation) {
                 continue;
             }
+            if state.action.kind == Some(AutomationActionKind::OfflineGoal)
+                && matches!(
+                    state.action.status,
+                    AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                        | AutomationActionStatus::Ambiguous
+                )
+                && let (Some(action_id), Some(account)) = (
+                    state.action.id.as_deref(),
+                    state
+                        .pairing
+                        .account_fingerprint
+                        .as_deref()
+                        .or(state.selection.account_fingerprint.as_deref()),
+                )
+                && let Ok(_run_guard) = self.run_lock.try_lock()
+            {
+                // The old observer may have disappeared during a service restart. Recover only
+                // an exact, completed goal-only receipt; never replay an uncertain user send.
+                if let Ok(Ok(Some(snapshot))) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.executor.retained_action(action_id, account),
+                )
+                .await
+                    && snapshot.action_id == action_id
+                    && snapshot.state == CompanionActionState::Idle
+                    && snapshot.send_accepted
+                    && snapshot.attention.is_none()
+                    && snapshot
+                        .canonical_url
+                        .as_deref()
+                        .is_some_and(|observed| same_chatgpt_conversation_url(observed, &url))
+                {
+                    let made_progress = state.action.updated_at_ms.is_some_and(|started| {
+                        activity.last_call_at_ms.is_some_and(|last| last >= started)
+                    });
+                    let epoch = activity
+                        .activity_epoch
+                        .as_deref()
+                        .unwrap_or("legacy-activity");
+                    let sequence = if activity.activity_sequence == 0 {
+                        activity.tool_call_count
+                    } else {
+                        activity.activity_sequence
+                    };
+                    if task.store.reconcile_completed_goal_action(
+                        &task.task,
+                        &state,
+                        epoch,
+                        sequence,
+                        made_progress,
+                        now_ms,
+                    )? {
+                        self.live.write().await.remove(task.task.stable_key());
+                        state = task.store.load(&task.task)?;
+                    }
+                }
+            }
+            if matches!(
+                state.action.status,
+                AutomationActionStatus::Navigating
+                    | AutomationActionStatus::Sending
+                    | AutomationActionStatus::Generating
+            ) && state.action.updated_at_ms.is_some_and(|started| {
+                now_ms.saturating_sub(started)
+                    >= self.action_timeouts.total.as_millis().min(u64::MAX as u128) as u64
+            }) && let Ok(_run_guard) = self.run_lock.try_lock()
+                && task
+                    .store
+                    .expire_unobserved_action(&task.task, &state.action)?
+            {
+                state = task.store.load(&task.task)?;
+            }
+            if let Some(retry_at) = state.automatic_retry_at_ms() {
+                if now_ms < retry_at {
+                    continue;
+                }
+                if task.store.reset_automatic_failure_for_retry(
+                    &task.task,
+                    &state.action,
+                    now_ms,
+                )? {
+                    self.live.write().await.remove(task.task.stable_key());
+                    state = task.store.load(&task.task)?;
+                } else {
+                    continue;
+                }
+            }
             if blocks_automatic_requeue(state.action.status) {
                 continue;
             }
-            let (Some(model), Some(effort), Some(catalog_revision), Some(account_fingerprint)) = (
-                state.selection.model.clone(),
-                state.selection.effort.clone(),
-                state.selection.catalog_revision.clone(),
-                state.selection.account_fingerprint.clone(),
-            ) else {
+            let Some(account_fingerprint) = state
+                .pairing
+                .account_fingerprint
+                .clone()
+                .or(state.selection.account_fingerprint.clone())
+            else {
                 continue;
             };
+            if state
+                .selection
+                .account_fingerprint
+                .as_ref()
+                .is_some_and(|saved| saved != &account_fingerprint)
+            {
+                continue;
+            }
+            let model = state.selection.model.clone();
+            let effort = state.selection.effort.clone();
+            let catalog_revision = state
+                .selection
+                .catalog_revision
+                .clone()
+                .unwrap_or_else(|| "conversation-current".into());
             let unread = task.chat.unread_snapshot().await?;
             let unread_ids = unread
                 .messages
@@ -857,7 +1313,7 @@ impl AgentAutomationSupervisor {
             queue.push_back(AutomationExecution {
                 task_key: task.task.stable_key().to_string(),
                 owner_generation: task.owner_generation,
-                account_fingerprint,
+                account_fingerprint: account_fingerprint.clone(),
                 catalog_revision,
                 activity_epoch,
                 activity_sequence,
@@ -873,6 +1329,7 @@ impl AgentAutomationSupervisor {
                     connector_name: self.config.connector_name.clone(),
                     model,
                     effort,
+                    expected_account_fingerprint: account_fingerprint,
                     prompt,
                     expected_url: url,
                     auto_approve_tool_calls: self.config.auto_approve_tool_calls,
@@ -932,35 +1389,124 @@ impl AgentAutomationSupervisor {
             },
         );
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
         let execute = self
             .executor
-            .execute(execution.clone(), events_tx, CancellationToken::new());
+            .execute(execution.clone(), events_tx, cancellation.clone());
         tokio::pin!(execute);
         let mut accumulator = EventAccumulator::default();
         let mut events_open = true;
+        let started = tokio::time::Instant::now();
+        let start_deadline = started + self.action_timeouts.start;
+        let total_deadline = started + self.action_timeouts.total;
+        let mut progress_deadline = started + self.action_timeouts.progress;
+        let mut watchdog_message = None;
         let outcome = loop {
+            let now = tokio::time::Instant::now();
+            if now >= total_deadline || (!accumulator.send_accepted && now >= start_deadline) {
+                let message = if now >= total_deadline {
+                    "Browser action reached its 32-minute time limit"
+                } else {
+                    "Browser action timed out before Send after 2 minutes"
+                };
+                watchdog_message = Some(message);
+                break Err(execution_error(message.into(), true));
+            }
+            let deadline = total_deadline.min(if accumulator.send_accepted {
+                progress_deadline
+            } else {
+                start_deadline
+            });
             tokio::select! {
+                biased;
                 result = &mut execute => break result,
                 event = events_rx.recv(), if events_open => match event {
-                    Some(event) => self.apply_event(&execution, &mut accumulator, event).await?,
+                    Some(event) => {
+                        self.apply_event(&execution, &mut accumulator, event).await?;
+                        progress_deadline = tokio::time::Instant::now() + self.action_timeouts.progress;
+                    }
                     None => events_open = false,
-                }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let message = if tokio::time::Instant::now() >= total_deadline {
+                        "Browser action reached its 32-minute time limit"
+                    } else if accumulator.send_accepted {
+                        "Browser action timed out after 3 minutes without checked progress"
+                    } else {
+                        "Browser action timed out before Send after 2 minutes"
+                    };
+                    watchdog_message = Some(message);
+                    break Err(execution_error(message.into(), true));
+                },
             }
+        };
+        let outcome = if let Some(message) = watchdog_message {
+            cancellation.cancel();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.executor.timed_out_action(&execution, message),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(execution_error(
+                    format!("{message}; browser status reconciliation timed out"),
+                    true,
+                ))
+            })
+        } else {
+            outcome
         };
         while let Ok(event) = events_rx.try_recv() {
             self.apply_event(&execution, &mut accumulator, event)
                 .await?;
         }
 
+        let outcome = outcome.and_then(|snapshot| {
+            if pair_verification && !snapshot.send_accepted {
+                return Err(execution_error(
+                    snapshot
+                        .attention
+                        .as_ref()
+                        .and_then(|attention| attention.message.clone())
+                        .unwrap_or_else(|| "Pairing verification failed before Send".into()),
+                    false,
+                ));
+            }
+            Ok(snapshot)
+        });
+
         let snapshot = match outcome {
             Ok(snapshot) => {
+                if snapshot.send_accepted
+                    && matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
+                {
+                    task.store.record_creation_send(
+                        &task.task,
+                        &execution.request.action_id,
+                        true,
+                    )?;
+                }
+                if snapshot.send_accepted && !pair_verification {
+                    task.store
+                        .record_goal_turn(&task.task, &execution.request.action_id)?;
+                }
                 accumulator.send_accepted |= snapshot.send_accepted;
                 snapshot
             }
             Err(error) => {
                 let action_current = current_action_matches(&task, &execution)?;
                 let send_accepted = error.send_accepted || accumulator.send_accepted;
-                if pair_verification && action_current {
+                if matches!(execution.request.prompt, ActionPrompt::CreateChat { .. }) {
+                    task.store.record_creation_send(
+                        &task.task,
+                        &execution.request.action_id,
+                        send_accepted,
+                    )?;
+                }
+                if pair_verification
+                    && action_current
+                    && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
+                {
                     task.store.invalidate_pairing(&task.task, now_ms)?;
                 }
                 if send_accepted {
@@ -1000,7 +1546,7 @@ impl AgentAutomationSupervisor {
                         )?;
                         let _ = task
                             .chat
-                            .claim_offline_automation_goal(now_ms, OFFLINE_AFTER_MS)
+                            .claim_offline_automation_goal(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
                             .await?;
                     }
                 }
@@ -1013,16 +1559,30 @@ impl AgentAutomationSupervisor {
                 } else {
                     AutomationActionStatus::Failed
                 };
+                let terminal_at_ms = if !send_accepted {
+                    now_ms
+                        .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                } else {
+                    now_ms
+                };
                 task.store.update_action_status(
                     &task.task,
                     &execution.request.action_id,
                     status,
                     Some(&error.message),
                     None,
-                    now_ms,
+                    terminal_at_ms,
                 )?;
-                self.update_live_terminal(&execution, status, Some(error.message.clone()), now_ms)
-                    .await;
+                self.update_live_terminal(
+                    &execution,
+                    status,
+                    Some(error.message.clone()),
+                    terminal_at_ms,
+                )
+                .await;
+                if let Ok(state) = task.store.load(&task.task) {
+                    task.store.notify_state(&task.chat, &state).await;
+                }
                 return Err(error.message);
             }
         };
@@ -1087,7 +1647,7 @@ impl AgentAutomationSupervisor {
             )?;
             let _ = task
                 .chat
-                .claim_offline_automation_goal(now_ms, OFFLINE_AFTER_MS)
+                .claim_offline_automation_goal(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
                 .await?;
         }
         if !pair_verification
@@ -1120,6 +1680,7 @@ impl AgentAutomationSupervisor {
         } else if accumulator.send_accepted && terminal_status == AutomationActionStatus::Failed {
             AutomationActionStatus::Ambiguous
         } else if accumulator.send_accepted
+            && !accumulator.submission_complete
             && execution_goal_revision(&execution).is_some()
             && no_tool_activity
             && terminal_status == AutomationActionStatus::Idle
@@ -1128,19 +1689,38 @@ impl AgentAutomationSupervisor {
         } else {
             terminal_status
         };
+        let failure_message = snapshot.attention.as_ref().and_then(|attention| attention.message.as_deref())
+            .or(watchdog_message).or(match status {
+                AutomationActionStatus::AuthenticationRequired => Some("Sign in to ChatGPT, then retry this action."),
+                AutomationActionStatus::Stalled => Some("The previous goal turn produced no tool activity. Continue the goal to start another turn."),
+                _ => None,
+            });
+        let terminal_at_ms = if !accumulator.send_accepted {
+            now_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        } else {
+            now_ms
+        };
         task.store.update_action_status(
             &task.task,
             &execution.request.action_id,
             status,
-            None,
+            failure_message,
             (!pair_verification)
                 .then_some(accumulator.final_markdown.as_deref())
                 .flatten()
                 .filter(|answer| answer.len() <= MAX_PRIVATE_TEXT_BYTES),
-            now_ms,
+            terminal_at_ms,
         )?;
-        self.update_live_terminal(&execution, status, None, now_ms)
-            .await;
+        self.update_live_terminal(
+            &execution,
+            status,
+            failure_message.map(str::to_owned),
+            terminal_at_ms,
+        )
+        .await;
+        if let Ok(state) = task.store.load(&task.task) {
+            task.store.notify_state(&task.chat, &state).await;
+        }
         Ok(Some(snapshot))
     }
 
@@ -1150,6 +1730,12 @@ impl AgentAutomationSupervisor {
         accumulator: &mut EventAccumulator,
         event: CompanionEvent,
     ) -> Result<(), String> {
+        if matches!(event.kind, CompanionEventKind::SendAccepted)
+            && let Some(task) = self.tasks.read().await.get(&execution.task_key)
+        {
+            task.store
+                .record_goal_turn(&task.task, &execution.request.action_id)?;
+        }
         let mut live = self.live.write().await;
         let state = live
             .entry(execution.task_key.clone())
@@ -1200,6 +1786,12 @@ impl AgentAutomationSupervisor {
                 accumulator.final_markdown = final_markdown;
                 accumulator.terminal_status = Some(AutomationActionStatus::Idle);
                 state.phase = AutomationActionStatus::Idle;
+            }
+            CompanionEventKind::SubmissionComplete { .. } => {
+                accumulator.submission_complete = true;
+                accumulator.terminal_status = Some(AutomationActionStatus::Idle);
+                state.phase = AutomationActionStatus::Idle;
+                state.status = Some("Message sent to ChatGPT".into());
             }
             CompanionEventKind::ApprovalRequired { message } => {
                 state.status = message;
@@ -1268,6 +1860,7 @@ impl AgentAutomationSupervisor {
 
 #[derive(Default)]
 struct EventAccumulator {
+    submission_complete: bool,
     send_accepted: bool,
     answer_markdown: Option<String>,
     answer_truncated: bool,
@@ -1313,35 +1906,6 @@ fn execution_error(message: String, send_accepted: bool) -> AutomationExecutionE
     }
 }
 
-fn validate_execution_catalog(
-    execution: &AutomationExecution,
-    catalog: &CapabilityCatalog,
-) -> Result<(), String> {
-    if catalog.account_fingerprint != execution.account_fingerprint {
-        return Err(
-            "Browser companion account changed; refresh capabilities and verify the pairing again"
-                .into(),
-        );
-    }
-    if catalog.catalog_revision != execution.catalog_revision {
-        return Err("Browser companion capability catalog changed; refresh model options".into());
-    }
-    let model = catalog
-        .models
-        .iter()
-        .find(|model| model.id == execution.request.model)
-        .ok_or("The selected browser model is no longer available")?;
-    let effort = model
-        .efforts
-        .iter()
-        .find(|effort| effort.id == execution.request.effort)
-        .ok_or("The selected browser effort is no longer available")?;
-    if !effort.available {
-        return Err("The selected browser effort is unavailable for this account".into());
-    }
-    Ok(())
-}
-
 fn validate_terminal_snapshot(
     execution: &AutomationExecution,
     snapshot: &CompanionActionSnapshot,
@@ -1368,19 +1932,30 @@ fn validate_terminal_snapshot(
         }
         return Ok(());
     }
-    let selected = snapshot.selected.as_ref().ok_or_else(|| {
-        execution_error(
-            "Browser companion did not prove the selected model and effort".into(),
-            true,
-        )
-    })?;
-    if selected.model != execution.request.model || selected.effort != execution.request.effort {
-        return Err(execution_error(
-            "Browser companion selected a different model or effort".into(),
-            true,
-        ));
+    if execution.request.model.is_some() {
+        let selected = snapshot.selected.as_ref().ok_or_else(|| {
+            execution_error(
+                "Browser companion did not prove the selected model and effort".into(),
+                true,
+            )
+        })?;
+        if Some(&selected.model) != execution.request.model.as_ref()
+            || Some(&selected.effort) != execution.request.effort.as_ref()
+        {
+            return Err(execution_error(
+                "Browser companion selected a different model or effort".into(),
+                true,
+            ));
+        }
     }
-    if snapshot.canonical_url.as_deref() != Some(execution.request.expected_url.as_str()) {
+    if !snapshot.canonical_url.as_deref().is_some_and(|observed| {
+        if matches!(execution.request.prompt, ActionPrompt::CreateChat { .. }) {
+            super::companion::canonical_chatgpt_conversation_url(observed)
+                .is_ok_and(|url| url.starts_with("https://chatgpt.com/c/"))
+        } else {
+            same_chatgpt_conversation_url(observed, &execution.request.expected_url)
+        }
+    }) {
         return Err(execution_error(
             "Browser companion returned a different conversation URL".into(),
             true,
@@ -1469,15 +2044,12 @@ async fn execution_matches(
     if state.action.id.as_deref() != Some(execution.request.action_id.as_str())
         || state.action.status != AutomationActionStatus::Queued
         || state.pairing.generation != execution.request.pairing_generation
-        || state.selection.model.as_deref() != Some(execution.request.model.as_str())
-        || state.selection.effort.as_deref() != Some(execution.request.effort.as_str())
-        || state.selection.catalog_revision.as_deref() != Some(execution.catalog_revision.as_str())
-        || state.selection.account_fingerprint.as_deref()
-            != Some(execution.account_fingerprint.as_str())
     {
         return Ok(false);
     }
-    if let ActionPrompt::PairVerify { reference } = &execution.request.prompt {
+    if let ActionPrompt::PairVerify { reference } | ActionPrompt::CreateChat { reference, .. } =
+        &execution.request.prompt
+    {
         if state.pairing.candidate_url.as_deref() != Some(execution.request.url.as_str())
             || state.pairing.pending.as_ref().is_none_or(|pending| {
                 pending.generation != execution.request.pairing_generation
@@ -1492,8 +2064,9 @@ async fn execution_matches(
         }
         return task
             .store
-            .validate_pending_pairing(
+            .activate_queued_pairing(
                 &task.task,
+                &execution.request.action_id,
                 execution.request.pairing_generation,
                 execution.owner_generation,
                 reference,
@@ -1508,10 +2081,26 @@ async fn execution_matches(
                 }
             });
     }
+    if state.selection.model != execution.request.model
+        || state.selection.effort != execution.request.effort
+        || state
+            .pairing
+            .account_fingerprint
+            .as_deref()
+            .or(state.selection.account_fingerprint.as_deref())
+            != Some(execution.account_fingerprint.as_str())
+        || (execution.request.model.is_some()
+            && state.selection.catalog_revision.as_deref()
+                != Some(execution.catalog_revision.as_str()))
+    {
+        return Ok(false);
+    }
     let activity = task.chat.offline_activity().await?;
-    if activity
-        .last_call_at_ms
-        .is_none_or(|last| now_ms.saturating_sub(last) < OFFLINE_AFTER_MS)
+    if activity.agent_stop_requested
+        || activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+        || activity
+            .agent_waiting_until_ms
+            .is_some_and(|until| now_ms < until)
         || state.pairing.canonical_url.as_deref() != Some(execution.request.url.as_str())
         || state.pairing.verified_owner_generation != Some(execution.owner_generation)
     {
@@ -1566,13 +2155,17 @@ fn execution_goal_revision(execution: &AutomationExecution) -> Option<u64> {
     match &execution.request.prompt {
         ActionPrompt::OfflineGoal { goal_revision }
         | ActionPrompt::OfflineCombined { goal_revision, .. } => Some(*goal_revision),
-        ActionPrompt::PairVerify { .. } | ActionPrompt::OfflineChat { .. } => None,
+        ActionPrompt::PairVerify { .. }
+        | ActionPrompt::CreateChat { .. }
+        | ActionPrompt::OfflineChat { .. } => None,
     }
 }
 
 fn execution_kind(execution: &AutomationExecution) -> AutomationActionKind {
     match &execution.request.prompt {
-        ActionPrompt::PairVerify { .. } => AutomationActionKind::PairVerify,
+        ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. } => {
+            AutomationActionKind::PairVerify
+        }
         ActionPrompt::OfflineChat { .. } => AutomationActionKind::OfflineChat,
         ActionPrompt::OfflineGoal { .. } => AutomationActionKind::OfflineGoal,
         ActionPrompt::OfflineCombined { .. } => AutomationActionKind::OfflineCombined,
@@ -1591,7 +2184,9 @@ fn execution_batch_id(execution: &AutomationExecution) -> Option<&str> {
     match &execution.request.prompt {
         ActionPrompt::OfflineChat { batch_id, .. }
         | ActionPrompt::OfflineCombined { batch_id, .. } => Some(batch_id),
-        ActionPrompt::PairVerify { .. } | ActionPrompt::OfflineGoal { .. } => None,
+        ActionPrompt::PairVerify { .. }
+        | ActionPrompt::CreateChat { .. }
+        | ActionPrompt::OfflineGoal { .. } => None,
     }
 }
 
@@ -1599,7 +2194,9 @@ fn execution_unread_messages(execution: &AutomationExecution) -> &[CompanionUnre
     match &execution.request.prompt {
         ActionPrompt::OfflineChat { messages, .. }
         | ActionPrompt::OfflineCombined { messages, .. } => messages,
-        ActionPrompt::PairVerify { .. } | ActionPrompt::OfflineGoal { .. } => &[],
+        ActionPrompt::PairVerify { .. }
+        | ActionPrompt::CreateChat { .. }
+        | ActionPrompt::OfflineGoal { .. } => &[],
     }
 }
 
@@ -1609,8 +2206,8 @@ fn queued_context_matches(
     owner_generation: u64,
     pairing_generation: u64,
     url: &str,
-    model: &str,
-    effort: &str,
+    model: &Option<String>,
+    effort: &Option<String>,
     catalog_revision: &str,
     account_fingerprint: &str,
     goal_revision: Option<u64>,
@@ -1619,8 +2216,8 @@ fn queued_context_matches(
         && queued.request.pairing_generation == pairing_generation
         && queued.request.url == url
         && queued.request.expected_url == url
-        && queued.request.model == model
-        && queued.request.effort == effort
+        && &queued.request.model == model
+        && &queued.request.effort == effort
         && queued.catalog_revision == catalog_revision
         && queued.account_fingerprint == account_fingerprint
         && execution_goal_revision(queued) == goal_revision
@@ -1672,4 +2269,161 @@ fn unread_batch_id<'a>(
         hash.update(id.as_bytes());
     }
     format!("{:x}", hash.finalize())
+}
+
+#[cfg(all(test, unix))]
+mod browser_startup_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn publish_descriptor(path: &std::path::Path) {
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let data = serde_json::json!({"version":1,"kind":"codexify-browser-companion",
+            "pid":std::process::id(),"endpoint":"http://127.0.0.1:9/",
+            "token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "build":format!("startup-test{}",super::super::PROTOCOL_BUILD_SUFFIX),
+            "createdAt":chrono::Utc::now().to_rfc3339()});
+        std::fs::write(path, serde_json::to_vec(&data).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn simultaneous_actions_start_a_missing_companion_once_and_reuse_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("descriptor.json");
+        let config = AgentAutomationConfig {
+            enabled: true,
+            descriptor_path: path.display().to_string(),
+            ..Default::default()
+        };
+        let lock = Mutex::new(());
+        let cancellation = CancellationToken::new();
+        let starts = AtomicUsize::new(0);
+        let start = || async {
+            starts.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            publish_descriptor(&path);
+            Ok(())
+        };
+        let (first, second) = tokio::join!(
+            companion_client_or_start(&config, &lock, &cancellation, start),
+            companion_client_or_start(&config, &lock, &cancellation, start)
+        );
+        assert!(first.is_ok(), "{:?}", first.err());
+        assert!(second.is_ok(), "{:?}", second.err());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(
+            companion_client_or_start(&config, &lock, &cancellation, || async {
+                panic!("Healthy companion must be reused")
+            })
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_launch_failure_never_produce_a_ready_client() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AgentAutomationConfig {
+            enabled: true,
+            descriptor_path: root.path().join("descriptor.json").display().to_string(),
+            ..Default::default()
+        };
+        let lock = Mutex::new(());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            companion_client_or_start(&config, &lock, &cancellation, || async {
+                panic!("Cancelled action must not launch Chrome")
+            })
+            .await
+            .err()
+            .unwrap()
+            .contains("cancelled")
+        );
+        let error =
+            companion_client_or_start(&config, &lock, &CancellationToken::new(), || async {
+                Err("Installed Chrome could not launch".into())
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Installed Chrome could not launch");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated home containing the signed companion runtime"]
+    async fn signed_companion_is_launched_by_an_action_without_sending_a_message() {
+        assert_eq!(
+            std::env::var("CODEXIFY_TEST_RECOVERY_SMOKE").as_deref(),
+            Ok("1")
+        );
+        let root = std::path::PathBuf::from(std::env::var_os("CODEXIFY_BROWSER_HOME").unwrap());
+        assert!(root.join("recovery-smoke-owned").is_file());
+        let config = AgentAutomationConfig {
+            enabled: true,
+            descriptor_path: root.join("descriptor.json").display().to_string(),
+            ..Default::default()
+        };
+        let manager = super::super::BrowserCompanionManager::from_config(&config).unwrap();
+        assert_eq!(
+            manager.status().await.state,
+            super::super::BrowserLifecycleState::Stopped
+        );
+        let executor = BrowserAutomationExecutor::new(config.clone());
+        let execution = AutomationExecution {
+            task_key: "a".repeat(64),
+            owner_generation: 0,
+            account_fingerprint: "deliberately-not-the-real-account".into(),
+            catalog_revision: "smoke".into(),
+            activity_epoch: "smoke".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 0,
+            unread_message_ids: Vec::new(),
+            transcript_revision: String::new(),
+            pairing_commit: None,
+            request: ExecuteActionRequest {
+                action_id: "recovery-smoke".into(),
+                idempotency_key: "recovery-smoke".into(),
+                url: "https://chatgpt.com/c/never-sent".into(),
+                expected_url: "https://chatgpt.com/c/never-sent".into(),
+                pairing_generation: 1,
+                connector_name: "Codexify".into(),
+                model: None,
+                effort: None,
+                expected_account_fingerprint: "deliberately-not-the-real-account".into(),
+                prompt: ActionPrompt::PairVerify {
+                    reference: "A".repeat(43),
+                },
+                auto_approve_tool_calls: false,
+            },
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let result = executor
+            .execute(execution, events, CancellationToken::new())
+            .await;
+        let client = BrowserCompanionClient::from_config(&config);
+        let health = match &client {
+            Ok(client) => client.health(&CancellationToken::new()).await,
+            Err(error) => Err(error.clone()),
+        };
+        let stopped = manager.stop().await;
+        let error = result
+            .err()
+            .expect("Account guard must prevent the smoke message from being sent");
+        assert!(!error.send_accepted);
+        assert!(client.is_ok());
+        assert!(health.is_ok());
+        assert!(stopped.is_ok());
+        assert!(!root.join("descriptor.json").exists());
+        assert!(root.join("chrome-profile").is_dir());
+        println!(
+            "Signed companion was launched by the action; account guard prevented any Send; isolated profile was retained"
+        );
+    }
 }

@@ -3,6 +3,8 @@ mod install;
 mod store;
 mod supervisor;
 
+pub(crate) use store::conversation_url_for_retry;
+
 pub use companion::{
     ActionPrompt, BrowserCompanionClient, COMPANION_KIND, CancelActionReceipt, CapabilityCatalog,
     CompanionActionSnapshot, CompanionActionState, CompanionAttention, CompanionEvent,

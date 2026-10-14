@@ -63,6 +63,8 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
         )
         .unwrap();
 
+    let chat = handler.markdown_chat.chat(&config, Some(&identity), &handler.session).unwrap();
+    chat.append_user("during-pairing".into(), "Start the actual work with the selected model.".into()).await.unwrap();
     let (server_transport, client_transport) = tokio::io::duplex(32 * 1024);
     let task = tokio::spawn(async move {
         handler
@@ -115,6 +117,18 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
             .verified_owner_generation,
         Some(0)
     );
+
+    assert!(structured["new_chat_message_from_user"].is_null());
+    let pending = chat.unread_snapshot().await.unwrap();
+    assert_eq!(pending.messages.len(), 1);assert_eq!(pending.messages[0].id, "during-pairing");
+    let summary = chat.owner_summary().await.unwrap();
+    let until = summary.agent_presence_until_ms.expect("verification has a short presence lease");
+    assert!(until >= summary.last_agent_call_at_ms.unwrap() + crate::markdown_chat::PAIRING_PRESENCE_GRACE_MS);
+    assert_eq!(chat.widget_page(None,None).await.unwrap().delivered_through, 0);
+    let normal = client.call_tool(automation_request("get_agent_brief", json!({}), conversation)).await.unwrap();
+    assert_ne!(normal.is_error, Some(true));
+    assert!(chat.owner_summary().await.unwrap().agent_presence_until_ms.is_none());
+    assert!(normal.structured_content.as_ref().unwrap()["new_chat_message_from_user"].as_str().unwrap().contains("Start the actual work"));
 
     client.cancel().await.unwrap();
     task.await.unwrap();

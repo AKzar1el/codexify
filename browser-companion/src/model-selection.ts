@@ -3,9 +3,10 @@
 import { activateChatGptEffortMenu, parseChatGptEffortSliderState, parseChatGptModelAnnouncement, readChatGptModelAnnouncements } from "./session";
 import type { Locator, Page } from "patchright";
 import { activeComposer, composerText } from "./composer";
-import { readChatGptEffortSnapshot, moveChatGptEffortSlider, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
-import { MODEL_FAMILY_LABELS, browserEffortIdFromLabel, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
+import { readChatGptEffortSnapshot, readCurrentEffortLabel, moveChatGptEffortSlider, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
+import { MODEL_FAMILY_LABELS, browserEffortIdFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
 import { BrowserCompanionError } from "./errors";
+import { canonicalChatGptConversationUrl } from "./protocol";
 
 type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
 
@@ -30,8 +31,10 @@ export async function selectChatGptModelFamily(
   menu: EffortMenu,
   family: BrowserModelFamily,
   activate: () => Promise<EffortMenu>,
+  signal?:AbortSignal,
 ): Promise<EffortMenu> {
   try {
+    signal?.throwIfAborted();
     const option = familyOption(menu, family);
     if (await option.count() > 1) throw familyError(family);
     if (await option.count() === 1 && await option.getAttribute("aria-checked") === "true") return menu;
@@ -43,15 +46,15 @@ export async function selectChatGptModelFamily(
         const trigger = powerView.locator('[data-model-picker-view-toggle="true"]:not([aria-hidden="true"])')
           .filter({ visible: true });
         if (await trigger.count() !== 1) throw familyError(family);
-        await trigger.click({ timeout: 5_000 });
+        await trigger.click({ timeout: 5_000,signal });
       } else if (view !== "advanced") throw familyError(family);
     } else {
       const trigger = menu.menu.locator('[role="menuitem"][aria-expanded][aria-hidden="false"]');
       if (await powerView.count() !== 0 || await trigger.count() !== 1) throw familyError(family);
-      if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000 });
+      if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000,signal });
     }
-    await option.waitFor({ state: "visible", timeout: 5_000 });
-    await option.click({ timeout: 5_000 });
+    await option.waitFor({ state: "visible", timeout: 5_000,signal });
+    await option.click({ timeout: 5_000,signal });
     // Choosing a family returns the open picker to its slider. Keep that surface:
     // Escape followed by an immediate reopen races the outgoing menu's cleanup.
     // Activation reuses the open menu and verifies its owner before returning it.
@@ -74,6 +77,7 @@ export function chatGptModelFamilyMatches(
   descriptions: readonly string[],
   family: BrowserModelFamily,
   effort: BrowserEffort,
+  observedName?: string,
 ): boolean {
   // GPT-6 uses Sol below Pro and Astra at Pro. An old Latest picker can still use
   // 5.6 at lower efforts; that is not proof of an explicitly requested GPT-6 turn.
@@ -83,7 +87,7 @@ export function chatGptModelFamilyMatches(
     return state ? [state] : [];
   });
   return states.length > 0 && states.every(state => state.version === family
-    && (!state.name || state.name === expectedName)
+    && (!state.name || state.name === expectedName || state.name === observedName)
     && browserEffortIdFromLabel(state.mode) === effort);
 }
 
@@ -104,7 +108,8 @@ export function chatGptModelSelectionMatches(
   const evidence = hasVersion ? descriptions : descriptions
     .filter(text => { const label = text.trim().replace(/[,、]\s*\d+\s+of\s+\d+\.?$/i, ""); return label && browserEffortIdFromLabel(label) === effort; })
     .map(text => `${family} ${text}`);
-  return chatGptModelFamilyMatches(evidence, family, effort);
+  const observedName=/\b(Sol|Luna|Astra)\b/i.exec(familyLabel||"")?.[1]?.toLowerCase();
+  return chatGptModelFamilyMatches(evidence, family, effort, observedName);
 }
 
 export async function assertChatGptModelFamily(
@@ -209,23 +214,58 @@ async function availableEffort(menu: EffortMenu, index: number): Promise<Awaited
   return state;
 }
 
+/** Resolve only the requested effort on the selected destination family. */
+async function requestedEffort(menu: EffortMenu, effort: string, cachedIndex: number | null | undefined, signal?: AbortSignal) {
+  const state = await readChatGptEffortSnapshot(menu.sliderContainer);
+  const matches = state.labels.flatMap((label, index) => label && browserEffortIdFromLabel(label) === effort ? [index] : []);
+  if (matches.length > 1) throw new Error("ChatGPT exposed duplicate effort labels");
+  const direct = matches[0];
+  if (direct !== undefined) {
+    if (!state.available[direct]) throw new Error("ChatGPT locks the requested effort");
+    return {id:effort, label:state.labels[direct]!, index:direct, available:true, reason:null};
+  }
+  // Some picker versions label only the selected tick. Use a cached position as
+  // a hint, verifying its live announcement; never treat the cache as authority.
+  const currentLabel = await readCurrentEffortLabel(menu);
+  if (browserEffortIdFromLabel(currentLabel) === effort) {
+    return {id:effort, label:currentLabel, index:state.value - state.min, available:true, reason:null};
+  }
+  const candidates = new Set<number>();
+  if (cachedIndex != null && state.available[cachedIndex] && !state.labels[cachedIndex]) candidates.add(cachedIndex);
+  state.labels.forEach((label, index) => { if (!label && state.available[index]) candidates.add(index); });
+  for (const index of candidates) {
+    if (state.min + index === state.value) continue;
+    await moveChatGptEffortSlider(menu, state.min + index, signal);
+    const live = await readChatGptEffortSnapshot(menu.sliderContainer);
+    if (live.min !== state.min || live.max !== state.max) throw new Error("ChatGPT changed its effort range");
+    const label = await readCurrentEffortLabel(menu);
+    if (browserEffortIdFromLabel(label) === effort) return {id:effort, label, index, available:true, reason:null};
+  }
+  throw new Error("ChatGPT did not expose the requested effort");
+}
+
 export async function selectModelAndEffort(
   page: Page,
   model: string,
   effort: string,
-  capabilities: AccountCapabilities,
+  capabilities?: AccountCapabilities,
   signal?: AbortSignal,
 ): Promise<SelectedBrowserModel> {
-  const resolved = resolveBrowserModel(model, effort, capabilities);
+  const family = /^gpt-(5\.5|5\.6|6)-(?:sol|astra)$/.exec(model)?.[1] as BrowserModelFamily | undefined;
+  const luna = model === "gpt-5.6-luna" && capabilities ? resolveBrowserModel(model, effort, capabilities) : null;
+  if (!luna && (!family || (model.endsWith("-astra") && (family !== "6" || effort !== "max"))
+    || (model === "gpt-6-sol" && effort === "max"))) {
+    throw new BrowserCompanionError("The requested ChatGPT model and effort are unsupported", "model_unavailable");
+  }
   const composer = await activeComposer(page, 30_000, signal);
   const form = composer.locator("xpath=ancestor::form[1]");
   const controls = form.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible:true });
-  if (resolved.effortIndex === null) {
+  if (luna) {
     if (await controls.count() > 0) {
       throw new BrowserCompanionError("ChatGPT account changed from Luna-only to Sol during selection", "model_unavailable");
     }
-    await setLunaThinkMode(composer, resolved.lunaThink, signal);
-    return { ...resolved, selection:null };
+    await setLunaThinkMode(composer, luna.lunaThink, signal);
+    return { ...luna, selection:null };
   }
   await controls.first().waitFor({ state:"visible", timeout:70_000, signal });
   if (await controls.count() !== 1) {
@@ -233,10 +273,21 @@ export async function selectModelAndEffort(
   }
   const control = controls.first();
   let menu = await activateChatGptEffortMenu(page, control);
-  menu = await selectChatGptModelFamily(menu, resolved.family!, () => activateChatGptEffortMenu(page, control));
-  const slider = await availableEffort(menu, resolved.effortIndex);
+  menu = await selectChatGptModelFamily(menu, family!, () => activateChatGptEffortMenu(page, control));
+  let resolved: ResolvedBrowserModel;
+  try {
+    const option = await requestedEffort(menu, effort, capabilities?.models.find(candidate => candidate.id === model)
+      ?.efforts.find(candidate => candidate.id === effort)?.index, signal);
+    resolved = resolveBrowserModel(model, effort, {models:modelsFromDiscoveredEfforts(family!, [option])});
+  } catch (error) {
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new BrowserCompanionError(`The requested ChatGPT model and effort could not be selected in this conversation: ${error instanceof Error ? error.message : "verification failed"}`, "model_unavailable", {cause:error});
+  }
+  const effortIndex = resolved.effortIndex;
+  if (effortIndex === null) throw new BrowserCompanionError("ChatGPT did not identify the requested effort position", "model_unavailable");
+  const slider = await availableEffort(menu, effortIndex);
   const origin = slider.min;
-  const target = origin + resolved.effortIndex;
+  const target = origin + effortIndex;
   await moveChatGptEffortSlider(menu, target, signal);
   const selectedUrl = page.url();
   await page.keyboard.press("Escape");
@@ -245,11 +296,11 @@ export async function selectModelAndEffort(
     throw new BrowserCompanionError("ChatGPT did not close the model picker with a selected effort", "model_unavailable");
   }
   const confirmation = await activateChatGptEffortMenu(page, control);
-  const confirmed = await availableEffort(confirmation, resolved.effortIndex);
+  const confirmed = await availableEffort(confirmation, effortIndex);
   if (confirmed.min !== origin || confirmed.value !== target) {
     throw new BrowserCompanionError("ChatGPT did not persist the requested effort", "model_unavailable");
   }
-  await assertChatGptModelFamily(confirmation, resolved.family!, resolved.effort, resolved.effortIndex, 1_000);
+  await assertChatGptModelFamily(confirmation, resolved.family!, resolved.effort, effortIndex, 1_000);
   await page.keyboard.press("Escape");
   return { ...resolved, selection:{ url:selectedUrl, label } };
 }
@@ -258,13 +309,15 @@ export async function assertSelectedModelAndEffort(
   page: Page,
   selected: SelectedBrowserModel,
   signal?: AbortSignal,
+  newChat = false,
 ): Promise<void> {
   const composer = await activeComposer(page, 30_000, signal);
   if (selected.effortIndex === null) {
     await setLunaThinkMode(composer, selected.lunaThink, signal);
     return;
   }
-  if (!selected.selection || page.url() !== selected.selection.url) {
+  if (!selected.selection || (!newChat && page.url() !== selected.selection.url
+    && canonicalChatGptConversationUrl(page.url()) !== canonicalChatGptConversationUrl(selected.selection.url))) {
     throw new BrowserCompanionError("ChatGPT changed the selected conversation before Send", "external_interference");
   }
   const controls = composer.locator("xpath=ancestor::form[1]")
@@ -277,6 +330,7 @@ export async function assertSelectedModelAndEffort(
   }
   const menu = await activateChatGptEffortMenu(page, control);
   try {
+    await availableEffort(menu, selected.effortIndex);
     await assertChatGptModelFamily(menu, selected.family!, selected.effort, selected.effortIndex);
   } finally {
     await page.keyboard.press("Escape");

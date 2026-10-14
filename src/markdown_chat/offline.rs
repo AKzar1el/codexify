@@ -31,6 +31,10 @@ pub(super) async fn monitor<F, Fut>(
                 continue;
             }
         };
+        if activity.agent_presence_until_ms.is_some() {
+            wake.notified().await;
+            continue;
+        }
         let Some(last_call_at_ms) = activity.last_call_at_ms else {
             wake.notified().await;
             continue;

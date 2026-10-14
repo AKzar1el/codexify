@@ -510,8 +510,8 @@ h1 { margin: 0; font-size: 16px; line-height: 1.3; letter-spacing: -.01em; }
 
     if (succeeded) {
       const instruction = payload.serviceRestart
-        ? "Open ChatGPT Settings, select the Codexify connector, scroll to the bottom of its tool list, and click Refresh so ChatGPT reloads the updated tools."
-        : "Restart the foreground Codexify process, then open ChatGPT Settings and click Refresh for the Codexify connector.";
+        ? "The signed-in browser companion refreshes the configured ChatGPT connector automatically after server readiness returns. Use Refresh connector in Codexify settings if it cannot complete."
+        : "Restart the foreground Codexify process. The signed-in browser companion then refreshes the configured ChatGPT connector automatically.";
       hero.append(el("div", "instruction", instruction));
     }
 

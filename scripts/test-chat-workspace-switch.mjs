@@ -224,16 +224,14 @@ for (const [name, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
         assert.equal(b.calls.filter(call => call.name === "chat_ui_send").length,0);
         await page.close();
       });
-      await t.test("same-workspace updates keep the DOM, and collapsed switches load on expansion", async () => {
+      await t.test("same-workspace updates keep the DOM, and workspace switches load immediately", async () => {
         const b = new Backend(); b.add(b.workspace,"agent","A ready"); b.add("/projects/b","agent","B ready");
         const {page} = await fixture(browser,b); await eventually(() => messages(page),["A ready"]);
         await page.locator(".message").evaluate(node => { window.previousMessage = node; });
         await change(page,b,"/projects/a");
         assert(await page.locator(".message").evaluate(node => node === window.previousMessage));
-        await page.getByRole("button",{name:"Collapse chat",exact:true}).click();
+        assert.equal(await page.locator("#collapse").count(),0);
         await change(page,b,"/projects/b");
-        assert.equal(await page.getByRole("button",{name:"Expand chat",exact:true}).count(),1);
-        await page.getByRole("button",{name:"Expand chat",exact:true}).click();
         await eventually(() => messages(page),["B ready"]);
         await page.close();
       });

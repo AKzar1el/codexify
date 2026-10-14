@@ -292,6 +292,11 @@ impl BrowserCompanionManager {
             .env("CODEXIFY_BROWSER_HOME", &self.layout.root)
             .env("CODEXIFY_BROWSER_DESCRIPTOR", &self.layout.descriptor_path)
             .env("CODEXIFY_BROWSER_BUILD", &self.expected_build)
+            .env(
+                "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST",
+                serde_json::to_string(&self.config.request_block_list)
+                    .map_err(|_| "Could not encode browser request block list")?,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -546,18 +551,20 @@ impl BrowserCompanionManager {
                 );
             }
         }
-        let state = if !health.authenticated
-            || health.status == CompanionSessionStatus::AuthenticationRequired
-        {
-            BrowserLifecycleState::AuthenticationRequired
-        } else if health.status == CompanionSessionStatus::Busy || health.active_action_id.is_some()
-        {
-            BrowserLifecycleState::Busy
-        } else if health.status == CompanionSessionStatus::Idle {
-            BrowserLifecycleState::Ready
-        } else {
-            BrowserLifecycleState::Unavailable
-        };
+        let state =
+            if health.active_action_id.is_some() || health.status == CompanionSessionStatus::Busy {
+                BrowserLifecycleState::Busy
+            } else if health.status == CompanionSessionStatus::Unavailable {
+                BrowserLifecycleState::Unavailable
+            } else if !health.authenticated
+                || health.status == CompanionSessionStatus::AuthenticationRequired
+            {
+                BrowserLifecycleState::AuthenticationRequired
+            } else if health.status == CompanionSessionStatus::Idle {
+                BrowserLifecycleState::Ready
+            } else {
+                BrowserLifecycleState::Unavailable
+            };
         self.status_value(
             state,
             true,

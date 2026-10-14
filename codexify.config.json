@@ -6,6 +6,9 @@
   "experimental": {
     "agentTickets": false,
     "forceReadOnlyToolAnnotations": false,
+    "forceDestructiveToolAnnotations": null,
+    "forceIdempotentToolAnnotations": null,
+    "forceOpenWorldToolAnnotations": null,
     "claudeSkills": false
   },
   "agentChat": {

@@ -28,6 +28,10 @@ pub static CHAT_UI_HTML: LazyLock<String> = LazyLock::new(|| {
             "/* CODEXIFY_MARKDOWN_RENDERER */",
             include_str!("markdown_chat_render.js"),
         )
+        .replace(
+            "/* CODEXIFY_ATTACHMENT_COMPOSER */",
+            include_str!("chat_attachments_ui.js"),
+        )
 });
 
 pub fn tool_meta() -> MetaObject {

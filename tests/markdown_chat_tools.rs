@@ -58,6 +58,106 @@ fn append(path: &std::path::Path, text: &str) {
     file.sync_all().unwrap();
 }
 
+#[tokio::test]
+async fn attachment_tools_list_search_read_and_isolate_the_current_conversation() {
+    use codexify::markdown_chat::attachments::AttachmentStore;
+    let (_root, config, session, context) = fixture();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    let store = AttachmentStore::for_chat(chat.path()).unwrap();
+    let file = store
+        .upload(
+            "tool-upload",
+            "Notes.TXT",
+            "text/plain",
+            Some(1000),
+            false,
+            b"Attachment text\nSecond line".to_vec(),
+        )
+        .unwrap();
+    let tools = load_tools_for_config(&config);
+    let list = tools
+        .iter()
+        .find(|t| t.name() == "chat_list_attachments")
+        .unwrap();
+    let search = tools
+        .iter()
+        .find(|t| t.name() == "chat_search_attachments")
+        .unwrap();
+    let get = tools
+        .iter()
+        .find(|t| t.name() == "chat_get_attachment")
+        .unwrap();
+    let draft = list
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(!draft.is_error);
+    assert_eq!(draft.structured_content.unwrap()["total"], 0);
+    chat.append_user_with_attachments(
+        "tool-prompt".into(),
+        "Read the notes".into(),
+        vec![file.id.clone()],
+    )
+    .await
+    .unwrap();
+    let listed = list
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(!listed.is_error);
+    let listed = listed.structured_content.unwrap();
+    assert_eq!(listed["attachments"][0]["originalName"], "Notes.TXT");
+    assert_eq!(listed["attachments"][0]["path"], file.path);
+    let found = search
+        .call_with_context(json!({"query":"notes"}), &config, &session, &context)
+        .await;
+    assert_eq!(found.structured_content.unwrap()["total"], 1);
+    let found = search
+        .call_with_context(json!({"query":"missing"}), &config, &session, &context)
+        .await;
+    assert_eq!(found.structured_content.unwrap()["total"], 0);
+    let read = get
+        .call_with_context(
+            json!({"attachment_id":file.id}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert!(!read.is_error);
+    let data = read.structured_content.unwrap();
+    assert_eq!(data["content"], "Attachment text\nSecond line");
+    assert!(!data["resource_uri"].is_null());
+    for (tool, value) in [(list, &listed), (get, &data)] {
+        assert!(
+            jsonschema::is_valid(&tool.output_schema().unwrap(), value),
+            "attachment output must satisfy its public schema"
+        );
+    }
+    let mut other = context.clone();
+    other.task_conversation = ConversationIdentity::from_openai_session("other-attachments");
+    let denied = get
+        .call_with_context(json!({"attachment_id":file.id}), &config, &session, &other)
+        .await;
+    assert!(denied.is_error);
+    let denied = get
+        .call_with_context(
+            json!({"attachment_id":"../../secret"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert!(denied.is_error);
+    assert_eq!(
+        chat.unread_snapshot().await.unwrap().messages.len(),
+        1,
+        "listing and reading files must not acknowledge the prompt"
+    );
+}
+
 #[test]
 fn tools_are_opt_in_and_read_wait_have_no_parameters() {
     let (_root, mut config, _session, _context) = fixture();
@@ -1132,5 +1232,202 @@ async fn apprise_ntfy_token_and_delivery_failure_preserve_transcript() {
         chat.read(false).await.unwrap().notification,
         NotificationState::Failed
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn stop_requests_persist_without_acknowledging_messages_and_resume_only_on_new_intent() {
+    let (_root, config, session, context) = fixture();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.conversation.as_ref(), &session)
+        .unwrap();
+    chat.append_user("unread".into(), "Pending message".into())
+        .await
+        .unwrap();
+    chat.record_agent_call(1000).await.unwrap();
+    let before = chat.widget_page(None, None).await.unwrap();
+    chat.request_agent_stop("stop-one".into()).await.unwrap();
+    chat.record_agent_call(2000).await.unwrap();
+    let stopped = chat.widget_page(None, None).await.unwrap();
+    assert!(stopped.agent_stop_requested);
+    assert_eq!(stopped.last_agent_call_at_ms, None);
+    assert_eq!(stopped.agent_waiting_until_ms, None);
+    assert_eq!(stopped.total_tool_calls, 2);
+    assert_eq!(stopped.read_through, before.read_through);
+    assert_eq!(stopped.delivered_through, before.delivered_through);
+    assert_eq!(chat.read(false).await.unwrap().text, "Pending message\n\n");
+    let reopened = MarkdownChatStore::default()
+        .chat(&config, context.conversation.as_ref(), &session)
+        .unwrap();
+    assert!(
+        reopened
+            .widget_page(None, None)
+            .await
+            .unwrap()
+            .agent_stop_requested
+    );
+    reopened
+        .append_user("next-intent".into(), "Continue with this instead".into())
+        .await
+        .unwrap();
+    let resumed = reopened.widget_page(None, None).await.unwrap();
+    assert!(!resumed.agent_stop_requested);
+    assert_eq!(resumed.last_agent_call_at_ms, None);
+    reopened
+        .request_agent_stop("stop-one".into())
+        .await
+        .unwrap();
+    assert!(
+        !reopened.agent_stop_requested().await.unwrap(),
+        "a retry of the old stop must not stop new work"
+    );
+    reopened.record_agent_call(3000).await.unwrap();
+    assert_eq!(
+        reopened
+            .widget_page(None, None)
+            .await
+            .unwrap()
+            .last_agent_call_at_ms,
+        Some(3000)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CODEXIFY_TEST_APPRISE_PYTHON; local notification receiver only"]
+async fn chat_event_filters_and_repeated_awaits_deliver_only_requested_alerts() {
+    use axum::{Router, routing::post};
+    let (_root, mut config, session, mut context) = fixture();
+    let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new().route(
+        "/",
+        post(move |body: String| {
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(serde_json::from_str::<serde_json::Value>(&body).unwrap())
+                    .unwrap();
+                axum::Json(json!({"id":"test","event":"message"}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    config.markdown_chat.notifications = Some(
+        serde_json::from_value(json!({
+            "urls":[format!("ntfy://{address}/test?image=no")],
+            "pythonPath":std::env::var("CODEXIFY_TEST_APPRISE_PYTHON").unwrap(),
+            "events":{"messages":false,"offline":false}
+        }))
+        .unwrap(),
+    );
+    let tools = load_tools_for_config(&config);
+    let writer = tools
+        .iter()
+        .find(|tool| tool.name() == "chat_write")
+        .unwrap();
+    let waiter = tools
+        .iter()
+        .find(|tool| tool.name() == "chat_await")
+        .unwrap();
+    let result = writer
+        .call_with_context(
+            json!({"message":"A progress update"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert_eq!(
+        result.structured_content.unwrap()["notification"],
+        "suppressed"
+    );
+    assert!(received.try_recv().is_err());
+    for _ in 0..2 {
+        let result = waiter
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert_eq!(result.structured_content.unwrap()["status"], "timeout");
+    }
+    let input = tokio::time::timeout(Duration::from_secs(10), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        input["message"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for your input")
+    );
+    assert!(received.try_recv().is_err());
+    context.markdown_chat = Arc::new(MarkdownChatStore::default());
+    waiter
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(
+        received.try_recv().is_err(),
+        "reopening a persistent chat must not repeat the input alert"
+    );
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.append_user("reply".into(), "Continue".into())
+        .await
+        .unwrap();
+    waiter
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(received.try_recv().is_err());
+    for (message, event, expected) in [
+        ("Which option?", "input_required", "accepted"),
+        ("Still the same question", "input_required", "suppressed"),
+        ("The request is complete", "completed", "accepted"),
+    ] {
+        let result = writer
+            .call_with_context(
+                json!({"message":message,"event":event}),
+                &config,
+                &session,
+                &context,
+            )
+            .await;
+        let output = result.structured_content.unwrap();
+        assert_eq!(output["notification"], expected);
+        assert_eq!(output["assistant_turn_may_end"], false);
+        if expected == "accepted" {
+            assert_eq!(received.recv().await.unwrap()["message"], message);
+        } else {
+            assert!(received.try_recv().is_err());
+        }
+    }
+    waiter
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(
+        received.try_recv().is_err(),
+        "waiting after completion must not request input again"
+    );
+    config
+        .markdown_chat
+        .notifications
+        .as_mut()
+        .unwrap()
+        .events
+        .completed = false;
+    let result = writer
+        .call_with_context(
+            json!({"message":"Complete","event":"completed"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert_eq!(
+        result.structured_content.unwrap()["notification"],
+        "suppressed"
+    );
+    assert!(received.try_recv().is_err());
     server.abort();
 }

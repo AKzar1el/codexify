@@ -76,6 +76,27 @@ pub enum ChatTool {
 #[serde(deny_unknown_fields)]
 struct WriteArgs {
     message: String,
+    #[serde(default)]
+    event: WriteEvent,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WriteEvent {
+    #[default]
+    Message,
+    Completed,
+    InputRequired,
+}
+
+impl From<WriteEvent> for notification::NotificationEvent {
+    fn from(event: WriteEvent) -> Self {
+        match event {
+            WriteEvent::Message => Self::Message,
+            WriteEvent::Completed => Self::Completed,
+            WriteEvent::InputRequired => Self::InputRequired,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -173,7 +194,7 @@ impl Tool for ChatTool {
 
     fn input_schema(&self) -> Value {
         if matches!(self, Self::Write) {
-            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."}}, "required":["message"], "additionalProperties":false})
+            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."},"event":{"type":"string","enum":["message","completed","input_required"],"default":"message","description":"Use completed for a finished chat request, input_required for a question that needs the user's reply, and message for progress or ordinary messages. Notification filters use this explicit event. This does not change turn termination or goal status; use goal_finish for a goal."}}, "required":["message"], "additionalProperties":false})
         } else {
             empty_object_schema()
         }
@@ -186,7 +207,7 @@ impl Tool for ChatTool {
                 "status":{"type":"string", "enum":["written","message","empty","timeout","cancelled","workspace_selected","workspace_selection"]},
                 "content":{"type":"string"},
                 "chat_file":{"type":["string","null"]},
-                "notification":{"type":"string", "enum":["not_configured","pending","accepted","failed","cancelled"]},
+                "notification":{"type":"string", "enum":["not_configured","suppressed","pending","accepted","failed","cancelled"]},
                 "required_next_action":{"type":"string", "enum":["continue_or_chat_await","chat_write","chat_await","get_agent_brief"]},
                 "assistant_turn_may_end":{"type":"boolean", "const":false}
             },
@@ -281,15 +302,28 @@ impl Tool for ChatTool {
             );
         }
         if matches!(self, Self::Write) {
-            let WriteArgs { message } = match parse_tool_args(args) {
+            let WriteArgs { message, event } = match parse_tool_args(args) {
                 Ok(args) => args,
                 Err(error) => return *error,
             };
-            let receipt = match chat.append(message.clone()).await {
+            let event = notification::NotificationEvent::from(event);
+            let receipt = match chat.append_with_event(message.clone(), event).await {
                 Ok(receipt) => receipt,
                 Err(error) => return ToolResult::error(error),
             };
-            let state = if config.markdown_chat.notifications.is_some() {
+            let notify = notification::enabled(&config.markdown_chat, event);
+            let claimed = if notify && event == notification::NotificationEvent::InputRequired {
+                match chat.claim_input_notification().await {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not claim input notification");
+                        false
+                    }
+                }
+            } else {
+                notify
+            };
+            let state = if claimed {
                 let _ = chat
                     .set_notification(receipt.end_offset, NotificationState::Pending)
                     .await;
@@ -298,13 +332,16 @@ impl Tool for ChatTool {
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy();
-                notification::publish_config(
+                notification::publish_event(
                     &config.markdown_chat,
+                    event,
                     &workspace,
                     message,
                     &context.cancellation,
                 )
                 .await
+            } else if config.markdown_chat.notifications.is_some() {
+                NotificationState::Suppressed
             } else {
                 NotificationState::NotConfigured
             };
@@ -331,6 +368,18 @@ impl Tool for ChatTool {
         }
         if let Err(error) = parse_tool_args::<EmptyArgs>(args) {
             return *error;
+        }
+        if matches!(self, Self::Await) {
+            let workspace = config
+                .work_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            if let Err(error) =
+                notification::notify_input(&chat, &config.markdown_chat, &workspace).await
+            {
+                tracing::warn!(%error, "could not notify pending chat input");
+            }
         }
         match self {
             Self::Read => match chat.read_cancellable(true, context.cancellation.clone()).await {

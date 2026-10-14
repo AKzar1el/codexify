@@ -14,7 +14,7 @@ import { readTurnDomState } from "../src/turn-binding";
 
 const fakeExecutablePath = join(tmpdir(), "managed-chrome");
 
-class FakePage {
+class FakePage extends EventEmitter {
   isClosed = () => this.closed;
   closed = false;
   navigations: string[] = [];
@@ -26,7 +26,7 @@ class FakePage {
   }
   async waitForLoadState() {}
   async bringToFront() { this.revealed = true; }
-  async close() { this.closed = true; }
+  async close() { this.closed = true; this.emit("close"); }
 }
 
 class FakeContext extends EventEmitter {
@@ -38,6 +38,7 @@ class FakeContext extends EventEmitter {
   async newPage() {
     const page = new FakePage();
     this.tabs.push(page);
+    this.emit("page", page);
     return page as unknown as Page;
   }
   browser() {
@@ -45,7 +46,6 @@ class FakeContext extends EventEmitter {
       send:async (_method: string, params: unknown) => {
         this.createdTargets.push(params);
         const page = await this.newPage();
-        this.emit("page", page);
       },
       detach:async () => {},
     }) };
@@ -202,9 +202,28 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME !== "1")(
       await turn.locator(".markdown p").evaluate(element => { element.textContent = "Updated answer"; });
       expect((await responseDomSnapshot(turn, cache)).visibleText).toContain("Updated answer");
       expect(cache.fullScans).toBe(2);
+      await page.close();
+      const closed = await Promise.race([surface.closed.then(()=>true),Bun.sleep(2_000).then(()=>false)]);
+      expect(closed).toBeTrue();
     } finally {
       await surface.close();
     }
   },
   60_000,
 );
+
+
+test("closing the last Chrome page releases the launcher even if the browser context stays alive",async()=>{
+  const {surface,fake}=await createSurface();
+  await fake.tabs[0]!.close();await surface.closed;
+  expect(fake.closed).toBeFalse();
+  await expect(surface.page()).rejects.toMatchObject({code:"external_interference"});
+});
+
+test("closing the shared page preserves other open pages until the last window is closed",async()=>{
+  const {surface,fake}=await createSurface();const other=await fake.newPage();let stopped=false;
+  void surface.closed.then(()=>{stopped=true;});
+  await fake.tabs[0]!.close();await Bun.sleep(0);expect(stopped).toBeFalse();
+  expect((other as unknown as FakePage).closed).toBeFalse();
+  await other.close();await surface.closed;expect(stopped).toBeTrue();
+});

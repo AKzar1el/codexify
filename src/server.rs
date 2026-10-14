@@ -384,8 +384,15 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
     }
     if config.experimental.force_read_only_tool_annotations {
         annotations.read_only_hint = Some(true);
-        annotations.destructive_hint = Some(false);
-        annotations.open_world_hint = Some(false);
+    }
+    if let Some(value) = config.experimental.force_destructive_tool_annotations {
+        annotations.destructive_hint = Some(value);
+    }
+    if let Some(value) = config.experimental.force_idempotent_tool_annotations {
+        annotations.idempotent_hint = Some(value);
+    }
+    if let Some(value) = config.experimental.force_open_world_tool_annotations {
+        annotations.open_world_hint = Some(value);
     }
     let mut advertised = rmcp::model::Tool::new(tool.name(), tool.describe(config), schema)
         .with_title(tool.title())
@@ -1151,7 +1158,10 @@ impl ServerHandler for CodexHandler {
                                     && matches!(
                                         name.as_str(),
                                         "automation_verify_pairing"
+                                            | "chat_ui_send"
                                             | "goal_read"
+                                            | "goal_set"
+                                            | "goal_resume"
                                             | "goal_finish"
                                             | "get_agent_brief"
                                     )
@@ -1275,7 +1285,7 @@ impl ServerHandler for CodexHandler {
                 )
                 .await;
             } else if name == SetProjectRoot::NAME
-                && let Some(activity) = activity
+                && let Some(activity) = activity.clone()
             {
                 self.persist_chat_activity(
                     task_conversation.as_ref(),
@@ -1351,6 +1361,34 @@ impl ServerHandler for CodexHandler {
             tracing::warn!(%error, "could not save conversation schema baseline");
         }
 
+        if name == "automation_verify_pairing"
+            && !result.is_error
+            && result
+                .structured_content
+                .as_ref()
+                .is_some_and(|value| value["verified"] == true)
+            && let (Some(activity), Some(root)) = (
+                activity.as_ref(),
+                self.selected_project_root(task_conversation.as_ref()),
+            )
+        {
+            let mut effective = self.config.as_ref().clone();
+            effective.work_dir = root;
+            if let Ok(chat) =
+                self.markdown_chat
+                    .chat(&effective, task_conversation.as_ref(), &self.session)
+                && let Err(error) = chat
+                    .finish_pairing_verification(
+                        &activity.epoch,
+                        activity.sequence,
+                        crate::markdown_chat::now_ms(),
+                    )
+                    .await
+            {
+                tracing::warn!(%error, "could not expire pairing-only chat presence");
+            }
+        }
+
         let mut delivery = None;
         let chat_delivery_root = if !result.is_error
             && matches!(name.as_str(), "chat_read" | "chat_write" | "chat_await")
@@ -1363,6 +1401,7 @@ impl ServerHandler for CodexHandler {
             self.selected_project_root(task_conversation.as_ref())
         };
         if self.config.markdown_chat.enabled
+            && name != "automation_verify_pairing"
             && !tool.is_some_and(|tool| app_only_tool(tool.as_ref()))
             && !context.ct.is_cancelled()
             && self
@@ -1375,20 +1414,31 @@ impl ServerHandler for CodexHandler {
             let chat =
                 self.markdown_chat
                     .chat(&effective, task_conversation.as_ref(), &self.session);
-            let pending = match &chat {
-                Ok(chat)
-                    if result.is_error
-                        || !matches!(name.as_str(), "chat_read" | "chat_write" | "chat_await") =>
-                {
-                    chat.read(false).await.map(|snapshot| {
-                        if !snapshot.text.is_empty() {
-                            result.chat_delivery_end = Some(snapshot.end);
-                        }
-                        snapshot.text
-                    })
+            let stop_requested = match &chat {
+                Ok(chat) => chat.agent_stop_requested().await.unwrap_or(false),
+                Err(_) => false,
+            };
+            let pending = if stop_requested {
+                Ok(String::new())
+            } else {
+                match &chat {
+                    Ok(chat)
+                        if result.is_error
+                            || !matches!(
+                                name.as_str(),
+                                "chat_read" | "chat_write" | "chat_await"
+                            ) =>
+                    {
+                        chat.read(false).await.map(|snapshot| {
+                            if !snapshot.text.is_empty() {
+                                result.chat_delivery_end = Some(snapshot.end);
+                            }
+                            snapshot.text
+                        })
+                    }
+                    Ok(chat) => chat.ensure().await.map(|_| String::new()),
+                    Err(error) => Err(error.clone()),
                 }
-                Ok(chat) => chat.ensure().await.map(|_| String::new()),
-                Err(error) => Err(error.clone()),
             };
             match pending {
                 Ok(text) if !text.is_empty() => result.new_chat_message_from_user = Some(format!(
@@ -1398,6 +1448,10 @@ impl ServerHandler for CodexHandler {
                 Err(error) => result.content.push(ToolContent::Text(format!(
                     "Markdown chat is unavailable: {error}. The original tool result above is unchanged; do not repeat a successful operation just to retry chat delivery."
                 ))),
+            }
+            if stop_requested {
+                result.new_chat_message_from_user =
+                    Some(crate::markdown_chat::AGENT_STOP_MESSAGE.into());
             }
             if let Ok(chat) = chat
                 && let Some(end) = result.chat_delivery_end
@@ -3136,6 +3190,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_goal_control_dispatch_uses_the_selected_tasks_private_store() {
+        use crate::agent_automation::{AgentAutomationStore, GoalStatus};
+        use crate::tools::goal::GoalTool;
+        let root = tempfile::tempdir().unwrap();
+        let access = root.path().join("projects");
+        std::fs::create_dir_all(access.join("demo")).unwrap();
+        let mut handler = handler_with_tools(
+            root.path(),
+            vec![
+                Box::new(SetProjectRoot),
+                Box::new(GoalTool::Read),
+                Box::new(GoalTool::Set),
+                Box::new(GoalTool::Resume),
+            ],
+            crate::types::ToolLogLevel::Info,
+        );
+        let config = Arc::make_mut(&mut handler.config);
+        config.multi_project = true;
+        config.work_dir = access;
+        config.markdown_chat.enabled = true;
+        config.markdown_chat.automation.enabled = true;
+        config.worktrees.auto_cleanup_enabled = false;
+        let config = handler.config.clone();
+        let bindings = handler.project_bindings.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(256 * 1024);
+        let server_task = tokio::spawn(async move {
+            handler
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ().serve(client_transport).await.unwrap();
+        let request = |name: &str, args: Value| {
+            serde_json::from_value::<CallToolRequestParams>(json!({
+                "name": name, "arguments": args, "_meta":{"openai/session":"goal-dispatch"}
+            }))
+            .unwrap()
+        };
+        let selected = client
+            .call_tool(request(
+                "set_project_root",
+                json!({"path":"demo","createWorktree":false}),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(selected.is_error, Some(true), "{selected:?}");
+        let created = client
+            .call_tool(request(
+                "goal_set",
+                json!({"requestId":"create","expectedRevision":0,"markdown":"Finish this task"}),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        assert_eq!(
+            created.structured_content.as_ref().unwrap()["status"],
+            "active"
+        );
+        let identity = ConversationIdentity::from_openai_session("goal-dispatch").unwrap();
+        let effective = bindings.effective_config(&config, &identity).unwrap();
+        let store = AgentAutomationStore::for_config(&effective).unwrap();
+        assert_eq!(
+            store.load(&identity).unwrap().goal.unwrap().markdown,
+            "Finish this task"
+        );
+        store
+            .stop_goal(&identity, 1, crate::markdown_chat::now_ms())
+            .unwrap();
+        let resumed = client
+            .call_tool(request(
+                "goal_resume",
+                json!({"requestId":"resume","expectedRevision":1}),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(resumed.is_error, Some(true), "{resumed:?}");
+        assert_eq!(
+            store.load(&identity).unwrap().goal.unwrap().status,
+            GoalStatus::Active
+        );
+        let read = client
+            .call_tool(request("goal_read", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(read.structured_content.as_ref().unwrap()["revision"], 1);
+        assert!(
+            AgentAutomationStore::for_config(&config)
+                .unwrap()
+                .load(&identity)
+                .unwrap()
+                .goal
+                .is_none()
+        );
+        client.cancel().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn project_worktree_override_is_honored_by_both_dispatch_paths() {
         use crate::types::{ToolLogLevel, WorktreeMode};
         for stable_conversation in [false, true] {
@@ -3642,12 +3797,28 @@ mod tests {
 
         for tool in tools {
             let behavior = tool.behavior();
+            let native = advertised_tool(
+                tool.as_ref(),
+                &crate::config::default_config(root.path().to_path_buf()),
+            )
+            .annotations
+            .unwrap();
             let advertised = advertised_tool(tool.as_ref(), &config);
             let annotations = advertised.annotations.unwrap();
 
             assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name());
-            assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name());
-            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name());
+            assert_eq!(
+                annotations.destructive_hint,
+                native.destructive_hint,
+                "{}",
+                tool.name()
+            );
+            assert_eq!(
+                annotations.open_world_hint,
+                native.open_world_hint,
+                "{}",
+                tool.name()
+            );
             assert_eq!(
                 annotations.idempotent_hint,
                 Some(behavior.idempotent),
@@ -3655,6 +3826,70 @@ mod tests {
                 tool.name()
             );
             assert_eq!(tool.behavior(), behavior, "{}", tool.name());
+        }
+    }
+
+    #[test]
+    fn optional_annotation_overrides_are_independent_and_preserve_actual_behavior() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        config.markdown_chat.enabled = true;
+        let tools = crate::registry::load_tools_for_config(&config);
+        for ticketed in [false, true] {
+            config.experimental.agent_tickets = ticketed;
+            for read_only in [false, true] {
+                config.experimental.force_read_only_tool_annotations = read_only;
+                for destructive in [None, Some(false), Some(true)] {
+                    for idempotent in [None, Some(false), Some(true)] {
+                        for open_world in [None, Some(false), Some(true)] {
+                            config.experimental.force_destructive_tool_annotations = None;
+                            config.experimental.force_idempotent_tool_annotations = None;
+                            config.experimental.force_open_world_tool_annotations = None;
+                            let baseline: Vec<_> = tools
+                                .iter()
+                                .map(|tool| advertised_tool(tool.as_ref(), &config))
+                                .collect();
+                            config.experimental.force_destructive_tool_annotations = destructive;
+                            config.experimental.force_idempotent_tool_annotations = idempotent;
+                            config.experimental.force_open_world_tool_annotations = open_world;
+                            for (tool, baseline) in tools.iter().zip(baseline) {
+                                let native = baseline.annotations.unwrap();
+                                let behavior = tool.behavior();
+                                let advertised = advertised_tool(tool.as_ref(), &config);
+                                let annotations = advertised.annotations.unwrap();
+                                assert_eq!(
+                                    annotations.read_only_hint,
+                                    native.read_only_hint,
+                                    "{}",
+                                    tool.name()
+                                );
+                                assert_eq!(
+                                    annotations.destructive_hint,
+                                    destructive.or(native.destructive_hint),
+                                    "{}",
+                                    tool.name()
+                                );
+                                assert_eq!(
+                                    annotations.idempotent_hint,
+                                    idempotent.or(native.idempotent_hint),
+                                    "{}",
+                                    tool.name()
+                                );
+                                assert_eq!(
+                                    annotations.open_world_hint,
+                                    open_world.or(native.open_world_hint),
+                                    "{}",
+                                    tool.name()
+                                );
+                                assert_eq!(tool.behavior(), behavior, "{}", tool.name());
+                                assert_eq!(advertised.input_schema, baseline.input_schema);
+                                assert_eq!(advertised.meta, baseline.meta);
+                                assert_eq!(advertised.title, baseline.title);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

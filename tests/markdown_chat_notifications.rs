@@ -68,6 +68,55 @@ fn apprise_configuration_is_opt_in_validated_and_redacted() {
     }
 }
 
+#[test]
+fn notification_filters_round_trip_and_reject_misspelled_categories() {
+    let config: MarkdownChatConfig = serde_json::from_value(json!({"notifications":{
+        "urls":["ntfys://test"],"events":{"messages":false,"offline":false}
+    }}))
+    .unwrap();
+    let events = &config.notifications.as_ref().unwrap().events;
+    assert!(!events.messages && !events.offline);
+    assert!(events.completed && events.input_required && events.goal_blocked && events.errors);
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert_eq!(serialized["notifications"]["events"]["messages"], false);
+    assert_eq!(serialized["notifications"]["events"]["inputRequired"], true);
+    assert!(
+        serde_json::from_value::<MarkdownChatConfig>(json!({"notifications":{
+            "urls":["ntfys://test"],"events":{"compeleted":true}
+        }}))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn disabled_categories_do_not_start_the_notification_provider() {
+    use notification::NotificationEvent as Event;
+    let config: MarkdownChatConfig = serde_json::from_value(json!({"notifications":{
+        "urls":["ntfys://test"],"pythonPath":"missing-notification-interpreter",
+        "events":{"messages":false,"completed":false,"inputRequired":false,"goalBlocked":false,"errors":false,"offline":false}
+    }})).unwrap();
+    for event in [
+        Event::Message,
+        Event::Completed,
+        Event::InputRequired,
+        Event::GoalBlocked,
+        Event::Error,
+        Event::Offline,
+    ] {
+        assert_eq!(
+            notification::publish_event(
+                &config,
+                event,
+                "test",
+                "body".into(),
+                &CancellationToken::new()
+            )
+            .await,
+            NotificationState::Suppressed
+        );
+    }
+}
+
 #[tokio::test]
 async fn missing_runtime_and_pre_cancelled_sends_have_explicit_outcomes() {
     let root = tempfile::tempdir().unwrap();

@@ -1,19 +1,19 @@
 {
-  "schemaHash": "edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
-  "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+  "schemaHash": "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+  "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
   "descriptor": {
     "version": 1,
     "kind": "codexify-browser-companion",
     "pid": 1234,
     "endpoint": "http://127.0.0.1:43123",
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "createdAt": "2026-10-09T12:00:00Z"
   },
   "health": {
     "protocolVersion": 1,
     "kind": "codexify-browser-companion",
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "status": "idle",
     "authenticated": true,
     "accountFingerprint": "fixture-account",
@@ -21,7 +21,7 @@
   },
   "capabilities": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "accountFingerprint": "fixture-account",
     "catalogRevision": "fixture-catalog",
     "models": [
@@ -50,7 +50,7 @@
   },
   "revealReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "revealed": true,
     "activeActionId": null
   },
@@ -61,8 +61,9 @@
       "url": "https://chatgpt.com/c/fixture",
       "pairingGeneration": 7,
       "connectorName": "Codexify",
-      "model": "gpt-6-sol",
-      "effort": "high",
+      "expectedAccountFingerprint": "fixture-account",
+      "model": null,
+      "effort": null,
       "expectedUrl": "https://chatgpt.com/c/fixture",
       "autoApproveToolCalls": false,
       "prompt": {
@@ -76,6 +77,7 @@
       "url": "https://chatgpt.com/c/fixture",
       "pairingGeneration": 7,
       "connectorName": "Codexify",
+      "expectedAccountFingerprint": "fixture-account",
       "model": "gpt-6-sol",
       "effort": "high",
       "expectedUrl": "https://chatgpt.com/c/fixture",
@@ -97,6 +99,7 @@
       "url": "https://chatgpt.com/c/fixture",
       "pairingGeneration": 7,
       "connectorName": "Codexify",
+      "expectedAccountFingerprint": "fixture-account",
       "model": "gpt-6-sol",
       "effort": "high",
       "expectedUrl": "https://chatgpt.com/c/fixture",
@@ -112,6 +115,7 @@
       "url": "https://chatgpt.com/c/fixture",
       "pairingGeneration": 7,
       "connectorName": "Codexify",
+      "expectedAccountFingerprint": "fixture-account",
       "model": "gpt-6-sol",
       "effort": "high",
       "expectedUrl": "https://chatgpt.com/c/fixture",
@@ -131,7 +135,7 @@
   ],
   "actionSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "actionId": "fixture-action",
     "state": "generating",
     "sendAccepted": true,
@@ -149,7 +153,7 @@
   },
   "cancelReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.edc90b30a9de09b1e992d4384ac1df24b08e4a98d8e52687a2542dee561877b2",
+    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
     "actionId": "fixture-action",
     "state": "ambiguous",
     "cancelled": true
@@ -221,48 +225,55 @@
       "sequence": 10,
       "actionId": "fixture-action",
       "atMs": 10,
-      "type": "generation_complete",
-      "finalMarkdown": "Answer",
+      "type": "submission_complete",
       "canonicalUrl": "https://chatgpt.com/c/fixture"
     },
     {
       "sequence": 11,
       "actionId": "fixture-action",
       "atMs": 11,
-      "type": "approval_required",
-      "message": "Approve once"
+      "type": "generation_complete",
+      "finalMarkdown": "Answer",
+      "canonicalUrl": "https://chatgpt.com/c/fixture"
     },
     {
       "sequence": 12,
       "actionId": "fixture-action",
       "atMs": 12,
-      "type": "authentication_required"
+      "type": "approval_required",
+      "message": "Approve once"
     },
     {
       "sequence": 13,
       "actionId": "fixture-action",
       "atMs": 13,
-      "type": "rate_limited",
-      "message": "Cooldown"
+      "type": "authentication_required"
     },
     {
       "sequence": 14,
       "actionId": "fixture-action",
       "atMs": 14,
-      "type": "external_interference",
-      "message": "Draft changed"
+      "type": "rate_limited",
+      "message": "Cooldown"
     },
     {
       "sequence": 15,
       "actionId": "fixture-action",
       "atMs": 15,
-      "type": "ambiguous_send",
-      "message": "Send acceptance uncertain"
+      "type": "external_interference",
+      "message": "Draft changed"
     },
     {
       "sequence": 16,
       "actionId": "fixture-action",
       "atMs": 16,
+      "type": "ambiguous_send",
+      "message": "Send acceptance uncertain"
+    },
+    {
+      "sequence": 17,
+      "actionId": "fixture-action",
+      "atMs": 17,
       "type": "failed",
       "code": "selector_drift",
       "message": "Selector changed"

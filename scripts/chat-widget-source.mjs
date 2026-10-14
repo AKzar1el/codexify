@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 
 export const chatHtml = readFileSync(new URL("../src/markdown_chat_ui.html", import.meta.url), "utf8")
   .replace("/* CODEXIFY_MARKDOWN_LIBRARY */", () => "/*\n" + readFileSync(new URL("../src/vendor/markdown-it.LICENSE", import.meta.url), "utf8") + "*/\n" + readFileSync(new URL("../src/vendor/markdown-it.min.js", import.meta.url), "utf8"))
-  .replace("/* CODEXIFY_MARKDOWN_RENDERER */", () => readFileSync(new URL("../src/markdown_chat_render.js", import.meta.url), "utf8"));
+  .replace("/* CODEXIFY_MARKDOWN_RENDERER */", () => readFileSync(new URL("../src/markdown_chat_render.js", import.meta.url), "utf8"))
+  .replace("/* CODEXIFY_ATTACHMENT_COMPOSER */", () => readFileSync(new URL("../src/chat_attachments_ui.js", import.meta.url), "utf8"));
 const setupHtml = readFileSync(new URL("../src/setup_ui.html", import.meta.url), "utf8");
 const section = (text, start, end) => {
   assert(text.includes(start) && text.includes(end));

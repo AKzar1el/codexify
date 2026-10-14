@@ -11,6 +11,75 @@ fn task(name: &str) -> ConversationIdentity {
 }
 
 #[test]
+fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() {
+    use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
+    let mut state = AutomationTaskState::default();
+    state.action = AutomationActionState {
+        id: Some("stop-failure".into()),
+        kind: Some(AutomationActionKind::OfflineChat),
+        status: AutomationActionStatus::Failed,
+        send_accepted: Some(false),
+        updated_at_ms: Some(100),
+        last_error: Some(
+            "ChatGPT did not stop the previous response; the new message was not sent".into(),
+        ),
+        ..Default::default()
+    };
+    assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
+    for accepted in [None, Some(true)] {
+        let mut uncertain = state.clone();
+        uncertain.action.send_accepted = accepted;
+        assert!(uncertain.automatic_retry_at_ms().is_none());
+    }
+    for kind in [
+        AutomationActionKind::PairVerify,
+        AutomationActionKind::OfflineGoal,
+        AutomationActionKind::OfflineCombined,
+    ] {
+        let mut other = state.clone();
+        other.action.kind = Some(kind);
+        assert!(other.automatic_retry_at_ms().is_none());
+    }
+    let mut fenced = state.clone();
+    fenced.action.messages_fenced = true;
+    assert!(fenced.automatic_retry_at_ms().is_none());
+    let mut different = state.clone();
+    different.action.last_error = Some("Selector verification failed before Send".into());
+    assert_eq!(different.automatic_retry_at_ms(), Some(30_100));
+    for (attempts, delay) in [(1, 60_000), (2, 120_000)] {
+        different.action.automatic_retry_attempts = attempts;
+        assert_eq!(different.automatic_retry_at_ms(), Some(100 + delay));
+    }
+    different.action.automatic_retry_attempts = 3;
+    assert!(different.automatic_retry_at_ms().is_none());
+    let mut cancelled = state.clone();
+    cancelled.action.last_error = Some("Browser action cancelled before Send".into());
+    assert!(cancelled.automatic_retry_at_ms().is_none());
+    let mut ambiguous = state.clone();
+    ambiguous.action.status = AutomationActionStatus::Ambiguous;
+    assert!(ambiguous.automatic_retry_at_ms().is_none());
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+    let task = task("automatic-stop-retry");
+    let goal = store.set_goal(&task, "Continue the goal.", 1).unwrap();
+    let mut active = store.run_goal(&task, goal.revision, 2).unwrap();
+    state.goal = Some(active.clone());
+    state.action.kind = Some(AutomationActionKind::OfflineGoal);
+    state.action.goal_revision = Some(active.revision);
+    assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
+    active.status = GoalStatus::Configured;
+    state.goal = Some(active.clone());
+    assert!(state.automatic_retry_at_ms().is_none());
+    active.status = GoalStatus::Blocked;
+    state.goal = Some(active.clone());
+    assert!(state.automatic_retry_at_ms().is_none());
+    active.status = GoalStatus::Active;
+    active.revision += 1;
+    state.goal = Some(active);
+    assert!(state.automatic_retry_at_ms().is_none());
+}
+
+#[test]
 fn goal_state_round_trips_with_private_storage() {
     let root = tempfile::tempdir().unwrap();
     let state_root = root.path().join("automation");
@@ -140,6 +209,84 @@ fn finishing_requires_the_exact_active_revision_and_a_blocked_reason() {
                 5
             )
             .is_err()
+    );
+}
+
+#[test]
+fn pairing_retry_url_survives_failures_and_reload_without_prefilling_creation_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("retry-pairing-url");
+    let url = "https://chatgpt.com/g/project-alias/c/attempted-chat";
+    store
+        .issue_pairing(&task, &format!("{url}?source=ignored"), 0, 1000)
+        .unwrap();
+    store.invalidate_pairing(&task, 1001).unwrap();
+    assert_eq!(
+        store
+            .load(&task)
+            .unwrap()
+            .pairing
+            .last_attempted_url
+            .as_deref(),
+        Some(url)
+    );
+    store.unlink_pairing(&task, 1002).unwrap();
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    let pairing = reloaded.load(&task).unwrap().pairing;
+    assert!(pairing.pending.is_none() && pairing.candidate_url.is_none());
+    assert_eq!(pairing.last_attempted_url.as_deref(), Some(url));
+
+    let issue = reloaded
+        .issue_pairing(&task, "https://chatgpt.com/g/g-p-project/project", 1, 2000)
+        .unwrap();
+    reloaded.mark_creating_chat(&task).unwrap();
+    assert!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .last_attempted_url
+            .is_none(),
+        "a destination project is not a created conversation URL"
+    );
+    reloaded
+        .record_pairing_canonical_url(
+            &task,
+            issue.generation,
+            "https://chatgpt.com/c/created-chat",
+            2001,
+        )
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .last_attempted_url
+            .as_deref(),
+        Some("https://chatgpt.com/c/created-chat")
+    );
+    let file = reloaded
+        .task_directory(&task)
+        .unwrap()
+        .join("automation.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    legacy["pairing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lastAttemptedUrl");
+    std::fs::write(&file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .last_attempted_url
+            .is_none(),
+        "older state remains readable"
     );
 }
 
@@ -730,4 +877,546 @@ fn only_pre_send_failed_non_pair_actions_can_be_reset_for_explicit_retry() {
             .unwrap_err()
             .contains("failed before Send")
     );
+}
+
+#[test]
+fn goal_timer_accumulates_only_enabled_intervals_and_survives_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("goal-timer");
+    let goal = store.set_goal(&task, "Track active time", 10).unwrap();
+    assert_eq!(goal.elapsed_active_ms, 0);
+    assert_eq!(goal.active_since_ms, None);
+    store.run_goal(&task, 1, 20).unwrap();
+    store
+        .sync_goal_presence(&task, Some(20), None, false, 20)
+        .unwrap();
+    let paused = store.stop_goal(&task, 1, 5020).unwrap();
+    assert_eq!(paused.elapsed_active_ms, 5000);
+    assert_eq!(paused.active_since_ms, None);
+    assert_eq!(
+        store.stop_goal(&task, 1, 8000).unwrap().elapsed_active_ms,
+        5000
+    );
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    reloaded.run_goal(&task, 1, 10000).unwrap();
+    reloaded
+        .sync_goal_presence(&task, Some(10000), None, false, 10000)
+        .unwrap();
+    assert_eq!(
+        reloaded.run_goal(&task, 1, 11000).unwrap().active_since_ms,
+        Some(10000)
+    );
+    let stopped = reloaded
+        .pause_goal_for_agent_stop(&task, "stop-timed-turn", 12000)
+        .unwrap()
+        .goal
+        .unwrap();
+    assert_eq!(stopped.elapsed_active_ms, 7000);
+    assert_eq!(stopped.active_since_ms, None);
+    reloaded
+        .apply_owner_goal_command(
+            &task,
+            "play-timed-goal",
+            codexify::agent_automation::OwnerGoalCommand::Run,
+            15000,
+        )
+        .unwrap();
+    reloaded
+        .sync_goal_presence(&task, Some(15000), None, false, 15000)
+        .unwrap();
+    let finished = reloaded
+        .finish_goal(&task, 1, GoalFinish::Completed { summary: None }, 18000)
+        .unwrap();
+    assert_eq!(finished.elapsed_active_ms, 10000);
+    assert_eq!(finished.active_since_ms, None);
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .goal
+            .unwrap()
+            .elapsed_active_ms,
+        10000
+    );
+}
+
+#[test]
+fn blocked_goals_resume_with_the_same_revision_time_and_turns() {
+    use codexify::agent_automation::OwnerGoalCommand;
+    for owner_command in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+        let task = task("resume-blocked-goal");
+        store.set_goal(&task, "Continue this goal", 10).unwrap();
+        store.run_goal(&task, 1, 20).unwrap();
+        store
+            .sync_goal_presence(&task, Some(20), None, false, 20)
+            .unwrap();
+        let url = "https://chatgpt.com/c/resume-blocked-goal";
+        let pairing = store.issue_pairing(&task, url, 1, 21).unwrap();
+        store
+            .record_pairing_canonical_url(&task, pairing.generation, url, 22)
+            .unwrap();
+        store
+            .verify_pairing(&task, pairing.generation, 1, &pairing.reference, 23)
+            .unwrap();
+        store
+            .queue_action(
+                &task,
+                "timed-out-goal",
+                AutomationActionKind::OfflineGoal,
+                1,
+                Some(1),
+                30,
+            )
+            .unwrap();
+        store.record_goal_turn(&task, "timed-out-goal").unwrap();
+        store
+            .update_action_status(
+                &task,
+                "timed-out-goal",
+                AutomationActionStatus::Ambiguous,
+                Some("Previous browser action timed out"),
+                None,
+                40,
+            )
+            .unwrap();
+        let blocked = store
+            .finish_goal(
+                &task,
+                1,
+                GoalFinish::Blocked {
+                    reason: "Waiting for input".into(),
+                },
+                5020,
+            )
+            .unwrap();
+        assert_eq!(blocked.elapsed_active_ms, 5000);
+        assert_eq!(blocked.turn_count, 2);
+
+        let resumed = if owner_command {
+            store
+                .apply_owner_goal_command(&task, "resume-blocked", OwnerGoalCommand::Run, 10000)
+                .unwrap()
+                .goal
+                .unwrap()
+        } else {
+            store.run_goal(&task, 1, 10000).unwrap()
+        };
+        assert_eq!(resumed.status, GoalStatus::Active);
+        assert_eq!(resumed.revision, blocked.revision);
+        assert_eq!(resumed.markdown, blocked.markdown);
+        assert_eq!(resumed.created_at_ms, blocked.created_at_ms);
+        assert_eq!(resumed.elapsed_active_ms, 5000);
+        assert_eq!(resumed.active_since_ms, None);
+        store
+            .sync_goal_presence(&task, Some(10000), None, false, 10000)
+            .unwrap();
+        assert_eq!(resumed.turn_count, 2);
+        assert!(resumed.finished_at_ms.is_none());
+        assert!(resumed.blocked_reason.is_none());
+        assert!(store.load(&task).unwrap().action.id.is_none());
+        assert_eq!(
+            store.stop_goal(&task, 1, 13000).unwrap().elapsed_active_ms,
+            8000
+        );
+    }
+}
+
+#[test]
+fn goal_timer_excludes_offline_gaps_and_stopped_goals_after_reload() {
+    use codexify::markdown_chat::OFFLINE_AFTER_MS;
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("presence-timer");
+    store.set_goal(&task, "Track actual presence", 10).unwrap();
+    store.run_goal(&task, 1, 20).unwrap();
+    store
+        .sync_goal_presence(&task, None, None, false, 1000)
+        .unwrap();
+    assert!(
+        store
+            .load(&task)
+            .unwrap()
+            .goal
+            .unwrap()
+            .active_since_ms
+            .is_none()
+    );
+    store
+        .sync_goal_presence(&task, Some(2000), None, false, 2000)
+        .unwrap();
+    store
+        .sync_goal_presence(&task, Some(4000), None, false, 4000)
+        .unwrap();
+    let reloaded = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    reloaded
+        .sync_goal_presence(&task, Some(4000), None, false, 900000)
+        .unwrap();
+    let offline = reloaded.load(&task).unwrap().goal.unwrap();
+    assert_eq!(offline.elapsed_active_ms, OFFLINE_AFTER_MS + 2000);
+    assert!(offline.active_since_ms.is_none());
+    assert_eq!(offline.status, GoalStatus::Active);
+    reloaded
+        .sync_goal_presence(&task, Some(950000), None, false, 950000)
+        .unwrap();
+    let paused = reloaded.stop_goal(&task, 1, 955000).unwrap();
+    assert_eq!(paused.elapsed_active_ms, OFFLINE_AFTER_MS + 7000);
+    reloaded
+        .sync_goal_presence(&task, Some(960000), None, false, 960000)
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .goal
+            .unwrap()
+            .elapsed_active_ms,
+        paused.elapsed_active_ms
+    );
+    reloaded.run_goal(&task, 1, 970000).unwrap();
+    reloaded
+        .sync_goal_presence(&task, Some(960000), None, false, 970000)
+        .unwrap();
+    assert_eq!(
+        reloaded.load(&task).unwrap().goal.unwrap().active_since_ms,
+        Some(970000)
+    );
+    reloaded
+        .sync_goal_presence(&task, Some(960000), None, true, 975000)
+        .unwrap();
+    let stopped = reloaded.load(&task).unwrap().goal.unwrap();
+    assert!(stopped.active_since_ms.is_none());
+    assert_eq!(stopped.elapsed_active_ms, OFFLINE_AFTER_MS + 12000);
+}
+
+#[test]
+fn retrying_pre_send_attention_and_continuing_goals_preserves_message_fences() {
+    use codexify::agent_automation::OwnerGoalCommand;
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("attention-retry");
+    store
+        .apply_owner_goal_command(
+            &task,
+            "set-attention-goal",
+            OwnerGoalCommand::Set {
+                markdown: "Continue".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let url = "https://chatgpt.com/c/attention-retry";
+    let pairing = store.issue_pairing(&task, url, 1, 2).unwrap();
+    store
+        .record_pairing_canonical_url(&task, pairing.generation, url, 3)
+        .unwrap();
+    store
+        .verify_pairing(&task, pairing.generation, 1, &pairing.reference, 4)
+        .unwrap();
+    for status in [
+        AutomationActionStatus::Interference,
+        AutomationActionStatus::AuthenticationRequired,
+        AutomationActionStatus::ApprovalRequired,
+        AutomationActionStatus::RateLimited,
+    ] {
+        store
+            .queue_action(
+                &task,
+                "before-send",
+                AutomationActionKind::OfflineCombined,
+                pairing.generation,
+                Some(1),
+                5,
+            )
+            .unwrap();
+        store
+            .update_action_status(
+                &task,
+                "before-send",
+                status,
+                Some("Resolve this condition, then retry"),
+                None,
+                6,
+            )
+            .unwrap();
+        assert_eq!(store.load(&task).unwrap().retry_mode(), Some("retry"));
+        store
+            .reset_failed_action_for_retry(&task, "before-send", 7)
+            .unwrap();
+    }
+    store
+        .queue_action(
+            &task,
+            "accepted-goal",
+            AutomationActionKind::OfflineGoal,
+            pairing.generation,
+            Some(1),
+            8,
+        )
+        .unwrap();
+    store.record_goal_turn(&task, "accepted-goal").unwrap();
+    store
+        .update_action_status(
+            &task,
+            "accepted-goal",
+            AutomationActionStatus::Ambiguous,
+            Some("Completion unknown"),
+            None,
+            9,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load(&task).unwrap().retry_mode(),
+        Some("continue_goal")
+    );
+    store
+        .reset_failed_action_for_retry(&task, "accepted-goal", 10)
+        .unwrap();
+    assert_eq!(store.load(&task).unwrap().goal.unwrap().turn_count, 2);
+    store
+        .queue_action(
+            &task,
+            "unknown-message",
+            AutomationActionKind::OfflineChat,
+            pairing.generation,
+            None,
+            11,
+        )
+        .unwrap();
+    store.record_goal_turn(&task, "unknown-message").unwrap();
+    store
+        .update_action_status(
+            &task,
+            "unknown-message",
+            AutomationActionStatus::Ambiguous,
+            Some("Message may be sent"),
+            None,
+            12,
+        )
+        .unwrap();
+    assert_eq!(store.load(&task).unwrap().retry_mode(), None);
+    assert!(
+        store
+            .reset_failed_action_for_retry(&task, "unknown-message", 13)
+            .is_err()
+    );
+}
+
+#[test]
+fn concurrent_agent_goal_updates_compare_revisions_under_the_mutation_lock() {
+    use codexify::agent_automation::OwnerGoalCommand;
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let task = task("agent-concurrent-goal-edit");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    // Owner and agent identifiers are independent, even with identical raw IDs.
+    store
+        .apply_owner_goal_command(
+            &task,
+            "request-a",
+            OwnerGoalCommand::Set {
+                markdown: "Initial".into(),
+            },
+            10,
+        )
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let attempts: Vec<_> = ["request-a", "request-b"]
+        .into_iter()
+        .map(|request_id| {
+            let state_root = state_root.clone();
+            let task = task.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let store = AgentAutomationStore::new(state_root).unwrap();
+                barrier.wait();
+                store.apply_agent_goal_command(
+                    &task,
+                    request_id,
+                    1,
+                    OwnerGoalCommand::Set {
+                        markdown: request_id.into(),
+                    },
+                    20,
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = attempts
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let failure = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    assert!(failure.contains("revision changed"));
+    let goal = store.load(&task).unwrap().goal.unwrap();
+    assert_eq!(goal.revision, 2);
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert!(["request-a", "request-b"].contains(&goal.markdown.as_str()));
+}
+
+#[test]
+fn legacy_goal_tracking_starts_once_at_upgrade_without_inventing_history() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("legacy-goal-timer");
+    store
+        .apply_owner_goal_command(
+            &task,
+            "legacy-set",
+            codexify::agent_automation::OwnerGoalCommand::Set {
+                markdown: "Already active".into(),
+            },
+            10,
+        )
+        .unwrap();
+    let path = store.task_directory(&task).unwrap().join("automation.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for key in ["elapsedActiveMs", "activeSinceMs", "turnCount"] {
+        state["goal"].as_object_mut().unwrap().remove(key);
+    }
+    for record in state["ownerGoalRequests"].as_array_mut().unwrap() {
+        for key in ["elapsedActiveMs", "activeSinceMs", "turnCount"] {
+            record["receipt"]["goal"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let goal = reloaded.load(&task).unwrap().goal.unwrap();
+    assert!(goal.updated_at_ms >= before);
+    assert!(goal.active_since_ms.is_none());
+    assert_eq!(goal.elapsed_active_ms, 0);
+    assert_eq!(goal.turn_count, 1);
+    assert_eq!(
+        reloaded.load(&task).unwrap().goal.unwrap().active_since_ms,
+        goal.active_since_ms
+    );
+}
+
+#[test]
+fn editing_an_active_goal_preserves_progress_and_invalidates_the_old_revision() {
+    use codexify::agent_automation::{OwnerGoalCommand, OwnerGoalCommandReceipt};
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("active-goal-edit");
+    let first = store
+        .apply_owner_goal_command(
+            &task,
+            "initial-goal",
+            OwnerGoalCommand::Set {
+                markdown: "Original goal".into(),
+            },
+            10,
+        )
+        .unwrap();
+    assert!(!first.updated_active_goal);
+    store
+        .sync_goal_presence(&task, Some(20), None, false, 20)
+        .unwrap();
+    let pairing = store
+        .issue_pairing(&task, "https://chatgpt.com/c/active-goal-edit", 0, 21)
+        .unwrap();
+    store
+        .record_pairing_canonical_url(
+            &task,
+            pairing.generation,
+            "https://chatgpt.com/c/active-goal-edit",
+            22,
+        )
+        .unwrap();
+    store
+        .verify_pairing(&task, pairing.generation, 0, &pairing.reference, 23)
+        .unwrap();
+    store
+        .queue_action(
+            &task,
+            "first-turn",
+            AutomationActionKind::OfflineGoal,
+            pairing.generation,
+            Some(1),
+            30,
+        )
+        .unwrap();
+    store.record_goal_turn(&task, "first-turn").unwrap();
+    let before = store.load(&task).unwrap().goal.unwrap();
+    let edit = || {
+        store.apply_owner_goal_command(
+            &task,
+            "edit-goal",
+            OwnerGoalCommand::Set {
+                markdown: "Updated goal".into(),
+            },
+            1020,
+        )
+    };
+    let receipt = edit().unwrap();
+    assert!(receipt.updated_active_goal);
+    let after = receipt.goal.unwrap();
+    assert_eq!(after.revision, 2);
+    assert_eq!(after.markdown, "Updated goal");
+    assert_eq!(after.status, GoalStatus::Active);
+    assert_eq!(after.created_at_ms, before.created_at_ms);
+    assert_eq!(after.active_since_ms, before.active_since_ms);
+    assert_eq!(after.elapsed_active_ms, before.elapsed_active_ms);
+    assert_eq!(after.timer_until_ms, before.timer_until_ms);
+    assert_eq!(after.turn_count, 2);
+    assert!(
+        store
+            .finish_goal(&task, 1, GoalFinish::Completed { summary: None }, 1030)
+            .is_err()
+    );
+    let replayed = edit().unwrap();
+    assert!(replayed.replayed && replayed.updated_active_goal);
+    assert_eq!(replayed.goal.unwrap(), after);
+    let mut old_receipt = serde_json::to_value(first).unwrap();
+    old_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("updatedActiveGoal");
+    let compatible: OwnerGoalCommandReceipt = serde_json::from_value(old_receipt).unwrap();
+    assert!(!compatible.updated_active_goal);
+}
+
+#[test]
+fn new_chat_verification_race_preserves_the_one_time_reference_until_url_is_ready() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("creation-race");
+    let issue = store
+        .issue_pairing(&task, "https://chatgpt.com/g/g-p-project/project", 1, 100)
+        .unwrap();
+    store.mark_creating_chat(&task).unwrap();
+    let first = store
+        .verify_pairing_reference(&task, 1, &issue.reference, 101)
+        .unwrap_err();
+    assert!(first.contains("not ready"));
+    assert!(store.load(&task).unwrap().pairing.pending.is_some());
+    store
+        .record_pairing_canonical_url(
+            &task,
+            issue.generation,
+            "https://chatgpt.com/c/created",
+            102,
+        )
+        .unwrap();
+    let pairing = store
+        .verify_pairing_reference(&task, 1, &issue.reference, 103)
+        .unwrap();
+    assert_eq!(pairing.verified_owner_generation, Some(1));
+    assert!(!pairing.creating_chat);
 }
