@@ -60,9 +60,14 @@ try {
   console.log("\nDerived symbol anchors:");
   for (const entry of manifest.derivedSymbols) {
     console.log(`\n--- ${entry.source} -> ${entry.local} ---`);
-    const pattern = entry.symbols.map(symbol => symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-    const result = run("rg", ["-n", pattern, join(source, entry.source)]);
-    process.stdout.write(result.stdout);
+    const upstream = readFileSync(join(source, entry.source), "utf8");
+    const anchors = upstream.split(/\r?\n/).map((line, index) =>
+      entry.symbols.some(symbol => line.includes(symbol)) ? `${index + 1}:${line}\n` : "",
+    ).join("");
+    if (!anchors) {
+      throw new Error(`${entry.source} contains none of the expected symbol anchors: ${entry.symbols.join(", ")}`);
+    }
+    process.stdout.write(anchors);
   }
   console.log("\nBrowser companion upstream boundary is current.");
 } finally {
