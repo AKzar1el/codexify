@@ -680,12 +680,15 @@ impl AgentAutomationSupervisor {
         before.saturating_sub(queue.len())
     }
 
-    pub async fn cancel_queued_action(
+    pub async fn cancel_action(
         &self,
         task: &ConversationIdentity,
         expected_action_id: &str,
         now_ms: u64,
     ) -> Result<super::AutomationActionState, String> {
+        // Serialize with automatic retry preparation. Hold the queue through the
+        // state change so the runner cannot start the action being cancelled.
+        let _scan_guard = self.scan_lock.lock().await;
         let handle = self
             .tasks
             .read()
@@ -693,38 +696,34 @@ impl AgentAutomationSupervisor {
             .get(task.stable_key())
             .cloned()
             .ok_or("Browser automation task is not registered")?;
+        let mut queue = self.queue.lock().await;
         let state = handle.store.load(&handle.task)?;
-        if state.action.id.as_deref() != Some(expected_action_id)
-            || state.action.status != AutomationActionStatus::Queued
-        {
-            return Err("Only the exact queued browser action can be cancelled here".into());
+        if state.action.id.as_deref() != Some(expected_action_id) {
+            return Err("The browser action changed before it could be cancelled".into());
         }
-        let removed = {
-            let mut queue = self.queue.lock().await;
-            let Some(position) = queue.iter().position(|execution| {
-                execution.task_key == handle.task.stable_key()
+        if state.action.status == AutomationActionStatus::Queued
+            && !queue.iter().any(|execution| {
+                execution.task_key == task.stable_key()
                     && execution.request.action_id == expected_action_id
-            }) else {
-                return Err("The browser action already started or left the queue".into());
-            };
-            queue.remove(position);
-            true
-        };
-        debug_assert!(removed);
-        self.live.write().await.remove(handle.task.stable_key());
-        let action = if state.action.kind == Some(AutomationActionKind::PairVerify) {
+            })
+        {
+            return Err("The browser action already started or left the queue".into());
+        }
+        let action = handle
+            .store
+            .cancel_action(&handle.task, expected_action_id, now_ms)?;
+        queue.retain(|execution| {
+            execution.task_key != task.stable_key()
+                || execution.request.action_id != expected_action_id
+        });
+        let action = if action.kind == Some(AutomationActionKind::PairVerify) {
             handle.store.unlink_pairing(&handle.task, now_ms)?;
             handle.store.load(&handle.task)?.action
         } else {
-            handle.store.update_action_status(
-                &handle.task,
-                expected_action_id,
-                AutomationActionStatus::Failed,
-                Some("Browser action cancelled before Send"),
-                None,
-                now_ms,
-            )?
+            action
         };
+        drop(queue);
+        self.live.write().await.remove(handle.task.stable_key());
         self.notify();
         Ok(action)
     }
@@ -949,6 +948,9 @@ impl AgentAutomationSupervisor {
             )?;
             let mut state = task.store.load(&task.task)?;
             task.store.notify_state(&task.chat, &state).await;
+            if state.action.status == AutomationActionStatus::Cancelled {
+                continue;
+            }
             if !activity.agent_stop_requested
                 && state.action.goal_turn_counted
                 && state.action.kind == Some(AutomationActionKind::OfflineGoal)
@@ -1976,6 +1978,7 @@ fn blocks_automatic_requeue(status: AutomationActionStatus) -> bool {
             | AutomationActionStatus::Interference
             | AutomationActionStatus::Ambiguous
             | AutomationActionStatus::Failed
+            | AutomationActionStatus::Cancelled
     )
 }
 

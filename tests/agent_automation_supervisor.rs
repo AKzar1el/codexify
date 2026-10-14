@@ -4492,7 +4492,7 @@ async fn queued_pair_verification_can_be_cancelled_without_replaying_its_referen
 
     let cancelled = fixture
         .supervisor
-        .cancel_queued_action(&fixture.task, &action_id, 1_002)
+        .cancel_action(&fixture.task, &action_id, 1_002)
         .await
         .unwrap();
 
@@ -6625,4 +6625,184 @@ async fn an_authorized_goal_can_start_after_pairing_grace_without_waiting_four_m
         ActionPrompt::OfflineGoal { .. }
     ));
     assert_eq!(executions[0].request.model.as_deref(), Some("gpt-6-sol"));
+}
+
+#[tokio::test]
+async fn cancelling_a_failed_action_stops_retries_across_restart_without_consuming_messages() {
+    use codexify::agent_automation::{AutomationActionKind, GoalStatus};
+    let f = fixture().await;
+    let goal = f
+        .store
+        .set_goal(&f.task, "Keep the requested goal", 1000)
+        .unwrap();
+    f.store.run_goal(&f.task, goal.revision, 1000).unwrap();
+    f.chat
+        .append_user("cancel-pending".into(), "Keep this message unread".into())
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1001).await.unwrap();
+    let action_id = f.store.load(&f.task).unwrap().action.id.unwrap();
+    f.supervisor.discard_queued_actions(&f.task).await;
+    f.store
+        .update_action_status(
+            &f.task,
+            &action_id,
+            AutomationActionStatus::Failed,
+            Some("Browser unavailable before Send"),
+            None,
+            1002,
+        )
+        .unwrap();
+    let before = f.store.load(&f.task).unwrap();
+    assert!(before.automatic_retry_at_ms().is_some());
+    let cancelled = f
+        .supervisor
+        .cancel_action(&f.task, &action_id, 1003)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, AutomationActionStatus::Cancelled);
+    assert!(cancelled.last_error.is_none());
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.goal, before.goal);
+    assert_eq!(after.chat_mirror, before.chat_mirror);
+    assert_eq!(after.goal.as_ref().unwrap().status, GoalStatus::Active);
+    assert!(after.automatic_retry_at_ms().is_none());
+    assert!(!after.action_needs_attention());
+    assert_eq!(after.retry_mode(), Some("retry"));
+    assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
+    assert_eq!(
+        f.supervisor
+            .cancel_action(&f.task, &action_id, 1004)
+            .await
+            .unwrap(),
+        cancelled
+    );
+    let restarted = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        f.executor.clone(),
+    );
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    restarted.scan_once(1_000_000).await.unwrap();
+    assert_eq!(restarted.queued_count().await, 0);
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+    // An explicit retry remains possible; cancelling did not discard the user's intent.
+    restarted
+        .retry_failed_action(&f.task, &action_id, 1_000_001)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.next_queued_kind().await,
+        Some(AutomationActionKind::OfflineCombined)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_uncertain_send_retains_its_acceptance_evidence_and_cannot_replay_it() {
+    let f = fixture().await;
+    f.chat
+        .append_user(
+            "uncertain-cancel".into(),
+            "Do not duplicate this message".into(),
+        )
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1001).await.unwrap();
+    let action_id = f.store.load(&f.task).unwrap().action.id.unwrap();
+    f.supervisor.discard_queued_actions(&f.task).await;
+    f.store
+        .update_action_status(
+            &f.task,
+            &action_id,
+            AutomationActionStatus::Ambiguous,
+            Some("Send could not be confirmed"),
+            None,
+            1002,
+        )
+        .unwrap();
+    f.supervisor
+        .cancel_action(&f.task, &action_id, 1003)
+        .await
+        .unwrap();
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.action.send_accepted, Some(true));
+    assert_eq!(after.action.status, AutomationActionStatus::Cancelled);
+    assert!(after.retry_mode().is_none());
+    assert!(
+        f.supervisor
+            .retry_failed_action(&f.task, &action_id, 1004)
+            .await
+            .is_err()
+    );
+    f.store
+        .resume_cancelled_action_for_new_message(&f.task, 1005)
+        .unwrap();
+    f.supervisor.scan_once(1_000_000).await.unwrap();
+    assert_eq!(f.store.load(&f.task).unwrap().action, after.action);
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_rejects_stale_or_running_actions_and_new_intent_can_resume_unsent_work() {
+    let f = fixture().await;
+    f.chat
+        .append_user("cancel-queued".into(), "Send this later".into())
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1001).await.unwrap();
+    let action_id = f.store.load(&f.task).unwrap().action.id.unwrap();
+    assert!(
+        f.supervisor
+            .cancel_action(&f.task, "old-action", 1002)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.supervisor.queued_count().await, 1);
+    f.supervisor
+        .cancel_action(&f.task, &action_id, 1003)
+        .await
+        .unwrap();
+    assert!(f.supervisor.run_next(1004).await.unwrap().is_none());
+    f.store
+        .resume_cancelled_action_for_new_message(&f.task, 1002)
+        .unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Cancelled
+    );
+    f.store
+        .resume_cancelled_action_for_new_message(&f.task, 1005)
+        .unwrap();
+    f.supervisor.scan_once(1006).await.unwrap();
+    let queued = f.store.load(&f.task).unwrap().action;
+    assert_ne!(queued.id.as_deref(), Some(action_id.as_str()));
+    assert_eq!(f.supervisor.queued_count().await, 1);
+    f.store
+        .update_action_status(
+            &f.task,
+            queued.id.as_ref().unwrap(),
+            AutomationActionStatus::Navigating,
+            None,
+            None,
+            1007,
+        )
+        .unwrap();
+    assert!(
+        f.supervisor
+            .cancel_action(&f.task, queued.id.as_ref().unwrap(), 1008)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Navigating
+    );
 }

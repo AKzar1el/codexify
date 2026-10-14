@@ -2039,6 +2039,10 @@ goal, and browser action errors appear as a red exclamation icon beside the
 sidebar title. Pending automatic retries stay quiet; exhausted retries produce
 one error notification per failure episode. Accepted or uncertain user messages,
 pairing requests, and cancelled actions are not replayed automatically.
+The failure banner also exposes **Cancel**. Cancelling clears the error and stops
+pending retries across restarts while preserving the goal and unread messages.
+Confirmed-unsent work can resume with a new user message or an explicit Retry in
+conversation settings; cancelling does not establish that an uncertain Send failed.
 
 This is unofficial ChatGPT UI automation and deliberately fails closed. Selector
 drift, an inaccessible conversation, account changes, stale capabilities, a model

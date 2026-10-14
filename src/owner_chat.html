@@ -378,7 +378,7 @@ input,select,textarea { font:inherit; }
         <div class="automation-actions"><button type="button" id="automation-set-goal">Set goal</button></div>
         <p id="goal-status" class="automation-detail"></p>
       </div>
-      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button></div>
+      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button><button type="button" class="composer-button" id="automation-cancel-inline" aria-label="Cancel failed action" title="Cancel this action and stop automatic retries" hidden>Cancel</button></div>
       <div id="goal-bar" hidden>
         <span id="goal-icon" aria-hidden="true"></span><span id="goal-caption"></span><span id="goal-text"></span><span id="goal-metrics" aria-label="Goal active time and turns" title="Counts while this goal is enabled and the agent is online, away, or waiting. Pauses when the agent is offline."></span>
         <button type="button" class="composer-button" id="goal-retry" hidden>Retry</button>
@@ -550,7 +550,9 @@ input,select,textarea { font:inherit; }
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
       for (const node of [nodes.liveStatus,nodes.liveCommentary,nodes.liveAnswer]) node.hidden = !node.textContent;
-      nodes.cancelAction.disabled = state.action?.status !== "queued" || !state.action?.id;
+      const canCancel = Boolean(state.action?.id) && (state.action.status === "queued" || actionFailed || state.action.status === "unverified" && Boolean(state.action.lastError));
+      nodes.cancelAction.disabled = !canCancel;
+      nodes.cancelAction.textContent = actionFailed ? "Cancel failed action" : "Cancel queued action";
       nodes.retryAction.disabled = !retryMode;
       nodes.retryAction.textContent = retryLabel;
       if (pairingSubmissionError) setError(pairingSubmissionError);
@@ -562,6 +564,7 @@ input,select,textarea { font:inherit; }
         setError(`${failure} ${nextStep}`);
       } else if (state.action?.lastError) setError(state.action.lastError);
       else setError("");
+      byId("automation-cancel-inline").hidden = nodes.error.hidden;
       if (atBottom) history.scrollTop = history.scrollHeight;
     }
     async function loadModels(refresh = false) {
@@ -689,9 +692,13 @@ input,select,textarea { font:inherit; }
     nodes.setGoal.addEventListener("click", () => run(async () => { await goalCommand(`/goal set ${nodes.goal.value}`); byId("goal-editor").hidden = true; }));
     nodes.toggleGoal.addEventListener("click", () => run(async () => { await goalCommand(current?.goal?.status === "active" ? "/goal stop" : "/goal run"); }));
     nodes.clearGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal clear"); }));
-    nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); }));
+    nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); pairingSubmissionError = ""; }));
     nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     byId("automation-retry-inline").addEventListener("click", () => nodes.retryAction.click());
+    byId("automation-cancel-inline").addEventListener("click", () => {
+      if (!nodes.cancelAction.disabled) nodes.cancelAction.click();
+      else { pairingSubmissionError = ""; setError(""); byId("automation-cancel-inline").hidden = true; }
+    });
     byId("goal-retry").addEventListener("click", () => {
       if (!nodes.retryAction.disabled) nodes.retryAction.click();
       else if (current?.action?.kind === "pair_verify") nodes.pair.click();

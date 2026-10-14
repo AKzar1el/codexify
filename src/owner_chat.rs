@@ -1167,7 +1167,7 @@ async fn automation_action_cancel(
         .as_ref()
         .ok_or_else(|| internal_error("Browser automation supervisor is unavailable"))?;
     let action = supervisor
-        .cancel_queued_action(
+        .cancel_action(
             &context.task,
             &body.action_id,
             crate::markdown_chat::now_ms(),
@@ -1413,9 +1413,11 @@ async fn chat_send(
     };
     match message {
         OwnerMessage::Chat(message) => {
-            if state.config.markdown_chat.automation.enabled {
-                let _ = automation_context(&state, &located).await?;
-            }
+            let automation = if state.config.markdown_chat.automation.enabled {
+                Some(automation_context(&state, &located).await?)
+            } else {
+                None
+            };
             let chat = state
                 .chats
                 .chat_at_path(located.path, true)
@@ -1424,6 +1426,12 @@ async fn chat_send(
                 .append_user_with_attachments(body.request_id, message, body.attachment_ids)
                 .await
                 .map_err(internal_error)?;
+            if let (Some(context), Some(created_at_ms)) = (automation, sent.created_at_ms) {
+                context
+                    .store
+                    .resume_cancelled_action_for_new_message(&context.task, created_at_ms)
+                    .map_err(internal_error)?;
+            }
             let organization = chat
                 .set_owner_organization(None, Some(false))
                 .await
@@ -3643,6 +3651,26 @@ mod tests {
             .unwrap();
         let id = list["chats"][0]["id"].as_str().unwrap();
 
+        let dismissed: Value = client
+            .post(format!("{base}/api/chats/{id}/automation/action/cancel"))
+            .bearer_auth("test-token")
+            .json(&json!({"requestId":"cancel-failed-owner-action","actionId":failed_action}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dismissed["action"]["status"], "cancelled");
+        assert!(dismissed["action"]["lastError"].is_null());
+        assert!(
+            store
+                .load(&identity)
+                .unwrap()
+                .automatic_retry_at_ms()
+                .is_none()
+        );
+
         let retried: Value = client
             .post(format!("{base}/api/chats/{id}/automation/action/retry"))
             .bearer_auth("test-token")
@@ -3673,7 +3701,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(cancelled["action"]["status"], "failed");
+        assert_eq!(cancelled["action"]["status"], "cancelled");
         assert!(cancelled["queue"].is_null());
         assert_eq!(supervisor.queued_count().await, 0);
         assert!(
@@ -3691,6 +3719,24 @@ mod tests {
                 .message_ids
                 .is_empty()
         );
+        supervisor.scan_once(now_ms + 1_000_000).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+        // A fresh user message resumes confirmed-unsent work through the normal send API.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let sent = client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({"request_id":"owner-after-cancel","message":"Continue now"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(sent.status().is_success());
+        assert_eq!(
+            store.load(&identity).unwrap().action.status,
+            crate::agent_automation::AutomationActionStatus::Idle
+        );
+        supervisor.scan_once(now_ms + 1_000_001).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
         owner_task.abort();
     }
 

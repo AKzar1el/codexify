@@ -187,6 +187,7 @@ pub enum AutomationActionStatus {
     Ambiguous,
     Stalled,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -322,6 +323,12 @@ impl AutomationTaskState {
 
 fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
     let action = &state.action;
+    if action.status == AutomationActionStatus::Cancelled {
+        return (action.id.is_some()
+            && action.kind != Some(AutomationActionKind::PairVerify)
+            && action.send_accepted == Some(false))
+        .then_some("retry");
+    }
     if action.id.is_none()
         || action.kind == Some(AutomationActionKind::PairVerify)
         || !matches!(
@@ -1565,6 +1572,56 @@ impl AgentAutomationStore {
                 state.action.automatic_retry_attempts = 0;
             }
             Ok(state.action.clone())
+        })
+    }
+
+    pub fn cancel_action(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(expected_action_id) {
+            return Err("Agent automation cancel action ID is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(expected_action_id) {
+                return Err("The browser action changed before it could be cancelled".into());
+            }
+            if state.action.status == AutomationActionStatus::Cancelled {
+                return Ok(state.action.clone());
+            }
+            if state.action.status != AutomationActionStatus::Queued
+                && !state.action_needs_attention()
+            {
+                return Err("Only a queued or failed browser action can be cancelled here".into());
+            }
+            state.action.status = AutomationActionStatus::Cancelled;
+            state.action.last_error = None;
+            state.action.automatic_retry_attempts = 0;
+            state.action.updated_at_ms = Some(now_ms);
+            Ok(state.action.clone())
+        })
+    }
+
+    pub fn resume_cancelled_action_for_new_message(
+        &self,
+        task: &ConversationIdentity,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.status == AutomationActionStatus::Cancelled
+                && state.action.send_accepted == Some(false)
+                && state
+                    .action
+                    .updated_at_ms
+                    .is_some_and(|cancelled| created_at_ms > cancelled)
+            {
+                // New user intent can resume confirmed-unsent work. Preserve any accepted
+                // batch fence; cancellation never proves that an uncertain send failed.
+                state.action = AutomationActionState::default();
+            }
+            Ok(())
         })
     }
 

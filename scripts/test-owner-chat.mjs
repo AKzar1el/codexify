@@ -264,6 +264,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     const host=page.locator('#chat-host'),inline=host.locator('#automation-retry-inline');
     await inline.waitFor();
     assert.equal(await host.locator('#goal-bar').isVisible(),false);
+    assert.equal(await host.getByRole('button',{name:'Cancel failed action',exact:true}).isVisible(),true);
     assert.equal(await host.locator('#automation-settings').isVisible(),false);
     assert.equal(await inline.textContent(),'Retry');
     assert((await host.locator('#automation-error').textContent()).includes('All three automatic retries failed'));
@@ -1360,3 +1361,52 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
+
+
+for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
+  test(`${engineName}: Cancel dismisses failed actions and retry countdowns while preserving goals`, {timeout:30000}, async()=>{
+    const browser=await engine.launch();
+    try {
+      const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
+      const id='d'.repeat(64),now=Date.now(),errors=[],cancellations=[];
+      page.on('pageerror',error=>errors.push(error.message));
+      const chat={id,title:'Retry cancellation',workspace:'test',lastEntryEnd:1,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:1};
+      const goal={revision:1,markdown:'Preserve this goal',status:'active',turnCount:1};
+      let action={id:'backoff',kind:'offline_goal',status:'failed',lastError:'Browser unavailable',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:now+30000,automaticRetryAttempts:0};
+      await page.route('http://127.0.0.1:43225/**',route=>{
+        const request=route.request(),url=new URL(request.url());
+        if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+        if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:action.lastError}],serverTimeMs:Date.now()}});
+        if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,catalog:{models:[]},pairing:{status:'verified'},companion:{authenticated:true,status:'idle'},serverTimeMs:Date.now(),presence:{lastAgentCallAtMs:null}}});
+        if(url.pathname.endsWith('/action/cancel')){
+          const body=request.postDataJSON();assert.equal(body.actionId,action.id);cancellations.push(body);
+          action={...action,status:'cancelled',lastError:null,automaticRetryAtMs:null,retryMode:null};
+          return route.fulfill({json:{action,queue:null}});
+        }
+        return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/test/CHAT.md',revision:'1',delivered_through:0,read_through:0,last_agent_call_at_ms:null,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+      });
+      await page.goto(`http://127.0.0.1:43225/?chat=${id}#test-token`);
+      const host=page.locator('#chat-host'),cancel=host.getByRole('button',{name:'Cancel failed action',exact:true}),error=host.locator('#automation-error');
+      for(const failure of [action,{...action,id:'exhausted',automaticRetryAtMs:null,automaticRetryAttempts:3},{...action,id:'uncertain',status:'ambiguous',sendAccepted:true,retryMode:null,automaticRetryAtMs:null}]) {
+        action=failure;
+        await error.waitFor();await cancel.waitFor();
+        const controls=host.locator('#automation-error-row');
+        const row=await controls.boundingBox(),cancelBox=await cancel.boundingBox();
+        assert(cancelBox.x>=row.x&&cancelBox.x+cancelBox.width<=row.x+row.width+1);
+        if(failure.id==='backoff') {
+          await error.getByText(/Retrying automatically/).waitFor();
+          const retryBox=await host.locator('#automation-retry-inline').boundingBox();
+          assert(Math.abs(retryBox.y-cancelBox.y)<2,'Cancel and Retry align on the same row');
+          mkdirSync('/tmp/chat-error-cancel-ui',{recursive:true});
+          await page.screenshot({path:`/tmp/chat-error-cancel-ui/${engineName.toLowerCase()}-before.png`});
+        }
+        await cancel.click();await error.waitFor({state:'hidden'});await cancel.waitFor({state:'hidden'});
+        await page.locator('.conversation .presence.error').waitFor({state:'detached'});
+        assert.equal(await host.locator('#goal-caption').textContent(),'Pursuing goal');
+        assert.equal(await host.locator('#goal-text').textContent(),goal.markdown);
+        if(failure.id==='backoff')await page.screenshot({path:`/tmp/chat-error-cancel-ui/${engineName.toLowerCase()}-after.png`});
+      }
+      assert.equal(cancellations.length,3);assert.equal(action.sendAccepted,true);assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+}
