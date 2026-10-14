@@ -111,7 +111,8 @@ function stateForEvent(type: ActionEvent["type"], current: ActionState): ActionS
     case "composer_ready": return "navigating";
     case "model_verified": return "navigating";
     case "connector_verified": return "navigating";
-    case "send_accepted": return "sending";
+    case "send_accepted":
+    case "conversation_created": return "sending";
     case "status_delta":
     case "commentary_delta":
     case "answer_delta": return "generating";
@@ -625,6 +626,10 @@ export class SingleWindowCoordinator {
         "failed",
       );
     }
+    if (raw.type === "conversation_created" && (record.request.prompt.kind !== "create_chat"
+      || !record.snapshot.sendAccepted || !canonicalChatGptConversationUrl(raw.canonicalUrl).startsWith("https://chatgpt.com/c/"))) {
+      throw new BrowserCompanionError("Browser driver reported a created conversation without an accepted creation request", "external_interference", {sendAccepted:record.snapshot.sendAccepted});
+    }
     if ((raw.type === "generation_complete" || raw.type === "submission_complete")
       && (!raw.canonicalUrl || (record.request.prompt.kind === "create_chat" ? !canonicalChatGptConversationUrl(raw.canonicalUrl).startsWith("https://chatgpt.com/c/") : canonicalChatGptConversationUrl(raw.canonicalUrl) !== canonicalChatGptConversationUrl(record.request.expectedUrl)))) {
       throw new BrowserCompanionError(
@@ -681,9 +686,9 @@ export class SingleWindowCoordinator {
     if (event.type === "connector_verified") record.connectorVerified = true;
     if (event.type === "send_accepted") {
       record.snapshot.sendAccepted = true;
-      record.snapshot.canonicalUrl = record.request.expectedUrl;
+      if(record.request.prompt.kind !== "create_chat")record.snapshot.canonicalUrl = record.request.expectedUrl;
     }
-    if (event.type === "generation_complete" || event.type === "submission_complete") record.snapshot.canonicalUrl = event.canonicalUrl;
+    if (event.type === "conversation_created" || event.type === "generation_complete" || event.type === "submission_complete") record.snapshot.canonicalUrl = event.canonicalUrl;
     actionSnapshotSchema.parse(record.snapshot);
     for (const listener of [...record.listeners]) listener(event);
     if (terminalType(event.type)) {

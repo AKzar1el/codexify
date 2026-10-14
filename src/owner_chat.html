@@ -331,10 +331,22 @@ input,select,textarea { font:inherit; }
     const text = String(value || "").replaceAll("_", " ");
     return text ? text[0].toUpperCase() + text.slice(1) : "Unknown";
   }
+  function pairingConversationUrl(value) {
+    try {
+      const url = new URL(value);
+      const match = /^\/(?:g\/[^/]+\/)?c\/([^/]+)\/?$/.exec(url.pathname);
+      if (url.origin !== "https://chatgpt.com" || url.username || url.password || !match || decodeURIComponent(match[1]).startsWith("local-chatgpt:")) return "";
+      url.search = ""; url.hash = ""; return url.href;
+    } catch { return ""; }
+  }
+  function savedPairingUrl(pairing) {
+    return [pairing.lastTriedUrl, pairing.canonicalUrl, pairing.candidateUrl].map(pairingConversationUrl).find(Boolean) || "";
+  }
   function pairingPhase(state, now) {
     const pairing = state?.pairing || {}, action = state?.action || {};
     if (pairing.status === "verified") return "verified";
     const pairAction = action.kind === "pair_verify";
+    if (pairAction && action.sendAccepted && Number.isSafeInteger(pairing.verificationWaitUntilMs)) return now < pairing.verificationWaitUntilMs ? "pairing" : "failed";
     if (pairAction && (action.lastError || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(action.status))) return "failed";
     // A queued request gets a fresh verification deadline when it starts.
     if (pairAction && action.status === "queued") return "pairing";
@@ -484,6 +496,8 @@ input,select,textarea { font:inherit; }
       const pairing = state.pairing || { status:"unpaired" };
       const verified = pairing.status === "verified";
       const currentPairingPhase = pairingPhase(state, Date.now() + clockOffset);
+      const pairingWaiting = currentPairingPhase === "pairing" && state.action?.kind === "pair_verify" && state.action?.sendAccepted;
+      const pairingTimedOut = currentPairingPhase === "failed" && state.action?.kind === "pair_verify" && state.action?.sendAccepted && Number.isSafeInteger(pairing.verificationWaitUntilMs);
       if (verified || currentPairingPhase === "pairing") pairingSubmissionError = "";
       const phase = pairingSubmitting ? "pairing" : pairingSubmissionError ? "failed" : currentPairingPhase;
       const pairChat = byId("automation-pair-chat");
@@ -495,10 +509,10 @@ input,select,textarea { font:inherit; }
       byId("pairing-editor-url").disabled = pairingSubmitting;
       if (verified || phase === "pairing") byId("pairing-editor").hidden = true;
       nodes.model.hidden = nodes.effort.hidden = !verified;
-      const pairedUrl = pairing.canonicalUrl || pairing.candidateUrl || "";
+      const pairedUrl = savedPairingUrl(pairing);
       if (pairedUrl && scope.activeElement !== nodes.url) nodes.url.value = pairedUrl;
       nodes.pairing.dataset.state = verified ? "connected" : "disconnected";
-      nodes.pairing.textContent = pairing.status === "verified" ? "Verified" : pairing.status === "unverified" ? (state.action?.status === "queued" ? (companion.activeActionId ? "Pairing queued — waiting for the current browser submission" : "Pairing verification queued") : pairing.expiresAtMs && state.action?.kind === "pair_verify" && !state.action?.lastError ? "Pairing request sent — waiting for agent verification" : "Verification required") : "Not paired";
+      nodes.pairing.textContent = verified ? "Verified" : pairingWaiting ? "Pairing request sent — waiting for agent verification" : pairing.status === "unverified" ? (state.action?.status === "queued" ? (companion.activeActionId ? "Pairing queued — waiting for the current browser submission" : "Pairing verification queued") : pairing.expiresAtMs && state.action?.kind === "pair_verify" && !state.action?.lastError ? "Pairing request sent — waiting for agent verification" : "Verification required") : "Not paired";
       const retryCreation = pairing.creatingChat && !pairing.canonicalUrl;
       nodes.pair.textContent = retryCreation ? "Retry creation" : pairing.status === "unpaired" ? "Pair conversation" : "Replace pairing";
       nodes.pair.disabled = retryCreation ? state.action?.sendAccepted !== false || !companion.authenticated : !nodes.url.value.trim() || !companion.authenticated;
@@ -514,11 +528,11 @@ input,select,textarea { font:inherit; }
       byId("goal-icon").dataset.state = goal?.status === "blocked" || goal?.status === "error" ? "blocked" : goal?.status === "active" ? "running" : "paused";
       byId("goal-bar").hidden = !goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
-      const actionFailed = ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(state.action?.status);
+      const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(state.action?.status));
       const actionNeedsAttention = !automaticRetry && actionFailed;
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
       byId("goal-caption").textContent = goalNeedsAttention ? "Goal needs attention" : goal?.status === "active" ? "Pursuing goal" : goal?.status === "configured" ? "Goal paused" : `Goal ${goal?.status || ""}`;
-      const failure = state.action?.lastError || state.live?.status || "The browser action did not finish.";
+      const failure = state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
       const retryMode = state.action && "retryMode" in state.action ? state.action.retryMode : state.action?.status === "failed" && state.action.kind !== "pair_verify" ? "retry" : null;
       const inlineRetry = byId("automation-retry-inline");
       inlineRetry.hidden = !actionFailed || Boolean(goal && goalNeedsAttention) || !retryMode;
@@ -550,12 +564,13 @@ input,select,textarea { font:inherit; }
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
       for (const node of [nodes.liveStatus,nodes.liveCommentary,nodes.liveAnswer]) node.hidden = !node.textContent;
-      const canCancel = Boolean(state.action?.id) && (state.action.status === "queued" || actionFailed || state.action.status === "unverified" && Boolean(state.action.lastError));
+      const canCancel = Boolean(state.action?.id) && (state.action.status === "queued" || actionFailed || pairingWaiting || state.action.status === "unverified" && Boolean(state.action.lastError));
       nodes.cancelAction.disabled = !canCancel;
       nodes.cancelAction.textContent = actionFailed ? "Cancel failed action" : "Cancel queued action";
       nodes.retryAction.disabled = !retryMode;
       nodes.retryAction.textContent = retryLabel;
-      if (pairingSubmissionError) setError(pairingSubmissionError);
+      if (pairingWaiting || verified && state.action?.kind === "pair_verify") setError("");
+      else if (pairingSubmissionError) setError(pairingSubmissionError);
       else if (automaticRetry) setError(`${failure} ${retryStatus}`);
       else if (actionNeedsAttention) {
         const preparation = state.action?.status === "authentication_required" ? "Sign in from connection settings, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
@@ -664,8 +679,8 @@ input,select,textarea { font:inherit; }
       if (pairingSubmissionError || pairingPhase(current, Date.now() + clockOffset) === "failed") {
         showSettings(false);
         const pairing = current?.pairing || {};
-        const savedUrl = "lastTriedUrl" in pairing ? pairing.lastTriedUrl || "" : pairing.canonicalUrl || (pairing.creatingChat ? "" : pairing.candidateUrl) || lastSubmittedPairingUrl || "";
-        byId("pairing-editor-url").value = (pairingSubmissionError ? lastSubmittedPairingUrl : "") || savedUrl;
+        const savedUrl = savedPairingUrl(pairing) || (!pairing.creatingChat && !("lastTriedUrl" in pairing) ? pairingConversationUrl(lastSubmittedPairingUrl) : "");
+        byId("pairing-editor-url").value = (pairingSubmissionError ? pairingConversationUrl(lastSubmittedPairingUrl) : "") || savedUrl;
         byId("pairing-editor").hidden = false; render(current); byId("pairing-editor-url").focus();
       } else { showSettings(true); nodes.url.focus(); }
     });

@@ -1473,3 +1473,170 @@ fn new_chat_verification_race_preserves_the_one_time_reference_until_url_is_read
     assert_eq!(pairing.verified_owner_generation, Some(1));
     assert!(!pairing.creating_chat);
 }
+
+#[test]
+fn a_late_valid_pairing_clears_the_error_and_retains_the_created_conversation_url() {
+    use codexify::agent_automation::PAIRING_VERIFICATION_GRACE_MS;
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("late-created-pairing");
+    let issue = store
+        .issue_pairing(&task, "https://chatgpt.com/g/g-p-project/project", 1, 1000)
+        .unwrap();
+    store.mark_creating_chat(&task).unwrap();
+    store
+        .queue_action(
+            &task,
+            "creation-action",
+            AutomationActionKind::PairVerify,
+            issue.generation,
+            None,
+            1001,
+        )
+        .unwrap();
+    store
+        .record_pairing_submission(&task, "creation-action", 1100)
+        .unwrap();
+    store
+        .record_pairing_canonical_url(
+            &task,
+            issue.generation,
+            "https://chatgpt.com/c/created-late",
+            1101,
+        )
+        .unwrap();
+    store
+        .update_action_status(
+            &task,
+            "creation-action",
+            AutomationActionStatus::Ambiguous,
+            Some("Preference restoration timed out"),
+            None,
+            1200,
+        )
+        .unwrap();
+    let state = store.load(&task).unwrap();
+    assert_eq!(
+        state.pairing.last_attempted_url.as_deref(),
+        Some("https://chatgpt.com/c/created-late")
+    );
+    assert!(!state.action_needs_attention_at(1100 + PAIRING_VERIFICATION_GRACE_MS - 1));
+    assert!(state.action_needs_attention_at(1100 + PAIRING_VERIFICATION_GRACE_MS));
+    let verified = store
+        .verify_pairing_reference(
+            &task,
+            1,
+            &issue.reference,
+            1100 + PAIRING_VERIFICATION_GRACE_MS + 1000,
+        )
+        .unwrap();
+    assert_eq!(verified.verified_owner_generation, Some(1));
+    let state = store.load(&task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(state.action.last_error.is_none());
+    assert!(!state.action_needs_attention_at(u64::MAX));
+    // A later browser failure cannot undo authenticated tool verification.
+    store
+        .update_action_status(
+            &task,
+            "creation-action",
+            AutomationActionStatus::Failed,
+            Some("Late cleanup failure"),
+            None,
+            100_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store.load(&task).unwrap().action.status,
+        AutomationActionStatus::Idle
+    );
+    assert!(store.load(&task).unwrap().action.last_error.is_none());
+    assert!(
+        store
+            .verify_pairing_reference(&task, 1, &issue.reference, 100_001)
+            .is_err()
+    );
+}
+
+#[test]
+fn created_urls_survive_expired_verification_but_project_urls_and_superseded_requests_are_rejected()
+{
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("expired-created-url");
+    let issue = store
+        .issue_pairing(&task, "https://chatgpt.com/g/g-p-project/project", 1, 1000)
+        .unwrap();
+    store.mark_creating_chat(&task).unwrap();
+    assert!(
+        store
+            .record_pairing_canonical_url(
+                &task,
+                issue.generation,
+                "https://chatgpt.com/g/g-p-project/project",
+                1001
+            )
+            .is_err()
+    );
+    let url = "https://chatgpt.com/c/created-after-expiry";
+    assert!(
+        store
+            .record_pairing_canonical_url(
+                &task,
+                issue.generation,
+                url,
+                1000 + PAIRING_REFERENCE_TTL_MS + 1
+            )
+            .is_err()
+    );
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .last_attempted_url
+            .as_deref(),
+        Some(url)
+    );
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .canonical_url
+            .as_deref(),
+        Some(url)
+    );
+    assert!(
+        reloaded
+            .verify_pairing_reference(
+                &task,
+                1,
+                &issue.reference,
+                1000 + PAIRING_REFERENCE_TTL_MS + 2
+            )
+            .is_err()
+    );
+    let current = reloaded
+        .issue_pairing(&task, "https://chatgpt.com/c/another", 1, 1_000_000)
+        .unwrap();
+    assert!(
+        reloaded
+            .record_pairing_canonical_url(&task, issue.generation, url, 1_000_001)
+            .is_err()
+    );
+    assert_eq!(
+        reloaded.load(&task).unwrap().pairing.generation,
+        current.generation
+    );
+    assert!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .canonical_url
+            .is_none()
+    );
+}

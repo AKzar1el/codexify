@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
+    "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
+    "+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -271,6 +271,9 @@ pub enum CompanionEventKind {
     },
     ConnectorVerified,
     SendAccepted,
+    ConversationCreated {
+        canonical_url: String,
+    },
     SubmissionComplete {
         canonical_url: String,
     },
@@ -1457,8 +1460,9 @@ fn validate_event(
                 validate_chatgpt_url(url)?;
             }
         }
-        CompanionEventKind::SubmissionComplete { canonical_url } => {
-            validate_chatgpt_url(canonical_url)?;
+        CompanionEventKind::SubmissionComplete { canonical_url }
+        | CompanionEventKind::ConversationCreated { canonical_url } => {
+            canonical_chatgpt_conversation_url(canonical_url)?;
         }
         CompanionEventKind::ApprovalRequired { message }
         | CompanionEventKind::RateLimited { message }

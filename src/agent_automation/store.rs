@@ -23,6 +23,7 @@ const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
 pub const PAIRING_REFERENCE_TTL_MS: u64 = 10 * 60 * 1000;
+pub const PAIRING_VERIFICATION_GRACE_MS: u64 = 60_000;
 const AUTOMATIC_RETRY_DELAYS_MS: [u64; 3] = [30_000, 60_000, 120_000];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +309,27 @@ impl AutomationTaskState {
             .map(|finished| finished.saturating_add(*delay))
     }
 
+    pub fn pairing_verification_wait_until_ms(&self) -> Option<u64> {
+        (self.action.kind == Some(AutomationActionKind::PairVerify)
+            && self.pairing.verified_owner_generation.is_none()
+            && self.action.send_accepted == Some(true))
+        .then_some(self.pairing.verification_sent_at_ms)
+        .flatten()
+        .map(|sent| sent.saturating_add(PAIRING_VERIFICATION_GRACE_MS))
+    }
+
     pub fn action_needs_attention(&self) -> bool {
+        self.action_needs_attention_at(crate::markdown_chat::now_ms())
+    }
+
+    pub fn action_needs_attention_at(&self, now_ms: u64) -> bool {
+        if let Some(until) = self.pairing_verification_wait_until_ms() {
+            return now_ms >= until;
+        }
+        self.raw_action_needs_attention()
+    }
+
+    fn raw_action_needs_attention(&self) -> bool {
         matches!(
             self.action.status,
             AutomationActionStatus::Failed
@@ -451,6 +472,12 @@ impl AgentAutomationStore {
         chat: &Arc<crate::markdown_chat::ChatFile>,
         state: &AutomationTaskState,
     ) {
+        if state
+            .pairing_verification_wait_until_ms()
+            .is_some_and(|until| crate::markdown_chat::now_ms() < until)
+        {
+            return;
+        }
         if let Some(config) = &self.notifications
             && let Err(error) = crate::markdown_chat::notification::notify_automation(
                 chat,
@@ -1197,6 +1224,23 @@ impl AgentAutomationStore {
         })
     }
 
+    pub fn record_pairing_submission(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() == Some(action_id)
+                && state.action.kind == Some(AutomationActionKind::PairVerify)
+            {
+                state.action.send_accepted = Some(true);
+                state.pairing.verification_sent_at_ms.get_or_insert(now_ms);
+            }
+            Ok(())
+        })
+    }
+
     pub fn mark_creating_chat(&self, task: &ConversationIdentity) -> Result<(), String> {
         self.mutate(task, |state| {
             state.pairing.creating_chat = true;
@@ -1212,27 +1256,25 @@ impl AgentAutomationStore {
         now_ms: u64,
     ) -> Result<PairingState, String> {
         let canonical_url = normalize_chatgpt_url(canonical_url)?;
+        if conversation_url_for_retry(&canonical_url).is_none() {
+            return Err("Pairing requires a ChatGPT conversation URL, not a project URL".into());
+        }
         self.mutate_persisting_errors(task, |state| {
-            let pending = state
-                .pairing
-                .pending
-                .as_ref()
-                .ok_or("No agent-chat pairing request is pending")?;
-            if state.pairing.generation != expected_generation
-                || pending.generation != expected_generation
-            {
+            if state.pairing.generation != expected_generation {
                 return Err("The agent-chat pairing request is stale".into());
             }
-            if now_ms > pending.expires_at_ms {
-                state.pairing.pending = None;
-                return Err("The agent-chat pairing reference expired".into());
-            }
-            if state.pairing.creating_chat || state.pairing.last_attempted_url.is_none() {
-                state.pairing.last_attempted_url =
-                    conversation_url_for_retry(&canonical_url).map(str::to_owned);
-            }
+            // A failed or expired verification does not erase the known chat identity.
+            state.pairing.last_attempted_url = Some(canonical_url.clone());
             state.pairing.canonical_url = Some(canonical_url);
-            state.action.updated_at_ms = Some(now_ms);
+            if let Some(pending) = state.pairing.pending.as_ref() {
+                if pending.generation != expected_generation {
+                    return Err("The agent-chat pairing request is stale".into());
+                }
+                if now_ms > pending.expires_at_ms {
+                    state.pairing.pending = None;
+                    return Err("The agent-chat pairing reference expired".into());
+                }
+            }
             Ok(state.pairing.clone())
         })
     }
@@ -1306,6 +1348,9 @@ impl AgentAutomationStore {
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
             state.action.status = AutomationActionStatus::Idle;
+            state.action.last_error = None;
+            state.action.automatic_retry_attempts = 0;
+            state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.pairing.clone())
         });
@@ -1363,14 +1408,19 @@ impl AgentAutomationStore {
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
             state.action.status = AutomationActionStatus::Idle;
+            state.action.last_error = None;
+            state.action.automatic_retry_attempts = 0;
+            state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
             validate_state(&state)?;
             persist_state(path, &state)?;
-            Ok(PairingReferenceOutcome::Verified(state.pairing.clone()))
+            Ok(PairingReferenceOutcome::Verified(Box::new(
+                state.pairing.clone(),
+            )))
         })?;
         let _ = self.remove_pairing_index(&supplied_digest);
         match outcome {
-            PairingReferenceOutcome::Verified(pairing) => Ok(pairing),
+            PairingReferenceOutcome::Verified(pairing) => Ok(*pairing),
             PairingReferenceOutcome::Rejected => Err(invalid_pairing_reference()),
         }
     }
@@ -1562,16 +1612,27 @@ impl AgentAutomationStore {
             if state.action.id.as_deref() != Some(action_id) {
                 return Err("Agent automation action changed before its status update".into());
             }
-            state.action.status = status;
+            let verified_pairing = state.action.kind == Some(AutomationActionKind::PairVerify)
+                && state.action.pairing_generation == Some(state.pairing.generation)
+                && state.pairing.verified_owner_generation.is_some();
+            state.action.status = if verified_pairing {
+                AutomationActionStatus::Idle
+            } else {
+                status
+            };
             if status == AutomationActionStatus::Ambiguous {
                 state.action.send_accepted = Some(true);
             }
-            state.action.last_error = error.map(str::to_string);
+            state.action.last_error = if verified_pairing {
+                None
+            } else {
+                error.map(str::to_string)
+            };
             if let Some(answer) = stable_answer {
                 state.action.last_stable_answer = Some(answer.to_string());
             }
             state.action.updated_at_ms = Some(now_ms);
-            if status == AutomationActionStatus::Idle {
+            if state.action.status == AutomationActionStatus::Idle {
                 state.action.automatic_retry_attempts = 0;
             }
             Ok(state.action.clone())
@@ -1595,7 +1656,9 @@ impl AgentAutomationStore {
                 return Ok(state.action.clone());
             }
             if state.action.status != AutomationActionStatus::Queued
-                && !state.action_needs_attention()
+                && !state.raw_action_needs_attention()
+                && !(state.action.kind == Some(AutomationActionKind::PairVerify)
+                    && state.pairing.pending.is_some())
             {
                 return Err("Only a queued or failed browser action can be cancelled here".into());
             }
@@ -2125,7 +2188,7 @@ fn pairing_index_root(config: &AppConfig, fallback_root: &Path) -> PathBuf {
 }
 
 enum PairingReferenceOutcome {
-    Verified(PairingState),
+    Verified(Box<PairingState>),
     Rejected,
 }
 

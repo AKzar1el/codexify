@@ -21,7 +21,8 @@ pub use store::{
     AcceptedChatBatch, AgentAutomationStore, AutomationActionKind, AutomationActionState,
     AutomationActionStatus, AutomationTaskState, ChatMirrorState, GoalFinish, GoalRecord,
     GoalStatus, GoalWakeState, MAX_GOAL_BYTES, OwnerGoalCommand, OwnerGoalCommandKind,
-    OwnerGoalCommandReceipt, PAIRING_REFERENCE_TTL_MS, PairingIssue, PairingState, SelectionState,
+    OwnerGoalCommandReceipt, PAIRING_REFERENCE_TTL_MS, PAIRING_VERIFICATION_GRACE_MS, PairingIssue,
+    PairingState, SelectionState,
 };
 pub use supervisor::{
     AgentAutomationSupervisor, AutomationExecution, AutomationExecutionError, AutomationExecutor,

@@ -512,7 +512,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       }
       sendAccepted = true;
       execution.emit({ type:"send_accepted" });
-      if (creating) { const created = new URL(await createdChatUrl(page, execution.signal)); created.search = ""; created.hash = ""; canonicalUrl = created.href; }
+      if (creating) {
+        const created = new URL(await createdChatUrl(page, execution.signal)); created.search = ""; created.hash = ""; canonicalUrl = created.href;
+        // Persist the actual chat identity before model restoration can fail or time out.
+        execution.emit({type:"conversation_created",canonicalUrl});
+      }
       restoreUrl = canonicalUrl;
       if (pairingSelection) {
         await this.restorePairingSelection(page, pairingSelection, restoreUrl, execution.request.expectedAccountFingerprint);

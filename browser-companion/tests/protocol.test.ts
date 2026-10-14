@@ -119,7 +119,7 @@ describe("fixed prompt contract", () => {
 test("events are strict, bounded, and enumerate the Rust surface", () => {
   expect(ACTION_EVENT_TYPES).toEqual([
     "queued", "navigating", "composer_ready", "model_verified", "connector_verified",
-    "send_accepted", "status_delta", "commentary_delta", "answer_delta",
+    "send_accepted", "conversation_created", "status_delta", "commentary_delta", "answer_delta",
     "submission_complete", "generation_complete", "approval_required", "authentication_required", "rate_limited",
     "external_interference", "ambiguous_send", "failed",
   ]);

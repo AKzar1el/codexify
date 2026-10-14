@@ -672,13 +672,15 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         .await
         .map_err(internal_error)?
         .map_err(internal_error)?;
-        let automation_error = automation.action_needs_attention().then(|| {
-            automation
-                .action
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "Browser action needs attention".into())
-        });
+        let automation_error = automation
+            .action_needs_attention_at(crate::markdown_chat::now_ms())
+            .then(|| {
+                automation
+                    .action
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "Browser action needs attention".into())
+            });
         let goal = automation.goal;
         let goal_status = goal.as_ref().map(|goal| goal.status);
         let goal_completion_dismissed = goal.as_ref().is_some_and(|goal| {
@@ -1357,7 +1359,8 @@ fn public_pairing(pairing: &crate::agent_automation::PairingState, owner_generat
         "lastTriedUrl": last_tried_url,
         "generation": pairing.generation,
         "verifiedAtMs": pairing.verified_at_ms,
-        "expiresAtMs": pairing.pending.as_ref().map(|pending| pending.expires_at_ms)
+        "expiresAtMs": pairing.pending.as_ref().map(|pending| pending.expires_at_ms),
+        "verificationWaitUntilMs": pairing.verification_sent_at_ms.map(|sent| sent.saturating_add(crate::agent_automation::PAIRING_VERIFICATION_GRACE_MS))
     })
 }
 
@@ -1857,7 +1860,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
 
     #[derive(Clone, Default)]
     struct OwnerCompanionState {

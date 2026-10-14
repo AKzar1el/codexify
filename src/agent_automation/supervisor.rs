@@ -1492,12 +1492,31 @@ impl AgentAutomationSupervisor {
                     task.store
                         .record_goal_turn(&task.task, &execution.request.action_id)?;
                 }
+                if pair_verification && snapshot.send_accepted {
+                    task.store.record_pairing_submission(
+                        &task.task,
+                        &execution.request.action_id,
+                        now_ms,
+                    )?;
+                }
                 accumulator.send_accepted |= snapshot.send_accepted;
                 snapshot
             }
             Err(error) => {
                 let action_current = current_action_matches(&task, &execution)?;
-                let send_accepted = error.send_accepted || accumulator.send_accepted;
+                let pairing = task.store.load(&task.task)?.pairing;
+                let pairing_verified = pair_verification
+                    && pairing.generation == execution.request.pairing_generation
+                    && pairing.verified_owner_generation == Some(execution.owner_generation);
+                let send_accepted =
+                    error.send_accepted || accumulator.send_accepted || pairing_verified;
+                if pair_verification && send_accepted {
+                    task.store.record_pairing_submission(
+                        &task.task,
+                        &execution.request.action_id,
+                        now_ms,
+                    )?;
+                }
                 if matches!(execution.request.prompt, ActionPrompt::CreateChat { .. }) {
                     task.store.record_creation_send(
                         &task.task,
@@ -1507,6 +1526,7 @@ impl AgentAutomationSupervisor {
                 }
                 if pair_verification
                     && action_current
+                    && !send_accepted
                     && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
                 {
                     task.store.invalidate_pairing(&task.task, now_ms)?;
@@ -1735,8 +1755,28 @@ impl AgentAutomationSupervisor {
         if matches!(event.kind, CompanionEventKind::SendAccepted)
             && let Some(task) = self.tasks.read().await.get(&execution.task_key)
         {
-            task.store
-                .record_goal_turn(&task.task, &execution.request.action_id)?;
+            if execution_kind(execution) == AutomationActionKind::PairVerify {
+                task.store.record_pairing_submission(
+                    &task.task,
+                    &execution.request.action_id,
+                    event.at_ms,
+                )?;
+            } else {
+                task.store
+                    .record_goal_turn(&task.task, &execution.request.action_id)?;
+            }
+        }
+        if let CompanionEventKind::ConversationCreated { ref canonical_url } = event.kind
+            && let Some(commit) = &execution.pairing_commit
+            && let Some(task) = self.tasks.read().await.get(&execution.task_key)
+            && current_action_matches(task, execution)?
+        {
+            commit.store.record_pairing_canonical_url(
+                &commit.task,
+                commit.generation,
+                canonical_url,
+                event.at_ms,
+            )?;
         }
         let mut live = self.live.write().await;
         let state = live
@@ -1751,6 +1791,9 @@ impl AgentAutomationSupervisor {
             | CompanionEventKind::ModelVerified { .. }
             | CompanionEventKind::ConnectorVerified => {
                 state.phase = AutomationActionStatus::Navigating;
+            }
+            CompanionEventKind::ConversationCreated { .. } => {
+                state.phase = AutomationActionStatus::Sending;
             }
             CompanionEventKind::SendAccepted => {
                 accumulator.send_accepted = true;

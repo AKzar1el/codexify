@@ -676,3 +676,18 @@ test.skipIf(!native)("a cached healthy identity cannot authorize a send after th
   expect(events.at(-1)?.type).toBe('authentication_required');expect((await coordinator.action(request.actionId))?.sendAccepted).toBeFalse();
   expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');expect(sessionRequests).toBe(2);
 },15_000);
+
+
+test.skipIf(!native)("a created conversation URL is retained when applying the saved model fails after Send",async()=>{
+ const driver=await fixture("",true,connector,0,false,true,{family:"5.6",value:2,locked:[]});
+ const create:ExecuteActionRequest={...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",model:"gpt-99-sol",effort:"max",prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
+ const coordinator=new SingleWindowCoordinator(driver,build),events:Parameters<DriverExecution['emit']>[0][]=[];
+ await coordinator.execute(create);for await(const event of coordinator.events(create.actionId,0))events.push(event);
+ const created=events.findIndex(event=>event.type==='conversation_created');
+ expect(created).toBeGreaterThan(events.findIndex(event=>event.type==='send_accepted'));
+ expect(events[created]).toMatchObject({type:'conversation_created',canonicalUrl:'https://chatgpt.com/c/new-created-fixture'});
+ expect(events.at(-1)?.type).not.toBe('submission_complete');
+ expect((await coordinator.action(create.actionId))?.canonicalUrl).toBe('https://chatgpt.com/c/new-created-fixture');
+ expect((await coordinator.action(create.actionId))?.sendAccepted).toBeTrue();
+ expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('1');
+},20_000);

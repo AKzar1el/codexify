@@ -1410,3 +1410,46 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
     }finally{await browser.close();}
   });
 }
+
+
+for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
+  test(`${engineName}: submitted pairing has a grace period, keeps the created URL, and clears a late verification error`, {timeout:30000}, async()=>{
+    const browser=await engine.launch();
+    try {
+      const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
+      let clock=Date.now();await page.clock.install({time:clock});
+      const id='e'.repeat(64),createdUrl='https://chatgpt.com/c/created-before-restoration-error',errors=[];
+      page.on('pageerror',error=>errors.push(error.message));
+      const waitUntil=clock+60000;
+      let paired=false;
+      const chat={id,title:'Late pairing',workspace:'test',lastEntryEnd:1,lastEntryAtMs:clock,lastAgentCallAtMs:null,totalToolCalls:1};
+      const model={id:'gpt-6-sol',label:'GPT-6 Sol',efforts:[{id:'medium',label:'Medium',available:true}]};
+      await page.route('http://127.0.0.1:43226/**',route=>{
+        const url=new URL(route.request().url());
+        if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+        if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:!paired&&clock>=waitUntil?'Pairing verification has not arrived yet':null}],serverTimeMs:clock}});
+        if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal:null,action:{id:'creation-action',kind:'pair_verify',status:paired?'idle':'ambiguous',lastError:paired?null:'Preference restoration timed out',sendAccepted:true,retryMode:null},catalog:{catalogRevision:'fixture',models:[model]},pairing:{status:paired?'verified':'unverified',creatingChat:!paired,canonicalUrl:createdUrl,candidateUrl:paired?null:'https://chatgpt.com/g/g-p-project/project',lastTriedUrl:null,verificationWaitUntilMs:waitUntil,expiresAtMs:paired?null:waitUntil+540000},companion:{authenticated:true,status:'idle'},serverTimeMs:clock,presence:{lastAgentCallAtMs:null}}});
+        return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/test/CHAT.md',revision:'1',delivered_through:0,read_through:0,last_agent_call_at_ms:null,total_tool_calls:1,server_time_ms:clock,messages:[],has_more:false,unchanged:false}}}});
+      });
+      await page.goto(`http://127.0.0.1:43226/?chat=${id}#test-token`);
+      const host=page.locator('#chat-host'),pending=host.getByRole('button',{name:'Pairing…',exact:true});
+      await pending.waitFor();assert.equal(await pending.isDisabled(),true);
+      assert.equal(await host.locator('#automation-error').isVisible(),false);
+      await host.getByRole('button',{name:'Connection settings',exact:true}).click();
+      await host.getByLabel('ChatGPT conversation URL',{exact:true}).waitFor();
+      assert.equal(await host.getByLabel('ChatGPT conversation URL',{exact:true}).inputValue(),createdUrl);
+      await host.getByRole('button',{name:'Close connection settings',exact:true}).click();
+      clock+=61000;await page.clock.fastForward(61000);
+      await host.getByRole('button',{name:'Retry chat pairing',exact:true}).waitFor();
+      await host.locator('#automation-error').waitFor();await page.locator('.conversation .presence.error').waitFor();
+      await host.getByRole('button',{name:'Retry chat pairing',exact:true}).click();
+      assert.equal(await host.getByLabel('ChatGPT URL',{exact:true}).inputValue(),createdUrl);
+      await host.getByRole('button',{name:'Close pairing',exact:true}).click();
+      paired=true;clock+=6000;await page.clock.fastForward(6000);
+      await host.locator('#automation-pair-chat').waitFor({state:'hidden'});
+      await host.locator('#automation-error').waitFor({state:'hidden'});
+      await page.locator('.conversation .presence.error').waitFor({state:'detached'});
+      assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+}

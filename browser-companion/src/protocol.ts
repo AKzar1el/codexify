@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc" as const;
+export const PROTOCOL_SCHEMA_HASH = "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -287,7 +287,7 @@ export type ActionSnapshot = z.infer<typeof actionSnapshotSchema>;
 
 export const ACTION_EVENT_TYPES = [
   "queued", "navigating", "composer_ready", "model_verified", "connector_verified",
-  "send_accepted", "status_delta", "commentary_delta", "answer_delta", "submission_complete", "generation_complete",
+  "send_accepted", "conversation_created", "status_delta", "commentary_delta", "answer_delta", "submission_complete", "generation_complete",
   "approval_required", "authentication_required", "rate_limited", "external_interference",
   "ambiguous_send", "failed",
 ] as const;
@@ -305,6 +305,7 @@ export const actionEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ ...eventBase, type:z.literal("model_verified"), model:opaqueIdSchema, effort:opaqueIdSchema }),
   z.strictObject({ ...eventBase, type:z.literal("connector_verified") }),
   z.strictObject({ ...eventBase, type:z.literal("send_accepted") }),
+  z.strictObject({ ...eventBase, type:z.literal("conversation_created"), canonicalUrl:chatGptUrlSchema }),
   z.strictObject({ ...eventBase, type:z.literal("status_delta"), text:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),
   z.strictObject({ ...eventBase, type:z.literal("commentary_delta"), markdown:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),
   z.strictObject({ ...eventBase, type:z.literal("answer_delta"), markdown:boundedTextSchema(MAX_DELTA_BYTES), continuation:z.boolean() }),

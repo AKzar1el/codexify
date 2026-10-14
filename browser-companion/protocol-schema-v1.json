@@ -77,6 +77,7 @@
     "model_verified",
     "connector_verified",
     "send_accepted",
+    "conversation_created",
     "status_delta",
     "commentary_delta",
     "answer_delta",
@@ -111,7 +112,8 @@
     "continuationTokenBytes": 43,
     "setupReferenceMaxBytes": 4096,
     "destination": "configured ChatGPT project or top-level new chat",
-    "completion": "confirmed new conversation URL after Send acceptance"
+    "completion": "confirmed new conversation URL after Send acceptance",
+    "createdConversationEvent": "conversation_created"
   },
   "accountPlan": {
     "request": {

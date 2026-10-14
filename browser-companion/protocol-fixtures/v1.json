@@ -1,19 +1,19 @@
 {
-  "schemaHash": "0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
-  "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+  "schemaHash": "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+  "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
   "descriptor": {
     "version": 1,
     "kind": "codexify-browser-companion",
     "pid": 1234,
     "endpoint": "http://127.0.0.1:43123",
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "createdAt": "2026-10-09T12:00:00Z"
   },
   "health": {
     "protocolVersion": 1,
     "kind": "codexify-browser-companion",
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "status": "idle",
     "authenticated": true,
     "accountFingerprint": "fixture-account",
@@ -21,7 +21,7 @@
   },
   "capabilities": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "accountFingerprint": "fixture-account",
     "catalogRevision": "fixture-catalog",
     "models": [
@@ -50,7 +50,7 @@
   },
   "revealReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "revealed": true,
     "activeActionId": null
   },
@@ -135,7 +135,7 @@
   ],
   "actionSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "actionId": "fixture-action",
     "state": "generating",
     "sendAccepted": true,
@@ -153,7 +153,7 @@
   },
   "cancelReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc",
+    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
     "actionId": "fixture-action",
     "state": "ambiguous",
     "cancelled": true
@@ -277,6 +277,13 @@
       "type": "failed",
       "code": "selector_drift",
       "message": "Selector changed"
+    },
+    {
+      "sequence": 18,
+      "actionId": "fixture-action",
+      "atMs": 18,
+      "type": "conversation_created",
+      "canonicalUrl": "https://chatgpt.com/c/fixture"
     }
   ]
 }

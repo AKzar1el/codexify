@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.0d4314cd5f4a891461a991a490ea963fc42c5bf2991bc1d431abcde8ce4056dc";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -5394,7 +5394,7 @@ async fn pairing_failure_before_send_preserves_the_browser_error_and_revokes_the
 }
 
 #[tokio::test]
-async fn failed_pair_turn_revokes_a_pairing_verified_before_terminal_reconciliation() {
+async fn valid_pairing_survives_a_browser_failure_before_terminal_reconciliation() {
     let fixture = fixture().await;
     let pair_task = ConversationIdentity::from_openai_session("pair-failed-after-tool").unwrap();
     let pair_chat = MarkdownChatStore::default()
@@ -5447,8 +5447,10 @@ async fn failed_pair_turn_revokes_a_pairing_verified_before_terminal_reconciliat
 
     let state = fixture.store.load(&pair_task).unwrap();
     assert!(state.pairing.pending.is_none());
-    assert!(state.pairing.verified_owner_generation.is_none());
-    assert!(state.pairing.verified_at_ms.is_none());
+    assert_eq!(state.pairing.verified_owner_generation, Some(0));
+    assert!(state.pairing.verified_at_ms.is_some());
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(state.action.last_error.is_none());
 }
 
 #[tokio::test]
@@ -6805,4 +6807,97 @@ async fn cancellation_rejects_stale_or_running_actions_and_new_intent_can_resume
         f.store.load(&f.task).unwrap().action.status,
         AutomationActionStatus::Navigating
     );
+}
+
+struct CreatedPairingFailureExecutor;
+#[async_trait]
+impl AutomationExecutor for CreatedPairingFailureExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        for (sequence, kind) in [
+            CompanionEventKind::SendAccepted,
+            CompanionEventKind::ConversationCreated {
+                canonical_url: "https://chatgpt.com/c/created-despite-failure".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events
+                .send(CompanionEvent {
+                    sequence: sequence as u64 + 1,
+                    action_id: execution.request.action_id.clone(),
+                    at_ms: 1002,
+                    kind,
+                })
+                .unwrap();
+        }
+        Err(AutomationExecutionError {
+            message: "Model restoration failed after creation".into(),
+            send_accepted: true,
+        })
+    }
+}
+
+#[tokio::test]
+async fn creation_records_its_url_before_failure_and_accepts_verification_after_the_grace_period() {
+    let f = fixture().await;
+    let issue = f
+        .store
+        .issue_pairing(
+            &f.task,
+            "https://chatgpt.com/g/g-p-project/project",
+            0,
+            1000,
+        )
+        .unwrap();
+    f.store.mark_creating_chat(&f.task).unwrap();
+    let supervisor = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(CreatedPairingFailureExecutor),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor
+        .queue_new_chat(
+            &f.task,
+            &issue.reference,
+            issue.generation,
+            1001,
+            "B".repeat(43),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(supervisor.run_next(1002).await.is_err());
+    let state = f.store.load(&f.task).unwrap();
+    assert_eq!(
+        state.pairing.canonical_url.as_deref(),
+        Some("https://chatgpt.com/c/created-despite-failure")
+    );
+    assert_eq!(
+        state.pairing.last_attempted_url,
+        state.pairing.canonical_url
+    );
+    assert!(state.pairing.pending.is_some());
+    assert!(state.action_needs_attention_at(70_000));
+    assert_eq!(supervisor.queued_count().await, 0);
+    f.store
+        .verify_pairing_reference(&f.task, 0, &issue.reference, 70_000)
+        .unwrap();
+    let state = f.store.load(&f.task).unwrap();
+    assert_eq!(state.pairing.verified_owner_generation, Some(0));
+    assert!(state.action.last_error.is_none());
+    assert!(!state.action_needs_attention_at(70_001));
 }

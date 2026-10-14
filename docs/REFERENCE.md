@@ -1936,6 +1936,12 @@ does not create a replacement conversation, and does not transfer or retire task
 ownership. A later full task continuation invalidates the old pairing until the
 user verifies the new physical conversation.
 
+After Send, pairing has a 60-second verification grace period that does not hold
+the browser queue. A valid verification can still arrive later while its current
+one-time reference is valid; it clears any pairing error. Created conversation
+URLs are saved as soon as the browser confirms them, before model restoration,
+and remain available in settings and Retry pairing even if verification fails.
+
 Pairing verification always uses a one-off **Medium** request. The companion reads the conversation's current model and effort, selects
 and verifies Medium before Send, then restores the original settings immediately
 after submission is confirmed. It does not wait for or monitor the verification

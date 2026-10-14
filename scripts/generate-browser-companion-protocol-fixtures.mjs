@@ -109,6 +109,7 @@ const fixture = {
     { sequence:15, actionId:"fixture-action", atMs:15, type:"external_interference", message:"Draft changed" },
     { sequence:16, actionId:"fixture-action", atMs:16, type:"ambiguous_send", message:"Send acceptance uncertain" },
     { sequence:17, actionId:"fixture-action", atMs:17, type:"failed", code:"selector_drift", message:"Selector changed" },
+    { sequence:18, actionId:"fixture-action", atMs:18, type:"conversation_created", canonicalUrl:"https://chatgpt.com/c/fixture" },
   ],
 };
 
