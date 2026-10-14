@@ -117,6 +117,59 @@ fn goal_state_round_trips_with_private_storage() {
 }
 
 #[test]
+fn unset_pairing_submission_time_keeps_persisted_state_compatible() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("pairing-state-compatibility");
+    let issue = store
+        .issue_pairing(&task, "https://chatgpt.com/c/compatibility", 1, 1000)
+        .unwrap();
+
+    let path = store.task_directory(&task).unwrap().join("automation.json");
+    let mut persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        persisted["pairing"].get("verificationSentAtMs").is_none(),
+        "older readers reject this new field even when it is null"
+    );
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .verification_sent_at_ms,
+        None
+    );
+
+    // A populated timestamp from a newer writer must survive a normal mutation.
+    persisted["pairing"]["verificationSentAtMs"] = serde_json::json!(1100);
+    std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    reloaded
+        .queue_action(
+            &task,
+            "compatibility-action",
+            AutomationActionKind::PairVerify,
+            issue.generation,
+            None,
+            1101,
+        )
+        .unwrap();
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["pairing"]["verificationSentAtMs"], 1100);
+    assert_eq!(
+        reloaded
+            .load(&task)
+            .unwrap()
+            .pairing
+            .verification_sent_at_ms,
+        Some(1100)
+    );
+}
+
+#[test]
 fn goals_are_bounded_revisioned_and_have_no_pause_state() {
     let root = tempfile::tempdir().unwrap();
     let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();

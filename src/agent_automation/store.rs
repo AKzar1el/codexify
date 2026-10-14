@@ -139,6 +139,8 @@ pub struct PairingState {
     pub generation: u64,
     pub verified_owner_generation: Option<u64>,
     pub verified_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_sent_at_ms: Option<u64>,
     pub pending: Option<PendingPairing>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
@@ -1056,6 +1058,7 @@ impl AgentAutomationStore {
                 generation,
                 verified_owner_generation: None,
                 verified_at_ms: None,
+                verification_sent_at_ms: None,
                 account_fingerprint: state.selection.account_fingerprint.clone(),
                 pending: Some(PendingPairing {
                     generation,
