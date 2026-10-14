@@ -18,40 +18,118 @@ export function classifyPlan(sourceLabel:string): Omit<AccountPlan,"accountFinge
     const aliases:Record<string,string>={"50":"5x","200":"20x","250":"25x","5x":"5x","20x":"20x","25x":"25x"};
     return {label:tier?`Pro ${aliases[tier]}`:/^pro$/i.test(normalized)?"Pro":label,sourceLabel:label,kind:"pro"};
   }
-  return {label:label||"Plan unavailable",sourceLabel:label,kind:"unknown"};
+  return {label,sourceLabel:label,kind:"unknown"};
+}
+
+async function markAccountMenuButton(page:Page):Promise<boolean> {
+  return page.evaluate(()=>{
+    for(const node of document.querySelectorAll('[data-account-plan-menu-target]'))node.removeAttribute('data-account-plan-menu-target');
+    const visible=(node:Element)=>node.getClientRects().length>0;
+    const direct=[...document.querySelectorAll('[data-testid="accounts-profile-button"],[data-testid="profile-button"],[data-testid="account-menu-button"]')].filter(visible);
+    let candidates=direct;
+    if(!candidates.length) {
+      // The account menu sits at the bottom of the left navigation. Do not use
+      // the account's display name or translated menu labels as selectors.
+      candidates=[...document.querySelectorAll('nav button[aria-haspopup="menu"],aside button[aria-haspopup="menu"],nav [role="button"][aria-haspopup="menu"],aside [role="button"][aria-haspopup="menu"]')].filter(node=>{
+        const rect=node.getBoundingClientRect();
+        return visible(node)&&rect.left>=0&&rect.right<=Math.min(320,innerWidth/3)&&rect.top>=innerHeight*0.7;
+      });
+    }
+    if(candidates.length!==1)return false;
+    candidates[0]!.setAttribute('data-account-plan-menu-target','true');return true;
+  });
+}
+
+async function readAccountMenuPlan(page:Page,previousUrl:string,signal?:AbortSignal):Promise<string|null> {
+  signal?.throwIfAborted();
+  if(!await markAccountMenuButton(page)) {
+    if(page.url()===previousUrl)return null;
+    await page.goto(previousUrl,{waitUntil:"domcontentloaded",timeout:2_000,signal});
+    if(!await markAccountMenuButton(page))return null;
+  }
+  const trigger=page.locator('[data-account-plan-menu-target="true"]');
+  let opened=false;
+  try {
+    if(await trigger.getAttribute('aria-expanded')!=="true") {
+      await trigger.click({timeout:1_000,signal});opened=true;
+    }
+    await page.locator('[role="menu"]').filter({visible:true}).first().waitFor({state:"visible",timeout:1_000,signal});
+    return await page.evaluate(()=>{
+      const visible=(node:Element)=>node.getClientRects().length>0;
+      const menus=[...document.querySelectorAll('[role="menu"]')].filter(visible).filter(node=>!node.parentElement?.closest('[role="menu"]'));
+      if(menus.length!==1)return null;
+      const menu=menus[0]!;
+      const direct=[...menu.querySelectorAll('[data-testid="plan-name"],[data-current-plan]')].filter(visible);
+      if(direct.length===1)return direct[0]!.textContent?.replace(/\s+/g,' ').trim().slice(0,128)||null;
+      const separator=menu.querySelector('[role="separator"],hr');
+      if(!separator)return null;
+      const row=[...menu.querySelectorAll<HTMLElement>('[role="menuitem"],button,a')].find(node=>visible(node)&&Boolean(node.compareDocumentPosition(separator)&Node.DOCUMENT_POSITION_FOLLOWING));
+      if(!row)return null;
+      // The plan sits below the name in the same text column. The avatar's
+      // initials belong to a different column and cannot supply a plan label.
+      const texts:{label:string;rect:DOMRect}[]=[];
+      const walker=document.createTreeWalker(row,NodeFilter.SHOW_TEXT);
+      while(walker.nextNode()) {
+        const label=walker.currentNode.textContent?.replace(/\s+/g,' ').trim();
+        if(!label||label.length>128)continue;
+        const range=document.createRange();range.selectNodeContents(walker.currentNode);
+        const rect=range.getBoundingClientRect();
+        if(rect.width&&rect.height)texts.push({label,rect});
+      }
+      const labels=texts.filter((text,index)=>texts.slice(0,index).some(previous=>
+        Math.abs(previous.rect.left-text.rect.left)<4&&previous.rect.bottom<=text.rect.top+2,
+      )).map(text=>text.label);
+      return labels.length===1?labels[0]!:null;
+    });
+  } finally {
+    if(opened)await page.keyboard.press('Escape').catch(()=>{});
+    await trigger.evaluate(node=>node.removeAttribute('data-account-plan-menu-target')).catch(()=>{});
+  }
 }
 
 export async function readBillingPlan(page:Page,signal?:AbortSignal):Promise<AccountPlan> {
-  await page.goto("https://chatgpt.com/settings/billing",{waitUntil:"domcontentloaded",timeout:5_000,signal});
-  await page.locator("body").waitFor({state:"visible",signal});
+  const previousUrl=page.url();
+  let billingReady=false;
+  try {
+    await page.goto("https://chatgpt.com/settings/billing",{waitUntil:"domcontentloaded",timeout:5_000,signal});
+    await page.locator("body").waitFor({state:"visible",timeout:1_000,signal});
+    billingReady=true;
+  } catch {
+    signal?.throwIfAborted();
+    await page.goto(previousUrl,{waitUntil:"domcontentloaded",timeout:2_000,signal});
+  }
   const account=await readChatGptAccount(page);
   let sourceLabel:string|null|undefined;
-  // Leave room for account verification and restoring the shared tab within the 10s action budget.
-  const deadline=Date.now()+2_500;
-  do {
-  signal?.throwIfAborted();
-  sourceLabel=await page.evaluate(()=>{
-    const visible=(node:Element)=>node.getClientRects().length>0;
-    const uniquePlan=(labels:string[])=>new Set(labels.map(label=>label.replace(/^ChatGPT\s+/i,"").toLowerCase())).size===1
-      ? labels.find(label=>/^ChatGPT\s+/i.test(label))??labels[0] : null;
-    const direct=[...document.querySelectorAll('[data-testid="current-plan"],[data-testid="plan-name"],[data-current-plan]')].filter(visible)
-      .map(node=>node.textContent?.trim()).filter((text):text is string=>Boolean(text&&text.length<=128));
-    if(uniquePlan(direct))return uniquePlan(direct);
-    const headings=[...document.querySelectorAll('h1,h2,h3,[role="heading"]')].filter(visible)
-      .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&(/^(?:ChatGPT\s+)?(?:Free|Go|Pro|Plus|Business|Enterprise|Edu)\b/i.test(text)||/^ChatGPT\s+\S/i.test(text))&&text.length<=128));
-    if(uniquePlan(headings))return uniquePlan(headings);
-    const labels=[...document.querySelectorAll('p,span,strong,div')].filter(visible)
-      .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&/^(?:ChatGPT\s+)?(?:Free|Go|Pro(?:\s+(?:5x|20x|25x|50|200|250))?|Plus|Business|Enterprise|Edu)(?:\s+plan)?$/i.test(text)));
-    return uniquePlan(labels);
-  });
-  if(sourceLabel)break;
-  await new Promise(resolve=>setTimeout(resolve,100));
-  }while(Date.now()<deadline);
-  if(process.env.CODEXIFY_BROWSER_MAINTENANCE_TRACE==="1") {
-    const candidates=await page.locator("body").innerText().then(text=>text.split("\n").map(line=>line.trim()).filter(line=>/^(?:ChatGPT\s+)?(?:Free|Go|Pro|Plus|Business|Enterprise|Edu)\b/i.test(line)&&line.length<=128));
-    console.info(`[account-plan] ${JSON.stringify({sourceLabel:sourceLabel??null,sessionPlan:account.planType,candidates})}`);
+  if(billingReady) {
+    // Leave room for account verification and restoring the shared tab within the 10s action budget.
+    const deadline=Date.now()+2_500;
+    do {
+    signal?.throwIfAborted();
+    sourceLabel=await page.evaluate(()=>{
+      const visible=(node:Element)=>node.getClientRects().length>0;
+      const uniquePlan=(labels:string[])=>new Set(labels.map(label=>label.replace(/^ChatGPT\s+/i,"").toLowerCase())).size===1
+        ? labels.find(label=>/^ChatGPT\s+/i.test(label))??labels[0] : null;
+      const direct=[...document.querySelectorAll('[data-testid="current-plan"],[data-testid="plan-name"],[data-current-plan]')].filter(visible)
+        .map(node=>node.textContent?.trim()).filter((text):text is string=>Boolean(text&&text.length<=128));
+      if(uniquePlan(direct))return uniquePlan(direct);
+      const headings=[...document.querySelectorAll('h1,h2,h3,[role="heading"]')].filter(visible)
+        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&(/^(?:ChatGPT\s+)?(?:Free|Go|Pro|Plus|Business|Enterprise|Edu)\b/i.test(text)||/^ChatGPT\s+\S/i.test(text))&&text.length<=128));
+      if(uniquePlan(headings))return uniquePlan(headings);
+      const labels=[...document.querySelectorAll('p,span,strong,div')].filter(visible)
+        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&/^(?:ChatGPT\s+)?(?:Free|Go|Pro(?:\s+(?:5x|20x|25x|50|200|250))?|Plus|Business|Enterprise|Edu)(?:\s+plan)?$/i.test(text)));
+      return uniquePlan(labels);
+    });
+    if(sourceLabel)break;
+    await new Promise(resolve=>setTimeout(resolve,100));
+    }while(Date.now()<deadline);
   }
-  return {...classifyPlan(sourceLabel||account.planType),accountFingerprint:account.fingerprint};
+  if(!sourceLabel) {
+    try {sourceLabel=await readAccountMenuPlan(page,previousUrl,signal);}
+    catch {signal?.throwIfAborted();}
+    if((await readChatGptAccount(page)).fingerprint!==account.fingerprint)throw new BrowserCompanionError("ChatGPT account changed during plan inspection","authentication_required");
+  }
+  if(process.env.CODEXIFY_BROWSER_MAINTENANCE_TRACE==="1")console.info(`[account-plan] ${JSON.stringify({sourceLabel:sourceLabel??null})}`);
+  return {...classifyPlan(sourceLabel??""),accountFingerprint:account.fingerprint};
 }
 
 async function markRefreshButton(page:Page):Promise<void> {

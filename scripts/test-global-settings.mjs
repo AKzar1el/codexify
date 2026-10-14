@@ -328,3 +328,34 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: missing plans stay hidden and footer controls remain aligned`,{timeout:30000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  let plan=null,fail=false;
+  await page.route('http://127.0.0.1:43241/**',async route=>{
+   const path=new URL(route.request().url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return fail?route.fulfill({status:503,body:'Unavailable'}):route.fulfill({json:{version:'1.7.0',plan,latest:{updateAvailable:false}}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   throw Error('Unexpected request: '+path);
+  });
+  await page.goto('http://127.0.0.1:43241/#test-token');await page.getByText('v1.7.0',{exact:true}).waitFor();
+  const label=page.locator('#account-plan');
+  assert.equal(await label.isVisible(),false);assert.equal(await label.textContent(),'');
+  for(const width of [1280,390]){
+   await page.setViewportSize({width,height:900});
+   const bounds=await page.locator('#global-footer').evaluate(footer=>{
+    const actions=footer.querySelector('#global-footer-actions').getBoundingClientRect(),version=footer.querySelector('#global-version').getBoundingClientRect(),gear=footer.querySelector('#global-settings').getBoundingClientRect(),box=footer.getBoundingClientRect();
+    return {overflow:footer.scrollWidth>footer.clientWidth,rightGap:box.right-actions.right,aligned:Math.abs((gear.top+gear.bottom)/2-(version.top+version.bottom)/2)<1};
+   });
+   assert.equal(bounds.overflow,false);assert(bounds.rightGap>=9&&bounds.rightGap<=17);assert.equal(bounds.aligned,true);
+   if(process.env.CODEXIFY_SETTINGS_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_SETTINGS_SCREENSHOTS,{recursive:true});await page.locator('aside').screenshot({path:`${process.env.CODEXIFY_SETTINGS_SCREENSHOTS}/${engineName.toLowerCase()}-${width}-no-plan.png`});}
+  }
+  plan={label:'Pro',sourceLabel:'Pro',kind:'pro'};await page.clock.fastForward(15000);await label.waitFor({state:'visible'});assert.equal(await label.textContent(),'Pro');
+  plan={label:'',sourceLabel:'',kind:'unknown'};await page.clock.fastForward(15000);await label.waitFor({state:'hidden'});assert.equal(await label.textContent(),'');assert.equal(await label.getAttribute('title'),'');
+  fail=true;await page.reload();
+  assert.equal(await label.isVisible(),false);assert.equal(await label.textContent(),'');assert.equal(await page.getByText('Plan unavailable',{exact:true}).count(),0);
+ }finally{await browser.close();}
+});

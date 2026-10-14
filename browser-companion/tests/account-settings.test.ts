@@ -15,6 +15,7 @@ test("billing aliases preserve unknown plans instead of calling them Free",()=>{
   ["ChatGPT Pro 200","Pro 20x","pro"],["ChatGPT Pro 250","Pro 25x","pro"],["Pro 25x","Pro 25x","pro"],
   ["ChatGPT Business","ChatGPT Business","unknown"],["ChatGPT Pro 300","ChatGPT Pro 300","pro"]
  ]){const plan=classifyPlan(source!);expect(plan.label).toBe(label!);expect(plan.kind).toBe(kind as any);}
+ expect(classifyPlan("")).toEqual({label:"",sourceLabel:"",kind:"unknown"});
 });
 test("model display names come from the picker when it names the family",()=>{
  const efforts=[{id:"low",label:"Instant",index:0,available:true,reason:null}];
@@ -118,7 +119,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
     planAccount='other-account';await expectFailure(driver.accountPlan('changed-account'),'account changed');expect(page.url()).toBe(original);planAccount='fixture-account';
     const originalGoto=page.goto.bind(page),goto=spyOn(page,'goto');
     goto.mockImplementation(async(url,options)=>{const result=await originalGoto(url,options);if(url.endsWith('/settings/billing'))throw Error('Billing navigation failed');return result;});
-    try {await expectFailure(driver.accountPlan('failed-billing'),'Billing navigation failed');}finally{goto.mockRestore();}
+    try {expect((await driver.accountPlan('failed-billing')).label).toBe('');}finally{goto.mockRestore();}
     expect(page.url()).toBe(original);
     failConnector=true;
     const freshDriver=new ChatGptBrowserDriver({page:async()=>page,navigate:async url=>{await page.goto(url);return page;},reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{}},protocolBuild('fresh-test'));
@@ -146,10 +147,52 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("billing r
   const coordinator=new SingleWindowCoordinator(driver,protocolBuild('plan-deadline-test'));
   expect((await coordinator.accountPlan('nested')).label).toBe('Pro 20x');
   billing='<h2>Billing</h2><p>Subscription details are loading.</p>';
-  const started=Date.now();expect((await coordinator.accountPlan('missing')).kind).toBe('pro');
+  const started=Date.now();expect((await coordinator.accountPlan('missing')).label).toBe('');
   expect(Date.now()-started).toBeLessThan(8_000);
   expect(page.url()).toBe('https://chatgpt.com/c/original');expect(context.pages()).toEqual([page]);
   await coordinator.accountPlan('missing');expect(visits).toBe(2);
   expect((await coordinator.health()).authenticated).toBeTrue();
  }finally{await browser.close();}
 },20_000);
+
+test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("account-menu fallback ignores names and language, preserves unknown labels, and caches missing plans",async()=>{
+ const executablePath=await privateChromeExecutable(join(import.meta.dirname,'../.browsers',`${process.platform}-${process.arch}`));
+ const browser=await chromium.launch({executablePath,headless:true});
+ try {
+  const context=await browser.newContext(),page=await context.newPage();
+  let name='Different account',label='Pro',billing='',testId=true,billingReads=0,menuReads=0;
+  const shell=()=>`<style>aside{position:fixed;left:8px;bottom:8px}#account-menu{position:fixed;left:60px;bottom:45px;background:white;padding:16px}#account-row{display:flex;gap:16px}#account-row span{display:block;line-height:24px}</style><form><div id="prompt-textarea" contenteditable="true"></div></form><aside><button ${testId?'data-testid="accounts-profile-button"':''} aria-haspopup="menu" aria-expanded="false" aria-label="メニュー">US</button></aside><div role="menu" id="account-menu" hidden><div role="menuitem" id="account-row"><div>US</div><div><span>${name}</span>${label?`<span>${label}</span>`:''}</div></div><hr role="separator"><div role="menuitem">Personnalisation</div><div role="menuitem">Paramètres</div></div><script>const button=document.querySelector('aside button'),menu=document.querySelector('[role=menu]');button.onclick=()=>{menu.hidden=false;button.setAttribute('aria-expanded','true');fetch('/menu-open');};document.onkeydown=event=>{if(event.key==='Escape'){menu.hidden=true;button.setAttribute('aria-expanded','false');}};</script>`;
+  await context.route('https://chatgpt.com/**',async route=>{
+   const path=new URL(route.request().url()).pathname;
+   if(path==='/api/auth/session')return route.fulfill({json:{user:{id:'fixture-user'},account:{id:'fixture-account',planType:'pro',structure:'personal'}}});
+   if(path==='/menu-open'){menuReads++;return route.fulfill({json:{ok:true}});}
+   if(path==='/settings/billing'){billingReads++;return route.fulfill({contentType:'text/html',body:billing||'<h2>Billing</h2><p>No subscription label</p>'});}
+   return route.fulfill({contentType:'text/html',body:shell()});
+  });
+  await page.goto('https://chatgpt.com/c/original');
+  const newPage=spyOn(context,'newPage');
+  try {
+   const driver=new ChatGptBrowserDriver({page:async()=>page,navigate:async url=>{await page.goto(url);return page;},reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{}},protocolBuild('menu-plan-test'));
+   const coordinator=new SingleWindowCoordinator(driver,protocolBuild('menu-plan-test'));
+   const check=async(epoch:string,expected:string,kind:string)=>{
+    const started=Date.now(),plan=await coordinator.accountPlan(epoch);
+    expect(plan.label).toBe(expected);expect(plan.kind).toBe(kind as any);
+    expect(Date.now()-started).toBeLessThan(8_000);
+    expect(page.url()).toBe('https://chatgpt.com/c/original');
+    expect(await page.locator('[role="menu"]').isVisible()).toBeFalse();expect(context.pages()).toEqual([page]);
+   };
+   await check('pro','Pro','pro');
+   const reads={billingReads,menuReads};await check('pro','Pro','pro');expect({billingReads,menuReads}).toEqual(reads);
+   name='Pro';label='Go';testId=false;await check('go','Go','go');
+   name='Another person';label='Research membership';await check('unknown','Research membership','unknown');
+   label='';await check('missing','','unknown');
+   const missingReads={billingReads,menuReads};await check('missing','','unknown');expect({billingReads,menuReads}).toEqual(missingReads);
+   billing='<h2>ChatGPT Pro 200</h2>';label='Pro';const before=menuReads;
+   await check('billing','Pro 20x','pro');expect(menuReads).toBe(before);
+   const originalGoto=page.goto.bind(page),goto=spyOn(page,'goto');
+   goto.mockImplementation(async(url,options)=>{if(url.endsWith('/settings/billing'))throw Error('Billing navigation failed');return originalGoto(url,options);});
+   try {await check('navigation-failed','Pro','pro');}finally{goto.mockRestore();}
+   expect(newPage).not.toHaveBeenCalled();
+  }finally{newPage.mockRestore();}
+ }finally{await browser.close();}
+},40_000);

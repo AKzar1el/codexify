@@ -21,7 +21,7 @@ function startGlobalSettings({api,onPlan}) {
   style.textContent=`
 #global-footer{border-top:1px solid var(--line);display:flex;align-items:center;gap:12px;min-height:52px;padding:10px 16px;font-size:15px;line-height:20px;color:var(--muted);background:var(--panel)}
 #account-plan{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--ink)}
-#global-footer-actions{display:flex;align-items:center;gap:6px;flex:none}
+#global-footer-actions{display:flex;align-items:center;gap:6px;flex:none;margin-left:auto}
 #global-version{white-space:nowrap;font-variant-numeric:tabular-nums}
 #global-settings{display:grid;place-items:center;flex:none;width:32px;height:32px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
 #global-settings:hover{background:var(--bg);color:var(--ink)}
@@ -267,14 +267,18 @@ function startGlobalSettings({api,onPlan}) {
       :'Codexify updated, but connector refresh failed. Use Refresh connector to retry.',true);
     else if(refresh?.phase==='completed')message('Connector refresh completed; Allow all tools is selected.');
   }
+  function renderPlan(plan) {
+    const label=plan?.label?.trim()||'',node=byId('account-plan');
+    node.textContent=label;node.hidden=!label;node.title=label?(plan.sourceLabel||label):'';onPlan(plan);
+  }
   async function pollStatus() {
     try{
       const epoch=refreshEpoch,next=await(await api('/api/global')).json();if(epoch!==refreshEpoch)return;global=next;byId('global-version').textContent=global.version?`v${global.version}`:'';
-      byId('account-plan').textContent=global.plan?.label||'Plan unavailable';byId('account-plan').title=global.plan?.sourceLabel||'Sign in to ChatGPT to inspect your plan';onPlan(global.plan);
+      renderPlan(global.plan);
       for(const id of ['global-update','settings-update'])byId(id).hidden=!global.latest?.updateAvailable;
       byId('settings-restart').disabled=maintenance||!global.restartAvailable;byId('global-settings').disabled=global.settingsAvailable===false;
       renderRefresh(global.connectorRefresh);
-    }catch{if(!global)byId('account-plan').textContent='Plan unavailable';}
+    }catch{if(!global)renderPlan(null);}
   }
   async function waitForRestart(targetVersion=null) {
     const deadline=Date.now()+180000;let sawUnavailable=false;
