@@ -485,15 +485,21 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       selectedConnector = await selectConnector(page, execution.request.connectorName, execution.signal);
       this.connectorApps.remember(account.fingerprint,execution.request.connectorName,selectedConnector.identity);
       execution.emit({ type:"connector_verified" });
+      // Read history before inserting a prompt: unsupported markers must not
+      // make a newly filled composer flash and disappear during failure cleanup.
+      const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       insertionAttempted = true;
-      await insertExactPrompt(selectedConnector.composer, execution.renderedPrompt);
+      try {await insertExactPrompt(selectedConnector.composer, execution.renderedPrompt);}
+      catch(error){
+        if(error instanceof BrowserCompanionError)throw error;
+        throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent","external_interference",{cause:error});
+      }
       const send = await uniqueSendButton(await activeComposer(page, 30_000, execution.signal), 30_000, execution.signal);
       if (pairingSelection) await pairingSelection.verify(execution.signal);
       else if (selected) await assertSelectedModelAndEffort(page, selected, execution.signal, creating);
       if (!await connectorIsSelected(await activeComposer(page, 30_000, execution.signal), execution.request.connectorName, selectedConnector.identity)) {
         throw new BrowserCompanionError("ChatGPT changed the selected connector before Send", "external_interference");
       }
-      const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       if (await composerText(await activeComposer(page, 30_000, execution.signal)) !== execution.renderedPrompt) {
         throw new BrowserCompanionError("ChatGPT composer text changed before Send", "external_interference");
       }

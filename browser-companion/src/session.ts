@@ -80,7 +80,7 @@ export async function readChatGptModelAnnouncements(slider: Locator): Promise<st
   });
 }
 /** Resolve only inside the verified composer's form; multiple submitters are an error. */
-export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"], button[type="submit"]';
+export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"]:not(:has(svg use[href*="#voice-"])), button[type="submit"]:not(:has(svg use[href*="#voice-"]))';
 export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form[data-chatgpt-composer] button[type="button"][aria-label="Stop"]';
 // The new footer is shared with user messages. Response extraction additionally requires
 // this control to FOLLOW the last assistant answer, excluding the user's earlier footer.

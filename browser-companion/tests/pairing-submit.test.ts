@@ -38,6 +38,8 @@ let changedAccountAfterReload = false;
 let changedUrlAfterReload = false;
 let shiftedEfforts = false;
 let hideEffortLabels = false;
+let nestedHistory = false;
+let missingHistoryId = false;
 let initialModel = {family:"6",value:4,locked:[] as number[]};
 const pill = (name: string) => `<span app-mention-path="app://fixture" app-mention-display-name="${name}" contenteditable="false">${name}</span> `;
 
@@ -122,7 +124,7 @@ beforeAll(async () => {
           send.disabled=true;
           if (window.enableSend) setTimeout(()=>{
             // History hydration happens after composer insertion, before Send becomes usable.
-            document.querySelector('#history').innerHTML='<section data-turn-id-container="old"><article data-turn-id="old" data-testid="conversation-turn-old" data-turn="assistant"><div data-message-author-role="assistant"><div class="markdown"><p>Old answer</p></div></div><button data-testid="copy-turn-action-button">Copy</button></article></section>';
+            document.querySelector('#history').innerHTML=${JSON.stringify('<section data-turn-id-container="old">'+(nestedHistory?'<div data-turn-id-container="old">':'')+'<article '+(missingHistoryId?'':'data-turn-id="old" ')+'data-testid="conversation-turn-old" data-turn="assistant"><div data-message-author-role="assistant"><div class="markdown"><p>Old answer</p></div></div><button data-testid="copy-turn-action-button">Copy</button></article>'+(nestedHistory?'</div>':'')+'</section>')};
             send.disabled=false;
           },300);
         });
@@ -167,7 +169,7 @@ async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
   generatingOnLoad=generating;acceptsStop=stopWorks;
   documentLoads=0;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
-  initialModel=model;shiftedEfforts=false;hideEffortLabels=false;
+  initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;
   await surface.navigate(url);
   return new ChatGptBrowserDriver(surface,build);
 }
@@ -182,6 +184,37 @@ test.skipIf(!native)("pairing waits for enabled Send and binds to the new answer
   expect((await driver.health()).status).toBe("idle");
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Medium");
   expect(await page.evaluate(()=>document.body.dataset.effort)).toBe("Pro");
+},15_000);
+
+test.skipIf(!native)("sending an existing conversation tolerates nested wrappers for one turn",async()=>{
+  const driver=await fixture();nestedHistory=true;
+  const submitted=offlineRequest('gpt-6-astra','max');
+  const error=await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  expect(error).toBeUndefined();expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+},15_000);
+
+test.skipIf(!native)("unsupported history markers report the cause before inserting any message",async()=>{
+  const driver=await fixture();missingHistoryId=true;
+  const submitted=offlineRequest('gpt-6-astra','max');
+  const error=await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  expect(error).toMatchObject({code:'selector_drift',message:'ChatGPT legacy turn has no stable data-turn-id'});
+  expect(await composerText(await activeComposer(page))).toBe('');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+},15_000);
+
+test.skipIf(!native)("Send readiness excludes the voice-bars icon until the control changes",async()=>{
+  for(const provisionalTestId of [false,true]) {
+    await fixture('Readiness fixture');
+    await page.locator('form button[type="submit"]').evaluate((button,provisional)=>{
+      const target=button as HTMLButtonElement;target.type='button';target.disabled=false;target.setAttribute('aria-label','Start Voice');
+      if(provisional)target.dataset.testid='send-button';
+      target.innerHTML='<svg><use href="/cdn/assets/icons.svg#voice-regular-20"></use></svg>';
+      setTimeout(()=>{target.type='submit';target.dataset.testid='send-button';target.setAttribute('aria-label','Envoyer');target.innerHTML='<svg><use href="/cdn/assets/icons.svg#arrow-up-regular-20"></use></svg>';},300);
+    },provisionalTestId);
+    const button=await uniqueSendButton(await activeComposer(page),2_000);
+    expect(await button.getAttribute('type')).toBe('submit');
+    expect(await button.locator('use').getAttribute('href')).toContain('#arrow-up-');
+  }
 },15_000);
 
 const offlineRequest = (model = "gpt-5.5-sol", effort = "low"): ExecuteActionRequest => ({

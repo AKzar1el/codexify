@@ -1,6 +1,7 @@
 // Derived from miuuyy/codex-chatgpt-web
 // src/adapters/chatgpt-web/browser-worker.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 import type { Locator, Page } from "patchright";
+import {selectorDrift} from "./errors";
 import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
@@ -73,10 +74,10 @@ export function submissionEvidence(state: {
 
 function unique(values: string[], kind: string): string[] {
   if (values.some(value => value.trim().length === 0)) {
-    throw new Error(`ChatGPT conversation ${kind} has an empty stable identity`);
+    throw selectorDrift(`ChatGPT conversation ${kind} has an empty stable identity`);
   }
   if (new Set(values).size !== values.length) {
-    throw new Error(`ChatGPT exposed duplicate ${kind} identities`);
+    throw selectorDrift(`ChatGPT exposed duplicate ${kind} identities`);
   }
   return values;
 }
@@ -93,7 +94,9 @@ export async function readTurnDomState(page: Page): Promise<TurnDomState> {
     const userIdentities = legacy(userSelector).map(legacyIdentity);
     const responseIdentities = legacy(assistantSelector).map(legacyIdentity);
     const turnIdentities = [...document.querySelectorAll<HTMLElement>("[data-turn-id-container]")]
-      .filter(element => !element.closest("[data-turn-key]"))
+      .filter(element => !element.closest("[data-turn-key]")
+        && element.parentElement?.closest("[data-turn-id-container]")?.getAttribute("data-turn-id-container")
+          !== element.getAttribute("data-turn-id-container"))
       .map(element => {
         const id = element.getAttribute("data-turn-id-container");
         if (!id?.trim()) throw new Error("ChatGPT turn container has no stable identity");
@@ -122,6 +125,10 @@ export async function readTurnDomState(page: Page): Promise<TurnDomState> {
     userSelector:CHATGPT_USER_TURN_SELECTOR,
     assistantSelector:CHATGPT_ASSISTANT_TURN_SELECTOR,
     stopSelector:CHATGPT_STOP_BUTTON_SELECTOR,
+  }).catch(error=>{
+    const reasons=["ChatGPT legacy turn has no stable data-turn-id","ChatGPT turn container has no stable identity","ChatGPT grouped turn has no stable data-turn-key"];
+    const detail=error instanceof Error?reasons.find(reason=>error.message.includes(reason)):undefined;
+    throw selectorDrift(detail??"ChatGPT conversation history could not be inspected before sending",error);
   }).then(state => ({
     turnIdentities:unique(state.turnIdentities, "turn"),
     userIdentities:unique(state.userIdentities, "user turn"),
