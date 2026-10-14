@@ -94,7 +94,8 @@ export async function selectConnector(
     composer = await activeComposer(page, 30_000, signal);
   }
   if ((await composerText(composer)).trim()) {
-    throw new BrowserCompanionError("ChatGPT composer contains an existing draft; connector selection will not overwrite it", "external_interference");
+    await clearComposerState(page, connectorName, signal);
+    composer = await activeComposer(page, 30_000, signal);
   }
   const rows = page.locator('.__menu-item[tabindex="0"], [data-mention-list-scroll-area] button[data-list-navigation-item="true"]');
   const exactRow = rows.filter({ has:page.getByText(connectorName, { exact:true }) });

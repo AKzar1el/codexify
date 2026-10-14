@@ -1,5 +1,5 @@
 import type { Page } from "patchright";
-import { activeComposer, composerText } from "./composer";
+import { activeComposer } from "./composer";
 import { BrowserCompanionError } from "./errors";
 import { assertAuthenticatedChatGptPage } from "./session";
 import type { SingleBrowserSurface } from "./chatgpt-driver";
@@ -34,8 +34,9 @@ export async function openNewChat(surface: SingleBrowserSurface, projectUrl: str
     }
     if (new URL(page.url()).origin !== "https://chatgpt.com" || new URL(page.url()).pathname !== '/') throw new BrowserCompanionError("ChatGPT did not open a new chat", "conversation_unavailable");
   }
-  if ((await composerText(await activeComposer(page, 30_000, signal))).trim()
-    || await page.locator('[data-message-author-role="user"], [data-message-author-role="assistant"]').count()) {
+  // The driver clears any draft after verifying the account. Existing messages
+  // still mean this is not a fresh conversation.
+  if (await page.locator('[data-message-author-role="user"], [data-message-author-role="assistant"]').count()) {
     throw new BrowserCompanionError("The new ChatGPT chat is not empty", "external_interference");
   }
   return page;

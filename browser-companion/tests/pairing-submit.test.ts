@@ -188,6 +188,43 @@ const offlineRequest = (model = "gpt-5.5-sol", effort = "low"): ExecuteActionReq
   ...request, model, effort, prompt:{kind:"offline_goal",goalRevision:1},
 });
 
+test.skipIf(!native)("pairing, messages, and new chats clear pre-existing drafts before sending",async()=>{
+  const requests:ExecuteActionRequest[]=[request,offlineRequest(),{
+    ...offlineRequest(),prompt:{kind:"offline_chat",batchId:"draft-test",messages:[{id:"message-one",markdown:"Continue the fixture task"}]},
+  },{
+    ...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",
+    prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null},
+  }];
+  for(const submitted of requests) {
+    const driver=await fixture('Discard this existing draft');
+    await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+    expect(await page.locator('body').getAttribute('data-sent-text')).not.toContain('Discard this existing draft');
+    expect(await composerText(await activeComposer(page))).toBe('');
+  }
+},25_000);
+
+test.skipIf(!native)("draft cleanup still requires the expected account and conversation",async()=>{
+  for(const mismatch of ['account','conversation']) {
+    const driver=await fixture('Keep this draft in the wrong destination');
+    const submitted={...request,...(mismatch==='account'?{expectedAccountFingerprint:'another-account'}:{expectedUrl:'https://chatgpt.com/c/another-conversation'})};
+    const error=await driver.execute({request:submitted,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    expect(error).toMatchObject({code:mismatch==='account'?'authentication_required':'conversation_unavailable'});
+    expect(await composerText(await activeComposer(page))).toBe('Keep this draft in the wrong destination');
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+  }
+},15_000);
+
+test.skipIf(!native)("model discovery and new-chat preparation clear existing drafts",async()=>{
+  for(const creating of [false,true]) {
+    const driver=await fixture('An old model-picker draft');
+    const catalog=await (creating?driver.prepareNewChat(null):driver.capabilities());
+    expect(catalog.models.length).toBeGreaterThan(0);
+    expect(await composerText(await activeComposer(page))).toBe('');
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+  }
+},20_000);
+
 test.skipIf(!native)("a cold-cache send navigates before touching models and selects only the destination family",async()=>{
   await fixture();
   await page.goto("https://chatgpt.com/c/unrelated-conversation");
@@ -384,14 +421,14 @@ test.skipIf(!native)("an aborted pre-Send wait clears only the unchanged owned p
     expect(await page.evaluate(()=> Number(document.body.dataset.sends))).toBe(0);
     const draft=await composerText(await activeComposer(page));
     expect(draft).toBe(edited?beforeAbort:"");
-    expect((await driver.health()).status).toBe(edited?"busy":"idle");
+    expect((await driver.health()).status).toBe("idle");
     expect(await page.evaluate(()=>document.body.dataset.effort)).toBe("Pro");
   }
 },15_000);
 
 test.skipIf(!native)("Replace pairing recovers an old verification draft without resubmitting its reference",async()=>{
   const driver=await fixture(oldPrompt);const coordinator=new SingleWindowCoordinator(driver,build);
-  expect((await coordinator.health()).status).toBe("busy");
+  expect((await coordinator.health()).status).toBe("idle");
   expect((await coordinator.health()).activeActionId).toBeNull();
   await coordinator.execute(request);
   const events=[];for await (const event of coordinator.events(request.actionId,0)) events.push(event);
@@ -530,14 +567,14 @@ test.skipIf(!native)("a stuck Stop is rehydrated and stopped automatically befor
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
 },20_000);
 
-test.skipIf(!native)("Stop recovery does not discard a user draft to reload the conversation",async()=>{
-  const driver=await fixture("A draft I am writing",true,connector,0,true,false);
+test.skipIf(!native)("Stop recovery clears an existing draft and reloads before sending once",async()=>{
+  const driver=await fixture("A draft I am writing",true,connector,0,true,"reload");
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
-  expect(failure).toMatchObject({code:"external_interference"});
-  expect(documentLoads).toBe(2);
-  expect(await composerText(await activeComposer(page))).toBe("A draft I am writing");
-  expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+  await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+  expect(documentLoads).toBe(3);
+  expect(await composerText(await activeComposer(page))).toBe("");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sent-text")).not.toContain("A draft I am writing");
 },20_000);
 
 test.skipIf(!native)("Stop recovery revalidates the account and conversation after reload",async()=>{
@@ -663,7 +700,8 @@ test.skipIf(!native)("health polling fetches one session while draft and page st
   for(let i=0;i<10;i++)expect((await driver.health()).authenticated).toBeTrue();
   expect(sessionRequests).toBe(1);
   await page.locator('[contenteditable="true"]').evaluate(element=>element.textContent='A draft I am writing');
-  expect((await driver.health()).status).toBe('busy');expect(sessionRequests).toBe(1);
+  expect((await driver.health()).status).toBe('idle');expect(sessionRequests).toBe(1);
+  expect(await composerText(await activeComposer(page))).toBe('A draft I am writing');
   await page.reload();expect((await driver.health()).status).toBe('idle');expect(sessionRequests).toBe(2);
 },15_000);
 

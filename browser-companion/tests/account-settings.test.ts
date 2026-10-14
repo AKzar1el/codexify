@@ -104,10 +104,22 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
     const pending=driver.accountPlan('startup-three');await entered;
     const health=await driver.health();expect(health.authenticated).toBeTrue();expect(health.status).toBe('busy');
     releaseBilling!();await pending;holdBilling=undefined;billingEntered=undefined;expect(page.url()).toBe(original);
-    // Drafts stay protected; ChatGPT response/approval UI does not own the browser queue.
+    // Drafts are cleared before maintenance; response/approval UI does not own the browser queue.
     const composer=page.locator('#prompt-textarea');await composer.fill('User draft');const readsBeforeDraft=billingReads;
-    await expectFailure(driver.accountPlan('draft'),'busy');await expectFailure(driver.refreshConnector('Fixture connector'),'busy');
-    expect(billingReads).toBe(readsBeforeDraft);expect(await composer.innerText()).toBe('User draft');expect(page.url()).toBe(original);
+    {
+      const beforeNavigation:string[]=[],originalGoto=page.goto.bind(page),goto=spyOn(page,'goto');
+      goto.mockImplementation(async(url,options)=>{
+        if(page.url()===original&&url!==original)beforeNavigation.push((await composer.innerText()).trim());
+        return originalGoto(url,options);
+      });
+      try {
+        expect((await driver.health()).status).toBe('idle');expect(await composer.innerText()).toBe('User draft');
+        await driver.accountPlan('draft');expect(billingReads).toBe(readsBeforeDraft+1);
+        await composer.fill('Another draft');await driver.refreshConnector('Fixture connector');
+        expect(beforeNavigation.length).toBeGreaterThanOrEqual(2);expect(beforeNavigation.every(text=>text==='')).toBeTrue();
+      }finally{goto.mockRestore();}
+    }
+    expect(await composer.innerText()).toBe('');expect(page.url()).toBe(original);
     await composer.fill('');await page.evaluate(()=>{const stop=document.createElement('button');stop.dataset.testid='stop-button';document.body.append(stop);});
     await driver.accountPlan('running');expect(page.url()).toBe(original);
     await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<button data-testid="stop-button">Stop</button>'));

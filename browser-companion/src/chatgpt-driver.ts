@@ -51,6 +51,14 @@ async function generationRunning(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
+async function clearExistingDraft(page:Page,signal?:AbortSignal):Promise<Locator> {
+  const composer=await activeComposer(page,30_000,signal);
+  if(!(await composerText(composer)).trim())return composer;
+  signal?.throwIfAborted();
+  await clearComposerState(page,"",signal);
+  return activeComposer(page,30_000,signal);
+}
+
 async function stopLingeringResponse(
   page: Page,
   signal: AbortSignal,
@@ -90,8 +98,7 @@ async function stopLingeringResponse(
       lastError = error;
     }
     if (attempt === 1 && !boundedSignal.aborted) {
-      // Rehydrate a stuck Stop control only before inserting our prompt, and
-      // preserve any draft the user may have written while Stop was pending.
+      // Rehydrate a stuck Stop control only before inserting our prompt.
       await assertTarget();
       let composer:Locator;
       try {
@@ -102,7 +109,7 @@ async function stopLingeringResponse(
         break;
       }
       if ((await composerText(composer)).trim()) {
-        throw new BrowserCompanionError("ChatGPT composer contains a user draft", "external_interference");
+        await clearExistingDraft(page,boundedSignal);
       }
       try {
         await page.reload({ waitUntil:"domcontentloaded", timeout:timeout(2_000), signal:boundedSignal });
@@ -221,14 +228,6 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           detail:"The shared ChatGPT window has no unique usable composer",
         };
       }
-      if ((await composerText(composer)).trim()) {
-        return {
-          authenticated:true,
-          accountFingerprint:account.fingerprint,
-          status:"busy",
-          detail:"The shared ChatGPT window contains a user draft",
-        };
-      }
       return {
         authenticated:true,
         accountFingerprint:account.fingerprint,
@@ -280,6 +279,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       throw new BrowserCompanionError("Sign in to ChatGPT before refreshing browser capabilities", "authentication_required", { cause:error });
     }
     const account = await readChatGptAccount(page);
+    await clearExistingDraft(page,signal);
     const capabilities = await detectChatGptAccountCapabilities(page,{signal});
     const planKind = this.planCache?.plan.accountFingerprint === account.fingerprint
       ? this.planCache.plan.kind : classifyPlan(account.planType).kind;
@@ -388,10 +388,10 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       const composers=page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true});
       const count=await composers.count();
       if(count>1||count===0&&!new URL(previousUrl).pathname.startsWith('/settings/'))throw new BrowserCompanionError("Browser companion is busy; the shared composer is not ready");
-      if(count===1&&(await composerText(composers)).trim())throw new BrowserCompanionError("Browser companion is busy with a user draft");
       if(await this.surface.page()!==page||page.url()!==previousUrl)throw new BrowserCompanionError("ChatGPT changed pages before account maintenance", "external_interference");
       this.maintenance={page,account};started=true;
       signal?.throwIfAborted();
+      if(count===1)await clearExistingDraft(page,signal);
       const result=await operation(page);completed=true;return result;
     } finally {
       try {
@@ -447,6 +447,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if (account.fingerprint !== execution.request.expectedAccountFingerprint) {
         throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
       }
+      ownedPage = page;
+      if (execution.request.prompt.kind === "pair_verify") await this.replacePairingDraft(execution.request);
+      await clearExistingDraft(page,execution.signal);
       if (execution.request.prompt.kind !== "pair_verify" && !creating) {
         // Offline actions are dispatched after tool-call inactivity. Stop only
         // while preparing this send; ongoing conversations need no observation.
@@ -456,12 +459,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         }
       }
       const cache = this.capabilitiesCache;
-      ownedPage = page;
-      if (execution.request.prompt.kind === "pair_verify") await this.replacePairingDraft(execution.request);
-      const composer = await activeComposer(page, 30_000, execution.signal);
-      if ((await composerText(composer)).trim()) {
-        throw new BrowserCompanionError("ChatGPT composer contains a user draft", "external_interference");
-      }
+      await clearExistingDraft(page,execution.signal);
       execution.emit({ type:"composer_ready" });
       let selected: Awaited<ReturnType<typeof selectModelAndEffort>> | null = null;
       if (!creating && execution.request.prompt.kind !== "pair_verify"
