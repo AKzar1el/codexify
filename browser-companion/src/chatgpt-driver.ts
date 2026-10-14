@@ -53,7 +53,13 @@ async function generationRunning(page: Page): Promise<boolean> {
 
 async function clearExistingDraft(page:Page,signal?:AbortSignal):Promise<Locator> {
   const composer=await activeComposer(page,30_000,signal);
-  if(!(await composerText(composer)).trim())return composer;
+  const hasDraft=await composer.evaluate(element=>{
+    if(element instanceof HTMLTextAreaElement||element instanceof HTMLInputElement)return element.value.length>0;
+    const clone=element.cloneNode(true) as HTMLElement;
+    for(const chip of clone.querySelectorAll('[contenteditable="false"],[app-mention-path],[data-id^="plugin:"]'))chip.remove();
+    return (clone.textContent??'').length>0;
+  });
+  if(!hasDraft)return composer;
   signal?.throwIfAborted();
   await clearComposerState(page,"",signal);
   return activeComposer(page,30_000,signal);

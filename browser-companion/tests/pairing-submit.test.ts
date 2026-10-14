@@ -215,6 +215,17 @@ test.skipIf(!native)("draft cleanup still requires the expected account and conv
   }
 },15_000);
 
+test.skipIf(!native)("whitespace-only drafts are removed from the submitted text",async()=>{
+  for(const draft of [' \t ','   ','\n']) {
+    const driver=await fixture(draft);
+    await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+    const sent=(await page.locator('body').getAttribute('data-sent-text'))!;
+    // Chrome may insert one separator after the reselected connector chip.
+    expect(sent.slice(connector.length).replace(/^ /,'')).toBe(prompt.replace(/\n/g,''));
+  }
+},15_000);
+
 test.skipIf(!native)("model discovery and new-chat preparation clear existing drafts",async()=>{
   for(const creating of [false,true]) {
     const driver=await fixture('An old model-picker draft');
