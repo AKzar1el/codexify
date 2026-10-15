@@ -952,11 +952,46 @@ impl AgentAutomationSupervisor {
                 continue;
             }
             if !activity.agent_stop_requested
-                && state.action.goal_turn_counted
+                && let Some(ids) = state.unconfirmed_chat_message_ids(task.owner_generation)
+                && task.chat.user_messages_read(ids).await?
+                && task.store.reconcile_read_chat_action(
+                    &task.task,
+                    &state,
+                    task.owner_generation,
+                    now_ms,
+                )?
+            {
+                if let Some(action_id) = state.action.id.as_deref() {
+                    self.clear_live_action(task.task.stable_key(), action_id)
+                        .await;
+                }
+                state = task.store.load(&task.task)?;
+            }
+            if !activity.agent_stop_requested
+                && state.pairing.verified_owner_generation == Some(task.owner_generation)
                 && state.action.kind == Some(AutomationActionKind::OfflineGoal)
                 && state.action.updated_at_ms.is_some_and(|started| {
-                    activity.last_call_at_ms.is_some_and(|last| last >= started)
+                    activity.last_call_at_ms.is_some_and(|last| last > started)
                 })
+                && (state.action.goal_turn_counted
+                    || state
+                        .goal_wake
+                        .nudged_epoch
+                        .as_deref()
+                        .zip(state.goal_wake.nudged_sequence)
+                        .is_some_and(|(epoch, sequence)| {
+                            let current = if activity.activity_sequence == 0 {
+                                activity.tool_call_count
+                            } else {
+                                activity.activity_sequence
+                            };
+                            activity
+                                .activity_epoch
+                                .as_deref()
+                                .unwrap_or("legacy-activity")
+                                != epoch
+                                || current > sequence
+                        }))
             {
                 // Tool activity proves the submitted goal has reached the agent. Browser
                 // ownership is no longer needed, even if the model is still working.
@@ -972,7 +1007,10 @@ impl AgentAutomationSupervisor {
                 if task.store.reconcile_completed_goal_action(
                     &task.task, &state, epoch, sequence, true, now_ms,
                 )? {
-                    self.live.write().await.remove(task.task.stable_key());
+                    if let Some(action_id) = state.action.id.as_deref() {
+                        self.clear_live_action(task.task.stable_key(), action_id)
+                            .await;
+                    }
                     state = task.store.load(&task.task)?;
                 }
             }
@@ -1883,7 +1921,26 @@ impl AgentAutomationSupervisor {
         status: Option<String>,
         now_ms: u64,
     ) {
+        let task = self.tasks.read().await.get(&execution.task_key).cloned();
         let mut live = self.live.write().await;
+        // Read the durable receipt while holding the live-state lock so a
+        // concurrent delivery reconciliation cannot resurrect a stale banner.
+        if let Some(task) = task
+            && let Ok(saved) = task.store.load(&task.task)
+            && (saved.action.id.as_deref() != Some(execution.request.action_id.as_str())
+                || phase != AutomationActionStatus::Idle
+                    && saved.action.status == AutomationActionStatus::Idle
+                    && saved.action.send_accepted == Some(true))
+        {
+            if live
+                .get(&execution.task_key)
+                .and_then(|state| state.action_id.as_deref())
+                == Some(execution.request.action_id.as_str())
+            {
+                live.remove(&execution.task_key);
+            }
+            return;
+        }
         let state = live
             .entry(execution.task_key.clone())
             .or_insert_with(AutomationLiveState::default);
@@ -1896,13 +1953,18 @@ impl AgentAutomationSupervisor {
     }
 
     async fn clear_live_if_action(&self, execution: &AutomationExecution) {
+        self.clear_live_action(&execution.task_key, &execution.request.action_id)
+            .await;
+    }
+
+    async fn clear_live_action(&self, task_key: &str, action_id: &str) {
         let mut live = self.live.write().await;
         if live
-            .get(&execution.task_key)
+            .get(task_key)
             .and_then(|state| state.action_id.as_deref())
-            == Some(execution.request.action_id.as_str())
+            == Some(action_id)
         {
-            live.remove(&execution.task_key);
+            live.remove(task_key);
         }
     }
 }
@@ -1973,6 +2035,16 @@ fn validate_terminal_snapshot(
                 | CompanionActionState::Ambiguous
                 | CompanionActionState::Stalled
         ) {
+            if snapshot.state == CompanionActionState::Ambiguous
+                && let Some(message) = snapshot.attention.as_ref().and_then(|attention| {
+                    attention
+                        .message
+                        .as_deref()
+                        .filter(|message| !message.trim().is_empty())
+                })
+            {
+                return Err(execution_error(message.to_owned(), true));
+            }
             return Err(execution_error(
                 "Browser companion reached a post-Send terminal state without proving Send acceptance"
                     .into(),

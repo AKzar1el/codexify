@@ -6901,3 +6901,342 @@ async fn creation_records_its_url_before_failure_and_accepts_verification_after_
     assert!(state.action.last_error.is_none());
     assert!(!state.action_needs_attention_at(70_001));
 }
+
+#[tokio::test]
+async fn agent_delivery_acknowledgment_clears_ambiguous_chat_and_combined_sends_without_replay() {
+    for combined in [false, true] {
+        let f = fixture().await;
+        if combined {
+            let goal = f.store.set_goal(&f.task, "Continue the goal", 100).unwrap();
+            f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        }
+        f.chat.record_agent_call(1_000).await.unwrap();
+        let sent = f
+            .chat
+            .append_user("delivery-proof".into(), "Use the new target".into())
+            .await
+            .unwrap();
+        let s = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            Arc::new(AmbiguousExecutor),
+        );
+        s.register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+        let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+        s.scan_once(now).await.unwrap();
+        assert!(s.run_next(now + 1).await.is_err());
+        let failed = f.store.load(&f.task).unwrap();
+        assert_eq!(failed.action.status, AutomationActionStatus::Ambiguous);
+        assert!(failed.action.messages_fenced);
+        assert!(!failed.action.goal_turn_counted);
+
+        // Activity or an outbound delivery receipt alone does not prove that
+        // the agent read this exact batch; leave uncertainty fenced.
+        f.chat.mark_delivered(sent.end).await.unwrap();
+        f.chat.record_agent_call(now + 2).await.unwrap();
+        s.scan_once(now + 2).await.unwrap();
+        assert_eq!(
+            f.store.load(&f.task).unwrap().action.status,
+            AutomationActionStatus::Ambiguous
+        );
+
+        f.chat.read(true).await.unwrap();
+        f.chat.record_agent_call(now + 3).await.unwrap();
+        s.scan_once(now + 3).await.unwrap();
+        let confirmed = f.store.load(&f.task).unwrap();
+        assert_eq!(confirmed.action.status, AutomationActionStatus::Idle);
+        assert!(confirmed.action.last_error.is_none());
+        assert_eq!(confirmed.action.send_accepted, Some(true));
+        assert!(s.live_state(&f.task).await.is_none());
+        if combined {
+            assert_eq!(confirmed.goal.unwrap().turn_count, 2);
+        }
+
+        // A late observer result must not put the confirmed action back into
+        // an error state after the stronger agent acknowledgment won.
+        f.store
+            .update_action_status(
+                &f.task,
+                failed.action.id.as_deref().unwrap(),
+                AutomationActionStatus::Ambiguous,
+                Some("Late browser cleanup error"),
+                None,
+                now + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            f.store.load(&f.task).unwrap().action.status,
+            AutomationActionStatus::Idle
+        );
+        assert!(f.store.load(&f.task).unwrap().action.last_error.is_none());
+        s.scan_once(now + 4).await.unwrap();
+        assert_eq!(s.queued_count().await, 0);
+        if combined {
+            assert_eq!(f.store.load(&f.task).unwrap().goal.unwrap().turn_count, 2);
+        }
+
+        f.chat
+            .append_user(
+                "next-instruction".into(),
+                "Only send this new instruction".into(),
+            )
+            .await
+            .unwrap();
+        let executor = Arc::new(FakeExecutor::default());
+        let restarted = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        restarted
+            .scan_once(now + 3 + AUTOMATION_OFFLINE_AFTER_MS)
+            .await
+            .unwrap();
+        restarted
+            .run_next(now + 4 + AUTOMATION_OFFLINE_AFTER_MS)
+            .await
+            .unwrap();
+        let requests = executor.executions.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].unread_message_ids, vec!["next-instruction"]);
+    }
+}
+
+#[tokio::test]
+async fn agent_delivery_acknowledgment_recovers_an_ambiguous_chat_after_restart() {
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user(
+            "read-before-restart".into(),
+            "Already received by the agent".into(),
+        )
+        .await
+        .unwrap();
+    let s = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(AmbiguousExecutor),
+    );
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    assert!(s.run_next(now + 1).await.is_err());
+    f.chat.read(true).await.unwrap();
+    f.chat.record_agent_call(now + 2).await.unwrap();
+    let executor = Arc::new(FakeExecutor::default());
+    let restarted =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    restarted.scan_once(now + 2).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Idle
+    );
+    assert!(f.store.load(&f.task).unwrap().action.last_error.is_none());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.inspections.load(Ordering::SeqCst), 0);
+    assert_eq!(restarted.queued_count().await, 0);
+}
+
+#[tokio::test]
+async fn agent_delivery_goal_progress_does_not_require_a_browser_acceptance_flag() {
+    let f = fixture().await;
+    let goal = f.store.set_goal(&f.task, "Keep working", 100).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    f.chat.record_agent_call(1_000).await.unwrap();
+    let s = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(AmbiguousExecutor),
+    );
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    assert!(s.run_next(now + 1).await.is_err());
+    let failed = f.store.load(&f.task).unwrap();
+    assert!(!failed.action.goal_turn_counted);
+    assert!(failed.goal_wake.nudged_epoch.is_some());
+    s.scan_once(now + 2).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Ambiguous
+    );
+    f.chat.record_agent_call(now + 3).await.unwrap();
+    s.scan_once(now + 3).await.unwrap();
+    let recovered = f.store.load(&f.task).unwrap();
+    assert_eq!(recovered.action.status, AutomationActionStatus::Idle);
+    assert!(recovered.action.last_error.is_none());
+    assert_eq!(recovered.goal.unwrap().turn_count, 2);
+    assert_eq!(s.queued_count().await, 0);
+    assert!(s.live_state(&f.task).await.is_none());
+}
+
+#[tokio::test]
+async fn agent_delivery_acknowledgment_does_not_override_explicit_cancellation() {
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user(
+            "cancelled-delivery".into(),
+            "Instruction before cancellation".into(),
+        )
+        .await
+        .unwrap();
+    let s = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(AmbiguousExecutor),
+    );
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    assert!(s.run_next(now + 1).await.is_err());
+    let action_id = f.store.load(&f.task).unwrap().action.id.unwrap();
+    f.store.cancel_action(&f.task, &action_id, now + 2).unwrap();
+    f.chat.read(true).await.unwrap();
+    f.chat.record_agent_call(now + 3).await.unwrap();
+    s.scan_once(now + 3).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Cancelled
+    );
+    assert_eq!(s.queued_count().await, 0);
+}
+
+#[tokio::test]
+async fn agent_delivery_acknowledgment_wins_over_a_late_browser_observer_failure() {
+    struct LateFailure {
+        started: Notify,
+        release: Notify,
+        execution: Mutex<Option<AutomationExecution>>,
+    }
+    #[async_trait]
+    impl AutomationExecutor for LateFailure {
+        async fn execute(
+            &self,
+            execution: AutomationExecution,
+            _: mpsc::UnboundedSender<CompanionEvent>,
+            _: CancellationToken,
+        ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+            *self.execution.lock().unwrap() = Some(execution);
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(AutomationExecutionError {
+                message: "Late browser observer failure".into(),
+                send_accepted: true,
+            })
+        }
+    }
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user(
+            "late-observer-message".into(),
+            "Already read by the agent".into(),
+        )
+        .await
+        .unwrap();
+    let executor = Arc::new(LateFailure {
+        started: Notify::new(),
+        release: Notify::new(),
+        execution: Mutex::new(None),
+    });
+    let s =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    let runner = tokio::spawn({
+        let s = s.clone();
+        async move { s.run_next(now + 1).await }
+    });
+    executor.started.notified().await;
+    let execution = executor.execution.lock().unwrap().clone().unwrap();
+    let ActionPrompt::OfflineChat { ref batch_id, .. } = execution.request.prompt else {
+        panic!("expected chat batch")
+    };
+    f.store
+        .record_accepted_batch(
+            &f.task,
+            &execution.request.action_id,
+            codexify::agent_automation::AcceptedChatBatch {
+                owner_generation: 0,
+                batch_id,
+                message_ids: &execution.unread_message_ids,
+                transcript_revision: &execution.transcript_revision,
+            },
+            now + 2,
+        )
+        .unwrap();
+    f.store
+        .update_action_status(
+            &f.task,
+            &execution.request.action_id,
+            AutomationActionStatus::Ambiguous,
+            Some("Initial browser uncertainty"),
+            None,
+            now + 2,
+        )
+        .unwrap();
+    f.chat.read(true).await.unwrap();
+    f.chat.record_agent_call(now + 3).await.unwrap();
+    s.scan_once(now + 3).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action.status,
+        AutomationActionStatus::Idle
+    );
+    executor.release.notify_one();
+    assert!(runner.await.unwrap().is_err());
+    let final_state = f.store.load(&f.task).unwrap();
+    assert_eq!(final_state.action.status, AutomationActionStatus::Idle);
+    assert!(final_state.action.last_error.is_none());
+    assert!(s.live_state(&f.task).await.is_none());
+}

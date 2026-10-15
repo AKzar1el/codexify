@@ -759,6 +759,37 @@ impl ChatFile {
         .await
     }
 
+    pub(crate) async fn user_messages_read(
+        self: &Arc<Self>,
+        message_ids: &[String],
+    ) -> Result<bool, String> {
+        if message_ids.is_empty() {
+            return Ok(false);
+        }
+        let message_ids = message_ids.to_vec();
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                let mut remaining = message_ids
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>();
+                for span in spans(file)? {
+                    if span.role != "user" || span.end > cursor.offset {
+                        continue;
+                    }
+                    let id = if span.id.starts_with("manual-") {
+                        format!("manual-{}-{}", span.body_start, span.body_end)
+                    } else {
+                        span.id
+                    };
+                    remaining.remove(&id);
+                }
+                Ok(remaining.is_empty())
+            })
+        })
+        .await
+    }
+
     pub async fn unread_snapshot(self: &Arc<Self>) -> Result<UnreadSnapshot, String> {
         self.run(|chat| {
             chat.with_cursor(|cursor, file| {
@@ -1656,6 +1687,33 @@ mod tests {
         assert_eq!(older.messages.len(), 1);
         assert_eq!(older.messages[0].markdown, "Reply 0");
         assert!(!older.has_more);
+    }
+
+    #[tokio::test]
+    async fn user_message_read_proof_requires_every_exact_message_to_be_acknowledged() {
+        let directory = tempfile::tempdir().unwrap();
+        let chat = Arc::new(ChatFile::new(directory.path().join("CHAT.md"), true));
+        let first = chat
+            .append_user("first".into(), "First instruction".into())
+            .await
+            .unwrap();
+        let ids = vec!["first".into()];
+        assert!(!chat.user_messages_read(&ids).await.unwrap());
+        chat.widget_page(None, None).await.unwrap();
+        chat.read(false).await.unwrap();
+        chat.mark_delivered(first.end).await.unwrap();
+        assert!(!chat.user_messages_read(&ids).await.unwrap());
+        chat.read(true).await.unwrap();
+        assert!(chat.user_messages_read(&ids).await.unwrap());
+        chat.append_user("second".into(), "Next instruction".into())
+            .await
+            .unwrap();
+        let both = vec!["first".into(), "second".into()];
+        assert!(!chat.user_messages_read(&both).await.unwrap());
+        chat.read(true).await.unwrap();
+        assert!(chat.user_messages_read(&both).await.unwrap());
+        assert!(!chat.user_messages_read(&["missing".into()]).await.unwrap());
+        assert!(!chat.user_messages_read(&[]).await.unwrap());
     }
 
     #[tokio::test]

@@ -287,6 +287,23 @@ impl AutomationTaskState {
         action_retry_mode(self)
     }
 
+    pub(crate) fn unconfirmed_chat_message_ids(&self, owner_generation: u64) -> Option<&[String]> {
+        (matches!(
+            self.action.kind,
+            Some(AutomationActionKind::OfflineChat | AutomationActionKind::OfflineCombined)
+        ) && matches!(
+            self.action.status,
+            AutomationActionStatus::Ambiguous
+                | AutomationActionStatus::Failed
+                | AutomationActionStatus::Stalled
+        ) && self.action.messages_fenced
+            && self.action.pairing_generation == Some(self.pairing.generation)
+            && self.pairing.verified_owner_generation == Some(owner_generation)
+            && self.chat_mirror.owner_generation == Some(owner_generation)
+            && !self.chat_mirror.message_ids.is_empty())
+        .then_some(self.chat_mirror.message_ids.as_slice())
+    }
+
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
         let action = &self.action;
         if action.status != AutomationActionStatus::Failed
@@ -1642,7 +1659,9 @@ impl AgentAutomationStore {
             let verified_pairing = state.action.kind == Some(AutomationActionKind::PairVerify)
                 && state.action.pairing_generation == Some(state.pairing.generation)
                 && state.pairing.verified_owner_generation.is_some();
-            state.action.status = if verified_pairing {
+            let completed = state.action.status == AutomationActionStatus::Idle
+                && state.action.send_accepted == Some(true);
+            state.action.status = if verified_pairing || completed {
                 AutomationActionStatus::Idle
             } else {
                 status
@@ -1650,7 +1669,7 @@ impl AgentAutomationStore {
             if status == AutomationActionStatus::Ambiguous {
                 state.action.send_accepted = Some(true);
             }
-            state.action.last_error = if verified_pairing {
+            state.action.last_error = if verified_pairing || completed {
                 None
             } else {
                 error.map(str::to_string)
@@ -1817,16 +1836,8 @@ impl AgentAutomationStore {
             {
                 return Ok(false);
             }
-            let goal = state.goal.as_mut().expect("checked active goal");
-            if !state.action.goal_turn_counted
-                && state
-                    .action
-                    .updated_at_ms
-                    .is_some_and(|started| started >= goal.updated_at_ms)
-            {
-                goal.turn_count = goal.turn_count.saturating_add(1);
-                state.action.goal_turn_counted = true;
-            }
+            count_accepted_goal_turn(state);
+            state.action.send_accepted = Some(true);
             state.action.status = if made_progress {
                 AutomationActionStatus::Idle
             } else {
@@ -1845,6 +1856,37 @@ impl AgentAutomationStore {
                     last_nudged_at_ms: Some(now_ms),
                 }
             };
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn reconcile_read_chat_action(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        owner_generation: u64,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.chat_mirror != expected.chat_mirror
+                || state.goal != expected.goal
+                || state
+                    .unconfirmed_chat_message_ids(owner_generation)
+                    .is_none()
+            {
+                return Ok(false);
+            }
+            // The exact fenced batch has been acknowledged through chat_read.
+            // Keep its fence even though the browser observer was inconclusive.
+            state.action.send_accepted = Some(true);
+            count_accepted_goal_turn(state);
+            state.action.status = AutomationActionStatus::Idle;
+            state.action.last_error = None;
+            state.action.automatic_retry_attempts = 0;
+            state.action.updated_at_ms = Some(now_ms);
+            state.goal_wake = GoalWakeState::default();
             Ok(true)
         })
     }
@@ -1910,31 +1952,11 @@ impl AgentAutomationStore {
         action_id: &str,
     ) -> Result<(), String> {
         self.mutate(task, |state| {
-            if state.action.id.as_deref() == Some(action_id) {
-                state.action.send_accepted = Some(true);
-            }
-            if state.action.id.as_deref() != Some(action_id)
-                || state.action.goal_turn_counted
-                || state.action.kind == Some(AutomationActionKind::PairVerify)
-            {
+            if state.action.id.as_deref() != Some(action_id) {
                 return Ok(());
             }
-            let Some(goal) = state
-                .goal
-                .as_mut()
-                .filter(|goal| goal.status == GoalStatus::Active)
-            else {
-                return Ok(());
-            };
-            if state
-                .action
-                .goal_revision
-                .is_some_and(|revision| revision != goal.revision)
-            {
-                return Ok(());
-            }
-            goal.turn_count = goal.turn_count.saturating_add(1);
-            state.action.goal_turn_counted = true;
+            state.action.send_accepted = Some(true);
+            count_accepted_goal_turn(state);
             Ok(())
         })
     }
@@ -2246,6 +2268,29 @@ fn exact_goal_mut(
         return Err("The agent-chat goal revision changed".into());
     }
     Ok(goal)
+}
+
+fn count_accepted_goal_turn(state: &mut AutomationTaskState) {
+    if state.action.goal_turn_counted || state.action.kind == Some(AutomationActionKind::PairVerify)
+    {
+        return;
+    }
+    let Some(goal) = state
+        .goal
+        .as_mut()
+        .filter(|goal| goal.status == GoalStatus::Active)
+    else {
+        return;
+    };
+    if state
+        .action
+        .goal_revision
+        .is_some_and(|revision| revision != goal.revision)
+    {
+        return;
+    }
+    goal.turn_count = goal.turn_count.saturating_add(1);
+    state.action.goal_turn_counted = true;
 }
 
 fn start_goal(
