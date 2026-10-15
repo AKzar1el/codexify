@@ -1529,7 +1529,11 @@ impl AgentAutomationSupervisor {
                     && !send_accepted
                     && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
                 {
-                    task.store.invalidate_pairing(&task.task, now_ms)?;
+                    task.store.invalidate_pairing(
+                        &task.task,
+                        execution.request.pairing_generation,
+                        now_ms,
+                    )?;
                 }
                 if send_accepted {
                     if let Some(batch_id) = execution_batch_id(&execution) {

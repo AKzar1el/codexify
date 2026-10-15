@@ -1447,10 +1447,18 @@ impl AgentAutomationStore {
     pub fn invalidate_pairing(
         &self,
         task: &ConversationIdentity,
+        expected_generation: u64,
         now_ms: u64,
     ) -> Result<PairingState, String> {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
+            // Verification can win the race with browser failure cleanup.
+            // A stale failure must not revoke that proof or a newer attempt.
+            if state.pairing.generation != expected_generation
+                || state.pairing.verified_owner_generation.is_some()
+            {
+                return Ok(state.pairing);
+            }
             let previous_digest = state
                 .pairing
                 .pending

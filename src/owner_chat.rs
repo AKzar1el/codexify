@@ -1121,7 +1121,9 @@ async fn automation_pair(
         .queue_pair_verification(&context.task, &issue.reference, issue.generation, now_ms)
         .await
     {
-        let _ = context.store.invalidate_pairing(&context.task, now_ms);
+        let _ = context
+            .store
+            .invalidate_pairing(&context.task, issue.generation, now_ms);
         return Err(internal_error(error));
     }
     supervisor.notify();

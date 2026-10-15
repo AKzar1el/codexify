@@ -396,7 +396,7 @@ async fn queue_creation(
         )
         .await
     {
-        let _ = store.invalidate_pairing(task, now);
+        let _ = store.invalidate_pairing(task, issue.generation, now);
         return Err(internal_error(error));
     }
     supervisor.notify();

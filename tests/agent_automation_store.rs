@@ -272,10 +272,12 @@ fn pairing_retry_url_survives_failures_and_reload_without_prefilling_creation_de
     let store = AgentAutomationStore::new(state_root.clone()).unwrap();
     let task = task("retry-pairing-url");
     let url = "https://chatgpt.com/g/project-alias/c/attempted-chat";
-    store
+    let issue = store
         .issue_pairing(&task, &format!("{url}?source=ignored"), 0, 1000)
         .unwrap();
-    store.invalidate_pairing(&task, 1001).unwrap();
+    store
+        .invalidate_pairing(&task, issue.generation, 1001)
+        .unwrap();
     assert_eq!(
         store
             .load(&task)
@@ -524,7 +526,9 @@ fn invalidating_pairing_revokes_its_pending_reference_index() {
         1
     );
 
-    let pairing = store.invalidate_pairing(&task, 1_001).unwrap();
+    let pairing = store
+        .invalidate_pairing(&task, issued.generation, 1_001)
+        .unwrap();
 
     assert!(pairing.pending.is_none());
     assert_eq!(
@@ -538,6 +542,78 @@ fn invalidating_pairing_revokes_its_pending_reference_index() {
             .verify_pairing_reference(&task, 0, &issued.reference, 1_002)
             .is_err()
     );
+}
+
+#[test]
+fn failed_pairing_cleanup_preserves_verification_that_won_the_race() {
+    let root = tempfile::tempdir().unwrap();
+    let state_root = root.path().join("automation");
+    let store = AgentAutomationStore::new(state_root.clone()).unwrap();
+    let task = task("verified-before-failure-cleanup");
+    let url = "https://chatgpt.com/g/g-p-project/c/verified-chat";
+    let issue = store.issue_pairing(&task, url, 1, 1_000).unwrap();
+    store
+        .record_pairing_canonical_url(&task, issue.generation, url, 1_001)
+        .unwrap();
+
+    // The browser has observed an unverified attempt, but the authenticated
+    // tool succeeds before that browser failure reaches its cleanup write.
+    store
+        .verify_pairing_reference(&task, 1, &issue.reference, 1_002)
+        .unwrap();
+    let path = store.task_directory(&task).unwrap().join("automation.json");
+    let verified_bytes = std::fs::read(&path).unwrap();
+    store
+        .invalidate_pairing(&task, issue.generation, 1_003)
+        .unwrap();
+
+    let reloaded = AgentAutomationStore::new(state_root).unwrap();
+    let state = reloaded.load(&task).unwrap();
+    assert_eq!(state.pairing.verified_owner_generation, Some(1));
+    assert_eq!(state.pairing.verified_at_ms, Some(1_002));
+    assert_eq!(state.pairing.canonical_url.as_deref(), Some(url));
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(
+        std::fs::read(&path).unwrap() == verified_bytes,
+        "Late failure cleanup changed the verified state"
+    );
+
+    // Explicit user unlinking remains authoritative.
+    let unlinked = reloaded.unlink_pairing(&task, 1_004).unwrap();
+    assert!(unlinked.verified_owner_generation.is_none());
+    assert!(unlinked.canonical_url.is_none());
+}
+
+#[test]
+fn failed_pairing_cleanup_does_not_revoke_a_newer_attempt() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+    let task = task("replaced-before-failure-cleanup");
+    let first = store
+        .issue_pairing(&task, "https://chatgpt.com/c/old-attempt", 0, 1_000)
+        .unwrap();
+    let url = "https://chatgpt.com/c/new-attempt";
+    let second = store.issue_pairing(&task, url, 0, 1_001).unwrap();
+    let path = store.task_directory(&task).unwrap().join("automation.json");
+    let pending_bytes = std::fs::read(&path).unwrap();
+
+    store
+        .invalidate_pairing(&task, first.generation, 1_002)
+        .unwrap();
+
+    assert!(
+        std::fs::read(&path).unwrap() == pending_bytes,
+        "Stale failure cleanup changed the newer pending state"
+    );
+    store
+        .record_pairing_canonical_url(&task, second.generation, url, 1_003)
+        .unwrap();
+    let verified = store
+        .verify_pairing_reference(&task, 0, &second.reference, 1_004)
+        .unwrap();
+    assert_eq!(verified.generation, second.generation);
+    assert_eq!(verified.verified_owner_generation, Some(0));
+    assert_eq!(verified.canonical_url.as_deref(), Some(url));
 }
 
 #[test]
