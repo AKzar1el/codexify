@@ -616,6 +616,15 @@ impl AgentAutomationSupervisor {
             activity.agent_stop_requested,
             crate::markdown_chat::now_ms(),
         )?;
+        if !activity.agent_stop_requested {
+            let state = task.store.load(&task.task)?;
+            if let Err(error) = self
+                .reconcile_chat_delivery(&task, &state, crate::markdown_chat::now_ms())
+                .await
+            {
+                tracing::warn!(%error, "could not reconcile agent message acknowledgment");
+            }
+        }
         self.tasks
             .write()
             .await

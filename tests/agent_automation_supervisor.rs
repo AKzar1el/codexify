@@ -7302,7 +7302,16 @@ async fn native_delivery_clears_pre_send_failure_and_retry_after_restart() {
             );
             f.chat.read(true).await.unwrap();
             f.chat.record_agent_call(now + 3).await.unwrap();
-            s.scan_once(now + 3).await.unwrap();
+            // Native tool completion and UI state reads register the task.
+            // Recovery must not wait for the global browser queue to drain.
+            s.register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
             let confirmed = f.store.load(&f.task).unwrap();
             assert_eq!(confirmed.action.status, AutomationActionStatus::Idle);
             assert!(confirmed.action.last_error.is_none());
