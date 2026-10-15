@@ -19,6 +19,7 @@ pub(crate) const MAX_CHAT_MIRROR_IDS: usize = 1024;
 const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
+const CHAT_SUBMISSION_FILE: &str = "chat-submission.json";
 const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
@@ -231,6 +232,18 @@ pub struct AcceptedChatBatch<'a> {
     pub transcript_revision: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ChatSubmission {
+    version: u32,
+    action_id: String,
+    owner_generation: u64,
+    pairing_generation: u64,
+    batch_id: String,
+    pub(crate) message_ids: Vec<String>,
+    transcript_revision: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueueFailure<'a> {
     pub action_id: &'a str,
@@ -287,21 +300,21 @@ impl AutomationTaskState {
         action_retry_mode(self)
     }
 
-    pub(crate) fn unconfirmed_chat_message_ids(&self, owner_generation: u64) -> Option<&[String]> {
-        (matches!(
+    fn can_reconcile_chat_delivery(&self, owner_generation: u64) -> bool {
+        matches!(
             self.action.kind,
             Some(AutomationActionKind::OfflineChat | AutomationActionKind::OfflineCombined)
         ) && matches!(
             self.action.status,
-            AutomationActionStatus::Ambiguous
+            AutomationActionStatus::Queued
+                | AutomationActionStatus::Navigating
+                | AutomationActionStatus::Sending
+                | AutomationActionStatus::Generating
+                | AutomationActionStatus::Ambiguous
                 | AutomationActionStatus::Failed
                 | AutomationActionStatus::Stalled
-        ) && self.action.messages_fenced
-            && self.action.pairing_generation == Some(self.pairing.generation)
+        ) && self.action.pairing_generation == Some(self.pairing.generation)
             && self.pairing.verified_owner_generation == Some(owner_generation)
-            && self.chat_mirror.owner_generation == Some(owner_generation)
-            && !self.chat_mirror.message_ids.is_empty())
-        .then_some(self.chat_mirror.message_ids.as_slice())
     }
 
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
@@ -1860,33 +1873,98 @@ impl AgentAutomationStore {
         })
     }
 
-    pub(crate) fn reconcile_read_chat_action(
+    pub(crate) fn record_chat_submission(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        pairing_generation: u64,
+        batch: AcceptedChatBatch<'_>,
+    ) -> Result<bool, String> {
+        validate_accepted_batch(
+            action_id,
+            batch.batch_id,
+            batch.message_ids,
+            batch.transcript_revision,
+        )?;
+        self.with_locked_task(task, |path| {
+            let state = load_state(path)?;
+            if state.action.id.as_deref() != Some(action_id)
+                || state.action.status != AutomationActionStatus::Queued
+                || state.pairing.generation != pairing_generation
+                || !state.can_reconcile_chat_delivery(batch.owner_generation)
+            {
+                return Ok(false);
+            }
+            let submission = ChatSubmission {
+                version: 1,
+                action_id: action_id.to_owned(),
+                owner_generation: batch.owner_generation,
+                pairing_generation,
+                batch_id: batch.batch_id.to_owned(),
+                message_ids: batch.message_ids.to_vec(),
+                transcript_revision: batch.transcript_revision.to_owned(),
+            };
+            // Publish the intent before any browser interaction. This is not a
+            // send receipt and must not fence an instruction that is still unread.
+            persist_private_record(&path.with_file_name(CHAT_SUBMISSION_FILE), &submission)?;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn chat_delivery_candidate(
         &self,
         task: &ConversationIdentity,
         expected: &AutomationTaskState,
         owner_generation: u64,
+    ) -> Result<Option<ChatSubmission>, String> {
+        self.with_locked_task(task, |path| {
+            let state = load_state(path)?;
+            if state.action != expected.action || state.pairing != expected.pairing {
+                return Ok(None);
+            }
+            chat_delivery_candidate(path, &state, owner_generation)
+        })
+    }
+
+    pub(crate) fn reconcile_read_chat_action(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        submission: &ChatSubmission,
         now_ms: u64,
     ) -> Result<bool, String> {
-        self.mutate(task, |state| {
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
             if state.action != expected.action
                 || state.pairing != expected.pairing
                 || state.chat_mirror != expected.chat_mirror
                 || state.goal != expected.goal
-                || state
-                    .unconfirmed_chat_message_ids(owner_generation)
-                    .is_none()
+                || chat_delivery_candidate(path, &state, submission.owner_generation)?.as_ref()
+                    != Some(submission)
             {
                 return Ok(false);
             }
-            // The exact fenced batch has been acknowledged through chat_read.
-            // Keep its fence even though the browser observer was inconclusive.
+            // Reading the exact batch proves delivery through the agent's native
+            // mailbox even if browser preparation failed before pressing Send.
+            merge_accepted_batch(
+                &mut state.chat_mirror,
+                submission.owner_generation,
+                &submission.batch_id,
+                &submission.message_ids,
+                &submission.transcript_revision,
+            )?;
+            let browser_may_have_sent = state.action.send_accepted == Some(true);
             state.action.send_accepted = Some(true);
-            count_accepted_goal_turn(state);
+            state.action.messages_fenced = true;
+            if browser_may_have_sent {
+                count_accepted_goal_turn(&mut state);
+            }
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
             state.action.updated_at_ms = Some(now_ms);
             state.goal_wake = GoalWakeState::default();
+            persist_state(path, &state)?;
             Ok(true)
         })
     }
@@ -2431,11 +2509,11 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
+fn read_private_record(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AutomationTaskState::default());
+            return Ok(None);
         }
         Err(error) => return Err(format!("Could not inspect agent automation state: {error}")),
     };
@@ -2476,6 +2554,63 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Agent automation state is too large".into());
     }
+    Ok(Some(bytes))
+}
+
+fn chat_delivery_candidate(
+    path: &Path,
+    state: &AutomationTaskState,
+    owner_generation: u64,
+) -> Result<Option<ChatSubmission>, String> {
+    if !state.can_reconcile_chat_delivery(owner_generation) {
+        return Ok(None);
+    }
+    if let Some(bytes) = read_private_record(&path.with_file_name(CHAT_SUBMISSION_FILE))? {
+        let submission: ChatSubmission = serde_json::from_slice(&bytes)
+            .map_err(|_| "Chat submission intent is invalid JSON".to_string())?;
+        validate_accepted_batch(
+            &submission.action_id,
+            &submission.batch_id,
+            &submission.message_ids,
+            &submission.transcript_revision,
+        )?;
+        if submission.version != 1 {
+            return Err("Chat submission intent version is unsupported".into());
+        }
+        if state.action.id.as_deref() == Some(submission.action_id.as_str())
+            && submission.owner_generation == owner_generation
+            && submission.pairing_generation == state.pairing.generation
+        {
+            return Ok(Some(submission));
+        }
+    }
+    // Preserve recovery of already-fenced actions from older installations.
+    if state.action.messages_fenced
+        && state.chat_mirror.owner_generation == Some(owner_generation)
+        && !state.chat_mirror.message_ids.is_empty()
+        && let (Some(action_id), Some(batch_id), Some(revision)) = (
+            &state.action.id,
+            &state.chat_mirror.last_accepted_batch_id,
+            &state.chat_mirror.transcript_revision_at_start,
+        )
+    {
+        return Ok(Some(ChatSubmission {
+            version: 1,
+            action_id: action_id.clone(),
+            owner_generation,
+            pairing_generation: state.pairing.generation,
+            batch_id: batch_id.clone(),
+            message_ids: state.chat_mirror.message_ids.clone(),
+            transcript_revision: revision.clone(),
+        }));
+    }
+    Ok(None)
+}
+
+fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
+    let Some(bytes) = read_private_record(path)? else {
+        return Ok(AutomationTaskState::default());
+    };
     let raw: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| "Agent automation state is invalid JSON".to_string())?;
     let legacy_goal = raw
@@ -2535,6 +2670,10 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
 
 fn persist_state(path: &Path, state: &AutomationTaskState) -> Result<(), String> {
     validate_state(state)?;
+    persist_private_record(path, state)
+}
+
+fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or("Agent automation state has no parent directory")?;
@@ -2545,7 +2684,7 @@ fn persist_state(path: &Path, state: &AutomationTaskState) -> Result<(), String>
         }
         validate_private_file(&metadata, "Agent automation state")?;
     }
-    let bytes = serde_json::to_vec(state)
+    let bytes = serde_json::to_vec(record)
         .map_err(|error| format!("Could not encode agent automation state: {error}"))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Agent automation state is too large".into());

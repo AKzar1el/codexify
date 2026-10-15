@@ -533,6 +533,7 @@ impl AgentAutomationSupervisor {
                 loop {
                     match supervisor.run_next(crate::markdown_chat::now_ms()).await {
                         Ok(Some(_)) => {}
+                        Ok(None) if supervisor.queued_count().await > 0 => continue,
                         Ok(None) => break,
                         Err(error) => {
                             tracing::warn!(%error, "agent automation action failed");
@@ -952,19 +953,8 @@ impl AgentAutomationSupervisor {
                 continue;
             }
             if !activity.agent_stop_requested
-                && let Some(ids) = state.unconfirmed_chat_message_ids(task.owner_generation)
-                && task.chat.user_messages_read(ids).await?
-                && task.store.reconcile_read_chat_action(
-                    &task.task,
-                    &state,
-                    task.owner_generation,
-                    now_ms,
-                )?
+                && self.reconcile_chat_delivery(&task, &state, now_ms).await?
             {
-                if let Some(action_id) = state.action.id.as_deref() {
-                    self.clear_live_action(task.task.stable_key(), action_id)
-                        .await;
-                }
                 state = task.store.load(&task.task)?;
             }
             if !activity.agent_stop_requested
@@ -1391,12 +1381,33 @@ impl AgentAutomationSupervisor {
             let Some(task) = self.tasks.read().await.get(&execution.task_key).cloned() else {
                 continue;
             };
+            if let Some(batch_id) = execution_batch_id(&execution) {
+                if !task.store.record_chat_submission(
+                    &task.task,
+                    &execution.request.action_id,
+                    execution.request.pairing_generation,
+                    AcceptedChatBatch {
+                        owner_generation: execution.owner_generation,
+                        batch_id,
+                        message_ids: &execution.unread_message_ids,
+                        transcript_revision: &execution.transcript_revision,
+                    },
+                )? {
+                    continue;
+                }
+                let state = task.store.load(&task.task)?;
+                if !task.chat.offline_activity().await?.agent_stop_requested
+                    && self.reconcile_chat_delivery(&task, &state, now_ms).await?
+                {
+                    continue;
+                }
+            }
             if !execution_matches(&task, &execution, now_ms).await? {
                 let _ = task.store.update_action_status(
                     &task.task,
                     &execution.request.action_id,
                     AutomationActionStatus::Idle,
-                    Some("Queued browser action became stale before execution"),
+                    None,
                     None,
                     now_ms,
                 );
@@ -1542,6 +1553,14 @@ impl AgentAutomationSupervisor {
             }
             Err(error) => {
                 let action_current = current_action_matches(&task, &execution)?;
+                if action_current && !pair_verification {
+                    let state = task.store.load(&task.task)?;
+                    if !task.chat.offline_activity().await?.agent_stop_requested
+                        && self.reconcile_chat_delivery(&task, &state, now_ms).await?
+                    {
+                        return Ok(None);
+                    }
+                }
                 let pairing = task.store.load(&task.task)?.pairing;
                 let pairing_verified = pair_verification
                     && pairing.generation == execution.request.pairing_generation
@@ -1764,6 +1783,16 @@ impl AgentAutomationSupervisor {
         } else {
             now_ms
         };
+        if !pair_verification && status != AutomationActionStatus::Idle {
+            let state = task.store.load(&task.task)?;
+            if !activity_after.agent_stop_requested
+                && self
+                    .reconcile_chat_delivery(&task, &state, terminal_at_ms)
+                    .await?
+            {
+                return Ok(Some(snapshot));
+            }
+        }
         task.store.update_action_status(
             &task.task,
             &execution.request.action_id,
@@ -1786,6 +1815,38 @@ impl AgentAutomationSupervisor {
             task.store.notify_state(&task.chat, &state).await;
         }
         Ok(Some(snapshot))
+    }
+
+    async fn reconcile_chat_delivery(
+        &self,
+        task: &AutomationTaskHandle,
+        state: &super::AutomationTaskState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let Some(submission) =
+            task.store
+                .chat_delivery_candidate(&task.task, state, task.owner_generation)?
+        else {
+            return Ok(false);
+        };
+        if !task
+            .chat
+            .user_messages_read(&submission.message_ids)
+            .await?
+        {
+            return Ok(false);
+        }
+        if !task
+            .store
+            .reconcile_read_chat_action(&task.task, state, &submission, now_ms)?
+        {
+            return Ok(false);
+        }
+        if let Some(action_id) = state.action.id.as_deref() {
+            self.clear_live_action(task.task.stable_key(), action_id)
+                .await;
+        }
+        Ok(true)
     }
 
     async fn apply_event(

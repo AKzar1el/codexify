@@ -7240,3 +7240,246 @@ async fn agent_delivery_acknowledgment_wins_over_a_late_browser_observer_failure
     assert!(final_state.action.last_error.is_none());
     assert!(s.live_state(&f.task).await.is_none());
 }
+
+#[tokio::test]
+async fn native_delivery_clears_pre_send_failure_and_retry_after_restart() {
+    for combined in [false, true] {
+        for restart in [false, true] {
+            let f = fixture().await;
+            if combined {
+                let goal = f.store.set_goal(&f.task, "Keep working", 100).unwrap();
+                f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+            }
+            f.chat.record_agent_call(1_000).await.unwrap();
+            let sent = f
+                .chat
+                .append_user(
+                    "native-read".into(),
+                    "Already delivered through a tool response".into(),
+                )
+                .await
+                .unwrap();
+            let executor = Arc::new(PreSendFailureExecutor::default());
+            let mut s = AgentAutomationSupervisor::new(
+                f.config.markdown_chat.automation.clone(),
+                executor.clone(),
+            );
+            s.register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+            let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+            s.scan_once(now).await.unwrap();
+            assert!(s.run_next(now + 1).await.is_err());
+            let failed = f.store.load(&f.task).unwrap();
+            assert_eq!(failed.action.send_accepted, Some(false));
+            assert!(!failed.action.messages_fenced);
+            assert!(failed.automatic_retry_at_ms().is_some());
+            if restart {
+                s = AgentAutomationSupervisor::new(
+                    f.config.markdown_chat.automation.clone(),
+                    executor.clone(),
+                );
+                s.register_task(AutomationTaskHandle::new(
+                    f.task.clone(),
+                    0,
+                    f.store.clone(),
+                    f.chat.clone(),
+                ))
+                .await
+                .unwrap();
+            }
+            f.chat.mark_delivered(sent.end).await.unwrap();
+            f.chat.record_agent_call(now + 2).await.unwrap();
+            s.scan_once(now + 2).await.unwrap();
+            assert_eq!(
+                f.store.load(&f.task).unwrap().action.status,
+                AutomationActionStatus::Failed
+            );
+            f.chat.read(true).await.unwrap();
+            f.chat.record_agent_call(now + 3).await.unwrap();
+            s.scan_once(now + 3).await.unwrap();
+            let confirmed = f.store.load(&f.task).unwrap();
+            assert_eq!(confirmed.action.status, AutomationActionStatus::Idle);
+            assert!(confirmed.action.last_error.is_none());
+            assert!(confirmed.automatic_retry_at_ms().is_none());
+            assert!(confirmed.action.messages_fenced);
+            assert_eq!(confirmed.chat_mirror.message_ids, vec!["native-read"]);
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(s.queued_count().await, 0);
+            if combined {
+                assert_eq!(
+                    confirmed.goal.unwrap().turn_count,
+                    1,
+                    "Native delivery did not start a new browser turn"
+                );
+            }
+            let directory = f.store.task_directory(&f.task).unwrap();
+            let intent: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join("chat-submission.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(intent["messageIds"], serde_json::json!(["native-read"]));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(directory.join("chat-submission.json"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_delivery_during_browser_preparation_is_successful_without_an_error_banner() {
+    struct ReadsThenFails {
+        chat: Arc<codexify::markdown_chat::ChatFile>,
+    }
+    #[async_trait]
+    impl AutomationExecutor for ReadsThenFails {
+        async fn execute(
+            &self,
+            _: AutomationExecution,
+            _: mpsc::UnboundedSender<CompanionEvent>,
+            _: CancellationToken,
+        ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+            self.chat.read(true).await.unwrap();
+            Err(AutomationExecutionError {
+                message: "ChatGPT did not stop the previous response; the new message was not sent"
+                    .into(),
+                send_accepted: false,
+            })
+        }
+    }
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user(
+            "read-during-stop".into(),
+            "The working agent receives this directly".into(),
+        )
+        .await
+        .unwrap();
+    let s = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(ReadsThenFails {
+            chat: f.chat.clone(),
+        }),
+    );
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    assert!(s.run_next(now + 1).await.unwrap().is_none());
+    let state = f.store.load(&f.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(state.action.last_error.is_none());
+    assert!(state.action.messages_fenced);
+    assert!(state.automatic_retry_at_ms().is_none());
+    assert!(s.live_state(&f.task).await.is_none());
+}
+
+#[tokio::test]
+async fn native_delivery_while_queued_skips_browser_work_and_stale_action_errors() {
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user(
+            "read-while-queued".into(),
+            "No browser submission is necessary".into(),
+        )
+        .await
+        .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    f.supervisor.scan_once(now).await.unwrap();
+    f.chat.read(true).await.unwrap();
+    f.chat.record_agent_call(now + 1).await.unwrap();
+    assert!(f.supervisor.run_next(now + 2).await.unwrap().is_none());
+    let state = f.store.load(&f.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert!(state.action.last_error.is_none());
+    assert!(state.action.messages_fenced);
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_delivery_does_not_reuse_an_older_submission_intent_for_a_new_action() {
+    let f = fixture().await;
+    f.chat.record_agent_call(1_000).await.unwrap();
+    f.chat
+        .append_user("old-intent".into(), "The old batch".into())
+        .await
+        .unwrap();
+    let s = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(PreSendFailureExecutor::default()),
+    );
+    s.register_task(AutomationTaskHandle::new(
+        f.task.clone(),
+        0,
+        f.store.clone(),
+        f.chat.clone(),
+    ))
+    .await
+    .unwrap();
+    let now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    s.scan_once(now).await.unwrap();
+    assert!(s.run_next(now + 1).await.is_err());
+    f.chat.read(true).await.unwrap();
+    f.chat
+        .append_user(
+            "new-unread-intent".into(),
+            "This batch has not been read".into(),
+        )
+        .await
+        .unwrap();
+    let generation = f.store.load(&f.task).unwrap().pairing.generation;
+    f.store
+        .queue_action(
+            &f.task,
+            "new-action-without-submission",
+            codexify::agent_automation::AutomationActionKind::OfflineChat,
+            generation,
+            None,
+            now + 2,
+        )
+        .unwrap();
+    f.store
+        .update_action_status(
+            &f.task,
+            "new-action-without-submission",
+            AutomationActionStatus::Failed,
+            Some("New unread action"),
+            None,
+            now + 3,
+        )
+        .unwrap();
+    f.chat.record_agent_call(now + 4).await.unwrap();
+    s.scan_once(now + 4).await.unwrap();
+    let state = f.store.load(&f.task).unwrap();
+    assert_eq!(state.action.status, AutomationActionStatus::Failed);
+    assert_eq!(
+        state.action.last_error.as_deref(),
+        Some("New unread action")
+    );
+    assert_eq!(
+        f.chat.unread_snapshot().await.unwrap().messages[0].id,
+        "new-unread-intent"
+    );
+}
