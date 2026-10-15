@@ -10,7 +10,7 @@ const origin='http://127.0.0.1:43261';
 const now=Date.parse('2026-10-15T12:00:00+02:00');
 const day=24*60*60*1000;
 
-async function fixture(browser) {
+async function fixture(browser, goalMarkdown='Goal completed: Review and analyze this PR', goalTimestamp=now-30000) {
  const page=await browser.newPage({viewport:{width:1280,height:960},timezoneId:'Europe/Zurich'});
  await page.clock.setFixedTime(new Date(now));page.setDefaultTimeout(6000);
  await page.addInitScript(()=>{
@@ -28,7 +28,7 @@ async function fixture(browser) {
  }));
  const messages=[
   {id:'before',role:'agent',markdown:'Before completion',start:0,end:100,tool_call_count:1,created_at_ms:now-60000},
-  {id:'goal-completed-1-2',role:'goal',markdown:'Goal completed: Review and analyze this PR',start:100,end:100,tool_call_count:11,created_at_ms:now-30000},
+  {id:'goal-completed-1-2',role:'goal',markdown:goalMarkdown,start:100,end:100,tool_call_count:11,created_at_ms:goalTimestamp},
   {id:'after',role:'agent',markdown:'After completion',start:100,end:200,tool_call_count:32,created_at_ms:now-1000},
  ];
  page.on('pageerror',error=>errors.push(error.message));
@@ -60,13 +60,60 @@ async function fixture(browser) {
 }
 
 for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
+ test(`${name}: completed goals stay compact and expand without losing their timeline position`,{timeout:30000},async()=>{
+  const browser=await engine.launch();
+  try {
+   const objective='Survey PHP libraries and implementations for generating CBR/CBZ thumbnails, including source quality, performance, maintenance, relevant GitHub issues, and the newly posted thenamelessthing/comicpreviews implementation; execute representative tests.\n\nCompare **performance** and `CBZ` support.\n\n'+ 'long-unbroken-project-name'.repeat(12);
+   const {page,errors}=await fixture(browser,'Goal completed: '+objective,now-day-30000),host=page.locator('#chat-host'),event=host.locator('.goal-completed-event'),summary=event.locator('summary');
+   await event.waitFor();
+   const capture=async label=>{
+    if(!process.env.CODEXIFY_UI_POLISH_SCREENSHOTS)return;
+    mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});
+    await host.locator('#messages').screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-goal-${label}.png`});
+   };
+   const assertCompact=async()=>{
+    const bounds=await event.boundingBox();assert(bounds.height<=36,'collapsed completion is one compact row');
+    assert(await event.locator('.markdown').isHidden(),'full goal is collapsed by default');
+    const metrics=await event.evaluate(element=>{
+     const box=element.getBoundingClientRect(),stamp=element.querySelector('.receipt').getBoundingClientRect(),label=element.querySelector('.goal-completed-label').getBoundingClientRect();
+     const svg=element.querySelector('svg'),view=svg.viewBox.baseVal;
+     return {fits:stamp.right<=box.right&&stamp.left>=label.right,viewport:[view.x,view.y,view.width,view.height],paths:[...svg.querySelectorAll('path')].map(path=>{const b=path.getBBox();return [b.x,b.y,b.x+b.width,b.y+b.height];})};
+    });
+    assert(metrics.fits,'timestamp never collides with the completion label: '+JSON.stringify(metrics));
+    assert.deepEqual(metrics.viewport,[0,0,24,24]);
+    assert(metrics.paths.every(([x,y,right,bottom])=>x>=1&&y>=1&&right<=23&&bottom<=23),'the complete icon and stroke fit inside the viewport');
+    assert.equal(await page.locator('body').evaluate(body=>body.scrollWidth>innerWidth),false,'no horizontal overflow');
+   };
+   await assertCompact();await capture('desktop');
+   assert.equal(await event.locator('time').getAttribute('datetime'),new Date(now-day-30000).toISOString(),'compact date retains its exact timestamp');
+   assert((await event.locator('time').textContent()).includes('Oct 14'),'historical completion still shows its date');
+   const preview=await event.locator('.goal-completed-preview').evaluate(element=>({width:element.clientWidth,content:element.scrollWidth}));
+   assert(preview.content>preview.width,'long preview stays on one ellipsized line');
+   await summary.focus();await summary.press('Space');assert(await event.locator('.markdown').isVisible());
+   assert((await event.locator('.markdown').textContent()).includes('long-unbroken-project-name'.repeat(12)),'the full objective is available without truncation');
+   assert.equal(await event.locator('.markdown strong').textContent(),'performance');
+   await capture('expanded');
+   const refreshed=page.waitForResponse(response=>response.url().endsWith('/api/chats'));
+   await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await refreshed;
+   assert.equal(await event.getAttribute('open'),'','refresh preserves the disclosure state');
+   await summary.press('Enter');await assertCompact();
+   for(const width of [390,320]){
+    await page.setViewportSize({width,height:960});await capture('mobile-'+width);await assertCompact();
+    await summary.click();assert(await event.locator('.markdown').isVisible());
+    assert.equal(await host.locator('#messages').evaluate(element=>element.scrollWidth>element.clientWidth),false,'expanded long words wrap in narrow layouts');
+    await summary.click();
+   }
+   await page.emulateMedia({colorScheme:'dark'});await assertCompact();await capture('dark-mobile');
+   assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+ });
  test(`${name}: goal timeline, project path editing, inline rename and backdrop dismissal`,{timeout:45000},async()=>{
   const browser=await engine.launch();
   try {
    const {page,chats,errors,operations}=await fixture(browser),host=page.locator('#chat-host');
    const capture=async label=>{if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});await (label.startsWith('compact-header')?host.locator('.header'):page).screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-${label}.png`});}};
    await host.locator('.goal-completed-event').waitFor();
-   assert.deepEqual(await host.locator('#messages > .tool-call-marker, #messages > .goal-completed-event').allTextContents(),['10 tool calls','Goal completed: Review and analyze this PR'+await host.locator('.goal-completed-event .receipt').textContent(),'21 tool calls']);
+   assert.deepEqual(await host.locator('#messages > .tool-call-marker, #messages > .goal-completed-event').evaluateAll(nodes=>nodes.map(node=>node.querySelector('.goal-completed-label')?.textContent||node.textContent)),['10 tool calls','Goal completed','21 tool calls']);
    assert.equal(await host.locator('.goal-completed-event').count(),1);
    assert.equal(await host.locator('.project-path').textContent(),chats[0].projectPath);
    const assertSingleMetadataLine=async()=>{
