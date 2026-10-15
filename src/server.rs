@@ -1393,23 +1393,21 @@ impl ServerHandler for CodexHandler {
                 activity.as_ref(),
                 self.selected_project_root(task_conversation.as_ref()),
             )
-        {
-            if let Ok(chat) = self
+            && let Ok(chat) = self
                 .effective_task_config(task_conversation.as_ref(), root)
                 .and_then(|effective| {
                     self.markdown_chat
                         .chat(&effective, task_conversation.as_ref(), &self.session)
                 })
-                && let Err(error) = chat
-                    .finish_pairing_verification(
-                        &activity.epoch,
-                        activity.sequence,
-                        crate::markdown_chat::now_ms(),
-                    )
-                    .await
-            {
-                tracing::warn!(%error, "could not expire pairing-only chat presence");
-            }
+            && let Err(error) = chat
+                .finish_pairing_verification(
+                    &activity.epoch,
+                    activity.sequence,
+                    crate::markdown_chat::now_ms(),
+                )
+                .await
+        {
+            tracing::warn!(%error, "could not expire pairing-only chat presence");
         }
 
         let mut delivery = None;
