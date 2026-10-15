@@ -1902,7 +1902,7 @@ the existing tab and restore its original URL, even while ChatGPT is responding.
 User drafts remain protected.
 
 Every browser UI operation has a **20-second deadline**. Timeout or cancellation
-aborts the operation, allows at most **2 seconds** for cleanup, and releases
+aborts the operation, allows at most **5 seconds** for cleanup, and releases
 ownership. A driver that ignores cancellation is retired and its browser is
 closed, with a further **2-second** bound on shutdown, so late work cannot mutate
 a tab reused by another action. A possibly accepted Send remains ambiguous and
