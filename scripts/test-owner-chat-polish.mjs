@@ -64,11 +64,16 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
   const browser=await engine.launch();
   try {
    const {page,chats,errors,operations}=await fixture(browser),host=page.locator('#chat-host');
-   const capture=async label=>{if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-${label}.png`});}};
+   const capture=async label=>{if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});await (label.startsWith('compact-header')?host.locator('.header'):page).screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-${label}.png`});}};
    await host.locator('.goal-completed-event').waitFor();
    assert.deepEqual(await host.locator('#messages > .tool-call-marker, #messages > .goal-completed-event').allTextContents(),['10 tool calls','Goal completed: Review and analyze this PR'+await host.locator('.goal-completed-event .receipt').textContent(),'21 tool calls']);
    assert.equal(await host.locator('.goal-completed-event').count(),1);
    assert.equal(await host.locator('.project-path').textContent(),chats[0].projectPath);
+   const assertSingleMetadataLine=async()=>{
+    const metrics=await host.locator('#chat-subtitle').evaluate(element=>({height:element.getBoundingClientRect().height,lineHeight:parseFloat(getComputedStyle(element).lineHeight)}));
+    assert(metrics.height<=metrics.lineHeight+1,'project, date, and path share one metadata line');
+   };
+   await assertSingleMetadataLine();await capture('compact-header');
    await host.locator('#chat-title').click();
    const input=host.getByRole('textbox',{name:'Chat name',exact:true});await input.fill('Renamed inline');await capture('inline-name');await input.press('Enter');
    await host.getByRole('button',{name:'Rename conversation',exact:true}).filter({hasText:'Renamed inline'}).waitFor();
@@ -87,6 +92,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
    await page.getByRole('button',{name:'New chat',exact:true}).click();await page.locator('#new-chat-dialog[open]').waitFor();
    await page.mouse.click(2,2);await page.locator('#new-chat-dialog').waitFor({state:'hidden'});
    await page.setViewportSize({width:390,height:960});
+   await assertSingleMetadataLine();await capture('compact-header-mobile');
    await host.locator('#chat-title').click();await capture('inline-name-mobile');
    assert.equal(await page.locator('body').evaluate(body=>body.scrollWidth>innerWidth),false,'inline naming fits a narrow viewport');
    await input.press('Escape');await page.setViewportSize({width:1280,height:960});

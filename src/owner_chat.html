@@ -207,7 +207,8 @@ input,select,textarea { font:inherit; }
 #rename-form.inline-rename button { font:inherit; padding:4px 7px; }
 #chat-title[role=button] { cursor:text; }
 #chat-title[role=button]:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:3px; }
-.project-path { display:block; overflow-wrap:anywhere; white-space:normal; font-family:ui-monospace,SFMono-Regular,monospace; font-size:11px; }
+.project-path { white-space:nowrap; font-family:ui-monospace,SFMono-Regular,monospace; font-size:11px; }
+.project-path::before { content:" · "; }
 #conversation-project-path { width:100%; padding:10px 11px; border:1px solid var(--connection-line); border-radius:8px; background:var(--connection-wash); color:var(--ink); font:13px ui-monospace,SFMono-Regular,monospace; }
 #rename-form label { display:block; margin-bottom:5px; }
 #rename-form p { color:var(--muted); font-size:12px; margin:5px 0; }
