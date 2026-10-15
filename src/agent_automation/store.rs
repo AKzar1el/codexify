@@ -57,6 +57,10 @@ pub struct GoalRecord {
     pub turn_count: u64,
     #[serde(default)]
     pub completed_chat_end: Option<u64>,
+    // The durable count lives in the timeline journal. Keep automation.json
+    // readable by earlier builds with strict goal-field validation.
+    #[serde(default, skip_serializing)]
+    pub completed_tool_call_count: Option<u64>,
 }
 
 fn initial_goal_turn() -> u64 {
@@ -411,7 +415,7 @@ static PROCESS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceL
 
 impl AgentAutomationStore {
     pub fn for_config(config: &AppConfig) -> Result<Self, String> {
-        let root = crate::memory::memory_dir(config).join("chats");
+        let root = crate::memory::task_state_dir(config).join("chats");
         let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
             .map(|store| store.with_notifications(config))
@@ -704,6 +708,7 @@ impl AgentAutomationStore {
                 timer_until_ms: None,
                 turn_count: 1,
                 completed_chat_end: None,
+                completed_tool_call_count: None,
             };
             state.goal = Some(goal.clone());
             state.goal_wake = GoalWakeState::default();
@@ -914,6 +919,7 @@ impl AgentAutomationStore {
                         timer_until_ms: previous.and_then(|goal| goal.timer_until_ms),
                         turn_count: previous.map_or(1, |goal| goal.turn_count.max(1)),
                         completed_chat_end: None,
+                        completed_tool_call_count: None,
                     };
                     state.goal = Some(goal.clone());
                     state.goal_wake = GoalWakeState::default();
@@ -1009,6 +1015,17 @@ impl AgentAutomationStore {
         finish: GoalFinish,
         now_ms: u64,
     ) -> Result<GoalRecord, String> {
+        self.finish_goal_with_tool_count(task, expected_revision, finish, now_ms, None)
+    }
+
+    pub fn finish_goal_with_tool_count(
+        &self,
+        task: &ConversationIdentity,
+        expected_revision: u64,
+        finish: GoalFinish,
+        now_ms: u64,
+        tool_call_count: Option<u64>,
+    ) -> Result<GoalRecord, String> {
         let normalized = normalize_goal_finish(finish)?;
         let transcript = self.task_directory(task)?.join("CHAT.md");
         self.mutate(task, |state| {
@@ -1026,6 +1043,7 @@ impl AgentAutomationStore {
                         goal.status = GoalStatus::Completed;
                         goal.summary = summary.clone();
                         goal.blocked_reason = None;
+                        goal.completed_tool_call_count = tool_call_count;
                         goal.completed_chat_end = std::fs::metadata(&transcript)
                             .ok()
                             .filter(|metadata| metadata.is_file())
@@ -1036,6 +1054,7 @@ impl AgentAutomationStore {
                         goal.summary = None;
                         goal.blocked_reason = Some(reason.clone());
                         goal.completed_chat_end = None;
+                        goal.completed_tool_call_count = None;
                     }
                 }
                 goal.updated_at_ms = now_ms;

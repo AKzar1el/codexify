@@ -30,6 +30,9 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .conversation-row:hover .conversation-action,.conversation-row:has(:focus-visible) .conversation-action,.conversation-row[data-pinned="true"] .pin-action,.conversation-row[data-archived="true"] .restore-action { opacity:1; pointer-events:auto; }
 .conversation-row[data-pinned="true"] .pin-action path { fill:currentColor; }
 .pinned-divider { border:0; border-top:1px solid var(--line); margin:8px 10px; }
+.recent-heading { display:flex; align-items:center; gap:10px; margin:12px 10px 6px; color:var(--muted); font-size:11px; font-weight:500; }
+.recent-heading::after { content:""; flex:1; border-top:1px solid var(--line); }
+.conversation-row[data-archived="true"] .restore-action .archive-body { fill:currentColor; }
 .conversation-action:hover { color:var(--ink); background:var(--line); }
 .conversation-action:focus-visible,.sidebar-icon:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
 .conversation-action:disabled { opacity:.45; cursor:wait; }
@@ -199,6 +202,13 @@ input,select,textarea { font:inherit; }
 #automation-error { flex:1; min-width:0; overflow-wrap:anywhere; }
 #automation-retry-inline { flex:none; margin:8px 4px; }
 #rename-form { padding:12px 18px; border-bottom:1px solid var(--border); }
+#rename-form.inline-rename { display:inline-flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:0; max-width:100%; padding:0; border:0; font-size:13px; }
+#rename-form.inline-rename input { width:280px; max-width:45vw; min-width:80px; padding:4px 7px; border:1px solid var(--accent); border-radius:6px; color:var(--ink); background:var(--bg); font:inherit; }
+#rename-form.inline-rename button { font:inherit; padding:4px 7px; }
+#chat-title[role=button] { cursor:text; }
+#chat-title[role=button]:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:3px; }
+.project-path { display:block; overflow-wrap:anywhere; white-space:normal; font-family:ui-monospace,SFMono-Regular,monospace; font-size:11px; }
+#conversation-project-path { width:100%; padding:10px 11px; border:1px solid var(--connection-line); border-radius:8px; background:var(--connection-wash); color:var(--ink); font:13px ui-monospace,SFMono-Regular,monospace; }
 #rename-form label { display:block; margin-bottom:5px; }
 #rename-form p { color:var(--muted); font-size:12px; margin:5px 0; }
 #rename-chat svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.7; }
@@ -220,6 +230,8 @@ input,select,textarea { font:inherit; }
   let selected = null, controller = null, chats = [], clockOffset = 0, presenceTimer = null;
   let listMode = "projects", matchedIds = null, matchedQuery = "", searchTimer = null, listRequest = 0, pendingList = null;
   let archiveView = false, lastNormalSelection = null, normalSearch = "", archivedSearch = "";
+  let waitingForPresenceRefresh = false;
+  const lastPresence = new Map();
   const organizing = new Set();
   try { if (localStorage.getItem("owner-chat-list-view-v1") === "recent") listMode = "recent"; } catch {}
   const chatIdPattern = /^[0-9a-f]{64}$/;
@@ -239,6 +251,15 @@ input,select,textarea { font:inherit; }
   try { seen = JSON.parse(localStorage.getItem("owner-chat-seen-v1") || "{}"); } catch {}
 
   function showError(message) { errorNode.hidden = !message; errorNode.textContent = message || ""; }
+  function bindBackdrop(dialog, close = () => dialog.close()) {
+    let pressedOutside = false;
+    const outside = event => {
+      const box = dialog.getBoundingClientRect();
+      return event.target === dialog && (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom);
+    };
+    dialog.addEventListener("pointerdown", event => { pressedOutside = outside(event); });
+    dialog.addEventListener("click", event => { if (pressedOutside && outside(event)) close(); pressedOutside = false; });
+  }
   for (const kind of ["dragover","drop"]) document.addEventListener(kind,event=>{
     if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
     event.preventDefault();
@@ -363,6 +384,16 @@ input,select,textarea { font:inherit; }
       <dialog id="automation-settings" hidden aria-labelledby="conversation-settings-heading" aria-describedby="conversation-settings-name">
         <div class="connection-settings-header"><div class="connection-settings-heading"><h2 id="conversation-settings-heading">Conversation settings</h2><p id="conversation-settings-name">This conversation</p></div><button type="button" id="automation-settings-close" aria-label="Close connection settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
         <div class="connection-settings-body">
+          <section class="connection-settings-card" aria-labelledby="connection-project-heading">
+            <div class="connection-card-heading"><h3 id="connection-project-heading">Project</h3></div>
+            <form id="conversation-project-form" class="connection-card-content">
+              <label class="automation-field" for="conversation-project-path">Full project path</label>
+              <input id="conversation-project-path" autocomplete="off" spellcheck="false" required>
+              <p class="connection-card-copy">Changing the path keeps this conversation and its history. The agent will load the new workspace before continuing.</p>
+              <div class="automation-actions"><button type="submit" id="conversation-project-save">Save project path</button></div>
+              <p id="conversation-project-error" role="alert" hidden></p>
+            </form>
+          </section>
           <section class="connection-settings-card" aria-labelledby="connection-browser-heading">
             <div class="connection-card-heading"><h3 id="connection-browser-heading">Browser connection</h3><p id="companion-status" class="connection-state" role="status"></p></div>
             <div class="connection-card-content"><p class="connection-card-copy">Manage the ChatGPT browser session used to send messages.</p><div class="automation-actions"><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div></div>
@@ -637,13 +668,34 @@ input,select,textarea { font:inherit; }
     }
     const settingsDialog = byId("automation-settings");
     const showSettings = visible => {
-      if (visible) { settingsDialog.hidden = false; if (!settingsDialog.open) settingsDialog.showModal(); }
+      if (visible) {
+        if (!settingsDialog.open) {
+          const path = chats.find(chat => chat.id === id)?.projectPath || "";
+          byId("conversation-project-path").value = byId("conversation-project-path").dataset.savedPath = path;
+          byId("conversation-project-error").hidden = true;
+        }
+        settingsDialog.hidden = false; if (!settingsDialog.open) settingsDialog.showModal();
+      }
       else { const wasOpen = settingsDialog.open; if (wasOpen) settingsDialog.close(); settingsDialog.hidden = true; if (wasOpen && !closed && !settingsToggle.hidden) settingsToggle.focus(); }
       settingsToggle.setAttribute("aria-expanded", String(visible));
       byId("goal-editor").hidden = byId("pairing-editor").hidden = true;
     };
     settingsDialog.addEventListener("close", () => { if (!settingsDialog.open) { settingsDialog.hidden = true; settingsToggle.setAttribute("aria-expanded", "false"); } });
     settingsDialog.addEventListener("cancel", event => { event.preventDefault(); showSettings(false); });
+    bindBackdrop(settingsDialog, () => showSettings(false));
+    byId("conversation-project-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const chat = chats.find(chat => chat.id === id), input = byId("conversation-project-path"), save = byId("conversation-project-save"), error = byId("conversation-project-error");
+      save.disabled = true; error.hidden = true;
+      try {
+        const payload = await (await api(`/api/chats/${id}/project`, { method:"POST", body:JSON.stringify({ path:input.value.trim(), expectedPath:input.dataset.savedPath || chat?.projectPath }) })).json();
+        if (closed) return;
+        if (chat) Object.assign(chat,payload);
+        input.value = payload.projectPath; input.dataset.savedPath = payload.projectPath;
+        renderList(); void refresh();
+      } catch (failure) { error.textContent = failure.message; error.hidden = false; }
+      finally { save.disabled = false; }
+    });
     settingsDialog.addEventListener("keydown", event => {
       if (event.key !== "Tab" || event.ctrlKey || event.metaKey || event.altKey) return;
       const focusable = [...settingsDialog.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]')].filter(node => node.getClientRects().length);
@@ -692,6 +744,14 @@ input,select,textarea { font:inherit; }
     byId("automation-add-goal").addEventListener("click", editGoal);
     byId("automation-edit-goal").addEventListener("click", editGoal);
     byId("goal-editor-close").addEventListener("click", () => { byId("goal-editor").hidden = true; });
+    const dismissEditors = event => {
+      const path = event.composedPath();
+      for (const name of ["goal-editor","pairing-editor"]) {
+        const editor = byId(name);
+        if (!editor.hidden && !path.includes(editor)) editor.hidden = true;
+      }
+    };
+    document.addEventListener("pointerdown",dismissEditors);
     nodes.model.addEventListener("change", () => {
       selectionDraft = { model:nodes.model.value, effort:null };
       renderEfforts(null); selectionDraft.effort = nodes.effort.value; void saveSelection();
@@ -722,11 +782,11 @@ input,select,textarea { font:inherit; }
     void refreshState();
     timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
     const metricsTimer = setInterval(() => { if (!document.hidden) updateGoalMetrics(); }, 1000);
-    return { close() { closed = true; showSettings(false); clearInterval(timer); clearInterval(metricsTimer); } };
+    return { close() { closed = true; showSettings(false); clearInterval(timer); clearInterval(metricsTimer); document.removeEventListener("pointerdown",dismissEditors); } };
   }
   function conversationDetail(chat) {
     const date = chat.lastEntryAtMs ? new Date(chat.lastEntryAtMs).toLocaleString() : "No messages";
-    return `${chat.workspace} · ${date}`;
+    return `${chat.isScratch ? "Scratch conversation" : chat.workspace} · ${date}`;
   }
   function updateSelectedHeader() {
     const chat = chats.find(chat => chat.id === selected);
@@ -736,7 +796,13 @@ input,select,textarea { font:inherit; }
     title.textContent = title.title = chat.title;
     const settingsName = scope.getElementById("conversation-settings-name");
     if (settingsName) settingsName.textContent = settingsName.title = chat.title;
-    subtitle.textContent = subtitle.title = conversationDetail(chat);
+    subtitle.replaceChildren(textNode("span", "", conversationDetail(chat)));
+    if (chat.projectPath && !chat.isScratch) subtitle.append(textNode("span", "project-path", chat.projectPath));
+    subtitle.title = chat.projectPath || conversationDetail(chat);
+    const pathInput = scope.getElementById("conversation-project-path");
+    if (pathInput && (!pathInput.dataset.savedPath || pathInput.value === pathInput.dataset.savedPath)) {
+      pathInput.value = pathInput.dataset.savedPath = chat.projectPath || "";
+    }
     const draft = scope.getElementById("draft");
     if (draft && !draft.disabled) draft.placeholder = chat.archivedAtMs != null ? "Message the agent (it will unarchive this chat)…" : "Message the agent…";
   }
@@ -748,17 +814,30 @@ input,select,textarea { font:inherit; }
     const pinned = visible.filter(chat => chat.pinnedAtMs != null).sort((a,b) => b.pinnedAtMs - a.pinnedAtMs || byDate(a,b));
     const groups = new Map();
     for (const chat of visible.filter(chat => chat.pinnedAtMs == null).sort(byDate)) {
-      const key = listMode === "projects" ? (chat.projectId || chat.projectPath || chat.workspace) : "recent";
-      if (!groups.has(key)) groups.set(key, { heading:listMode === "projects" ? chat.workspace : null, title:chat.projectPath || chat.workspace, chats:[] });
+      const key = listMode === "projects" ? (chat.projectId || chat.projectPath || chat.workspace) : recentPeriod(chat.lastEntryAtMs, Date.now() + clockOffset);
+      if (!groups.has(key)) groups.set(key, { heading:listMode === "projects" ? (chat.isScratch ? "Scratch conversation" : chat.workspace) : key, title:listMode === "projects" ? (chat.projectPath || chat.workspace) : key, chats:[] });
       groups.get(key).chats.push(chat);
     }
     return [...(pinned.length ? [{ heading:"Pinned", chats:pinned }] : []), ...groups.values()];
+  }
+  function recentPeriod(timestamp, now) {
+    const today = new Date(now); today.setHours(0,0,0,0);
+    const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+    const week = new Date(today); week.setDate(today.getDate() - (today.getDay() + 6) % 7);
+    const lastWeek = new Date(week); lastWeek.setDate(week.getDate() - 7);
+    const month = new Date(today); month.setDate(1); month.setMonth(month.getMonth() - 1);
+    const lastMonth = new Date(month); lastMonth.setDate(Math.min(today.getDate(),new Date(month.getFullYear(),month.getMonth() + 1,0).getDate()));
+    return timestamp >= today ? "Today" : timestamp >= yesterday ? "Yesterday" : timestamp >= week ? "This week" : timestamp >= lastWeek ? "Last week" : timestamp >= lastMonth ? "Last month" : "Older";
   }
   function organizationIcon(kind) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true");
     const path = document.createElementNS(svg.namespaceURI, "path");
-    path.setAttribute("d", kind === "pin" ? "M12 17v5M9 9V4h6v5l3 3v3H6v-3Z" : kind === "restore" ? "M3 3h18v4H3zM5 7v14h14V7m-10 7 3-3 3 3m-3-3v7" : "M3 3h18v4H3zM5 7v14h14V7M10 11h4");
+    path.setAttribute("d", kind === "pin" ? "M12 17v5M9 9V4h6v5l3 3v3H6v-3Z" : kind === "restore" ? "M3 3h18v4H3zM5 7v14h14V7Z" : "M3 3h18v4H3zM5 7v14h14V7M10 11h4");
+    if (kind === "restore") {
+      path.classList.add("archive-body");
+      const arrow = document.createElementNS(svg.namespaceURI,"path"); arrow.setAttribute("d","m9 14 3-3 3 3m-3-3v7"); arrow.setAttribute("stroke","var(--panel)"); svg.append(path,arrow); return svg;
+    }
     svg.append(path); return svg;
   }
   async function organize(chat, operation) {
@@ -802,9 +881,10 @@ input,select,textarea { font:inherit; }
     renderList(); void refresh();
   }
   function renderList() {
+    clearTimeout(presenceTimer);
+    if (document.hidden) return;
     updateSelectedHeader();
     const now = Date.now() + clockOffset;
-    clearTimeout(presenceTimer);
     const next = chats.flatMap(chat => [chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, ...[180000,300000].map(age => chat.lastAgentCallAtMs + age)].map(deadline => deadline - now)).filter(delay => Number.isFinite(delay) && delay > 0);
     if (!document.hidden && next.length) presenceTimer = setTimeout(renderList, Math.max(1, Math.min(...next)));
     const focused = document.activeElement;
@@ -826,11 +906,11 @@ input,select,textarea { font:inherit; }
     const groups = chatGroups();
     if (!groups.some(group => group.chats.length)) list.append(textNode("p", "list-empty", query ? "No matching chats." : archiveView ? "No archived chats." : "No persisted conversations yet."));
     for (const [groupIndex,group] of groups.entries()) {
-      if (!archiveView && listMode === "recent" && groupIndex > 0 && groups[0].heading === "Pinned") {
+      if (!archiveView && listMode === "recent" && groupIndex === 1 && groups[0].heading === "Pinned") {
         const separator = document.createElement("hr"); separator.className = "pinned-divider"; separator.setAttribute("aria-hidden", "true"); list.append(separator);
       }
       if (group.heading) {
-        const heading = textNode("h2", "project-heading", group.heading);
+        const heading = textNode("h2", !archiveView && listMode === "recent" ? "recent-heading" : "project-heading", group.heading);
         heading.title = group.title || group.heading;
         list.append(heading);
       }
@@ -844,7 +924,8 @@ input,select,textarea { font:inherit; }
       button.setAttribute("aria-current", String(chat.id === selected));
       button.title = `${chat.title} · ${chat.workspace}`;
       button.addEventListener("click", () => select(chat.id));
-      const state = sidebarState(chat, now);
+      const state = waitingForPresenceRefresh && lastPresence.has(chat.id) ? lastPresence.get(chat.id) : sidebarState(chat, now);
+      lastPresence.set(chat.id,state);
       const icon = textNode("span", `presence ${state}`, "");
       if (state === "goal-running" || state === "online") icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
       icon.append(presenceIcon(state));
@@ -904,15 +985,19 @@ input,select,textarea { font:inherit; }
     rename.setAttribute("aria-label", "Rename chat"); rename.title = "Rename chat";
     rename.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16 12-12 4 4-12 12H4ZM14 6l4 4"/></svg>`;
     scope.querySelector(".header-actions").prepend(rename);
-    const renameForm = document.createElement("form"); renameForm.id = "rename-form"; renameForm.hidden = true;
-    renameForm.innerHTML = `<label for="chat-name">Chat name</label><input id="chat-name" maxlength="200" autocomplete="off"><p>Leave empty to show the latest message.</p><div class="automation-actions"><button type="submit">Save name</button><button type="button" id="cancel-rename">Cancel</button></div><p id="rename-error" role="alert" hidden></p>`;
-    scope.querySelector(".header").after(renameForm);
-    rename.addEventListener("click", () => {
-      renameForm.hidden = false;
-      scope.querySelector("#chat-name").value = chats.find(chat => chat.id === id)?.customTitle || "";
-      scope.querySelector("#chat-name").focus();
-    });
-    scope.querySelector("#cancel-rename").addEventListener("click", () => { renameForm.hidden = true; });
+    const title = scope.getElementById("chat-title"); title.tabIndex = 0; title.setAttribute("role","button"); title.setAttribute("aria-label","Rename conversation");
+    const renameForm = document.createElement("form"); renameForm.id = "rename-form"; renameForm.className = "inline-rename"; renameForm.hidden = true;
+    renameForm.innerHTML = `<input id="chat-name" aria-label="Chat name" maxlength="200" autocomplete="off" title="Leave empty to show the latest message"><button type="submit">Save name</button><button type="button" id="cancel-rename">Cancel</button><span id="rename-error" role="alert" hidden></span>`;
+    title.after(renameForm);
+    const closeRename = () => { renameForm.hidden = true; title.hidden = false; title.focus(); };
+    const openRename = () => {
+      title.hidden = true; renameForm.hidden = false;
+      const input = scope.querySelector("#chat-name"); input.value = chats.find(chat => chat.id === id)?.title || ""; input.focus(); input.select();
+    };
+    rename.addEventListener("click",openRename); title.addEventListener("click",openRename);
+    title.addEventListener("keydown",event=>{ if(event.key === "Enter" || event.key === " ") { event.preventDefault(); openRename(); } });
+    renameForm.addEventListener("keydown",event=>{if(event.key === "Escape"){event.preventDefault();closeRename();}});
+    scope.querySelector("#cancel-rename").addEventListener("click",closeRename);
     renameForm.addEventListener("submit", async event => {
       event.preventDefault();
       const submit = renameForm.querySelector('[type="submit"]'); submit.disabled = true;
@@ -921,7 +1006,7 @@ input,select,textarea { font:inherit; }
         const payload = await (await api(`/api/chats/${id}/title`, { method:"POST", body:JSON.stringify({ title:scope.querySelector("#chat-name").value }) })).json();
         const chat = chats.find(chat => chat.id === id);
         if (chat) Object.assign(chat, payload);
-        renameForm.hidden = true;
+        closeRename();
         renderList(); void refresh();
       } catch (failure) { error.textContent = failure.message; error.hidden = false; }
       finally { submit.disabled = false; }
@@ -1026,6 +1111,7 @@ input,select,textarea { font:inherit; }
       chats = payload.chats || [];
       matchedQuery = query; matchedIds = new Set(payload.matchedChatIds || []);
       if (Number.isSafeInteger(payload.serverTimeMs)) clockOffset = payload.serverTimeMs - Date.now();
+      waitingForPresenceRefresh = false;
       showError("");
       selectFromUrl();
       renderList();
@@ -1137,7 +1223,8 @@ input,select,textarea { font:inherit; }
     }catch(error){newError(error.message);}
     finally{newBusy=false;newReady();}
   });
-  startGlobalSettings({api,onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
+  bindBackdrop(newDialog, () => { if (!newBusy) newDialog.close(); });
+  startGlobalSettings({api,bindBackdrop,onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
   search.addEventListener("input", () => {
     clearTimeout(searchTimer); ++listRequest; pendingList = null; renderList();
     searchTimer = setTimeout(refresh, 200);
@@ -1150,8 +1237,8 @@ input,select,textarea { font:inherit; }
     renderList();
   });
   window.addEventListener("popstate", selectFromUrl);
-  window.addEventListener("focus", () => { renderList(); void refresh(); });
-  document.addEventListener("visibilitychange", () => { renderList(); if (!document.hidden) void refresh(); });
+  window.addEventListener("focus", () => { void refresh(); });
+  document.addEventListener("visibilitychange", () => { waitingForPresenceRefresh = true; clearTimeout(presenceTimer); if (!document.hidden) void refresh(); });
   window.addEventListener("storage", event => {
     if (event.key === "owner-chat-seen-v1") {
       try { seen = JSON.parse(event.newValue || "{}"); } catch {}

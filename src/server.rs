@@ -130,6 +130,27 @@ pub struct CodexHandler {
 }
 
 impl CodexHandler {
+    fn effective_task_config(
+        &self,
+        task: Option<&ConversationIdentity>,
+        root: PathBuf,
+    ) -> Result<AppConfig, String> {
+        let mut effective = if self.config.multi_project
+            && let Some(task) = task
+        {
+            self.project_bindings.effective_config(&self.config, task)?
+        } else {
+            self.config.as_ref().clone()
+        };
+        if self.config.multi_project && task.is_some() && effective.work_dir != root {
+            return Err(
+                "The conversation workspace changed; call get_agent_brief before continuing."
+                    .into(),
+            );
+        }
+        effective.work_dir = root;
+        Ok(effective)
+    }
     async fn ticket_rejection(
         &self,
         error: String,
@@ -143,8 +164,10 @@ impl CodexHandler {
                 .is_none()
             && let Some(root) = self.selected_project_root(task_conversation)
         {
-            let mut config = self.config.as_ref().clone();
-            config.work_dir = root;
+            let config = match self.effective_task_config(task_conversation, root) {
+                Ok(config) => config,
+                Err(_) => return ToolResult::error(error),
+            };
             let warning = match self
                 .markdown_chat
                 .chat(&config, task_conversation, &self.session)
@@ -187,8 +210,9 @@ impl CodexHandler {
         clear_waiting: bool,
     ) {
         if let Some(root) = self.selected_project_root(task_conversation) {
-            let mut effective = self.config.as_ref().clone();
-            effective.work_dir = root;
+            let Ok(effective) = self.effective_task_config(task_conversation, root) else {
+                return;
+            };
             if let Ok(chat) = self
                 .markdown_chat
                 .chat(&effective, task_conversation, &self.session)
@@ -1137,9 +1161,7 @@ impl ServerHandler for CodexHandler {
                             return Err(change.notice(root.as_deref()));
                         }
                         let root = root.as_ref().ok_or_else(|| "No workspace is selected. Leave the setup project picker open for the user. A greeting is not consent to scratch. Use chat_await to wait for selection; do not pick a project merely to enable chat_write.".to_string())?;
-                        let mut effective = self.config.as_ref().clone();
-                        effective.work_dir = root.clone();
-                        Ok(effective)
+                        self.effective_task_config(task_conversation.as_ref(), root.clone())
                     })
                         };
                         match resolved {
@@ -1372,11 +1394,12 @@ impl ServerHandler for CodexHandler {
                 self.selected_project_root(task_conversation.as_ref()),
             )
         {
-            let mut effective = self.config.as_ref().clone();
-            effective.work_dir = root;
-            if let Ok(chat) =
-                self.markdown_chat
-                    .chat(&effective, task_conversation.as_ref(), &self.session)
+            if let Ok(chat) = self
+                .effective_task_config(task_conversation.as_ref(), root)
+                .and_then(|effective| {
+                    self.markdown_chat
+                        .chat(&effective, task_conversation.as_ref(), &self.session)
+                })
                 && let Err(error) = chat
                     .finish_pairing_verification(
                         &activity.epoch,
@@ -1409,11 +1432,12 @@ impl ServerHandler for CodexHandler {
                 .is_none()
             && let Some(root) = chat_delivery_root
         {
-            let mut effective = self.config.as_ref().clone();
-            effective.work_dir = root;
-            let chat =
-                self.markdown_chat
-                    .chat(&effective, task_conversation.as_ref(), &self.session);
+            let chat = self
+                .effective_task_config(task_conversation.as_ref(), root)
+                .and_then(|effective| {
+                    self.markdown_chat
+                        .chat(&effective, task_conversation.as_ref(), &self.session)
+                });
             let stop_requested = match &chat {
                 Ok(chat) => chat.agent_stop_requested().await.unwrap_or(false),
                 Err(_) => false,

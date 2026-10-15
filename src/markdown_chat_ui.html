@@ -49,6 +49,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 @media (prefers-color-scheme:dark) { :root:not([data-theme="light"]) .warning-banner { background:#473a19; color:#ffe6a0; border-color:#96742b; } }
 .warning-banner .markdown p { margin:0; }
 .tool-call-marker { align-self:center; margin:-7px 0; padding:0 6px; color:var(--muted); font-size:10px; line-height:1.25; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.goal-completed-event { display:flex; align-self:center; align-items:center; gap:7px; max-width:100%; padding:6px 10px; color:var(--accent); font-size:12px; }
+.goal-completed-event .markdown { min-width:0; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.goal-completed-event .markdown p { margin:0; }
+.goal-completed-event svg { width:17px; height:17px; flex:none; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.goal-completed-event .receipt { white-space:nowrap; font-size:10px; color:var(--muted); }
 .author { font-size:11px; font-weight:650; margin-bottom:3px; color:var(--muted); }
 .markdown { overflow-wrap:anywhere; min-width:0; }
 .markdown p { margin:0 0 7px; white-space:pre-wrap; }
@@ -156,6 +161,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let refreshing = false, sending = false, loadingOlder = false, visible = true;
   let revision = null, before = null, hasMore = false, delivered = 0, readThrough = 0, chatFile = null, failures = 0, snapshotEnd = 0;
   let lastAgentCall = null, totalToolCalls = null, clockOffset = 0, presenceTimer = null;
+  let waitingForPresenceRefresh = false;
   let agentWaitingUntil = null, agentPresenceUntil = null, waitingReplyEnd = 0;
   let agentStopped = false, stopping = false, stopRequestId = null;
   let messageClockTimer = null;
@@ -336,6 +342,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   function updatePresence() {
     clearTimeout(presenceTimer);
+    if (document.hidden || waitingForPresenceRefresh) return;
     const { state, label, delay } = stopping ? { state:"online", label:"online", delay:null } : presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil);
     const node = el("presence");
     const changed = node.dataset.state !== state, waiting = state === "waiting";
@@ -485,7 +492,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function render() {
     if (tornDown) return;
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 50;
-    const messages = [...records.values()].sort((a, b) => a.start - b.start).concat([...pendingSends.values()].filter(message => chatFile && message.chat_file === chatFile));
+    const messages = [...records.values()].sort((a, b) => a.start - b.start || Number(b.role === "goal") - Number(a.role === "goal")).concat([...pendingSends.values()].filter(message => chatFile && message.chat_file === chatFile));
     el("empty").hidden = messages.length > 0;
     if (!messages.length && chatFile) el("empty").textContent = "Messages here stay in this conversation. Send an instruction to the agent below.";
     let previousNode = el("empty");
@@ -508,14 +515,17 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       latestMessageId = current === null ? null : message.id;
       let node = nodes.get(message.id);
       if (!node) {
-        node = make(message.role === "warning" ? "div" : "article", message.role === "warning" ? "warning-banner" : "message " + message.role); node.dataset.messageId = message.id;
+        node = make(message.role === "warning" || message.role === "goal" ? "div" : "article", message.role === "goal" ? "goal-completed-event" : message.role === "warning" ? "warning-banner" : "message " + message.role); node.dataset.messageId = message.id;
         if (message.role === "warning") {
           node.setAttribute("role", "alert");
           node.append(make("div", "markdown"), make("div", "receipt"));
+        } else if (message.role === "goal") {
+          node.append(icon(["M22 12a10 10 0 1 1-10-10","M17 12a5 5 0 1 1-5-5","M22 2 12 12m0-5v5h5"]),make("div","markdown"),make("div","receipt"));
+          node.setAttribute("role","status"); node.title = message.markdown;
         } else {
           node.append(make("div", "author", message.role === "user" ? "You" : "Agent"), make("div", "markdown"), make("div", "message-attachments"), make("div", "receipt"));
         }
-        if (canCopyMessage) {
+        if (canCopyMessage && message.role !== "goal") {
           node.classList.add("copy-enabled");
           const tools = make("div", "message-tools");
           const copy = make("button", "message-copy");
@@ -532,7 +542,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       if (node._markdown !== message.markdown || node._generation !== generation) {
         const body = node.querySelector(".markdown"); body.replaceChildren(); markdown(body, message.markdown); node._markdown = message.markdown; node._generation = generation;
       }
-      if (message.role !== "warning") {
+      if (message.role !== "warning" && message.role !== "goal") {
         const files=node.querySelector(".message-attachments");
         if (attachments) attachments.renderMessage(files,message.attachments);
         else files.hidden=true;
@@ -583,6 +593,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       pageRetired = page.retired === true;
       updateToolTotal();
       if (Number.isSafeInteger(page.server_time_ms)) clockOffset = page.server_time_ms - Date.now();
+      waitingForPresenceRefresh = false;
       updatePresence();
       syncReadOnly();
     }
@@ -590,7 +601,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (!page.unchanged) {
       const gap = !history && snapshotEnd > 0 && page.has_more && page.messages?.[0]?.start > snapshotEnd;
       for (const message of page.messages || []) {
-        if (!Number.isSafeInteger(message.start) || !Number.isSafeInteger(message.end) || typeof message.id !== "string" || typeof message.markdown !== "string" || !["user", "agent", "warning"].includes(message.role) || (message.tool_call_count != null && (!Number.isSafeInteger(message.tool_call_count) || message.tool_call_count < 0))) throw new Error("Invalid chat message from connector.");
+        if (!Number.isSafeInteger(message.start) || !Number.isSafeInteger(message.end) || typeof message.id !== "string" || typeof message.markdown !== "string" || !["user", "agent", "warning", "goal"].includes(message.role) || (message.tool_call_count != null && (!Number.isSafeInteger(message.tool_call_count) || message.tool_call_count < 0))) throw new Error("Invalid chat message from connector.");
         const previous = records.get(message.id);
         if (!previous || message.end >= previous.end) records.set(message.id, message);
         pendingSends.delete(message.id);
@@ -693,6 +704,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       pendingSends.delete(message.id);
       if (!currentGeneration(origin)) return;
       agentStopped = false;
+      waitingForPresenceRefresh = false;
       if (payload.sent.end > readThrough) {
         waitingReplyEnd = Math.max(waitingReplyEnd, payload.sent.end);
         agentWaitingUntil = null;
@@ -787,8 +799,8 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       revision = null; void refresh();
     }
   }
-  function onFocus() { render(); void refresh(); }
-  function onVisibility() { updatePresence(); render(); schedule(); if (!document.hidden) void refresh(); }
+  function onFocus() { void refresh(); }
+  function onVisibility() { waitingForPresenceRefresh = true; clearTimeout(presenceTimer); render(); schedule(); if (!document.hidden) void refresh(); }
   window.addEventListener("message", onMessage);
   window.addEventListener("openai:set_globals", onGlobals);
   window.addEventListener("focus", onFocus);

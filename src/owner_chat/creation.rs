@@ -167,6 +167,7 @@ fn located_chat(chat: &crate::markdown_chat::ChatFile) -> LocatedChat {
         path,
         work_dir: None,
         workspace: String::new(),
+        is_scratch: false,
     }
 }
 
@@ -408,7 +409,7 @@ pub(super) async fn retry_creation(
     Json(_body): Json<OwnerMutationBody>,
 ) -> ApiResult {
     let _guard = state.creation_lock.lock().await;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let saved = context.store.load(&context.task).map_err(internal_error)?;
     if !saved.pairing.creating_chat || saved.action.send_accepted != Some(false) {
@@ -613,7 +614,7 @@ mod tests {
                     std::fs::canonicalize(state.config.work_dir.join("repo")).unwrap()
                 );
             }
-            let located = selected(&state.config, created["id"].as_str().unwrap()).unwrap();
+            let located = selected(&state, created["id"].as_str().unwrap()).unwrap();
             let context = automation_context(&state, &located).await.unwrap();
             assert_eq!(
                 context.owner_generation, 1,

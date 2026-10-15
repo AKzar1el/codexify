@@ -886,6 +886,8 @@ pub struct AppConfig {
     /// The selected global configuration file; effective project configs retain it.
     pub loaded_config_path: Option<std::path::PathBuf>,
     pub work_dir: std::path::PathBuf,
+    /// Internal anchor preserving task history when its owner changes workspace.
+    pub task_state_root: Option<std::path::PathBuf>,
     /// Expose bounded operational timing metadata to MCP App widgets.
     pub debug: bool,
     /// Advertise and serve Codexify's built-in MCP App widgets.

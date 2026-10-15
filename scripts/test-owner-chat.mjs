@@ -818,7 +818,8 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
     const assertHeaderMatchesSidebar = async () => {
       const row = page.locator('.conversation[aria-current="true"]');
       assert.equal(await panel.locator("#chat-title").textContent(), await row.locator(".conversation-title").textContent());
-      assert.equal(await panel.locator("#chat-subtitle").textContent(), await row.locator(".conversation-detail").textContent());
+      assert.equal(await panel.locator("#chat-subtitle > span").first().textContent(), await row.locator(".conversation-detail").textContent());
+      assert.equal(await panel.locator("#chat-subtitle .project-path").textContent(), chats[0].projectPath);
     };
     await assertHeaderMatchesSidebar();
     await panel.getByRole("button", { name:"Rename chat" }).click();

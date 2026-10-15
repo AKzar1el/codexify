@@ -947,6 +947,7 @@ fn resolve_mcp_servers_from(
 pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
     AppConfig {
         loaded_config_path: None,
+        task_state_root: None,
         project_clone_dir: work_dir.clone(),
         work_dir,
         debug: false,
@@ -1787,6 +1788,7 @@ fn load_config_with_announcements(
     }
     let config = AppConfig {
         loaded_config_path: select_config_path(cli)?.path,
+        task_state_root: None,
         work_dir,
         debug: file.debug.unwrap_or(false),
         ui_widgets: file.ui_widgets.unwrap_or(true),

@@ -169,6 +169,8 @@ struct StoredProjectBinding {
     version: u32,
     access_root: String,
     project_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_root: Option<String>,
     #[serde(default)]
     source_project_root: Option<String>,
     #[serde(default)]
@@ -195,6 +197,7 @@ struct StoredWithoutProjectBinding {
 struct ResolvedProjectBinding {
     source_project_root: PathBuf,
     project_root: PathBuf,
+    state_root: Option<PathBuf>,
     repository_url: Option<String>,
     managed_worktree: bool,
     worktree_git_root: Option<PathBuf>,
@@ -307,6 +310,13 @@ impl ProjectBindingStore {
         &self.base_dir
     }
 
+    pub(crate) fn is_scratch_root(&self, path: &Path) -> bool {
+        let scratch =
+            std::fs::canonicalize(&self.scratch_dir).unwrap_or_else(|_| self.scratch_dir.clone());
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        path != scratch && path.starts_with(scratch)
+    }
+
     pub fn effective_config(
         &self,
         config: &AppConfig,
@@ -333,6 +343,7 @@ impl ProjectBindingStore {
 
         let mut effective = config.clone();
         effective.work_dir = binding.project_root;
+        effective.task_state_root = binding.state_root;
         Ok(effective)
     }
 
@@ -494,6 +505,7 @@ impl ProjectBindingStore {
         );
         let stored = StoredProjectBinding {
             version: BINDING_VERSION,
+            state_root: None,
             access_root: access_root.to_string_lossy().into_owned(),
             source_project_root: Some(source_project_root.to_string_lossy().into_owned()),
             project_root: resolved.project_root.to_string_lossy().into_owned(),
@@ -641,6 +653,7 @@ impl ProjectBindingStore {
             if let Some(binding) = project {
                 let stored = StoredProjectBinding {
                     version: BINDING_VERSION,
+                    state_root: None,
                     access_root: access_root.to_string_lossy().into_owned(),
                     source_project_root: Some(
                         binding.source_project_root.to_string_lossy().into_owned(),
@@ -995,6 +1008,21 @@ impl ProjectBindingStore {
                     path.display()
                 )
             })?;
+        let state_root = binding
+            .state_root
+            .as_deref()
+            .map(|root| {
+                canonical_binding_dir(
+                    root,
+                    "conversation state",
+                    path,
+                    "Restore the saved conversation state directory.",
+                )?;
+                // Chat IDs include the absolute transcript path. Validate its
+                // destination without rewriting an existing symlink spelling.
+                Ok::<_, String>(PathBuf::from(root))
+            })
+            .transpose()?;
         if !binding.managed_worktree {
             if project_root != source_project_root {
                 if let Some(root) = binding.worktree_git_root.as_deref() {
@@ -1011,6 +1039,7 @@ impl ProjectBindingStore {
                     )?;
                     return Ok(Some(ResolvedProjectBinding {
                         source_project_root,
+                        state_root: state_root.clone(),
                         project_root,
                         repository_url,
                         managed_worktree: false,
@@ -1025,6 +1054,7 @@ impl ProjectBindingStore {
             }
             return Ok(Some(ResolvedProjectBinding {
                 source_project_root,
+                state_root: state_root.clone(),
                 project_root,
                 repository_url,
                 managed_worktree: false,
@@ -1112,6 +1142,7 @@ impl ProjectBindingStore {
 
         Ok(Some(ResolvedProjectBinding {
             source_project_root,
+            state_root: state_root.clone(),
             project_root,
             repository_url,
             managed_worktree: true,
@@ -1374,6 +1405,7 @@ fn resolved_from_managed(
 ) -> ResolvedProjectBinding {
     match managed {
         Some(worktree) => ResolvedProjectBinding {
+            state_root: None,
             source_project_root: source_project_root.to_path_buf(),
             project_root: worktree.project_root.clone(),
             repository_url,
@@ -1382,6 +1414,7 @@ fn resolved_from_managed(
             worktrees_root: Some(worktree.worktrees_root.clone()),
         },
         None => ResolvedProjectBinding {
+            state_root: None,
             source_project_root: source_project_root.to_path_buf(),
             project_root: source_project_root.to_path_buf(),
             repository_url,
@@ -1680,6 +1713,7 @@ mod tests {
             &legacy_path,
             serde_json::to_vec_pretty(&StoredProjectBinding {
                 version: BINDING_VERSION,
+                state_root: None,
                 access_root: access_root.to_string_lossy().into_owned(),
                 project_root: project.to_string_lossy().into_owned(),
                 source_project_root: Some(project.to_string_lossy().into_owned()),

@@ -361,7 +361,7 @@ impl MarkdownChatStore {
             return Err("Markdown chat is disabled in the server configuration.".into());
         }
         let owner = self.owner(conversation, session);
-        let path = crate::memory::memory_dir(config)
+        let path = crate::memory::task_state_dir(config)
             .join("chats")
             .join(owner)
             .join("CHAT.md");

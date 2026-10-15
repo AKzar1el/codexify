@@ -370,6 +370,7 @@ struct LocatedChat {
     state_root: PathBuf,
     work_dir: Option<PathBuf>,
     workspace: String,
+    is_scratch: bool,
 }
 
 fn state_roots(config: &AppConfig) -> Vec<PathBuf> {
@@ -414,8 +415,12 @@ fn work_dir_for_root(config: &AppConfig, root: &FilePath) -> Option<PathBuf> {
     value.get("workDir")?.as_str().map(PathBuf::from)
 }
 
-fn locate(config: &AppConfig) -> Vec<LocatedChat> {
+fn locate(
+    config: &AppConfig,
+    bindings: &crate::project_bindings::ProjectBindingStore,
+) -> Vec<LocatedChat> {
     let mut found = Vec::new();
+    let active_roots = bindings.owner_chat_work_dirs(config);
     for root in state_roots(config) {
         let chats_dir = root.join("chats");
         if !is_real_dir(&chats_dir) {
@@ -441,13 +446,23 @@ fn locate(config: &AppConfig) -> Vec<LocatedChat> {
             };
             let mut hasher = Sha256::new();
             hasher.update(path.to_string_lossy().as_bytes());
-            let active_work_dir = work_dir.clone();
-            let workspace = active_work_dir
+            let active_work_dir = active_roots
+                .get(&owner)
+                .cloned()
+                .or_else(|| work_dir.clone());
+            let is_scratch = active_work_dir
                 .as_ref()
-                .and_then(|path| path.file_name())
-                .unwrap_or_else(|| root.file_name().unwrap_or_default())
-                .to_string_lossy()
-                .into_owned();
+                .is_some_and(|path| bindings.is_scratch_root(path));
+            let workspace = if is_scratch {
+                "Scratch conversation".into()
+            } else {
+                active_work_dir
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .unwrap_or_else(|| root.file_name().unwrap_or_default())
+                    .to_string_lossy()
+                    .into_owned()
+            };
             found.push(LocatedChat {
                 id: format!("{:x}", hasher.finalize()),
                 owner,
@@ -455,17 +470,18 @@ fn locate(config: &AppConfig) -> Vec<LocatedChat> {
                 state_root: root.clone(),
                 work_dir: active_work_dir,
                 workspace,
+                is_scratch,
             });
         }
     }
     found
 }
 
-fn selected(config: &AppConfig, id: &str) -> Result<LocatedChat, (StatusCode, String)> {
+fn selected(state: &OwnerState, id: &str) -> Result<LocatedChat, (StatusCode, String)> {
     if !stable_owner(id) {
         return Err((StatusCode::NOT_FOUND, "Conversation not found".into()));
     }
-    locate(config)
+    locate(&state.config, &state.project_bindings)
         .into_iter()
         .find(|chat| chat.id == id)
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".into()))
@@ -490,6 +506,7 @@ struct ChatListing {
     workspace: String,
     project_id: String,
     project_path: String,
+    is_scratch: bool,
     last_entry_end: u64,
     last_entry_at_ms: u64,
     last_agent_call_at_ms: Option<u64>,
@@ -593,7 +610,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             "Search must be a single line of at most 1 KiB".into(),
         ));
     }
-    let located_chats = locate(&state.config);
+    let located_chats = locate(&state.config, &state.project_bindings);
     let mut matched = if query.is_empty() {
         None
     } else {
@@ -706,6 +723,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             workspace: located.workspace,
             project_id,
             project_path,
+            is_scratch: located.is_scratch,
             last_entry_end,
             last_entry_at_ms,
             last_agent_call_at_ms,
@@ -740,7 +758,7 @@ async fn rename_chat(
     Path(id): Path<String>,
     Json(body): Json<TitleBody>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)
@@ -751,6 +769,53 @@ async fn rename_chat(
     let summary = chat.owner_summary().await.map_err(internal_error)?;
     Ok(Json(
         json!({"title": summary.title, "customTitle": summary.custom_title}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectPathBody {
+    path: String,
+    expected_path: String,
+}
+
+async fn change_project_path(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProjectPathBody>,
+) -> ApiResult {
+    let _guard = state.creation_lock.lock().await;
+    let located = selected(&state, &id)?;
+    let previous = located
+        .work_dir
+        .as_ref()
+        .ok_or_else(|| internal_error("This conversation has no saved project path."))?;
+    if body.expected_path != previous.to_string_lossy() {
+        return Err(internal_error(
+            "The project path changed. Refresh before saving.",
+        ));
+    }
+    if body.path.len() > 4096 || body.path.chars().any(char::is_control) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid project path.".into()));
+    }
+    let task = automation_task(&located)?;
+    let path = state
+        .project_bindings
+        .change_owner_workspace(
+            &state.config,
+            &task,
+            previous,
+            FilePath::new(&body.path),
+            &located.state_root,
+        )
+        .await
+        .map_err(internal_error)?;
+    if let Some(supervisor) = &state.automation {
+        supervisor.discard_queued_work(&task).await;
+    }
+    let project_path = path.to_string_lossy().into_owned();
+    Ok(Json(
+        json!({"projectPath":project_path,"projectId":format!("{:x}",Sha256::digest(project_path.as_bytes())),"workspace":path.file_name().unwrap_or_default().to_string_lossy(),"isScratch":false}),
     ))
 }
 
@@ -778,7 +843,7 @@ async fn organize_chat(
             "Change either pinning or archiving, one at a time.".into(),
         ));
     }
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)
@@ -804,11 +869,22 @@ async fn chat_state(
     {
         return Err((StatusCode::BAD_REQUEST, "Invalid chat revision".into()));
     }
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)
         .map_err(internal_error)?;
+    let task = ConversationIdentity::from_stable_keys(located.owner.clone(), located.owner)
+        .ok_or_else(|| internal_error("Conversation has an invalid stable task identity"))?;
+    if let Some(goal) = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
+        .and_then(|store| store.load(&task))
+        .map_err(internal_error)?
+        .goal
+    {
+        chat.record_goal_completion(&goal)
+            .await
+            .map_err(internal_error)?;
+    }
     let page = chat
         .widget_page(query.before, query.revision)
         .await
@@ -823,7 +899,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             "serverTimeMs": crate::markdown_chat::now_ms()
         })));
     }
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let automation = context.store.load(&context.task).map_err(internal_error)?;
     let summary = context.chat.owner_summary().await.map_err(internal_error)?;
@@ -920,7 +996,7 @@ async fn automation_capabilities(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let _ = automation_context(&state, &located).await?;
     let (health, catalog) = owner_catalog(
         &state,
@@ -948,7 +1024,7 @@ async fn automation_selection(
     Json(body): Json<SelectionBody>,
 ) -> ApiResult {
     validate_owner_request_id(&body.request_id)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     if body.model.is_none() && body.effort.is_none() {
         let selection = context
@@ -1017,7 +1093,7 @@ async fn automation_pair(
     Json(body): Json<PairBody>,
 ) -> ApiResult {
     validate_owner_request_id(&body.request_id)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let health = companion_client(&state)?
         .health(&CancellationToken::new())
@@ -1068,7 +1144,7 @@ async fn automation_unlink(
     Json(body): Json<OwnerMutationBody>,
 ) -> ApiResult {
     validate_owner_request_id(&body.request_id)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let pairing = context
         .store
@@ -1088,7 +1164,7 @@ async fn automation_login(
     Path(id): Path<String>,
     Json(_): Json<Value>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let _ = automation_context(&state, &located).await?;
     let health = companion_client(&state)?
         .login(&CancellationToken::new())
@@ -1103,7 +1179,7 @@ async fn automation_reveal(
     Path(id): Path<String>,
     Json(_): Json<Value>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let store = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
         .map_err(internal_error)?;
     let automation = store
@@ -1133,7 +1209,7 @@ async fn automation_action_state(
     State(state): State<OwnerState>,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let action = context
         .store
@@ -1162,7 +1238,7 @@ async fn automation_action_cancel(
     Json(body): Json<ActionMutationBody>,
 ) -> ApiResult {
     validate_owner_request_id(&body.request_id)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let supervisor = state
         .automation
@@ -1189,7 +1265,7 @@ async fn automation_action_retry(
     Json(body): Json<ActionMutationBody>,
 ) -> ApiResult {
     validate_owner_request_id(&body.request_id)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
     let supervisor = state
         .automation
@@ -1214,7 +1290,7 @@ async fn chat_markdown(
     State(state): State<OwnerState>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)
@@ -1369,7 +1445,7 @@ async fn chat_send(
     Path(id): Path<String>,
     Json(body): Json<SendBody>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     if body.stop_agent {
         if body.request_id.is_empty()
             || body.request_id.len() > 80
@@ -1521,7 +1597,7 @@ async fn chat_file(
     if query.href.is_empty() || query.href.len() > 4096 {
         return Err((StatusCode::BAD_REQUEST, "Invalid file reference".into()));
     }
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let work_dir = state
         .project_bindings
         .owner_chat_work_dirs(&state.config)
@@ -1793,6 +1869,7 @@ fn router(state: OwnerState) -> Router {
         )
         .route("/api/chats/{id}/markdown", get(chat_markdown))
         .route("/api/chats/{id}/send", post(chat_send))
+        .route("/api/chats/{id}/project", post(change_project_path))
         .route("/api/chats/{id}/attachments", post(attachments::upload))
         .route(
             "/api/chats/{id}/attachments/{attachment}",
@@ -2139,6 +2216,187 @@ mod tests {
                 .to_string()
                 .contains(&format!("127.0.0.1:{fixed_port}"))
         );
+    }
+
+    #[tokio::test]
+    async fn owner_project_edit_preserves_chat_identity_history_and_goal_and_labels_scratch() {
+        crate::tls::ensure_crypto_provider();
+        let temp = tempfile::tempdir().unwrap();
+        let access = temp.path().join("projects");
+        let first = access.join("first");
+        let second = access.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let mut config = crate::config::default_config(access);
+        config.multi_project = true;
+        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        config.markdown_chat.enabled = true;
+        config.memory.dir = Some(temp.path().join("state").to_string_lossy().into_owned());
+        let bindings = Arc::new(crate::project_bindings::ProjectBindingStore::new(
+            temp.path().join("bindings"),
+        ));
+        let identity = ConversationIdentity::from_openai_session("owner-project-route").unwrap();
+        bindings
+            .select_project_root(&config, &identity, first.to_str().unwrap())
+            .await
+            .unwrap();
+        let effective = bindings.effective_config(&config, &identity).unwrap();
+        let chats = Arc::new(MarkdownChatStore::default());
+        let chat = chats
+            .chat(&effective, Some(&identity), &SessionState::new())
+            .unwrap();
+        chat.append("Keep this original history".into())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(chat.path()).unwrap();
+        let id = format!(
+            "{:x}",
+            Sha256::digest(chat.path().to_string_lossy().as_bytes())
+        );
+        let store = AgentAutomationStore::for_config(&effective).unwrap();
+        let now = crate::markdown_chat::now_ms();
+        store
+            .set_goal(&identity, "Keep this goal", now - 5000)
+            .unwrap();
+        store.run_goal(&identity, 1, now - 4000).unwrap();
+        store
+            .finish_goal(
+                &identity,
+                1,
+                crate::agent_automation::GoalFinish::Completed { summary: None },
+                now - 2000,
+            )
+            .unwrap();
+        let scratch = ConversationIdentity::from_openai_session("owner-scratch-route").unwrap();
+        bindings
+            .select_without_project(&config, &scratch)
+            .await
+            .unwrap();
+        chats
+            .chat(
+                &bindings.effective_config(&config, &scratch).unwrap(),
+                Some(&scratch),
+                &SessionState::new(),
+            )
+            .unwrap()
+            .ensure()
+            .await
+            .unwrap();
+        let state = OwnerState {
+            project_bindings: bindings.clone(),
+            creation_lock: Arc::default(),
+            artifacts: Arc::new(ArtifactEgressStore::new_at(
+                config.artifact_egress.clone(),
+                temp.path().join("artifacts"),
+            )),
+            continuations: Arc::new(
+                ConversationContinuationStore::new(temp.path().join("continuations.json")).unwrap(),
+            ),
+            config: Arc::new(config),
+            chats,
+            automation: None,
+            open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
+            token: "test-token".into(),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let listing: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = listing["chats"].as_array().unwrap();
+        let original = rows.iter().find(|row| row["id"] == id).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["isScratch"] == true && row["workspace"] == "Scratch conversation")
+        );
+        let body = json!({"expectedPath":original["projectPath"],"path":second});
+        let endpoint = format!("{base}/api/chats/{id}/project");
+        assert_eq!(
+            client
+                .post(&endpoint)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let changed = client
+            .post(&endpoint)
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        let changed: Value = changed.json().await.unwrap();
+        assert_eq!(
+            changed["projectPath"],
+            second.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            client
+                .post(&endpoint)
+                .bearer_auth("test-token")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let listing: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = listing["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap();
+        assert_eq!(row["projectPath"], changed["projectPath"]);
+        assert_eq!(row["goalStatus"], "completed");
+        let page: Value = client
+            .get(format!("{base}/api/chats/{id}"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let messages = page["_meta"][CHAT_WIDGET_META]["messages"]
+            .as_array()
+            .unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["markdown"] == "Keep this original history")
+        );
+        assert!(messages.iter().any(|message| message["role"] == "goal"
+            && message["markdown"] == "Goal completed: Keep this goal"));
+        assert_eq!(std::fs::read(chat.path()).unwrap(), bytes);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3412,7 +3670,7 @@ mod tests {
         assert_eq!(supervisor.queued_count().await, 1);
 
         // Prefer the canonical project URL and do not depend on a companion or supervisor.
-        let located = selected(&open_state.config, id).unwrap();
+        let located = selected(&open_state, id).unwrap();
         let store =
             AgentAutomationStore::for_state_root(&open_state.config, &located.state_root).unwrap();
         let task = automation_task(&located).unwrap();

@@ -37,6 +37,119 @@ impl WorkspaceChange {
 }
 
 impl ProjectBindingStore {
+    /// Change only the workspace binding; the chat and automation state keep
+    /// their original directory and the agent must acknowledge the new root.
+    pub(crate) async fn change_owner_workspace(
+        &self,
+        config: &AppConfig,
+        identity: &ConversationIdentity,
+        expected_path: &Path,
+        path: &Path,
+        state_root: &Path,
+    ) -> Result<PathBuf, String> {
+        if !config.multi_project {
+            return Err("Workspace editing requires multi-project mode.".into());
+        }
+        if !path.is_absolute() {
+            return Err("Enter an absolute project directory.".into());
+        }
+        let (access_root, source_root, root, managed, git_root, worktrees_root) =
+            match resolve_project_root(config, &path.to_string_lossy()) {
+                Ok((access, root)) => (access, root.clone(), root, false, None, None),
+                Err(direct_error) => {
+                    let ProjectBindingState::Project(selection) =
+                        self.binding_state(config, identity)?
+                    else {
+                        return Err(direct_error);
+                    };
+                    let choice = crate::worktrees::existing_worktree_choice(
+                        config,
+                        &selection.source_project_root,
+                        path,
+                    )
+                    .await
+                    .map_err(|_| direct_error)?;
+                    let worktrees_root = if choice.managed_worktree {
+                        Some(
+                            load_metadata(
+                                &metadata_path_for_worktree(&choice.git_root)
+                                    .ok_or("Missing worktree metadata")?,
+                            )?
+                            .worktrees_root,
+                        )
+                    } else {
+                        None
+                    };
+                    (
+                        selection.access_root,
+                        selection.source_project_root,
+                        choice.path,
+                        choice.managed_worktree,
+                        Some(choice.git_root),
+                        worktrees_root,
+                    )
+                }
+            };
+        let expected_path =
+            std::fs::canonicalize(expected_path).map_err(|error| error.to_string())?;
+        let binding_path = self.binding_path(&access_root, identity);
+        let _lock = acquire_lock(&binding_path).await?;
+        let current = self
+            .selected_project_root(config, identity)?
+            .unwrap_or_else(|| expected_path.clone());
+        if current != expected_path {
+            return Err("The project path changed. Refresh before saving.".into());
+        }
+        if current == root {
+            return Ok(root);
+        }
+        if !state_root.is_absolute()
+            || !state_root
+                .join("chats")
+                .join(identity.stable_key())
+                .join("CHAT.md")
+                .is_file()
+        {
+            return Err("The conversation state directory is unavailable.".into());
+        }
+        let stored = StoredProjectBinding {
+            version: BINDING_VERSION,
+            access_root: access_root.to_string_lossy().into_owned(),
+            project_root: root.to_string_lossy().into_owned(),
+            source_project_root: Some(source_root.to_string_lossy().into_owned()),
+            state_root: Some(state_root.to_string_lossy().into_owned()),
+            repository_url: None,
+            managed_worktree: managed,
+            worktree_git_root: git_root.map(|root| root.to_string_lossy().into_owned()),
+            worktrees_root,
+        };
+        // Keep the previous binding recoverable before publishing the change.
+        let mut change = WorkspaceChange::new(current);
+        let archive = self
+            .access_root_dir(&access_root)
+            .join("previous-workspaces")
+            .join(&change.revision);
+        std::fs::create_dir_all(&archive).map_err(|error| error.to_string())?;
+        for previous in self.active_record_paths(&access_root, identity) {
+            if previous.is_file() {
+                std::fs::copy(
+                    &previous,
+                    archive.join(previous.file_name().ok_or("Invalid binding filename")?),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        self.save_change(&access_root, identity, &change)?;
+        self.write_binding(&binding_path, &stored)?;
+        let scratch = self.without_project_path(&access_root, identity);
+        if scratch.exists() {
+            std::fs::remove_file(scratch).map_err(|error| error.to_string())?;
+        }
+        change.awaiting_selection = false;
+        self.save_change(&access_root, identity, &change)?;
+        Ok(root)
+    }
+
     pub async fn dispatch_workspace(
         &self,
         config: &AppConfig,
@@ -84,6 +197,7 @@ impl ProjectBindingStore {
         };
         let stored = StoredProjectBinding {
             version: BINDING_VERSION,
+            state_root: None,
             access_root: root.to_string_lossy().into_owned(),
             source_project_root: Some(source.to_string_lossy().into_owned()),
             project_root: choice.path.to_string_lossy().into_owned(),
@@ -298,5 +412,132 @@ impl ProjectBindingStore {
                     .filter(|path| path.extension().is_some_and(|ext| ext == "json")),
             )
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod owner_workspace_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn editing_a_project_keeps_task_state_and_survives_reopening_the_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = temp.path().join("projects");
+        let first = access.join("first");
+        let second = access.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let mut config = crate::config::default_config(access.clone());
+        config.multi_project = true;
+        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        config.memory.dir = Some(temp.path().join("state").to_string_lossy().into_owned());
+        config.markdown_chat.enabled = true;
+        let base = temp.path().join("bindings");
+        let bindings = ProjectBindingStore::new(base.clone());
+        let task = ConversationIdentity::from_openai_session("owner-project-edit").unwrap();
+        bindings
+            .select_project_root(&config, &task, first.to_str().unwrap())
+            .await
+            .unwrap();
+        let effective = bindings.effective_config(&config, &task).unwrap();
+        let state_root = crate::memory::memory_dir(&effective);
+        let chats = crate::markdown_chat::MarkdownChatStore::default();
+        let session = crate::exec_sessions::SessionState::new();
+        let chat = chats.chat(&effective, Some(&task), &session).unwrap();
+        chat.append("Keep the current conversation".into())
+            .await
+            .unwrap();
+        let store = crate::agent_automation::AgentAutomationStore::for_config(&effective).unwrap();
+        store.set_goal(&task, "Keep the current goal", 100).unwrap();
+        bindings
+            .change_owner_workspace(&config, &task, &first, &second, &state_root)
+            .await
+            .unwrap();
+        let reopened = ProjectBindingStore::new(base);
+        let updated = reopened.effective_config(&config, &task).unwrap();
+        assert_eq!(updated.work_dir, std::fs::canonicalize(&second).unwrap());
+        assert_eq!(crate::memory::task_state_dir(&updated), state_root);
+        assert_ne!(crate::memory::memory_dir(&updated), state_root);
+        assert_eq!(
+            chats.chat(&updated, Some(&task), &session).unwrap().path(),
+            chat.path()
+        );
+        assert_eq!(
+            crate::agent_automation::AgentAutomationStore::for_config(&updated)
+                .unwrap()
+                .load(&task)
+                .unwrap()
+                .goal
+                .unwrap()
+                .markdown,
+            "Keep the current goal"
+        );
+        assert!(
+            reopened
+                .pending_workspace_change(&config, &task)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .change_owner_workspace(&config, &task, &first, &second, &state_root)
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .change_owner_workspace(&config, &task, &second, temp.path(), &state_root)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .selected_project_root(&config, &task)
+                .unwrap()
+                .unwrap(),
+            updated.work_dir
+        );
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&second)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let worktree = temp.path().join("registered-worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            worktree.to_str().unwrap(),
+        ]);
+        reopened
+            .change_owner_workspace(&config, &task, &second, &worktree, &state_root)
+            .await
+            .unwrap();
+        let worktree_config = reopened.effective_config(&config, &task).unwrap();
+        assert_eq!(
+            worktree_config.work_dir,
+            std::fs::canonicalize(worktree).unwrap()
+        );
+        assert_eq!(crate::memory::task_state_dir(&worktree_config), state_root);
     }
 }

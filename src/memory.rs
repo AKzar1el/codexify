@@ -93,6 +93,15 @@ pub fn memory_dir(config: &AppConfig) -> PathBuf {
         .join(project_state_dir_name(&config.work_dir))
 }
 
+/// Conversation state stays with its task when the owner changes project.
+/// Project memory and diff checkpoints continue to use the selected project.
+pub(crate) fn task_state_dir(config: &AppConfig) -> PathBuf {
+    config
+        .task_state_root
+        .clone()
+        .unwrap_or_else(|| memory_dir(config))
+}
+
 pub fn memory_path(config: &AppConfig) -> PathBuf {
     memory_dir(config).join(MEMORY_FILENAME)
 }

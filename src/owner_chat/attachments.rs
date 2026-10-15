@@ -34,7 +34,7 @@ pub(super) async fn upload(
             )
         })?
         .map_err(internal_error)?;
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let media = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -79,7 +79,7 @@ pub(super) async fn metadata(
     State(state): State<OwnerState>,
     Path((id, attachment)): Path<(String, String)>,
 ) -> ApiResult {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)
@@ -115,7 +115,7 @@ pub(super) async fn content(
     Query(query): Query<ContentQuery>,
     request: Request<Body>,
 ) -> Result<Response, (StatusCode, String)> {
-    let located = selected(&state.config, &id)?;
+    let located = selected(&state, &id)?;
     let chat = state
         .chats
         .chat_at_path(located.path, true)

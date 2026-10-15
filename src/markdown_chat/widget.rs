@@ -6,6 +6,29 @@ const USER_START: &str = "\n\n<!-- codexify-user-message:v1:start id=\"";
 const PAGE_MESSAGES: usize = 50;
 const PAGE_BYTES: usize = 512 * 1024;
 const MAX_CLEAN_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GOAL_EVENTS_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GoalCompletionEvent {
+    id: String,
+    markdown: String,
+    offset: u64,
+    created_at_ms: u64,
+    tool_call_count: Option<u64>,
+}
+
+fn goal_events(chat: &ChatFile) -> Result<Vec<GoalCompletionEvent>, String> {
+    let path = chat.path.with_file_name("goal-events.json");
+    if !path.try_exists().map_err(io_error)? {
+        return Ok(Vec::new());
+    }
+    let file = open_regular(&path, false)?;
+    if file.metadata().map_err(io_error)?.len() > MAX_GOAL_EVENTS_BYTES {
+        return Err("Goal timeline is too large.".into());
+    }
+    serde_json::from_reader(file.take(MAX_GOAL_EVENTS_BYTES + 1))
+        .map_err(|_| "Goal timeline could not be read.".into())
+}
 
 pub const AGENT_STOP_MESSAGE: &str = "Write your current progress and status using chat_write if that tool is available, then immediately finish your turn without running any further tools. The user has stopped this turn and paused the goal; do not continue the goal unless the user explicitly resumes it.";
 
@@ -549,8 +572,13 @@ impl ChatFile {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
+                let events_stamp = std::fs::metadata(chat.path.with_file_name("goal-events.json"))
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |time| time.as_nanos());
                 let revision = format!(
-                    "{length}-{modified}-{}-{}",
+                    "{length}-{modified}-{}-{}-{events_stamp}",
                     cursor.delivered_through, cursor.offset
                 );
                 let unchanged = before.is_none() && known_revision.as_deref() == Some(&revision);
@@ -608,8 +636,81 @@ impl ChatFile {
                     page.before = Some(message.start);
                     page.messages.push(message);
                 }
-                page.messages.reverse();
+                let first = page.messages.last().map_or(0, |message| message.start);
+                for event in goal_events(chat)?.into_iter().filter(|event| {
+                    event.offset >= first
+                        && event.offset <= length
+                        && before.is_none_or(|end| event.offset < end)
+                }) {
+                    page.messages.push(WidgetMessage {
+                        id: event.id,
+                        role: "goal".into(),
+                        markdown: event.markdown,
+                        start: event.offset,
+                        end: event.offset,
+                        created_at_ms: Some(event.created_at_ms),
+                        tool_call_count: event.tool_call_count,
+                        attachments: Vec::new(),
+                    });
+                }
+                page.messages
+                    .sort_by_key(|message| (message.start, message.role != "goal"));
                 Ok(page)
+            })
+        })
+        .await
+    }
+
+    pub async fn record_goal_completion(
+        self: &Arc<Self>,
+        goal: &crate::agent_automation::GoalRecord,
+    ) -> Result<(), String> {
+        if goal.status != crate::agent_automation::GoalStatus::Completed {
+            return Ok(());
+        }
+        let Some(created_at_ms) = goal.finished_at_ms else {
+            return Ok(());
+        };
+        let Some(offset) = goal.completed_chat_end else {
+            return Ok(());
+        };
+        let event = GoalCompletionEvent {
+            id: format!("goal-completed-{}-{}", goal.created_at_ms, goal.revision),
+            markdown: format!("Goal completed: {}", goal.markdown),
+            offset,
+            created_at_ms,
+            tool_call_count: goal.completed_tool_call_count,
+        };
+        self.run(move |chat| {
+            chat.with_cursor(|_, file| {
+                let mut events = goal_events(chat)?;
+                if let Some(saved) = events.iter_mut().find(|saved| saved.id == event.id) {
+                    if saved.tool_call_count.is_some() || event.tool_call_count.is_none() {
+                        return Ok(());
+                    }
+                    // A polling reader may have backfilled the terminal receipt
+                    // before goal_finish published its exact counter snapshot.
+                    saved.tool_call_count = event.tool_call_count;
+                } else {
+                    events.push(event);
+                }
+                if offset > file.metadata().map_err(io_error)?.len() {
+                    return Err("Goal completion is outside this chat.".into());
+                }
+                let bytes = serde_json::to_vec(&events).map_err(|error| error.to_string())?;
+                if bytes.len() as u64 > MAX_GOAL_EVENTS_BYTES {
+                    return Err("Goal timeline is too large.".into());
+                }
+                let parent = chat.path.parent().ok_or("Chat has no directory")?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
+                temporary
+                    .write_all(&bytes)
+                    .and_then(|_| temporary.as_file().sync_all())
+                    .map_err(io_error)?;
+                temporary
+                    .persist(parent.join("goal-events.json"))
+                    .map_err(|error| io_error(error.error))?;
+                Ok(())
             })
         })
         .await
@@ -1135,6 +1236,62 @@ pub(super) fn user_text(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_completion_is_durable_exactly_once_and_does_not_consume_user_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chats/task/CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.record_agent_call(1000).await.unwrap();
+        chat.append("Before completion".into()).await.unwrap();
+        chat.append_user("pending-goal-event".into(), "Keep this unread".into())
+            .await
+            .unwrap();
+        let unread = chat.unread_snapshot().await.unwrap();
+        for call in 2..=11 {
+            chat.record_agent_call(1000 + call).await.unwrap();
+        }
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let goal: crate::agent_automation::GoalRecord = serde_json::from_value(serde_json::json!({
+            "revision":2,"markdown":"Review and analyze this PR","status":"completed",
+            "createdAtMs":1000,"updatedAtMs":2000,"finishedAtMs":2000,
+            "summary":null,"blockedReason":null,"completedChatEnd":offset,"completedToolCallCount":11
+        })).unwrap();
+        let old_page = chat.widget_page(None, None).await.unwrap();
+        let mut legacy_receipt = goal.clone();
+        legacy_receipt.completed_tool_call_count = None;
+        chat.record_goal_completion(&legacy_receipt).await.unwrap();
+        chat.record_goal_completion(&goal).await.unwrap();
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        chat.record_agent_call(3000).await.unwrap();
+        chat.record_goal_completion(&goal).await.unwrap();
+        let reopened = Arc::new(ChatFile::new(path, true));
+        let page = reopened
+            .widget_page(None, Some(old_page.revision))
+            .await
+            .unwrap();
+        assert!(!page.unchanged);
+        let events = page
+            .messages
+            .iter()
+            .filter(|message| message.role == "goal")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].start, offset);
+        assert_eq!(events[0].tool_call_count, Some(11));
+        assert_eq!(events[0].created_at_ms, Some(2000));
+        assert!(events[0].markdown.contains("Review and analyze this PR"));
+        assert!(
+            serde_json::to_value(&goal)
+                .unwrap()
+                .get("completedToolCallCount")
+                .is_none()
+        );
+        assert_eq!(
+            reopened.unread_snapshot().await.unwrap().messages,
+            unread.messages
+        );
+    }
 
     #[tokio::test]
     async fn pairing_presence_lease_survives_reopen_and_expires_without_waiting_five_minutes() {

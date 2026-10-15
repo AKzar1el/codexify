@@ -1,4 +1,4 @@
-function startGlobalSettings({api,onPlan}) {
+function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
   const byId=id=>document.getElementById(id);
   const icons={
     general:'<path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="4"/>',
@@ -294,6 +294,7 @@ function startGlobalSettings({api,onPlan}) {
   }
   byId('global-settings').addEventListener('click',async()=>{dialog.showModal();if(!await saveChanges())return;message('Loading settings…');try{await load();}catch(error){message(error.message,true);}});
   byId('settings-close').addEventListener('click',()=>dialog.close());
+  bindBackdrop(dialog,()=>dialog.close());
   byId('settings-reload').addEventListener('click',async()=>{if(saving)await savePromise;clearTimeout(saveTimer);rawEdited=false;try{await load();}catch(error){message(error.message,true);}});
   byId('settings-raw-toggle').addEventListener('click',async()=>{if(!snapshot||!await saveChanges())return;rawMode=!rawMode;if(rawMode&&!rawEdited)byId('settings-raw').value=snapshot.raw;renderForm();byId('settings-main').scrollTop=0;});
   byId('settings-raw').addEventListener('input',()=>{rawEdited=true;message('Raw configuration changes are not saved yet.');});

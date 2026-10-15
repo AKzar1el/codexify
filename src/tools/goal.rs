@@ -360,13 +360,29 @@ impl Tool for GoalTool {
                         }
                     }
                 };
-                match store.finish_goal(
+                let chat = match store.task_directory(task).and_then(|path| {
+                    context
+                        .markdown_chat
+                        .chat_at_path(path.join("CHAT.md"), true)
+                }) {
+                    Ok(chat) => chat,
+                    Err(error) => return ToolResult::error(error),
+                };
+                let calls = match chat.owner_summary().await {
+                    Ok(summary) => summary.total_tool_calls,
+                    Err(error) => return ToolResult::error(error),
+                };
+                match store.finish_goal_with_tool_count(
                     task,
                     args.expected_revision,
                     finish,
                     crate::markdown_chat::now_ms(),
+                    Some(calls),
                 ) {
                     Ok(goal) => {
+                        if let Err(error) = chat.record_goal_completion(&goal).await {
+                            return ToolResult::error(error);
+                        }
                         // Notify the durable terminal receipt immediately; the supervisor also
                         // checks it after restarts, using the same persisted deduplication claim.
                         if let Ok(path) = store.task_directory(task)
@@ -513,6 +529,7 @@ mod tests {
             timer_until_ms: None,
             turn_count: 0,
             completed_chat_end: None,
+            completed_tool_call_count: None,
         };
         let result = goal_result(Some(&goal), true);
         assert!(result.audit.sensitive_output);
