@@ -41,6 +41,10 @@ let hideEffortLabels = false;
 let nestedHistory = false;
 let missingHistoryId = false;
 let duplicateHistoryViews = false;
+let destinationLocks:Record<string,number[]> = {};
+let absentFamilies:string[] = [];
+let duplicateEffortLabels = false;
+let changeAccountAtRequest = Number.MAX_SAFE_INTEGER;
 let initialModel = {family:"6",value:4,locked:[] as number[]};
 const pill = (name: string) => `<span app-mention-path="app://fixture" app-mention-display-name="${name}" contenteditable="false">${name}</span> `;
 
@@ -53,7 +57,7 @@ beforeAll(async () => {
   await context.route("https://chatgpt.com/**",async route => {
     if (new URL(route.request().url()).pathname === "/api/auth/session") {
       sessionRequests++;
-      await route.fulfill({json:{user:{id:"fixture-user"},account:{id:changedAccountAfterReload&&documentLoads>=3 ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
+      await route.fulfill({json:{user:{id:"fixture-user"},account:{id:sessionRequests>=changeAccountAtRequest||changedAccountAfterReload&&documentLoads>=3 ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
       return;
     }
     documentLoads++;
@@ -88,6 +92,9 @@ beforeAll(async () => {
         };
         window.definitions[window.family].value=${initialModel.value};
         window.definitions[window.family].locked=${JSON.stringify(initialModel.locked)};
+        for(const [family,locked] of Object.entries(${JSON.stringify(destinationLocks)}))window.definitions[family].locked=locked;
+        for(const family of ${JSON.stringify(absentFamilies)})document.querySelector('[data-family="'+family+'"]')?.remove();
+        if(${duplicateEffortLabels})window.definitions['6'].labels[3]='High';
         const control=document.querySelector('#effort'),picker=document.querySelector('#picker'),range=document.querySelector('#range');
         window.renderModel=()=>{
           const model=window.definitions[window.family],index=model.value-model.min;
@@ -172,6 +179,7 @@ async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating
   generatingOnLoad=generating;acceptsStop=stopWorks;
   documentLoads=0;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
   initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
+  destinationLocks={};absentFamilies=[];duplicateEffortLabels=false;changeAccountAtRequest=Number.MAX_SAFE_INTEGER;
   await surface.navigate(url);
   return new ChatGptBrowserDriver(surface,build);
 }
@@ -309,18 +317,76 @@ test.skipIf(!native)("an already-selected request does not cycle any effort or m
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Pro");
 },15_000);
 
-test.skipIf(!native)("a locked destination effort or changed account prevents selection and Send",async()=>{
-  for(const mismatch of [false,true]) {
-    const driver=await fixture("",true,connector,0,false,true,{family:"6",value:4,locked:[2]});
-    const submitted={...offlineRequest("gpt-6-sol","high"),expectedAccountFingerprint:mismatch?"another-account":request.expectedAccountFingerprint};
-    let failure:unknown;
-    try {await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
-    expect(failure).toBeInstanceOf(Error);
-    expect(await page.evaluate(()=>document.body.dataset.sends)).toBe("0");
-    expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe("0");
-    expect(await composerText(await activeComposer(page))).toBe("");
-  }
+test.skipIf(!native)("a changed account prevents selection and Send even when fallback would be available",async()=>{
+  const driver=await fixture("",true,connector,0,false,true,{family:"6",value:4,locked:[2]});
+  const submitted={...offlineRequest("gpt-6-sol","high"),expectedAccountFingerprint:"another-account"};
+  let failure:unknown;
+  try {await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
+  expect(failure).toBeInstanceOf(Error);
+  expect(await page.evaluate(()=>document.body.dataset.sends)).toBe("0");
+  expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe("0");
+  expect(await composerText(await activeComposer(page))).toBe("");
 },15_000);
+
+test.skipIf(!native)("locked preferred models follow the fallback order and try the preference again next turn",async()=>{
+  const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build);
+  destinationLocks={'6':[4]};
+  const preferred=offlineRequest('gpt-6-astra','max');await coordinator.execute(preferred);
+  const events=[];for await(const event of coordinator.events(preferred.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe('submission_complete');
+  expect((await coordinator.action(preferred.actionId))?.selected).toEqual({model:'gpt-5.6-sol',effort:'max'});
+  expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.sends])).toEqual(['5.6','Pro','1']);
+  expect(preferred.model).toBe('gpt-6-astra');expect(preferred.effort).toBe('max');
+  destinationLocks={};const next={...preferred,actionId:'preferred-restored',idempotencyKey:'preferred-restored-key'};
+  await coordinator.execute(next);for await(const event of coordinator.events(next.actionId,0)){}
+  expect((await coordinator.action(next.actionId))?.selected).toEqual({model:'gpt-6-astra',effort:'max'});
+  expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe('Pro');await coordinator.close();
+},20_000);
+
+test.skipIf(!native)("goal continuations advance to the next available model on later turns",async()=>{
+  const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build);
+  const preferred=offlineRequest('gpt-6-astra','max');
+  for(const turn of [1,2]) {
+    destinationLocks=turn===1?{'6':[4]}:{'6':[4],'5.6':[4]};
+    const next:ExecuteActionRequest={...preferred,actionId:`goal-turn-${turn}`,idempotencyKey:`goal-turn-${turn}-key`,
+      prompt:turn===1?{kind:'offline_goal',goalRevision:1}:{kind:'offline_combined',goalRevision:1,batchId:'goal-follow-up',messages:[{id:'follow-up',markdown:'Continue'}]}};
+    await coordinator.execute(next);
+    const events=[];for await(const event of coordinator.events(next.actionId,0))events.push(event);
+    expect(events.at(-1)?.type).toBe('submission_complete');
+    expect(events.filter(event=>event.type==='send_accepted')).toHaveLength(1);
+    expect((await coordinator.action(next.actionId))?.selected).toEqual(turn===1
+      ?{model:'gpt-5.6-sol',effort:'max'}:{model:'gpt-6-sol',effort:'xhigh'});
+    expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.sends]))
+      .toEqual(turn===1?['5.6','Pro','1']:['6','Extra High','1']);
+    expect((await coordinator.health()).activeActionId).toBeNull();
+    expect(next.model).toBe('gpt-6-astra');expect(next.effort).toBe('max');
+  }
+  await coordinator.close();
+},20_000);
+
+test.skipIf(!native)("fallback skips missing families and locked efforts in the requested order",async()=>{
+  for(const locked of [[4],[4,3]]) {
+    const driver=await fixture();destinationLocks={'6':locked};absentFamilies=['5.6'];
+    const submitted=offlineRequest('gpt-6-astra','max'),events:Parameters<DriverExecution['emit']>[0][]=[];
+    await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+    expect(events.find(event=>event.type==='model_verified')).toMatchObject({model:'gpt-6-sol',effort:locked.length===1?'xhigh':'high'});
+    expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.sends])).toEqual(['6',locked.length===1?'Extra High':'High','1']);
+  }
+},20_000);
+
+test.skipIf(!native)("exhausted fallbacks, ambiguous picker state, and changed accounts never send",async()=>{
+  for(const mode of ['exhausted','ambiguous','account']) {
+    const driver=await fixture();destinationLocks=mode==='exhausted'?{'6':[0,1,2,3,4],'5.6':[0,1,2,3,4],'5.5':[0,1,2,3,4]}:mode==='account'?{'6':[4]}:{};
+    duplicateEffortLabels=mode==='ambiguous';if(mode==='account')changeAccountAtRequest=2;
+    const submitted=offlineRequest(mode==='ambiguous'?'gpt-6-sol':'gpt-6-astra',mode==='ambiguous'?'high':'max');
+    let failure:unknown;try{await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
+    expect(failure).toBeInstanceOf(Error);expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');
+    expect(await composerText(await activeComposer(page))).toBe('');
+    if(mode==='exhausted')expect((failure as Error).message).toContain('all supported fallbacks');
+    if(mode==='ambiguous')expect(await page.evaluate(()=>document.body.dataset.familyChanges)).toBe('');
+    if(mode==='account')expect((failure as any).code).toBe('authentication_required');
+  }
+},25_000);
 
 test.skipIf(!native)("a stale catalog index does not override the destination's native effort labels",async()=>{
   const driver=await fixture();

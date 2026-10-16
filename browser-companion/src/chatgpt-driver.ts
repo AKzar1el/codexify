@@ -8,7 +8,7 @@ import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browse
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
 import { asCompanionError, BrowserCompanionError } from "./errors";
-import { assertSelectedModelAndEffort, selectModelAndEffort } from "./model-selection";
+import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
 import { buildCapabilityCatalog, type AccountCapabilities } from "./models";
 import { canonicalChatGptConversationUrl, validateChatGptConversationUrl, type CapabilityCatalog, type ExecuteActionRequest } from "./protocol";
@@ -467,17 +467,27 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       const cache = this.capabilitiesCache;
       await clearExistingDraft(page,execution.signal);
       execution.emit({ type:"composer_ready" });
-      let selected: Awaited<ReturnType<typeof selectModelAndEffort>> | null = null;
+      const verifyFallbackDestination=async()=>{
+        execution.signal.throwIfAborted();
+        if (canonicalChatGptConversationUrl(page.url())!==canonicalChatGptConversationUrl(canonicalUrl)) {
+          throw new BrowserCompanionError("ChatGPT changed conversations during model fallback","conversation_unavailable");
+        }
+        if ((await readChatGptAccount(page)).fingerprint!==execution.request.expectedAccountFingerprint) {
+          throw new BrowserCompanionError("ChatGPT account changed during model fallback","authentication_required");
+        }
+      };
+      let selected: Awaited<ReturnType<typeof selectAvailableModelAndEffort>> | null = null;
       if (!creating && execution.request.prompt.kind !== "pair_verify"
         && execution.request.model !== null && execution.request.effort !== null) {
-        selected = await selectModelAndEffort(
+        selected = await selectAvailableModelAndEffort(
         page,
         execution.request.model,
         execution.request.effort,
         cache?.accountFingerprint === account.fingerprint ? cache.capabilities : undefined,
         execution.signal,
+        verifyFallbackDestination,
       );
-      execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+      execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
       }
       if (creating || execution.request.prompt.kind === "pair_verify") {
         pairingSelection = await selectPairingMedium(page, execution.signal);
@@ -539,10 +549,10 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           || (await readChatGptAccount(page)).fingerprint !== execution.request.expectedAccountFingerprint) {
           throw new BrowserCompanionError("ChatGPT changed the new conversation before applying its settings", "external_interference");
         }
-        selected = await selectModelAndEffort(page, execution.request.model, execution.request.effort,
-          cache?.accountFingerprint === account.fingerprint ? cache.capabilities : undefined, execution.signal);
+        selected = await selectAvailableModelAndEffort(page, execution.request.model, execution.request.effort,
+          cache?.accountFingerprint === account.fingerprint ? cache.capabilities : undefined, execution.signal,verifyFallbackDestination);
         await assertSelectedModelAndEffort(page, selected, execution.signal);
-        execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
+        execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
       }
       execution.emit({ type:"submission_complete", canonicalUrl });
     } catch (error) {

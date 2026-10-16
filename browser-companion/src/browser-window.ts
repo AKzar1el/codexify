@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { asCompanionError, BrowserCompanionError } from "./errors";
+import { modelSelectionAllowed } from "./model-fallback";
 import {
   COMPANION_KIND,
   MAX_DELTA_BYTES,
@@ -599,11 +600,16 @@ export class SingleWindowCoordinator {
   private emit(record: ActionRecord, raw: DriverEvent): void {
     if (record.terminal) return;
     if (raw.type === "model_verified"
-      && (raw.model !== record.request.model || raw.effort !== record.request.effort)) {
+      && !modelSelectionAllowed(record.request.model,record.request.effort,raw)) {
       throw new BrowserCompanionError(
         "Browser driver reported a different model or effort than requested",
         "failed",
       );
+    }
+    if (raw.type === "model_verified" && record.snapshot.sendAccepted
+      && record.request.prompt.kind !== "create_chat" && record.snapshot.selected
+      && (record.snapshot.selected.model !== raw.model || record.snapshot.selected.effort !== raw.effort)) {
+      throw new BrowserCompanionError("Browser driver changed its verified model after Send","failed",{sendAccepted:true});
     }
     const pairing = record.request.prompt.kind === "pair_verify" || record.request.prompt.kind === "create_chat";
     if (raw.type === "connector_verified" && !pairing && record.request.model !== null && !record.snapshot.selected) {

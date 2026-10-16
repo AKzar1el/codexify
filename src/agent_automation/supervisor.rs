@@ -2130,9 +2130,11 @@ fn validate_terminal_snapshot(
                 true,
             )
         })?;
-        if Some(&selected.model) != execution.request.model.as_ref()
-            || Some(&selected.effort) != execution.request.effort.as_ref()
-        {
+        if !super::model_fallback::selection_allowed(
+            execution.request.model.as_deref(),
+            execution.request.effort.as_deref(),
+            selected,
+        ) {
             return Err(execution_error(
                 "Browser companion selected a different model or effort".into(),
                 true,
@@ -2153,6 +2155,64 @@ fn validate_terminal_snapshot(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_fallback_snapshot_tests {
+    use super::*;
+
+    fn execution() -> AutomationExecution {
+        AutomationExecution {
+            task_key: "fallback".into(),
+            owner_generation: 0,
+            account_fingerprint: "account".into(),
+            catalog_revision: "catalog".into(),
+            activity_epoch: "epoch".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 0,
+            unread_message_ids: Vec::new(),
+            transcript_revision: "revision".into(),
+            pairing_commit: None,
+            request: ExecuteActionRequest {
+                action_id: "fallback".into(),
+                idempotency_key: "fallback-key".into(),
+                url: "https://chatgpt.com/c/fallback".into(),
+                expected_url: "https://chatgpt.com/c/fallback".into(),
+                pairing_generation: 1,
+                connector_name: "Fixture".into(),
+                expected_account_fingerprint: "account".into(),
+                model: Some("gpt-6-astra".into()),
+                effort: Some("max".into()),
+                prompt: ActionPrompt::OfflineGoal { goal_revision: 1 },
+                auto_approve_tool_calls: false,
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_proof_accepts_ranked_fallbacks_but_keeps_identity_and_selection_guards() {
+        let execution = execution();
+        let mut snapshot: CompanionActionSnapshot = serde_json::from_value(serde_json::json!({
+            "protocolVersion":1,"build":"test","actionId":"fallback","state":"idle","sendAccepted":true,
+            "canonicalUrl":"https://chatgpt.com/c/fallback","selected":{"model":"gpt-5.6-sol","effort":"max"},
+            "lastEventSequence":3,"attention":null
+        })).unwrap();
+        assert!(validate_terminal_snapshot(&execution, &snapshot).is_ok());
+        assert_eq!(execution.request.model.as_deref(), Some("gpt-6-astra"));
+        snapshot.selected = None;
+        assert!(validate_terminal_snapshot(&execution, &snapshot).is_err());
+        snapshot.selected = Some(super::super::CompanionSelection {
+            model: "unexpected-model".into(),
+            effort: "max".into(),
+        });
+        assert!(validate_terminal_snapshot(&execution, &snapshot).is_err());
+        snapshot.selected = Some(super::super::CompanionSelection {
+            model: "gpt-6-sol".into(),
+            effort: "high".into(),
+        });
+        snapshot.canonical_url = Some("https://chatgpt.com/c/another-chat".into());
+        assert!(validate_terminal_snapshot(&execution, &snapshot).is_err());
+    }
 }
 
 fn blocks_automatic_requeue(status: AutomationActionStatus) -> bool {

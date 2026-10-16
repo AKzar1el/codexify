@@ -4,9 +4,10 @@ import { activateChatGptEffortMenu, parseChatGptEffortSliderState, parseChatGptM
 import type { Locator, Page } from "patchright";
 import { activeComposer, composerText } from "./composer";
 import { readChatGptEffortSnapshot, readCurrentEffortLabel, moveChatGptEffortSlider, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
-import { MODEL_FAMILY_LABELS, browserEffortIdFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
-import { BrowserCompanionError } from "./errors";
+import { MODEL_FAMILY_LABELS, browserModelFamilyFromLabel, browserEffortIdFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
+import { BrowserCompanionError, ModelOptionUnavailableError } from "./errors";
 import { canonicalChatGptConversationUrl } from "./protocol";
+import { modelFallbacks } from "./model-fallback";
 
 type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
 
@@ -37,6 +38,9 @@ export async function selectChatGptModelFamily(
     signal?.throwIfAborted();
     const option = familyOption(menu, family);
     if (await option.count() > 1) throw familyError(family);
+    if (await option.count() === 1 && (await option.getAttribute("aria-disabled") === "true" || await option.getAttribute("disabled") !== null)) {
+      throw new ModelOptionUnavailableError(`ChatGPT model ${family} is unavailable`,family);
+    }
     if (await option.count() === 1 && await option.getAttribute("aria-checked") === "true") return menu;
     // The attached radio rows are inert while this composer-owned advanced view is collapsed.
     const powerView = menu.menu.locator('[data-model-picker-view]');
@@ -52,6 +56,13 @@ export async function selectChatGptModelFamily(
       const trigger = menu.menu.locator('[role="menuitem"][aria-expanded][aria-hidden="false"]');
       if (await powerView.count() !== 0 || await trigger.count() !== 1) throw familyError(family);
       if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000,signal });
+    }
+    if (await option.count() === 0) {
+      const labels=await menu.menu.getByRole("menuitemradio").filter({visible:true}).allTextContents();
+      if (labels.some(label=>browserModelFamilyFromLabel(label))) {
+        throw new ModelOptionUnavailableError(`ChatGPT model ${family} is not offered in this conversation`,family);
+      }
+      throw familyError(family);
     }
     await option.waitFor({ state: "visible", timeout: 5_000,signal });
     await option.click({ timeout: 5_000,signal });
@@ -209,7 +220,7 @@ async function availableEffort(menu: EffortMenu, index: number): Promise<Awaited
     throw new BrowserCompanionError(`ChatGPT effort slider does not expose index ${index}`, "model_unavailable");
   }
   if (!state.available[index]) {
-    throw new BrowserCompanionError("ChatGPT locks the requested effort for this account", "model_unavailable");
+    throw new ModelOptionUnavailableError("ChatGPT locks the requested effort for this account");
   }
   return state;
 }
@@ -221,13 +232,14 @@ async function requestedEffort(menu: EffortMenu, effort: string, cachedIndex: nu
   if (matches.length > 1) throw new Error("ChatGPT exposed duplicate effort labels");
   const direct = matches[0];
   if (direct !== undefined) {
-    if (!state.available[direct]) throw new Error("ChatGPT locks the requested effort");
+    if (!state.available[direct]) throw new ModelOptionUnavailableError("ChatGPT locks the requested effort");
     return {id:effort, label:state.labels[direct]!, index:direct, available:true, reason:null};
   }
   // Some picker versions label only the selected tick. Use a cached position as
   // a hint, verifying its live announcement; never treat the cache as authority.
   const currentLabel = await readCurrentEffortLabel(menu);
   if (browserEffortIdFromLabel(currentLabel) === effort) {
+    if (!state.available[state.value-state.min]) throw new ModelOptionUnavailableError("ChatGPT locks the requested effort");
     return {id:effort, label:currentLabel, index:state.value - state.min, available:true, reason:null};
   }
   const candidates = new Set<number>();
@@ -241,7 +253,7 @@ async function requestedEffort(menu: EffortMenu, effort: string, cachedIndex: nu
     const label = await readCurrentEffortLabel(menu);
     if (browserEffortIdFromLabel(label) === effort) return {id:effort, label, index, available:true, reason:null};
   }
-  throw new Error("ChatGPT did not expose the requested effort");
+  throw new ModelOptionUnavailableError("ChatGPT did not expose the requested effort");
 }
 
 export async function selectModelAndEffort(
@@ -273,7 +285,7 @@ export async function selectModelAndEffort(
   }
   const control = controls.first();
   let menu = await activateChatGptEffortMenu(page, control);
-  menu = await selectChatGptModelFamily(menu, family!, () => activateChatGptEffortMenu(page, control));
+  menu = await selectChatGptModelFamily(menu, family!, () => activateChatGptEffortMenu(page, control),signal);
   let resolved: ResolvedBrowserModel;
   try {
     const option = await requestedEffort(menu, effort, capabilities?.models.find(candidate => candidate.id === model)
@@ -281,6 +293,8 @@ export async function selectModelAndEffort(
     resolved = resolveBrowserModel(model, effort, {models:modelsFromDiscoveredEfforts(family!, [option])});
   } catch (error) {
     await page.keyboard.press("Escape").catch(() => {});
+    signal?.throwIfAborted();
+    if (error instanceof ModelOptionUnavailableError) throw error;
     throw new BrowserCompanionError(`The requested ChatGPT model and effort could not be selected in this conversation: ${error instanceof Error ? error.message : "verification failed"}`, "model_unavailable", {cause:error});
   }
   const effortIndex = resolved.effortIndex;
@@ -303,6 +317,30 @@ export async function selectModelAndEffort(
   await assertChatGptModelFamily(confirmation, resolved.family!, resolved.effort, effortIndex, 1_000);
   await page.keyboard.press("Escape");
   return { ...resolved, selection:{ url:selectedUrl, label } };
+}
+
+export async function selectAvailableModelAndEffort(
+  page:Page,model:string,effort:string,capabilities?:AccountCapabilities,signal?:AbortSignal,
+  verifyFallbackDestination?:()=>Promise<void>,
+):Promise<SelectedBrowserModel> {
+  const missingFamilies=new Set<string>();
+  const candidates=[{model,effort},...modelFallbacks(model,effort)];
+  for (let index=0;index<candidates.length;index++) {
+    const candidate=candidates[index]!;
+    const family=/^gpt-([\d.]+)-/.exec(candidate.model)?.[1];
+    if (family&&missingFamilies.has(family)&&candidate.model!=="gpt-5.6-luna") continue;
+    if (candidate.model==="gpt-5.6-luna"&&!capabilities?.models.some(option=>option.id===candidate.model)) continue;
+    signal?.throwIfAborted();
+    if (index>0) { await verifyFallbackDestination?.(); await page.keyboard.press("Escape"); }
+    try { return await selectModelAndEffort(page,candidate.model,candidate.effort,capabilities,signal); }
+    catch(error) {
+      signal?.throwIfAborted();
+      if (!(error instanceof ModelOptionUnavailableError)) throw error;
+      if (error.unavailableFamily) missingFamilies.add(error.unavailableFamily);
+    }
+  }
+  await page.keyboard.press("Escape").catch(()=>{});
+  throw new ModelOptionUnavailableError("The preferred ChatGPT model and all supported fallbacks are unavailable; the message was not sent");
 }
 
 export async function assertSelectedModelAndEffort(

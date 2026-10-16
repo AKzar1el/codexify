@@ -1,5 +1,6 @@
 mod companion;
 mod install;
+mod model_fallback;
 mod store;
 mod supervisor;
 

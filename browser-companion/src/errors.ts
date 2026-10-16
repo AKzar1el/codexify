@@ -29,6 +29,13 @@ export function selectorDrift(message: string, cause?: unknown): BrowserCompanio
   return new BrowserCompanionError(message, "selector_drift", { cause });
 }
 
+/** Only a picker-confirmed missing/locked option permits an automatic fallback. */
+export class ModelOptionUnavailableError extends BrowserCompanionError {
+  constructor(message:string,readonly unavailableFamily?:string) {
+    super(message,"model_unavailable");
+  }
+}
+
 export function asCompanionError(error: unknown): BrowserCompanionError {
   if (error instanceof BrowserCompanionError) return error;
   if (error instanceof DOMException && error.name === "AbortError") {

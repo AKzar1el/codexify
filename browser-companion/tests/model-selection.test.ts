@@ -10,7 +10,7 @@ test("model family selection recognizes only the exact supported UI rows", async
     const menu = { menu: {
       getByRole: (_role: string, options: { name: RegExp }) => ({
         count: async () => options.name.test(label) ? 1 : 0,
-        getAttribute: async () => "true",
+        getAttribute: async (name:string) => name==="aria-checked"?"true":null,
         waitFor: async () => { throw new Error("Requested family is absent"); },
       }),
       locator: () => ({ count:async () => 1, getAttribute:async () => "true" }),
@@ -39,7 +39,7 @@ test("GPT-5.5 remains selectable when its retirement notice is part of the radio
     const menu = { menu:{
       getByRole: (_role: string, options: { name:RegExp }) => ({
         count:async () => options.name.test(label) ? 1 : 0,
-        getAttribute:async () => "true",
+        getAttribute:async (name:string) => name==="aria-checked"?"true":null,
       }),
     } } as unknown as Parameters<typeof selectChatGptModelFamily>[0];
     expect(await selectChatGptModelFamily(menu, "5.5", async () => menu)).toBe(menu);
