@@ -72,6 +72,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
     await host.locator('#messages').screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-goal-${label}.png`});
    };
    const assertCompact=async()=>{
+    assert.equal(await event.locator('svg').evaluate(element=>getComputedStyle(element).color),await host.locator('#goal-icon').evaluate(element=>getComputedStyle(element).color),'timeline and goal bar use the same completed-goal green');
     const bounds=await event.boundingBox();assert(bounds.height<=36,'collapsed completion is one compact row');
     assert(await event.locator('.markdown').isHidden(),'full goal is collapsed by default');
     const metrics=await event.evaluate(element=>{

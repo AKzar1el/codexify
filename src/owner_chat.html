@@ -52,7 +52,8 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .presence.goal-running .goal-outer-ring { transform-box:view-box; transform-origin:center; animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
 @keyframes presence-spin { to { transform:rotate(360deg); } }
 .presence.away { background:#eba916; border-color:#eba916; color:white; }
-.presence.offline { color:#85898d; background:#fff; }
+.presence.offline,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
+.presence.offline { background:#fff; }
 #conversations .presence.offline { visibility:hidden; }
 .presence.waiting,.presence.goal-blocked,.presence.error { color:#c4313b; }
 @media(prefers-color-scheme:dark) { .presence.waiting,.presence.goal-blocked,.presence.error { color:#ff858e; } }
@@ -925,9 +926,12 @@ input,select,textarea { font:inherit; }
       button.setAttribute("aria-current", String(chat.id === selected));
       button.title = `${chat.title} · ${chat.workspace}`;
       button.addEventListener("click", () => select(chat.id));
-      const state = waitingForPresenceRefresh && lastPresence.has(chat.id) ? lastPresence.get(chat.id) : sidebarState(chat, now);
-      lastPresence.set(chat.id,state);
+      const previousPresence = waitingForPresenceRefresh ? lastPresence.get(chat.id) : null;
+      const state = previousPresence?.state ?? sidebarState(chat, now);
+      const agentState = previousPresence?.agentState ?? presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs);
+      lastPresence.set(chat.id,{ state, agentState });
       const icon = textNode("span", `presence ${state}`, "");
+      icon.dataset.agentState = agentState;
       if (state === "goal-running" || state === "online") icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
       icon.append(presenceIcon(state));
       icon.title = state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;

@@ -525,7 +525,8 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
       assert.equal(await icons.nth(index).locator('.goal-outer-ring').count(),1);
       assert.equal(await icons.nth(index).locator('.goal-outer-ring').evaluate(node=>getComputedStyle(node).animationName),'none');
       assert.equal(await icons.nth(index).getAttribute('title'),'Goal completed');
-      assert.equal(await icons.nth(index).evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)');
+      assert.equal(await icons.nth(index).evaluate(node=>getComputedStyle(node).color),index===11?'rgb(133, 137, 141)':'rgb(21, 155, 39)');
+      assert.equal(await icons.nth(index).isVisible(),true,'completed goals remain visible when the agent is offline');
     }
     assert.equal(await icons.nth(12).locator('.presence-spinner').count(),1);
     assert.equal(await icons.nth(13).isVisible(),false);
@@ -570,6 +571,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     assert.equal(await icons.nth(5).locator(".goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
     await page.emulateMedia({colorScheme:"dark"});
     assert.equal(await icons.nth(5).evaluate(node=>getComputedStyle(node).color),"rgb(255, 133, 142)");
+    assert.equal(await icons.nth(11).evaluate(node=>getComputedStyle(node).color),await icons.nth(7).evaluate(node=>getComputedStyle(node).color),'completed offline goals match the offline gray in dark mode');
     await page.emulateMedia({colorScheme:"light"});
     const header = page.locator("#chat-host #presence");
     await page.locator('#chat-host #presence[data-state="online"]').waitFor();
@@ -585,8 +587,25 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     await page.locator(".conversation-row:nth-of-type(4) .conversation .presence.online .presence-spinner").waitFor();
     await page.locator(".conversation-row:nth-of-type(5) .conversation .presence.offline").waitFor({state:"attached"});
     assert.equal(await page.locator(".conversation-row:nth-of-type(5) .conversation .presence.offline").isVisible(),false);
+    const completed=page.locator(`.conversation-row[data-chat-id="${chats[10].id}"] .presence.goal-completed`);
+    chats[10].lastAgentCallAtMs=Date.now()-240000;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator(`.conversation-row[data-chat-id="${chats[10].id}"] .presence[data-agent-state="away"]`).waitFor();
+    assert.equal(await completed.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)','completed goals stay green while the agent is away');
+    chats[10].lastAgentCallAtMs=null;chats[10].agentPresenceUntilMs=Date.now()+2000;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator(`.conversation-row[data-chat-id="${chats[10].id}"] .presence[data-agent-state="online"]`).waitFor();
+    assert.equal(await completed.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)','goal completion alone does not gray an online agent');
+    await page.locator(`.conversation-row[data-chat-id="${chats[10].id}"] .presence[data-agent-state="offline"]`).waitFor();
+    assert.equal(await completed.evaluate(node=>getComputedStyle(node).color),'rgb(133, 137, 141)','the existing completed icon turns gray when presence expires');
+    chats[10].agentWaitingUntilMs=Date.now()+60000;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator(`.conversation-row[data-chat-id="${chats[10].id}"] .presence[data-agent-state="waiting"]`).waitFor();
+    assert.equal(await completed.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)','an agent waiting for a reply keeps its completed icon green');
     if (process.env.CODEXIFY_WORKSPACE_SCREENSHOTS) {
       mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS,{recursive:true});
+      await page.locator(`.conversation-row[data-chat-id="${chats[10].id}"]`).screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-completed-waiting.png`});
+      await page.locator(`.conversation-row[data-chat-id="${chats[11].id}"]`).screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-completed-offline.png`});
       await page.screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-goal-sidebar.png`,fullPage:true});
     }
     assert.deepEqual(errors,[]);
