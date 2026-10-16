@@ -323,7 +323,7 @@ mod tests {
         fixture.health_calls.fetch_add(1, Ordering::SeqCst);
         Json(
             json!({"protocolVersion":1,"kind":"codexify-browser-companion",
-            "build":format!("1.7.0{}",crate::agent_automation::PROTOCOL_BUILD_SUFFIX),
+            "build":format!("{}{}",env!("CARGO_PKG_VERSION"),crate::agent_automation::PROTOCOL_BUILD_SUFFIX),
             "authenticated":true,"accountFingerprint":"fixture-account","activeActionId":null,
             "status":if fixture.mode.load(Ordering::SeqCst)==0 {"busy"} else {"idle"}}),
         )
@@ -393,7 +393,7 @@ mod tests {
         let descriptor = browser_directory.join("descriptor.json");
         std::fs::write(&descriptor, json!({"version":1,"kind":"codexify-browser-companion","pid":std::process::id(),
             "endpoint":endpoint,"token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "build":format!("1.7.0{}",crate::agent_automation::PROTOCOL_BUILD_SUFFIX),"createdAt":"2026-10-14T00:00:00Z"}).to_string()).unwrap();
+            "build":format!("{}{}",env!("CARGO_PKG_VERSION"),crate::agent_automation::PROTOCOL_BUILD_SUFFIX),"createdAt":"2026-10-14T00:00:00Z"}).to_string()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

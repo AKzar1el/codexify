@@ -6,28 +6,75 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-17
+
 ### Added
 
-- Agent-chat browser automation is available as an opt-in offline fallback in the
-  standalone chat. It uses one separately packaged, version-matched Electron
-  companion and one shared ChatGPT window, explicit verified conversation URLs,
-  exact model/effort/connector checks, a Rust-owned global queue, streamed stable
-  browser output, and 10 KiB revisioned goals through `goal_read`/`goal_finish`.
-  Ordinary online chat remains unchanged, Web models are not added to Codex, and
-  ambiguous Send, UI drift, approvals, rate limits, account changes, and manual
-  interference fail closed without automatic replay.
-- `codexify browser install|start|stop|status|login|reveal` manages the optional
-  user-session companion. Release installers remain server-only unless
-  `CODEXIFY_INSTALL_BROWSER=1` is set. Browser archives are SHA-256-verified,
-  installed privately under `~/.codexify/browser/runtime/`, and include Codexify's
-  license plus the upstream `codex-chatgpt-web` MIT notice.
+- Optional browser automation for standalone agent chats and autonomous goals,
+  with one shared ChatGPT tab, verified conversation pairing, a global action
+  queue, and goal controls through `goal_read` and `goal_finish`.
+- A separately packaged browser companion with bundled private Chrome, Patchright,
+  an isolated profile, and `codexify browser install|start|stop|status|login|reveal`
+  lifecycle commands. Browser installation remains opt-in with
+  `CODEXIFY_INSTALL_BROWSER=1`.
+- Local chat pinning and archives, transcript search, project and recent views,
+  date grouping, persistent chat names, and inline renaming. Pinning and archiving
+  affect only Codexify's interface.
+- Persistent chat attachments with preview, download, and agent attachment tools.
+- Redesigned global and conversation settings, settings search, validated
+  automatic saving, a raw JSON editor, and actual default values that remain
+  unsaved until explicitly changed.
+- Browser request blocking with configurable regular expressions, plus independent
+  experimental overrides for read-only, destructive, idempotent, and open-world
+  tool annotations.
+- Conversation workspace controls that preserve chat identity and keep project
+  memory separate when changing the workspace.
+
+### Changed
+
+- Unavailable model and effort selections automatically fall back to the next
+  verified available option for chats and goal continuations, starting with
+  GPT-6 Astra Pro, GPT-5.6 Sol Pro, GPT-6 Sol Extra High, and GPT-6 Sol High.
+  Saved preferences remain intact and are retried on later turns.
+- Automatic pairing uses Medium effort, records created conversation URLs before
+  verification completes, accepts valid late pairing, and restores the requested
+  conversation settings afterward.
+- Browser queue ownership ends after verified submission instead of waiting for
+  the generated response. Operations use bounded deadlines and cancellation
+  cleanup; connector refreshes queue behind active work and reuse the existing tab.
+- Connector tools refresh automatically after updates. Subscription labels use
+  billing information with an account-menu fallback and remain hidden when no
+  reliable plan label is available.
+- Goal completion appears at its transcript position with a compact expandable
+  summary. Completed-goal icons share consistent colors and reflect offline
+  presence; conversation headers, controls, and sidebar footers are aligned.
+
+### Fixed
+
+- Message submission now waits for the real enabled Send control, excludes voice
+  controls, handles repeated DOM markers for one logical turn, and clears stale
+  drafts before browser actions.
+- Native message delivery and read receipts reconcile without waiting for browser
+  work. Agent acknowledgments can resolve uncertain submissions without sending
+  the same message again.
+- Verified pairings survive browser failure cleanup. Created chat URLs remain
+  available for retrying failed pairing instead of reverting to a project URL.
+- Failed chat actions can be cancelled as well as retried. Goal updates no longer
+  insert internal control messages into the visible conversation.
+- Archived-chat navigation preserves the selected conversation when it has been
+  restored to the inbox. Pinned chats have a persistent filled pin and a visual
+  separator from unpinned chats.
+- Unresponsive upstream services and blocking filesystem work are isolated so
+  they cannot stall unrelated tool requests.
 
 ### Security
 
-- Automation pairing references, ChatGPT URLs, prompts, goals, browser output, and
-  account fingerprints are omitted from audit values and redacted from payload
-  logging. Goal tool inputs use write-only schema fields and private goal results
-  suppress their complete payload preview.
+- Browser archives are SHA-256-verified and installed privately with the required
+  license notices. Account, conversation, model, effort, connector, and pairing
+  identity are checked before submission; ambiguous Send, UI drift, approvals,
+  account changes, and interference fail closed without automatic replay.
+- Pairing references, ChatGPT URLs, prompts, goals, browser output, and account
+  fingerprints are redacted from payload logging and omitted from audit values.
 
 ## [1.7.0] - 2026-10-07
 
@@ -633,7 +680,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/devnoname120/codexify/compare/v1.6.6...v1.7.0
 [1.6.6]: https://github.com/devnoname120/codexify/compare/v1.6.5...v1.6.6
 [1.6.5]: https://github.com/devnoname120/codexify/compare/v1.6.4...v1.6.5
