@@ -6,13 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.8.0] - 2026-10-17
+## [2.0.0] - 2026-10-17
 
 ### Added
 
-- Optional browser automation for standalone agent chats and autonomous goals,
-  with one shared ChatGPT tab, verified conversation pairing, a global action
-  queue, and goal controls through `goal_read` and `goal_finish`.
+- Agent-chat browser automation is available as an opt-in offline fallback for
+  standalone chats and autonomous goals, with one shared ChatGPT tab, verified
+  conversation pairing, a global action queue, and goal controls through
+  `goal_read` and `goal_finish`.
 - A separately packaged browser companion with bundled private Chrome, Patchright,
   an isolated profile, and `codexify browser install|start|stop|status|login|reveal`
   lifecycle commands. Browser installation remains opt-in with
@@ -680,8 +681,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v1.8.0...HEAD
-[1.8.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v1.8.0
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/devnoname120/codexify/compare/v1.6.6...v1.7.0
 [1.6.6]: https://github.com/devnoname120/codexify/compare/v1.6.5...v1.6.6
 [1.6.5]: https://github.com/devnoname120/codexify/compare/v1.6.4...v1.6.5

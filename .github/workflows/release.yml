@@ -50,6 +50,7 @@ jobs:
           cd browser-companion
           bun test
           bun run typecheck
+          bun run build
           cd ..
           node --test scripts/test-browser-companion-boundary.mjs
 
