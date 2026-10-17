@@ -204,13 +204,14 @@ impl AgentAutomationStore {
         task: &ConversationIdentity,
         send: TurnSend,
     ) -> Result<(), String> {
-        self.mutate(task, |state| {
+        let analytics_send = send.clone();
+        let result = self.mutate(task, |state| {
             if state.action.id.as_deref() != Some(send.action_id.as_str())
                 || state.action.kind == Some(AutomationActionKind::PairVerify)
                 || state.pairing.generation != send.pairing_generation
                 || state.pairing.verified_owner_generation != Some(send.owner_generation)
             {
-                return Ok(());
+                return Ok(false);
             }
             if let Some(saved) = &mut state.turn_renewal.send
                 && saved.action_id == send.action_id
@@ -222,7 +223,7 @@ impl AgentAutomationStore {
                     saved.model = send.model;
                     saved.effort = send.effort;
                 }
-                return Ok(());
+                return Ok(true);
             }
             let resume_wait_until_ms = state.turn_renewal.handoff.as_ref().map(|_| {
                 send.at_ms
@@ -233,8 +234,14 @@ impl AgentAutomationStore {
                 handoff: None,
                 resume_wait_until_ms,
             };
-            Ok(())
-        })
+            Ok(true)
+        });
+        if matches!(result, Ok(true))
+            && let Ok(path) = self.task_directory(task)
+        {
+            crate::usage_analytics::sent(&self.usage_options, path.join("CHAT.md"), analytics_send);
+        }
+        result.map(|_| ())
     }
     pub fn turn_renewal_notice(
         &self,

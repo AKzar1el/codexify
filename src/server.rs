@@ -979,6 +979,22 @@ impl ServerHandler for CodexHandler {
         } else {
             None
         };
+        let _usage_guard = activity.as_ref().and_then(|activity| {
+            let root = self.selected_project_root(task_conversation.as_ref())?;
+            let config = self
+                .effective_task_config(task_conversation.as_ref(), root)
+                .ok()?;
+            let chat = self
+                .markdown_chat
+                .chat(&config, task_conversation.as_ref(), &self.session)
+                .ok()?;
+            Some(crate::usage_analytics::tool(
+                &config,
+                chat.path(),
+                activity,
+                &name,
+            ))
+        });
         let call_identity = tool
             .map(|tool| tool.call_identity(&args))
             .unwrap_or_else(|| ToolCallIdentity::native(name.clone()));

@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — planned for 2.1
+
+- A local Analytics dashboard in global settings with daily stacked model/effort
+  charts for turns, estimated active time and native tool calls; date ranges,
+  lifetime totals, conversation leaderboards, goal completions and milestones.
+  Collection is enabled by default, starts with new activity and can be paused.
+  It uses separate best-effort storage and never controls chat automation.
+
 ## [2.0.0] - 2026-10-17
 
 ### Added

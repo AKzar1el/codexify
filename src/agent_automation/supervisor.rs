@@ -547,6 +547,7 @@ impl AgentAutomationSupervisor {
 
     pub fn start(self: &Arc<Self>) -> AutomationSupervisorWorker {
         super::turn_analytics::initialize();
+        crate::usage_analytics::initialize();
         let supervisor = self.clone();
         let task = tokio::spawn(async move {
             loop {

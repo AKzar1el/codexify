@@ -1852,6 +1852,7 @@ static OWNER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .replace("<!-- CHAT_TEMPLATE -->", &format!("<template id=\"chat-template\"><style>{style}\n#chat {{ max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; }} #panel {{ display:flex; flex:1; min-height:0; flex-direction:column; }} #panel[hidden] {{ display:none; }} #messages {{ flex:1; max-height:none; min-height:0; }}\n</style>{body}</template>"))
         .replace("/* CHAT_SCRIPT */", script)
         .replace("/* GLOBAL_SETTINGS_SCRIPT */", include_str!("global_settings_ui.js"))
+        .replace("/* USAGE_ANALYTICS_SCRIPT */", include_str!("analytics_ui.js"))
 });
 
 pub async fn start(
@@ -1907,6 +1908,7 @@ pub(crate) async fn start_with_automation(
     continuations: Arc<ConversationContinuationStore>,
     automation: Option<Arc<AgentAutomationSupervisor>>,
 ) -> anyhow::Result<OwnerServer> {
+    crate::usage_analytics::initialize();
     let listener = bind_owner_listener(&config).await?;
     let port = listener.local_addr()?.port();
     let info = load_or_create_runtime(&runtime_path(), port)?;
@@ -1953,6 +1955,7 @@ fn router(state: OwnerState) -> Router {
         .route("/api/global", get(settings::status))
         .route("/api/settings", get(settings::read).post(settings::save))
         .route("/api/analytics/turn-cutoffs", get(analytics::read))
+        .route("/api/analytics/usage", get(analytics::usage))
         .route("/api/settings/restart", post(settings::restart))
         .route("/api/settings/update", post(settings::update))
         .route(

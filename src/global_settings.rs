@@ -185,6 +185,7 @@ pub fn save(
             chat.remove("defaultMessageMode");
             chat.remove("rolloutReminderInterval");
             chat.remove("rolloutEnabled");
+            chat.remove("analyticsEnabled");
             chat.remove("turnRenewal");
         }
         if value

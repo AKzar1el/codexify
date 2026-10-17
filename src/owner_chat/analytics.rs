@@ -14,16 +14,16 @@ impl Drop for ReaderPermit {
 }
 static READING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-async fn best_effort(
+async fn best_effort<T: Default + Send + 'static>(
     busy: Arc<AtomicBool>,
     deadline: Duration,
-    work: impl FnOnce() -> Summary + Send + 'static,
-) -> Summary {
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
     if busy
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return Summary::default();
+        return T::default();
     }
     let permit = ReaderPermit(busy);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -56,6 +56,41 @@ pub(super) async fn read(State(state): State<OwnerState>) -> Json<Summary> {
     )
 }
 
+#[derive(Deserialize)]
+pub(super) struct UsageQuery {
+    days: Option<String>,
+}
+pub(super) async fn usage(
+    State(state): State<OwnerState>,
+    Query(query): Query<UsageQuery>,
+) -> Json<crate::usage_analytics::Dashboard> {
+    let days = match query.days.as_deref() {
+        Some("all") => None,
+        value => Some(
+            value
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(7)
+                .clamp(1, 3660),
+        ),
+    };
+    // Separate permits keep optional dashboard reads independent of cutoff stats.
+    static USAGE_READING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    let busy = USAGE_READING.get_or_init(Default::default).clone();
+    Json(
+        best_effort(busy, Duration::from_secs(2), move || {
+            crate::usage_analytics::dashboard(
+                locate(&state.config, &state.project_bindings)
+                    .into_iter()
+                    .map(|c| (c.id, c.path)),
+                days,
+                crate::markdown_chat::now_ms(),
+                &crate::usage_analytics::Options::from_config(&state.config),
+            )
+        })
+        .await,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,7 +105,7 @@ mod tests {
         .await;
         assert_eq!(result.samples, 0);
         assert!(busy.load(Ordering::Acquire));
-        let result = best_effort(busy.clone(), Duration::from_millis(10), || {
+        let result = best_effort::<Summary>(busy.clone(), Duration::from_millis(10), || {
             panic!("busy readers must be skipped")
         })
         .await;
@@ -166,6 +201,16 @@ mod tests {
                 .len(),
             1
         );
+        let usage = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/analytics/usage?days=30"
+            ))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(usage.status(), StatusCode::OK);
+        assert_eq!(usage.json::<Value>().await.unwrap()["totals"]["turns"], 0);
         assert_eq!(std::fs::read(&bad).unwrap(), b"bad analytics");
         server.abort();
     }

@@ -11,4 +11,5 @@ const widgetScript = section(chatHtml, "<script>", "</script>");
 export const ownerHtml = readFileSync(new URL("../src/owner_chat.html", import.meta.url), "utf8")
   .replace("<!-- CHAT_TEMPLATE -->", `<template id="chat-template"><style>${style}\n#chat { max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; } #panel { display:flex; flex:1; min-height:0; flex-direction:column; } #panel[hidden] { display:none; } #messages { flex:1; max-height:none; min-height:0; }\n</style>${widgetBody}</template>`)
   .replace("/* CHAT_SCRIPT */", widgetScript)
+  .replace("/* USAGE_ANALYTICS_SCRIPT */",readFileSync(new URL("../src/analytics_ui.js",import.meta.url),"utf8"))
   .replace("/* GLOBAL_SETTINGS_SCRIPT */",readFileSync(new URL("../src/global_settings_ui.js",import.meta.url),"utf8"));

@@ -1,4 +1,4 @@
-function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
+function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onOpenChat=()=>{}}) {
   const byId=id=>document.getElementById(id);
   const icons={
     general:'<path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="4"/>',
@@ -14,6 +14,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     code:'<path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-14-2 16"/>',
     arrow:'<path d="m9 5 7 7-7 7"/>',
     check:'<path d="m5 12 4 4L19 6"/>',
+    analytics:'<path d="M4 20V10m8 10V4m8 16v-7M2 20h20"/>',
     restart:'<path d="M3 10a9 9 0 1 1 1 8M3 3v7h7"/>',
   };
   const icon=name=>`<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name]||icons.advanced}</svg>`;
@@ -81,6 +82,8 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
 #settings-dialog .setting-object-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}
 #settings-dialog .setting-object-summary button{font-size:12px;white-space:nowrap}
 #settings-dialog .cutoff-body{padding:14px 18px}#settings-dialog .cutoff-body p{margin:0 0 12px}#settings-dialog .cutoff-body p:last-child{margin-bottom:0}#settings-dialog .cutoff-scroll{overflow-x:auto;margin:14px 0}#settings-dialog .cutoff-scroll table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#settings-dialog .cutoff-scroll :is(th,td){text-align:right;white-space:nowrap;padding:9px 8px;border-bottom:1px solid var(--line)}#settings-dialog .cutoff-scroll :is(th,td):first-child{text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:120px}#settings-dialog .cutoff-scroll th{color:var(--muted);font-weight:500}
+#settings-dialog.analytics-view{width:min(1280px,calc(100vw - 48px))}#settings-nav button[data-category=analytics]{margin-top:18px;border-top:1px solid var(--line);border-radius:0;padding-top:18px}#settings-dialog.analytics-view #settings-content-description{margin-bottom:18px}
+@media(max-width:680px){#settings-nav button[data-category=analytics]{margin-top:0;border-top:0;padding-top:10px}}
 #settings-dialog .settings-empty{padding:40px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
 #settings-dialog .settings-empty p{margin:8px 0 0;font-size:13px}
 #settings-raw-panel p{color:var(--muted);font-size:13px;margin:0 0 16px}
@@ -110,6 +113,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     {id:'connections',name:'Connections',description:'Manage authentication, MCP servers, and OpenAI tunnels.'},
     {id:'tools',name:'Tools & files',description:'Set command limits and control file access, imports, and exports.'},
     {id:'advanced',name:'Advanced',description:'Logging, diagnostics, memory, and experimental features.'},
+    {id:'analytics',name:'Analytics',description:'Turns, tools, goals, and the momentum behind your conversations.'},
   ];
   const groups={general:'Preferences',agentChat:'Chat server',worktrees:'Worktrees',projectCatalog:'Project catalogue',projectDoc:'Project instructions',skills:'Skills',codexMcp:'Imported MCP servers',tree:'Directory tree',ignore:'Ignored files',command:'Command limits',exec:'Command sessions',output:'Output limits',filesystem:'Filesystem limits',diff:'Diff limits',artifactIngress:'File imports',artifactEgress:'File exports',toolLogging:'Tool logging',audit:'Audit log',memory:'Memory',experimental:'Experimental features'};
   const names={workDir:'Project access directory',multiProject:'Allow multiple projects',projectCloneDir:'Git clone directory',uiWidgets:'Embedded chat widgets',apiKey:'API key',conversationAuthToken:'Conversation setup reference',openaiTunnel:'Primary OpenAI tunnel',openaiTunnels:'Additional OpenAI tunnels',mcpServers:'MCP servers',allowedHosts:'Allowed host names',debug:'Debug mode'};
@@ -123,6 +127,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     'agentChat.rolloutEnabled':['Keep chronological per-chat progress reports and checkpoint reminders. Independent of turn renewal. Applies immediately.','chats','Progress journal'],
     'agentChat.turnRenewal.enabled':['Ask for a final handoff at the model limit, then continue automatically after the report finishes. Applies immediately.','chats','Turn renewal'],
     'agentChat.turnRenewal.limits':['Minutes from the last accepted ChatGPT send. All limits remain editable while turn renewal is off. Unlisted selections use 55 minutes.','chats','Turn limits by model'],
+    'agentChat.analyticsEnabled':['Collect local usage counters from new activity. Applies within a few seconds. Existing statistics are preserved when paused.','analytics','Collect analytics'],
     'agentChat.enabled':['Enable conversations and agent messaging.','chats'], 'agentChat.rolloutReminderInterval':['Agent work tool calls between progress checkpoint reminders. UI polling and idle wait loops do not count. Applies immediately.','chats','Progress report interval'], 'agentChat.defaultMessageMode':['Default composer action. Cmd+Enter on Mac or Ctrl+Enter on Windows/Linux uses the other mode for one message.','chats','Default message mode'], 'agentChat.port':['Port for the owner chat interface.','chats'], 'agentChat.maxWaitMs':['Maximum duration of a chat_await or turn_completed call, in milliseconds.','chats'],
     'agentChat.automation.enabled':['Use the browser companion to send messages and continue goals.','browser'], 'agentChat.automation.connectorName':['The connector to mention when sending messages in ChatGPT.','browser'], 'agentChat.automation.chatgptProjectUrl':['ChatGPT project used for new conversations.','browser'], 'agentChat.automation.descriptorPath':['Location of the browser companion connection descriptor.','browser'], 'agentChat.automation.requestBlockList':['One case-sensitive Chrome regex per line. Matching requests never reach the server. Restart the browser companion after changing this list.','browser','Blocked requests'], 'agentChat.automation.maxQueuedActions':['Maximum number of actions waiting to be sent.','chats'], 'agentChat.automation.autoApproveToolCalls':['Automatically approve tool calls in ChatGPT.','browser'],
     'agentChat.notifications.events.completed':['A chat or goal finishes.','notifications','Completion'], 'agentChat.notifications.events.inputRequired':['A chat needs your reply. Repeated alerts are deduplicated.','notifications','Input required'], 'agentChat.notifications.events.goalBlocked':['A goal becomes blocked.','notifications','Goal blocked'], 'agentChat.notifications.events.errors':['An error prevents a chat from continuing.','notifications','Chat errors'], 'agentChat.notifications.events.messages':['Notify for new agent messages.','notifications','New messages'], 'agentChat.notifications.events.offline':['Notify when an agent goes offline.','notifications','Agent offline'], 'agentChat.notifications.urls':['Apprise destination URLs, one per line.','notifications','Delivery destinations'], 'agentChat.notifications.pythonPath':['Python executable used to deliver notifications.','notifications','Python executable'], 'agentChat.notifications.timeoutMs':['Notification delivery timeout, in milliseconds.','notifications','Delivery timeout'],
@@ -247,6 +252,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     const request=++cutoffRequest;
     try {const response=await api('/api/analytics/turn-cutoffs');if(!response.ok)return;const data=await response.json();if(request!==cutoffRequest)return;cutoffEstimates=data;const card=byId('cutoff-estimates');if(card)card.replaceWith(cutoffCard());}catch{/* Optional analytics must never affect settings or display errors. */}
   }
+  const usageDashboard=createUsageAnalytics({api,getChats,onOpenChat:id=>{dialog.close();onOpenChat(id);},isVisible:()=>dialog.open&&category==='analytics'&&!rawMode,getEnabled:()=>draftAt('agentChat.analyticsEnabled')??snapshot?.defaults?.agentChat?.analyticsEnabled??true,setEnabled:value=>queue('agentChat.analyticsEnabled',value),cutoffCard});
   function renderForm() {
     for(const button of byId('settings-nav').children)button.setAttribute('aria-current',String(!rawMode&&button.dataset.category===category));
     byId('settings-sidebar').hidden=rawMode;byId('settings-form').hidden=rawMode;byId('settings-raw-panel').hidden=!rawMode;byId('settings-dialog').querySelector('.settings-body').style.gridTemplateColumns=rawMode?'minmax(0,1fr)':'';
@@ -257,6 +263,8 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     byId('settings-content-description').textContent=rawMode?'Edit the configuration file directly.':query?`${matching.length} ${matching.length===1?'setting':'settings'} matching “${byId('settings-search').value.trim()}”`:current.description;
     if(rawMode)return;
     const form=byId('settings-form');form.replaceChildren();
+    dialog.classList.toggle('analytics-view',category==='analytics'&&!query);
+    if(category==='analytics'&&!query){usageDashboard.mount(form);return;}
     const eventOrder=['completed','inputRequired','goalBlocked','errors','messages','offline'];
     matching.sort((a,b)=>{const aEvent=a.category==='notifications'&&a.section==='Events',bEvent=b.category==='notifications'&&b.section==='Events';return Number(bEvent)-Number(aEvent)||(aEvent&&bEvent?eventOrder.indexOf(a.path.split('.').at(-1))-eventOrder.indexOf(b.path.split('.').at(-1)):0);});
     const sections=new Map();for(const field of matching){const title=query?`${categories.find(item=>item.id===field.category).name} · ${field.section}`:field.section;if(!sections.has(title))sections.set(title,[]);sections.get(title).push(field);}

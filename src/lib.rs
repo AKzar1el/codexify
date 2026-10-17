@@ -64,6 +64,7 @@ mod tool_logging;
 pub mod tools;
 pub mod types;
 mod upstream_control;
+pub(crate) mod usage_analytics;
 pub mod util;
 pub mod widget_debug;
 pub mod worktrees;

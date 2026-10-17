@@ -235,6 +235,7 @@ input,select,textarea { font:inherit; }
 <!-- CHAT_TEMPLATE -->
 <script>
 /* CHAT_SCRIPT */
+/* USAGE_ANALYTICS_SCRIPT */
 /* GLOBAL_SETTINGS_SCRIPT */
 (() => {
   "use strict";
@@ -1304,7 +1305,7 @@ input,select,textarea { font:inherit; }
     finally{newBusy=false;newReady();}
   });
   bindBackdrop(newDialog, () => { if (!newBusy) newDialog.close(); });
-  startGlobalSettings({api,bindBackdrop,onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
+  startGlobalSettings({api,bindBackdrop,getChats:()=>chats,onOpenChat:id=>select(id),onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
   search.addEventListener("input", () => {
     clearTimeout(searchTimer); ++listRequest; pendingList = null; renderList();
     searchTimer = setTimeout(refresh, 200);

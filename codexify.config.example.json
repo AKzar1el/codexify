@@ -141,6 +141,7 @@
       }
     },
     "rolloutEnabled": true,
+    "analyticsEnabled": true,
     "turnRenewal": {
       "enabled": false,
       "limits": [

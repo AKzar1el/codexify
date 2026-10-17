@@ -480,6 +480,7 @@ pub struct AgentAutomationStore {
     notification_workspace: String,
     pub(super) renewal_config: super::turn_renewal::TurnRenewalConfig,
     pub(super) settings_path: Option<PathBuf>,
+    pub(super) usage_options: crate::usage_analytics::Options,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +538,7 @@ impl AgentAutomationStore {
             notification_workspace: "Agent chat".into(),
             renewal_config: Default::default(),
             settings_path: None,
+            usage_options: Default::default(),
         })
     }
 
@@ -544,6 +546,7 @@ impl AgentAutomationStore {
         self.notifications = config.markdown_chat.notifications.clone();
         self.renewal_config = config.markdown_chat.turn_renewal.clone();
         self.settings_path = config.loaded_config_path.clone();
+        self.usage_options = crate::usage_analytics::Options::from_config(config);
         self.notification_workspace = config
             .work_dir
             .file_name()
@@ -1111,7 +1114,7 @@ impl AgentAutomationStore {
     ) -> Result<GoalRecord, String> {
         let normalized = normalize_goal_finish(finish)?;
         let transcript = self.task_directory(task)?.join("CHAT.md");
-        self.mutate(task, |state| {
+        let result = self.mutate(task, |state| {
             let result = {
                 let goal = exact_goal_mut(state, expected_revision)?;
                 if terminal_finish_matches(goal, &normalized) {
@@ -1150,7 +1153,15 @@ impl AgentAutomationStore {
                 state.action.updated_at_ms = Some(now_ms);
             }
             Ok(result)
-        })
+        });
+        if let Ok(goal) = &result {
+            crate::usage_analytics::goal(
+                &self.usage_options,
+                self.root.join(task.stable_key()).join("CHAT.md"),
+                goal,
+            );
+        }
+        result
     }
 
     pub fn issue_pairing(
