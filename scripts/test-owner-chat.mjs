@@ -1549,6 +1549,7 @@ for (const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
       await page.reload();await host.locator('#draft').waitFor();assert(await sidebar.isHidden());assert.equal(await host.locator('#draft').inputValue(),'Keep this unsent draft');
       await host.getByRole('button',{name:'Back to chats',exact:true}).click();
       await row(chats[21]).click();await host.locator('#draft').waitFor();assert.equal(await host.locator('#draft').inputValue(),'');
+      await host.locator('#messages').getByText(`Update for ${chats[21].title}.`,{exact:false}).waitFor();
       assert((await host.locator('#messages').textContent()).includes(chats[21].title));
       await page.setViewportSize({width:1280,height:900});await sidebar.waitFor();assert(await main.isVisible());assert(await host.getByRole('button',{name:'Back to chats',exact:true}).isHidden());await capture('desktop');
       assert(!writes.some(path=>path.endsWith('/send')||path.includes('/goal')||path.endsWith('/action/cancel')),'navigation never sends, cancels, or pauses agent work');assert.deepEqual(errors,[]);
