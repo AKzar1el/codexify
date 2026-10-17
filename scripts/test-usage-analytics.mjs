@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createRequire} from 'node:module';
 import {mkdirSync} from 'node:fs';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat',ids=['a'.repeat(64),'b'.repeat(64)],modelIds=['gpt-6-astra\x1fmax','gpt-5.6-sol\x1fhigh'];
 function fixture(range){
@@ -15,7 +15,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   const page=await browser.newPage({viewport:{width:1500,height:1000}});page.setDefaultTimeout(7000);
   const errors=[],writes=[],reads=[];page.on('pageerror',e=>errors.push(e.message));let fail=false,malformed=false,revision=1;
   const config={agentChat:{analyticsEnabled:true,turnRenewal:{enabled:false,limits:[]}}},snapshot=()=>({document:config,defaults:{agentChat:{analyticsEnabled:true}},raw:JSON.stringify(config),path:'/fixture/config.json',revision:String(revision),restartRequired:false});
-  await page.route('http://127.0.0.1:43318/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43318/**',async route=>{
    const request=route.request(),url=new URL(request.url()),path=url.pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    assert.equal(request.headers().authorization,'Bearer test-token');

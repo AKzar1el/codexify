@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {mkdirSync,readFileSync} from 'node:fs';
 import test from 'node:test';
 import {createRequire} from 'node:module';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 
 for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: Pro labels repair old generic catalogs and preserve Astra/Pro selection`,{timeout:30000},async()=>{
@@ -16,7 +16,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    {id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:[{id:'high',label:'High',available:true}]},
   ];
   const mutations=[];
-  await page.route('http://127.0.0.1:43228/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43228/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(request.method()!=='GET')mutations.push(path);
@@ -49,7 +49,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   let document={debug:false,workDir:'/workspace',worktrees:{mode:'auto'},agentChat:{enabled:true,automation:{enabled:true}},apiKey:'private-fixture-key'};
   const saves=[],operations=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
   const snapshot=()=>({path:'/private/codexify.config.json',document,raw:JSON.stringify(document,null,2),revision:String(revision),defaults:document,restartRequired:false});
-  await page.route('http://127.0.0.1:43227/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43227/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    assert.equal(request.headers().authorization,'Bearer test-token');
@@ -105,7 +105,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const writes=[],errors=[];let failSave=false,heldSave=null;
   page.on('pageerror',error=>errors.push(error.message));
   const snapshot=()=>({path:'/fixture/config.json',document,defaults,revision:String(revision),raw:JSON.stringify(document,null,2)});
-  await page.route('http://127.0.0.1:43229/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43229/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{label:'Pro 20x'},settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});
@@ -187,7 +187,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   let document={workDir:'/projects'},revision=1;
   const writes=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
   const snapshot=()=>({path:'/fixture/config.json',document,defaults,fieldSchema,revision:String(revision),raw:JSON.stringify(document)});
-  await page.route('http://127.0.0.1:43230/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43230/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return route.fulfill({json:{version:'1.7.0',settingsAvailable:true,latest:{updateAvailable:false}}});
@@ -243,7 +243,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const oldRead=new Promise(resolve=>{oldReadStarted=resolve;});
   const oldReadGate=new Promise(resolve=>{releaseOldRead=resolve;});
   const errors=[];page.on('pageerror',error=>errors.push(error.message));
-  await page.route('http://127.0.0.1:43231/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43231/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/chats')return route.fulfill({json:{chats:[]}});
@@ -291,7 +291,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   let document={workDir:'/fixture',experimental:{forceReadOnlyToolAnnotations:true}},revision=1;
   const writes=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
   const snapshot=()=>({document,raw:JSON.stringify(document,null,2),revision:String(revision),defaults:{experimental:{forceReadOnlyToolAnnotations:false,...hints}},fieldSchema:{experimental:{forceReadOnlyToolAnnotations:false,...hints}},defaultLabels:Object.fromEntries(keys.map(key=>['experimental.'+key,'Keep tool hints']))});
-  await page.route('http://127.0.0.1:43240/**',route=>{
+  await routeOwner(page,'http://127.0.0.1:43240/**',route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    assert.equal(request.headers().authorization,'Bearer test-token');
@@ -338,7 +338,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
  try {
   const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
   let plan=null,fail=false;
-  await page.route('http://127.0.0.1:43241/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43241/**',async route=>{
    const path=new URL(route.request().url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return fail?route.fulfill({status:503,body:'Unavailable'}):route.fulfill({json:{version:'1.7.0',plan,latest:{updateAvailable:false}}});
@@ -373,7 +373,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   let document={workDir:'/fixture',agentChat:{enabled:true},codexMcp:{enabled:false}},revision=1;
   const writes=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
   const snapshot=()=>({path:'/fixture/config.json',defaults,document,raw:JSON.stringify(document),revision:String(revision),restartRequired:false});
-  await page.route('http://127.0.0.1:43316/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43316/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return route.fulfill({json:{version:'2.0.0',plan:null,settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});
@@ -402,7 +402,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
   let document={workDir:'/fixture',agentChat:{enabled:true}},revision=1;const writes=[],errors=[];page.on('pageerror',e=>errors.push(e.message));
   const snapshot=()=>({path:'/fixture/config.json',defaults,document,raw:JSON.stringify(document),revision:String(revision),restartRequired:false});
-  await page.route('http://127.0.0.1:43317/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43317/**',async route=>{
    const req=route.request(),path=new URL(req.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return route.fulfill({json:{version:'2.0.0',plan:null,settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});
@@ -430,7 +430,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
   const errors=[],writes=[];page.on('pageerror',error=>errors.push(error.message));let fail=false;
   const config={agentChat:{turnRenewal:{enabled:false,limits:[]}}};
-  await page.route('http://127.0.0.1:43242/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43242/**',async route=>{
    const path=new URL(route.request().url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(route.request().method()!=='GET')writes.push(path);

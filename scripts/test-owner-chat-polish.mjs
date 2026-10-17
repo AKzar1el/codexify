@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {mkdirSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import test from 'node:test';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat';
@@ -32,7 +32,7 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
   {id:'after',role:'agent',markdown:'After completion',start:100,end:200,tool_call_count:32,created_at_ms:now-1000},
  ];
  page.on('pageerror',error=>errors.push(error.message));
- await page.route(origin+'/**',async route=>{
+ await routeOwner(page,origin+'/**',async route=>{
   const request=route.request(),url=new URL(request.url());
   if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   if(held&&(url.pathname==='/api/chats'||/^\/api\/chats\/[0-9a-f]+$/.test(url.pathname)))await gate;

@@ -4,6 +4,7 @@
 mod analytics;
 mod attachments;
 mod creation;
+mod pwa;
 mod settings;
 
 use std::io::{Read, Write};
@@ -1774,7 +1775,7 @@ async fn authorize(
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         == Some("https");
-    if request.uri().path() != "/" {
+    if request.uri().path() != "/" && !pwa::is_asset(request.uri().path()) {
         let expected = format!("Bearer {}", state.token);
         if request
             .headers()
@@ -1814,7 +1815,7 @@ async fn authorize(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(if content_request {
             "sandbox; default-src 'none'; img-src 'self' blob: data:; media-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
-        }else{"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}),
+        }else{"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"}),
     );
     response
 }
@@ -1951,6 +1952,8 @@ async fn bind_owner_listener(config: &AppConfig) -> anyhow::Result<tokio::net::T
 fn router(state: OwnerState) -> Router {
     Router::new()
         .route("/", get(page))
+        .route("/manifest.webmanifest", get(pwa::serve))
+        .route("/icons/{name}", get(pwa::serve))
         .route("/api/health", get(settings::health))
         .route("/api/global", get(settings::status))
         .route("/api/settings", get(settings::read).post(settings::save))
@@ -2578,6 +2581,66 @@ mod tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+        for (path, mime, size) in [
+            ("/manifest.webmanifest", "application/manifest+json", 0),
+            ("/icons/app-180.png", "image/png", 180),
+            ("/icons/app-192.png", "image/png", 192),
+            ("/icons/app-512.png", "image/png", 512),
+        ] {
+            let response = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(
+                response.headers()[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap()
+                    .contains("manifest-src 'self'")
+            );
+            let bytes = response.bytes().await.unwrap();
+            if size == 0 {
+                let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(manifest["name"], "Codexify");
+                assert_eq!(manifest["display"], "standalone");
+                assert_eq!(manifest["id"], "/");
+                assert!(
+                    manifest.get("start_url").is_none(),
+                    "retain the existing private launch URL"
+                );
+                assert!(!String::from_utf8_lossy(&bytes).contains("test-token"));
+            } else {
+                let image = image::load_from_memory(&bytes).unwrap();
+                assert_eq!((image.width(), image.height()), (size, size));
+            }
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .header(header::HOST, "other.example")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/icons/not-an-icon.png"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/api/settings"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         let unauthorized = client
             .get(format!("{base}/api/chats"))
             .send()

@@ -3,6 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/app-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/app-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Codexify">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f5f7f6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#171b1a" media="(prefers-color-scheme: dark)">
 <title>Codexify chats</title>
 <style>
 :root { color-scheme:light dark; --bg:#f5f7f6; --panel:#fff; --ink:#202427; --muted:#6b7475; --line:#dce2df; --accent:#136f50; --selected:#e4f3ed; }
@@ -242,6 +250,11 @@ input,select,textarea { font:inherit; }
   "use strict";
   const token = location.hash.slice(1) || sessionStorage.getItem("owner-chat-token");
   if (token) sessionStorage.setItem("owner-chat-token", token);
+  // Home Screen launches use this private URL, including its access fragment.
+  if (token && !location.hash) {
+    const url = new URL(location.href); url.hash = token;
+    history.replaceState(history.state, "", url);
+  }
   const list = document.getElementById("conversations");
   const host = document.getElementById("chat-host");
   const errorNode = document.getElementById("error");

@@ -291,6 +291,14 @@ connector, so list titles are derived from chat entries (preferring the first
 user entry). See the
 [standalone chat reference](docs/REFERENCE.md#standalone-owner-chat).
 
+On iPhone, open your working private chat URL in Safari, choose **Share → Add to
+Home Screen**, leave **Open as Web App** enabled, and tap **Add**. The Home Screen
+app uses a Codexify icon and standalone display. It needs a connection to your
+running service. This adds no service worker, offline cache, or push notifications.
+The manifest keeps the installation page's URL so its private access fragment
+continues to work when the app is reopened; credentials are not put in the
+manifest or icons.
+
 The **New chat** button in standalone chat creates and verifies a corresponding
 ChatGPT conversation. Choose an existing project, a Git repository or GitHub
 PR/branch/commit URL, a saved worktree, or **Chat without a project**. The worktree

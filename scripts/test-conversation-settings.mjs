@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createRequire} from 'node:module';
 import {mkdirSync,readFileSync} from 'node:fs';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat';
 
@@ -14,7 +14,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   page.on('pageerror',error=>errors.push(error.message));
   const state={enabled:true,pairing:{status:'verified',canonicalUrl:'https://chatgpt.com/c/example-conversation'},goal:{status:'active',markdown:'Continue the investigation',revision:1,elapsedActiveMs:3600000,turnCount:2},selection:{model:'gpt-6-astra',effort:'max'},catalog:{models:[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}]},companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:now},action:{status:'failed',kind:'offline_chat',id:'failed-action',lastError:'The browser could not send the message.',retryMode:'retry'}};
   const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
-  await page.route('http://127.0.0.1:43302/**',async route=>{
+  await routeOwner(page,'http://127.0.0.1:43302/**',async route=>{
    const request=route.request(),path=new URL(request.url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{label:'Pro 20x'},settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});

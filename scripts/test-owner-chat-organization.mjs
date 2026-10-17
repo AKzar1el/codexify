@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {mkdirSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import test from 'node:test';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat';
 const origin='http://127.0.0.1:43238';
@@ -14,7 +14,7 @@ async function fixture(browser) {
  const chats=titles.map((title,i)=>({id:'abcde'[i].repeat(64),title,workspace:i===2?'orbstack':i===4?'Dopamine2-roothide':'mach-o-vita',projectId:i===2?'orb':i===4?'dopamine':'vita',projectPath:'/projects/'+i,lastEntryEnd:200,lastEntryAtMs:now-i*10000,lastAgentCallAtMs:null,totalToolCalls:12,pinnedAtMs:null,archivedAtMs:i===3?now-30000:i===4?now-20000:null}));
  page.on('pageerror',error=>errors.push(error.message));
  const messages=[{id:'agent-message',role:'agent',markdown:'The latest checks passed. The conversation and its saved files are ready for the next step.',start:0,end:100,created_at_ms:now,tool_call_count:10},{id:'user-message',role:'user',markdown:'Continue from the current progress.',start:100,end:200,created_at_ms:now,tool_call_count:12}];
- await page.route(origin+'/**',route=>{
+ await routeOwner(page, origin+'/**',route=>{
   const request=route.request(),url=new URL(request.url());
   if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   assert.equal(request.headers().authorization,'Bearer test-token');

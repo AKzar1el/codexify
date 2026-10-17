@@ -13,3 +13,16 @@ export const ownerHtml = readFileSync(new URL("../src/owner_chat.html", import.m
   .replace("/* CHAT_SCRIPT */", widgetScript)
   .replace("/* USAGE_ANALYTICS_SCRIPT */",readFileSync(new URL("../src/analytics_ui.js",import.meta.url),"utf8"))
   .replace("/* GLOBAL_SETTINGS_SCRIPT */",readFileSync(new URL("../src/global_settings_ui.js",import.meta.url),"utf8"));
+
+// Match the owner's public install assets before conversation-specific API mocks.
+const ownerAssets=new Map([
+  ["/manifest.webmanifest", "application/manifest+json", "manifest.webmanifest"],
+  ...[180,192,512].map(size=>[`/icons/app-${size}.png`, "image/png", `app-${size}.png`]),
+].map(([path,contentType,file])=>[path,{contentType,body:readFileSync(new URL("../src/owner_chat/pwa/"+file,import.meta.url))}]));
+export const ownerAssetResponse = path => ownerAssets.get(path);
+export function routeOwner(page, pattern, handler, options) {
+  return page.route(pattern,(route,request)=>{
+    const asset=ownerAssetResponse(new URL(route.request().url()).pathname);
+    return asset?route.fulfill(asset):handler(route,request);
+  },options);
+}

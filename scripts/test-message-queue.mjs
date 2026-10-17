@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createRequire} from 'node:module';
 import {mkdirSync,readFileSync} from 'node:fs';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat';
 const id='a'.repeat(64),base='http://127.0.0.1:43314';
@@ -21,7 +21,7 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
  const state=()=>({_meta:{[META]:{chat_file:'/fixture/chats/CHAT.md',workspace_path:'/fixture',revision:String(backend.revision),messages:[...messages],delivered_through:0,read_through:0,total_tool_calls:1,last_agent_call_at_ms:Date.now(),server_time_ms:Date.now(),has_more:false,unchanged:false,queued_messages:structuredClone(backend.queue),default_message_mode:backend.mode}}});
  const append=(entry)=>{const msg={...entry,role:'user',start:backend.end,end:backend.end+100,tool_call_count:1};backend.end=msg.end;messages.push(msg);backend.revision++;return msg;};
  const receipt=(entry)=>({id:entry.id,end:entry.end,created_at_ms:entry.created_at_ms,tool_call_count:entry.tool_call_count});
- await page.route(`${base}/**`,async route=>{
+ await routeOwner(page, `${base}/**`,async route=>{
   const request=route.request(),url=new URL(request.url()),path=url.pathname;
   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   assert.equal(request.headers().authorization,'Bearer queue-test-token');

@@ -148,6 +148,9 @@ jobs:
       - name: Test Markdown chat composer, synchronization, and receipts
         run: node --test scripts/test-markdown-chat-widget.mjs
 
+      - name: Test Home Screen app metadata and private launch
+        run: node --test scripts/test-owner-chat-pwa.mjs
+
       - name: Test private message queue and composer modes
         run: node --test scripts/test-message-queue.mjs
 

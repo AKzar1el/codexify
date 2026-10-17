@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
-import { ownerHtml } from "./owner-chat-source.mjs";
+import { ownerHtml, routeOwner } from "./owner-chat-source.mjs";
 
 const { chromium, webkit } = createRequire(import.meta.url)("playwright");
 const META = "io.github.devnoname120/codexify/markdown-chat";
@@ -60,7 +60,7 @@ test(`${engineName}: multiline drafts keep message history stable across backgro
     page.on('pageerror',error=>errors.push(error.message));
     const messages=Array.from({length:40},(_,i)=>({id:`message-${i}`,role:'agent',markdown:`Progress ${i}. ${'Some details from the ongoing work. '.repeat(15)}`,start:i*100,end:(i+1)*100,created_at_ms:now,tool_call_count:i+1}));
     const goal={status:'completed',markdown:'Completed goal',revision:1,elapsedActiveMs:3600000,turnCount:1,finishedAtMs:now-1000};
-    await page.route('http://127.0.0.1:43221/**',route=>{
+    await routeOwner(page, 'http://127.0.0.1:43221/**',route=>{
       const url=new URL(route.request().url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
       if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Multiline draft',workspace:'scrolling',lastEntryEnd:4000,lastEntryAtMs:now,lastAgentCallAtMs:now,totalToolCalls:40,goalStatus:'completed',goalCompletionDismissed:true}],serverTimeMs:Date.now()}});
@@ -104,7 +104,7 @@ test(`${engineName}: unpaired composer offers Pair chat until verification compl
     page.on('pageerror',error=>errors.push(error.message));
     const chat={id,title:'Unpaired chat',workspace:'test',lastEntryEnd:1,lastEntryAtMs:Date.now(),lastAgentCallAtMs:Date.now(),totalToolCalls:1};
     const state={enabled:true,pairing:{status:'unpaired'},goal:null,action:{status:'idle'},selection:{model:'gpt-6-astra',effort:'max'},companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:chat.lastAgentCallAtMs}};
-    await page.route('http://127.0.0.1:43220/**',route=>{
+    await routeOwner(page, 'http://127.0.0.1:43220/**',route=>{
       const request=route.request(),url=new URL(request.url());
       if(request.method()!=='GET') {operations.push(url.pathname);return route.fulfill({status:405});}
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
@@ -167,7 +167,7 @@ test(`${engineName}: pairing failures open a prefilled retry box and submit one 
     let holdNextPoll=false,pollStarted,postStarted,rejectReceipt=false;
     const postReady=new Promise(resolve=>{postStarted=resolve;});
     page.on('pageerror',error=>errors.push(error.message));
-    await page.route('http://127.0.0.1:43226/**',async route=>{
+    await routeOwner(page, 'http://127.0.0.1:43226/**',async route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
       assert.equal(request.headers().authorization,'Bearer test-token');
@@ -247,7 +247,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     page.on('pageerror',error=>errors.push(error.message));
     const chat={id,title:"Failed message",workspace:"test",lastEntryEnd:1,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:1};
     let action={id:"failed-action",kind:"offline_chat",status:"failed",lastError:"ChatGPT connector menu did not open",sendAccepted:false,retryMode:"retry",automaticRetryAtMs:null,automaticRetryAttempts:3};
-    await page.route('http://127.0.0.1:43219/**',route=>{
+    await routeOwner(page, 'http://127.0.0.1:43219/**',route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
       if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:['failed','ambiguous'].includes(action.status)?action.lastError:null}],serverTimeMs:Date.now()}});
@@ -301,7 +301,7 @@ test(`${engineName}: completed sidebar badges clear after follow-up and leave th
     let goal={revision:1,markdown:"Completed objective",status:"completed",createdAtMs:now-5000,finishedAtMs:now-1000,elapsedActiveMs:4000,turnCount:1};
     const chat={id,title:"Completed objective chat",workspace:"completed",goalStatus:"completed",goalCompletionDismissed:false,goalCompletedAtMs:goal.finishedAtMs,goalCompletedChatEnd:42,lastAgentCallAtMs:now,lastEntryEnd:42,lastEntryAtMs:now,totalToolCalls:1};
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
-    await page.route('http://127.0.0.1:43218/**',route=>{
+    await routeOwner(page, 'http://127.0.0.1:43218/**',route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
       if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[chat],serverTimeMs:Date.now()}});
@@ -366,7 +366,7 @@ test(`${engineName}: reopening a running goal editor immediately enables its res
     const held=new Promise(resolve=>{releasePoll=resolve;});
     const submissions=[],errors=[];
     page.on("pageerror",error=>errors.push(error.message));
-    await page.route("http://127.0.0.1:43217/**",async route=>{
+    await routeOwner(page, "http://127.0.0.1:43217/**",async route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==="/")return route.fulfill({contentType:"text/html",body:ownerHtml});
       if(url.pathname==="/api/chats")return route.fulfill({json:{chats:[{id,title:"Running goal",workspace:"goal-editor",lastAgentCallAtMs:now,lastEntryEnd:0,lastEntryAtMs:now,totalToolCalls:1,goalStatus:goal.status}],serverTimeMs:Date.now()}});
@@ -419,7 +419,7 @@ test(`${engineName}: opening a goal chat stays at the bottom after controls load
       hold(order === "history-first" ? "automation" : "history");
       const errors=[];
       page.on("pageerror",error=>errors.push(error.message));
-      await page.route("http://127.0.0.1:43216/**",async route=>{
+      await routeOwner(page, "http://127.0.0.1:43216/**",async route=>{
         const url=new URL(route.request().url());
         if(url.pathname==="/")return route.fulfill({contentType:"text/html",body:ownerHtml});
         if(url.pathname==="/api/chats")return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
@@ -507,7 +507,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     }));
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
-    await page.route("http://127.0.0.1:43215/**", route => {
+    await routeOwner(page, "http://127.0.0.1:43215/**", route => {
       const url = new URL(route.request().url());
       if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml });
       if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats, serverTimeMs:Date.now() } });
@@ -647,7 +647,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     messages.get(chats[0].id).push({ id:"raw-one", role:"agent", markdown:rawSource, start:1, end:100, created_at_ms:now, tool_call_count:3 });
     const seenRequests = [];
     let failPolling = false;
-    await page.route("http://127.0.0.1:43210/**", async route => {
+    await routeOwner(page, "http://127.0.0.1:43210/**", async route => {
       const request = route.request();
       const url = new URL(request.url());
       if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml, headers:{
@@ -783,7 +783,7 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
       { id:"4".repeat(64), title:"Oldest beta", workspace:"same-name", projectId:"beta", projectPath:"/projects/beta/same-name", lastEntryAtMs:now - 3000 }
     ].map(chat => ({ ...chat, customTitle:null, latestTitle:chat.title, lastEntryEnd:100, lastAgentCallAtMs:null, totalToolCalls:0 }));
     let releaseOldSearch = null;
-    await page.route("http://127.0.0.1:43212/**", async route => {
+    await routeOwner(page, "http://127.0.0.1:43212/**", async route => {
       const request = route.request(), url = new URL(request.url());
       if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml });
       assert.equal(request.headers().authorization, "Bearer test-token");
@@ -892,7 +892,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       serverTimeMs:now
     };
     const meta = payload => ({ _meta:{ [META]:payload } });
-    await page.route("http://127.0.0.1:43211/**", async route => {
+    await routeOwner(page, "http://127.0.0.1:43211/**", async route => {
       const request = route.request();
       const url = new URL(request.url());
       if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml, headers:{
@@ -1199,7 +1199,7 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
       const chat = { id:"f".repeat(64), title:"Timed goal", workspace:"timer-project", lastEntryEnd:0, lastEntryAtMs:clock, lastAgentCallAtMs:null, totalToolCalls:0 };
       const goal = { markdown:"Keep making progress", status:"active", elapsedActiveMs:0, activeSinceMs:clock - 3000, timerUntilMs:clock - 3000 + 300000, turnCount:1392 };
       let failState = false;
-      await page.route("http://127.0.0.1:43213/**", async route => {
+      await routeOwner(page, "http://127.0.0.1:43213/**", async route => {
         const request = route.request(), url = new URL(request.url());
         if (url.pathname === "/") return route.fulfill({ contentType:"text/html", body:ownerHtml });
         if (url.pathname === "/api/chats") return route.fulfill({ json:{ chats:[chat], serverTimeMs:clock } });
@@ -1264,7 +1264,7 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
       const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
       const chats=[], submitted=[], errors=[];let preparations=0;
       page.on('pageerror',error=>errors.push(error.message));
-      await page.route('http://127.0.0.1:43215/**',async route=>{
+      await routeOwner(page, 'http://127.0.0.1:43215/**',async route=>{
         const request=route.request(),url=new URL(request.url());
         if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
         assert.equal(request.headers().authorization,'Bearer test-token');
@@ -1365,7 +1365,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
  try {
   const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);const now=Date.now();await page.clock.install({time:now});
   const id='d'.repeat(64),errors=[];let serverNow=now,lastCall=now,until=now+5000;page.on('pageerror',error=>errors.push(error.message));
-  await page.route('http://127.0.0.1:43232/**',route=>{
+  await routeOwner(page, 'http://127.0.0.1:43232/**',route=>{
    const path=new URL(route.request().url()).pathname;
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Just paired',workspace:'pairing',lastEntryEnd:0,lastEntryAtMs:now,lastAgentCallAtMs:lastCall,agentPresenceUntilMs:until,totalToolCalls:2}],serverTimeMs:serverNow}});
@@ -1396,7 +1396,7 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
       const chat={id,title:'Retry cancellation',workspace:'test',lastEntryEnd:1,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:1};
       const goal={revision:1,markdown:'Preserve this goal',status:'active',turnCount:1};
       let action={id:'backoff',kind:'offline_goal',status:'failed',lastError:'Browser unavailable',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:now+30000,automaticRetryAttempts:0};
-      await page.route('http://127.0.0.1:43225/**',route=>{
+      await routeOwner(page, 'http://127.0.0.1:43225/**',route=>{
         const request=route.request(),url=new URL(request.url());
         if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
         if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:action.lastError}],serverTimeMs:Date.now()}});
@@ -1453,7 +1453,7 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
       let paired=false;
       const chat={id,title:'Late pairing',workspace:'test',lastEntryEnd:1,lastEntryAtMs:clock,lastAgentCallAtMs:null,totalToolCalls:1};
       const model={id:'gpt-6-sol',label:'GPT-6 Sol',efforts:[{id:'medium',label:'Medium',available:true}]};
-      await page.route('http://127.0.0.1:43226/**',route=>{
+      await routeOwner(page, 'http://127.0.0.1:43226/**',route=>{
         const url=new URL(route.request().url());
         if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
         if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:!paired&&clock>=waitUntil?'Pairing verification has not arrived yet':null}],serverTimeMs:clock}});
@@ -1494,7 +1494,7 @@ async function mobileNavigationFixture(browser, options = {}) {
     lastEntryAtMs:now-index*1000,lastAgentCallAtMs:now,totalToolCalls:16998,
   }));
   page.on('pageerror', error => errors.push(error.message));
-  await page.route(origin+'/**', route => {
+  await routeOwner(page, origin+'/**', route => {
     const request=route.request(), url=new URL(request.url());
     if(request.method()==='POST')writes.push(url.pathname);
     if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});

@@ -4,7 +4,7 @@ import {createRequire} from 'node:module';
 import {createHash} from 'node:crypto';
 import {createServer} from 'node:http';
 import test from 'node:test';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,ownerAssetResponse} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat';
 const png=readFileSync(new URL('../tests/fixtures/attachment-image.png',import.meta.url));
@@ -20,6 +20,7 @@ test(`${name}: attachments support paste focus, page-wide drop, drafts, retries,
   const messages=[];let revision=0;
   const handler=async route=>{
    const request=route.request(),url=new URL(request.url()),path=url.pathname;
+   const asset=ownerAssetResponse(path);if(asset)return route.fulfill(asset);
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/chats')return route.fulfill({headers:{'set-cookie':'codexify-attachment=test-token; Path=/api/chats/; HttpOnly; SameSite=Strict'},json:{chats:[{id,title:'Attachment test',workspace:'test',lastEntryEnd:revision,lastEntryAtMs:Date.now(),lastAgentCallAtMs:Date.now(),agentWaitingUntilMs:Date.now()+120000,totalToolCalls:0}],serverTimeMs:Date.now()}});
    if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal:null,pairing:{status:'unpaired'},action:{status:'idle'},companion:{authenticated:false},presence:{lastAgentCallAtMs:Date.now(),agentWaitingUntilMs:Date.now()+120000},serverTimeMs:Date.now()}});

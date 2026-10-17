@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
-import {ownerHtml} from './owner-chat-source.mjs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const origin='http://127.0.0.1:43329',today='2026-10-17';
 const numbers={7:{turns:84,toolCalls:12480,goals:9},30:{turns:328,toolCalls:50321,goals:27},90:{turns:820,toolCalls:150000,goals:84},all:{turns:1240,toolCalls:284000,goals:119}};
@@ -21,7 +21,7 @@ async function fixture(engine,{clipboard=true}={}){
    Object.defineProperty(navigator,'clipboard',{configurable:true,value:{write(items){window.__copyActivation=navigator.userActivation?.isActive??null;window.__copied=items[0];return window.__copyFailed?Promise.reject(new DOMException('Denied','NotAllowedError')):Promise.resolve();}}});
   }else Object.defineProperty(navigator,'clipboard',{configurable:true,value:undefined});
  },{clipboard});
- await page.route(origin+'/**',async route=>{
+ await routeOwner(page,origin+'/**',async route=>{
   const request=route.request(),url=new URL(request.url()),path=url.pathname;
   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   assert.equal(request.headers().authorization,'Bearer share-test-token');
