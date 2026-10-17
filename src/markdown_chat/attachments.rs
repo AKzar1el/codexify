@@ -735,7 +735,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let shown = store.model_message("request-id", &plan.full_markdown);
         assert!(shown.starts_with(literal));
-        assert!(shown.contains(&file.path));
+        assert!(shown.contains(&serde_json::to_string(&file.path).unwrap()));
         assert!(shown.contains("1970-01-01T00:00:02.000Z"));
         assert!(!shown.contains("request-id"));
         assert!(!shown.contains("submittedAtMs"));
