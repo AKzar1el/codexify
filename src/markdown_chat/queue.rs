@@ -292,6 +292,19 @@ impl ChatFile {
         self.run(|chat| with_queue(chat, false, |state| Ok(state.input_waiting)))
             .await
     }
+    pub async fn queue_reply_received(self: &Arc<Self>) -> Result<(), String> {
+        self.run(|chat| {
+            with_queue(chat, false, |state| {
+                if state.input_waiting || state.completed_waiting {
+                    state.input_waiting = false;
+                    state.completed_waiting = false;
+                    persist(chat, state)?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
     pub async fn queue_goal_holds(self: &Arc<Self>) -> Result<bool, String> {
         self.run(|chat| with_queue(chat, true, |_| goal_holds_queue(chat)))
             .await
@@ -517,10 +530,12 @@ impl ChatFile {
         self.run(move |chat| {
             with_queue(chat, false, |state| {
                 let changed = state.completed_waiting
-                    || state.input_waiting == progress
+                    || !progress && !state.input_waiting
                     || progress && state.in_flight.as_ref().is_some_and(|f| !f.progressed);
                 state.completed_waiting = false;
-                state.input_waiting = !progress;
+                if !progress {
+                    state.input_waiting = true;
+                }
                 if progress && let Some(flight) = &mut state.in_flight {
                     flight.progressed = true;
                 }
@@ -946,6 +961,17 @@ mod tests {
             "input-needed holds queue even when idle"
         );
         chat.queue_agent_work(true).await.unwrap();
+        assert!(
+            chat.queue_input_required().await.unwrap(),
+            "tool progress does not answer the user's pending question"
+        );
+        assert!(
+            chat.release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        chat.queue_reply_received().await.unwrap();
         chat.request_agent_stop("stop-request".into())
             .await
             .unwrap();

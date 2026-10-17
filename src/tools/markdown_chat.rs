@@ -353,6 +353,11 @@ impl Tool for ChatTool {
                 Err(error) => return ToolResult::error(error),
             };
             let mut next_action = NEXT_CONTINUE_OR_COMPLETED;
+            if !receipt.user_text.is_empty()
+                && let Err(error) = chat.queue_reply_received().await
+            {
+                tracing::warn!(%error, "could not clear the answered input request");
+            }
             if event == notification::NotificationEvent::InputRequired
                 && receipt.user_text.is_empty()
             {
@@ -455,8 +460,16 @@ impl Tool for ChatTool {
             }
         }
         match self {
-            Self::Read => match chat.read_cancellable(true, context.cancellation.clone()).await {
+            Self::Read => match chat
+                .read_cancellable(true, context.cancellation.clone())
+                .await
+            {
                 Ok(snapshot) => {
+                    if !snapshot.text.is_empty()
+                        && let Err(error) = chat.queue_reply_received().await
+                    {
+                        tracing::warn!(%error, "could not clear the answered input request");
+                    }
                     let (status, content, next_action) = if snapshot.text.is_empty() {
                         (
                             "empty",
@@ -494,7 +507,11 @@ impl Tool for ChatTool {
                     };
                 }
             } {
-                Ok(WaitOutcome::Message(snapshot)) => with_message(
+                Ok(WaitOutcome::Message(snapshot)) => {
+                    if let Err(error) = chat.queue_reply_received().await {
+                        tracing::warn!(%error, "could not clear the answered input request");
+                    }
+                    with_message(
                     result(
                         "message",
                         "The user replied. Read new_chat_message_from_user before continuing and answer or acknowledge it ASAP with chat_write.".into(),
@@ -505,20 +522,40 @@ impl Tool for ChatTool {
                     snapshot.text,
                     false,
                     snapshot.end,
-                ),
+                )
+                }
                 Ok(WaitOutcome::TimedOut(state)) => result(
                     "timeout",
-                    if matches!(self, Self::Completed) { KEEP_COMPLETED_WAITING.into() } else { format!("The user has not replied yet. {} {KEEP_WAITING}",notification::description(state)) },
+                    if matches!(self, Self::Completed) {
+                        KEEP_COMPLETED_WAITING.into()
+                    } else {
+                        format!(
+                            "The user has not replied yet. {} {KEEP_WAITING}",
+                            notification::description(state)
+                        )
+                    },
                     chat.path(),
                     state,
-                    if matches!(self, Self::Completed) { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
+                    if matches!(self, Self::Completed) {
+                        NEXT_TURN_COMPLETED
+                    } else {
+                        NEXT_CHAT_AWAIT
+                    },
                 ),
                 Ok(WaitOutcome::Cancelled) => result(
                     "cancelled",
-                    if matches!(self, Self::Completed) { KEEP_COMPLETED_WAITING.into() } else { KEEP_WAITING.into() },
+                    if matches!(self, Self::Completed) {
+                        KEEP_COMPLETED_WAITING.into()
+                    } else {
+                        KEEP_WAITING.into()
+                    },
                     chat.path(),
                     NotificationState::Cancelled,
-                    if matches!(self, Self::Completed) { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
+                    if matches!(self, Self::Completed) {
+                        NEXT_TURN_COMPLETED
+                    } else {
+                        NEXT_CHAT_AWAIT
+                    },
                 ),
                 Err(error) => ToolResult::error(error),
             },
