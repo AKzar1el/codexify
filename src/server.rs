@@ -219,9 +219,18 @@ impl CodexHandler {
             && let Ok(chat) = self
                 .markdown_chat
                 .chat(&config, task_conversation, &self.session)
+            && crate::global_settings::rollout_enabled(&config).unwrap_or(false)
             && let Err(error) = chat.record_rollout_work().await
         {
             tracing::warn!(%error, "could not record progress-report work count");
+        }
+        if let Some(task) = task_conversation
+            && let Some(root) = self.selected_project_root(task_conversation)
+            && let Ok(config) = self.effective_task_config(task_conversation, root)
+            && let Ok(store) = crate::agent_automation::AgentAutomationStore::for_config(&config)
+            && let Err(error) = store.turn_renewal_notice(task, at_ms)
+        {
+            tracing::warn!(%error, "could not check turn renewal");
         }
         Some(activity)
     }
@@ -479,6 +488,10 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
             fields.push((
                 crate::markdown_chat::rollout::REMINDER_FIELD,
                 crate::markdown_chat::rollout::REMINDER_DESCRIPTION,
+            ));
+            fields.push((
+                crate::agent_automation::turn_renewal::NOTICE_FIELD,
+                crate::agent_automation::turn_renewal::NOTICE_DESCRIPTION,
             ));
         }
     }
@@ -1581,7 +1594,28 @@ impl ServerHandler for CodexHandler {
                     self.markdown_chat
                         .chat(&config, task_conversation.as_ref(), &self.session)
             {
-                let notice = if chat.agent_stop_requested().await.unwrap_or(true) {
+                let renewal = if !chat.agent_stop_requested().await.unwrap_or(true)
+                    && let Some(task) = task_conversation.as_ref()
+                {
+                    match crate::agent_automation::AgentAutomationStore::for_config(&config)
+                        .and_then(|store| {
+                            store.turn_renewal_notice(task, crate::markdown_chat::now_ms())
+                        }) {
+                        Ok(notice) => notice,
+                        Err(error) => {
+                            tracing::warn!(%error,"could not check turn renewal");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let renewing = renewal.is_some();
+                output_fields.push((crate::agent_automation::turn_renewal::NOTICE_FIELD, renewal));
+                let notice = if renewing
+                    || !crate::global_settings::rollout_enabled(&config).unwrap_or(false)
+                    || chat.agent_stop_requested().await.unwrap_or(true)
+                {
                     Ok(None)
                 } else {
                     match crate::global_settings::rollout_reminder_interval(&config) {
@@ -2836,6 +2870,7 @@ mod tests {
     include!("server_starvation_tests.rs");
     include!("server_agent_ticket_tests.rs");
     include!("server_agent_automation_tests.rs");
+    include!("server_turn_renewal_tests.rs");
     include!("server_continuation_tests.rs");
 
     fn handler_with_tools(
@@ -2844,6 +2879,7 @@ mod tests {
         tool_log_level: crate::types::ToolLogLevel,
     ) -> CodexHandler {
         let mut config = crate::config::default_config(root.to_path_buf());
+        config.memory.dir = Some(root.join("test-state").display().to_string());
         config.tool_logging.mode = crate::types::ToolLogMode::All;
         config.tool_logging.level = tool_log_level;
         config.audit.log_file = Some(root.join("audit.jsonl"));

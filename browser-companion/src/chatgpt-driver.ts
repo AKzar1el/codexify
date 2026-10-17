@@ -1,4 +1,5 @@
 import type { Locator, Page } from "patchright";
+import {completedHandoff} from "./turn-renewal";
 import {classifyPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
@@ -430,6 +431,14 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     return true;
   }
 
+  async turnHandoffComplete(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean> {
+    await this.surface.beginAction();
+    try {
+      const exact=await exactConversationPage(this.surface,url,url,signal);
+      return await completedHandoff(exact.page,url,account,handoffId,signal);
+    } finally {await this.surface.endAction();}
+  }
+
   async execute(execution: DriverExecution): Promise<void> {
     execution.signal.throwIfAborted();
     this.pendingSubmission={actionId:execution.request.actionId,mayHaveSent:false};
@@ -454,9 +463,16 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
       }
       ownedPage = page;
+      const renewal=execution.request.prompt.kind === "turn_renewal" ? execution.request.prompt : null;
+      const verifyHandoff=async()=>{
+        if(renewal && !await completedHandoff(page,canonicalUrl,account.fingerprint,renewal.handoffId,execution.signal)) {
+          throw new BrowserCompanionError("Turn handoff is not complete; continuation was not sent","external_interference");
+        }
+      };
+      await verifyHandoff();
       if (execution.request.prompt.kind === "pair_verify") await this.replacePairingDraft(execution.request);
       await clearExistingDraft(page,execution.signal);
-      if (execution.request.prompt.kind !== "pair_verify" && !creating) {
+      if (execution.request.prompt.kind !== "pair_verify" && !creating && !renewal) {
         // Offline actions are dispatched after tool-call inactivity. Stop only
         // while preparing this send; ongoing conversations need no observation.
         await stopLingeringResponse(page, execution.signal, { canonicalUrl, accountFingerprint:account.fingerprint });
@@ -497,6 +513,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       execution.emit({ type:"connector_verified" });
       // Read history before inserting a prompt: unsupported markers must not
       // make a newly filled composer flash and disappear during failure cleanup.
+      await verifyHandoff();
       const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       insertionAttempted = true;
       try {await insertExactPrompt(selectedConnector.composer, execution.renderedPrompt);}
@@ -518,6 +535,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         throw new BrowserCompanionError("ChatGPT changed the verified conversation before Send", "conversation_unavailable");
       }
       execution.signal.throwIfAborted();
+      await verifyHandoff();
       sendActivated = true;
       if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
       await send.click({ timeout:10_000, signal:execution.signal });

@@ -176,6 +176,7 @@ pub enum AutomationActionKind {
     OfflineChat,
     OfflineGoal,
     OfflineCombined,
+    TurnRenewal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -276,6 +277,8 @@ pub struct AutomationTaskState {
     pub chat_mirror: ChatMirrorState,
     pub action: AutomationActionState,
     pub goal_wake: GoalWakeState,
+    #[serde(skip_serializing_if = "super::turn_renewal::TurnRenewalState::is_empty")]
+    pub turn_renewal: super::turn_renewal::TurnRenewalState,
     #[serde(default)]
     owner_goal_requests: Vec<OwnerGoalRequestRecord>,
 }
@@ -291,6 +294,7 @@ impl Default for AutomationTaskState {
             chat_mirror: ChatMirrorState::default(),
             action: AutomationActionState::default(),
             goal_wake: GoalWakeState::default(),
+            turn_renewal: Default::default(),
             owner_goal_requests: Vec::new(),
         }
     }
@@ -372,7 +376,7 @@ impl AutomationTaskState {
             return None;
         }
         match action.kind {
-            Some(AutomationActionKind::OfflineChat) => {}
+            Some(AutomationActionKind::OfflineChat | AutomationActionKind::TurnRenewal) => {}
             Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined)
                 if self.goal.as_ref().is_some_and(|goal| {
                     goal.status == GoalStatus::Active && Some(goal.revision) == action.goal_revision
@@ -474,6 +478,8 @@ pub struct AgentAutomationStore {
     pairing_index_root: PathBuf,
     notifications: Option<crate::markdown_chat::NotificationsConfig>,
     notification_workspace: String,
+    pub(super) renewal_config: super::turn_renewal::TurnRenewalConfig,
+    pub(super) settings_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,11 +535,15 @@ impl AgentAutomationStore {
             pairing_index_root,
             notifications: None,
             notification_workspace: "Agent chat".into(),
+            renewal_config: Default::default(),
+            settings_path: None,
         })
     }
 
     fn with_notifications(mut self, config: &AppConfig) -> Self {
         self.notifications = config.markdown_chat.notifications.clone();
+        self.renewal_config = config.markdown_chat.turn_renewal.clone();
+        self.settings_path = config.loaded_config_path.clone();
         self.notification_workspace = config
             .work_dir
             .file_name()
@@ -826,6 +836,7 @@ impl AgentAutomationStore {
                 goal.clone()
             };
             state.goal_wake = GoalWakeState::default();
+            state.turn_renewal = Default::default();
             if state.action.goal_revision == Some(expected_revision) {
                 state.action = AutomationActionState::default();
             }
@@ -1642,6 +1653,7 @@ impl AgentAutomationStore {
                     return Err("Agent automation queued action has inconsistent goal state".into());
                 }
                 (AutomationActionKind::PairVerify | AutomationActionKind::OfflineChat, None) => {}
+                (AutomationActionKind::TurnRenewal, _) => {}
             }
             state.action = AutomationActionState {
                 id: Some(action_id.to_string()),
@@ -2191,7 +2203,7 @@ impl AgentAutomationStore {
         })
     }
 
-    fn mutate<R>(
+    pub(super) fn mutate<R>(
         &self,
         task: &ConversationIdentity,
         mutation: impl FnOnce(&mut AutomationTaskState) -> Result<R, String>,
@@ -2681,8 +2693,9 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
     let Some(bytes) = read_private_record(path)? else {
         return Ok(AutomationTaskState::default());
     };
-    let raw: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "Agent automation state is invalid JSON".to_string())?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        "Agent automation state contains malformed JSON; saved data was preserved".to_string()
+    })?;
     let legacy_goal = raw
         .get("goal")
         .is_some_and(|goal| goal.is_object() && goal.get("elapsedActiveMs").is_none());
@@ -2709,8 +2722,10 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
                     .is_some_and(|goal| goal.is_object() && goal.get("timerUntilMs").is_none())
             })
         });
-    let mut state: AutomationTaskState = serde_json::from_value(raw)
-        .map_err(|_| "Agent automation state is invalid JSON".to_string())?;
+    let mut state: AutomationTaskState = serde_json::from_value(raw).map_err(|_| {
+        "Agent automation state does not match this build's schema; saved data was preserved"
+            .to_string()
+    })?;
     if (legacy_goal || legacy_presence_timer)
         && let Some(goal) = state.goal.as_mut()
     {

@@ -80,6 +80,14 @@ pub struct AutomationLiveState {
 
 #[async_trait]
 pub trait AutomationExecutor: Send + Sync {
+    async fn turn_handoff_complete(
+        &self,
+        _url: &str,
+        _account: &str,
+        _handoff_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn prepare_new_chat(
         &self,
         _project_url: Option<&str>,
@@ -168,6 +176,18 @@ where
 
 #[async_trait]
 impl AutomationExecutor for BrowserAutomationExecutor {
+    async fn turn_handoff_complete(
+        &self,
+        url: &str,
+        account: &str,
+        handoff_id: &str,
+    ) -> Result<bool, String> {
+        let cancellation = CancellationToken::new();
+        let client = self.ready_client(&cancellation).await?;
+        client
+            .turn_handoff_complete(url, account, handoff_id, &cancellation)
+            .await
+    }
     async fn prepare_new_chat(
         &self,
         project_url: Option<&str>,
@@ -724,6 +744,7 @@ impl AgentAutomationSupervisor {
         let action = handle
             .store
             .cancel_action(&handle.task, expected_action_id, now_ms)?;
+        handle.store.clear_turn_renewal(&handle.task)?;
         queue.retain(|execution| {
             execution.task_key != task.stable_key()
                 || execution.request.action_id != expected_action_id
@@ -960,6 +981,51 @@ impl AgentAutomationSupervisor {
             )?;
             let mut state = task.store.load(&task.task)?;
             task.store.notify_state(&task.chat, &state).await;
+            let renewal_config = task.store.turn_renewal_settings()?;
+            let renewal_invalid = activity.agent_stop_requested
+                || !renewal_config.enabled
+                || state.turn_renewal.send.as_ref().is_some_and(|send| {
+                    send.owner_generation != task.owner_generation
+                        || send.pairing_generation != state.pairing.generation
+                });
+            if renewal_invalid
+                && (state.turn_renewal.handoff.is_some()
+                    || activity.agent_stop_requested && state.turn_renewal.send.is_some())
+            {
+                task.store.clear_turn_renewal(&task.task)?;
+                self.queue.lock().await.retain(|q| {
+                    q.task_key != task.task.stable_key()
+                        || execution_kind(q) != AutomationActionKind::TurnRenewal
+                });
+                state = task.store.load(&task.task)?;
+            }
+            if let Some(handoff) = state.turn_renewal.handoff.clone() {
+                if state.action.kind == Some(AutomationActionKind::TurnRenewal)
+                    && state.action.send_accepted == Some(true)
+                {
+                    continue;
+                }
+                if !handoff.report_complete {
+                    if let (Some(url), Some(account)) = (
+                        state.pairing.canonical_url.as_deref(),
+                        state.pairing.account_fingerprint.as_deref(),
+                    ) && state.pairing.verified_owner_generation == Some(task.owner_generation)
+                        && now_ms.saturating_sub(handoff.requested_at_ms) >= 5_000
+                        && let Ok(_browser_guard) = self.run_lock.try_lock()
+                        && let Ok(Ok(true)) = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            self.executor
+                                .turn_handoff_complete(url, account, &handoff.id),
+                        )
+                        .await
+                    {
+                        task.store.confirm_turn_handoff(&task.task, &handoff.id)?;
+                        state = task.store.load(&task.task)?;
+                    } else {
+                        continue;
+                    }
+                }
+            }
             if state.action.status == AutomationActionStatus::Cancelled
                 && state.goal_retry_at_ms().is_none()
             {
@@ -1017,11 +1083,17 @@ impl AgentAutomationSupervisor {
                     state = task.store.load(&task.task)?;
                 }
             }
+            let renewing = state
+                .turn_renewal
+                .handoff
+                .as_ref()
+                .is_some_and(|h| h.report_complete);
             if activity.agent_stop_requested
-                || activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
-                || activity
-                    .agent_waiting_until_ms
-                    .is_some_and(|until| now_ms < until)
+                || !renewing
+                    && (activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+                        || activity
+                            .agent_waiting_until_ms
+                            .is_some_and(|until| now_ms < until))
             {
                 continue;
             }
@@ -1090,22 +1162,27 @@ impl AgentAutomationSupervisor {
                     }
                 }
             }
-            if matches!(
-                state.action.status,
-                AutomationActionStatus::Navigating
-                    | AutomationActionStatus::Sending
-                    | AutomationActionStatus::Generating
-            ) && state.action.updated_at_ms.is_some_and(|started| {
-                now_ms.saturating_sub(started)
-                    >= self.action_timeouts.total.as_millis().min(u64::MAX as u128) as u64
-            }) && let Ok(_run_guard) = self.run_lock.try_lock()
+            let obsolete_action =
+                renewing && state.action.kind != Some(AutomationActionKind::TurnRenewal);
+            if !obsolete_action
+                && matches!(
+                    state.action.status,
+                    AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
+                && state.action.updated_at_ms.is_some_and(|started| {
+                    now_ms.saturating_sub(started)
+                        >= self.action_timeouts.total.as_millis().min(u64::MAX as u128) as u64
+                })
+                && let Ok(_run_guard) = self.run_lock.try_lock()
                 && task
                     .store
                     .expire_unobserved_action(&task.task, &state.action)?
             {
                 state = task.store.load(&task.task)?;
             }
-            if let Some(retry_at) = state.goal_retry_at_ms() {
+            if let Some(retry_at) = state.goal_retry_at_ms().filter(|_| !obsolete_action) {
                 if now_ms < retry_at {
                     continue;
                 }
@@ -1119,7 +1196,7 @@ impl AgentAutomationSupervisor {
                     continue;
                 }
             }
-            if let Some(retry_at) = state.automatic_retry_at_ms() {
+            if let Some(retry_at) = state.automatic_retry_at_ms().filter(|_| !obsolete_action) {
                 if now_ms < retry_at {
                     continue;
                 }
@@ -1134,7 +1211,7 @@ impl AgentAutomationSupervisor {
                     continue;
                 }
             }
-            if blocks_automatic_requeue(state.action.status) {
+            if !obsolete_action && blocks_automatic_requeue(state.action.status) {
                 continue;
             }
             let Some(account_fingerprint) = state
@@ -1201,7 +1278,10 @@ impl AgentAutomationSupervisor {
                 .as_ref()
                 .filter(|goal| goal.status == GoalStatus::Active)
                 .map(|goal| goal.revision);
-            if !all_pending_messages.is_empty() && retained_accepted.len() >= MAX_CHAT_MIRROR_IDS {
+            if !renewing
+                && !all_pending_messages.is_empty()
+                && retained_accepted.len() >= MAX_CHAT_MIRROR_IDS
+            {
                 let kind = if goal_revision.is_some() {
                     AutomationActionKind::OfflineCombined
                 } else {
@@ -1221,6 +1301,11 @@ impl AgentAutomationSupervisor {
                 )?;
                 continue;
             }
+            let all_pending_messages = if renewing {
+                Vec::new()
+            } else {
+                all_pending_messages
+            };
             let pending_messages = match bounded_unread_batch(&all_pending_messages, goal_revision)
             {
                 Ok(messages) => messages,
@@ -1254,7 +1339,8 @@ impl AgentAutomationSupervisor {
             } else {
                 activity.activity_sequence
             };
-            if pending_messages.is_empty()
+            if !renewing
+                && pending_messages.is_empty()
                 && goal_revision.is_some()
                 && state.goal_wake.nudged_epoch.as_deref() == Some(activity_epoch.as_str())
                 && state.goal_wake.nudged_sequence == Some(activity_sequence)
@@ -1265,7 +1351,7 @@ impl AgentAutomationSupervisor {
             {
                 continue;
             }
-            if pending_messages.is_empty() && goal_revision.is_none() {
+            if !renewing && pending_messages.is_empty() && goal_revision.is_none() {
                 continue;
             }
             let batch_id = (!pending_messages.is_empty()).then(|| {
@@ -1288,24 +1374,43 @@ impl AgentAutomationSupervisor {
                 .iter()
                 .map(|message| message.id.clone())
                 .collect::<Vec<_>>();
-            let (kind, prompt) = match (batch_id, goal_revision) {
-                (Some(batch_id), Some(goal_revision)) => (
-                    AutomationActionKind::OfflineCombined,
-                    ActionPrompt::OfflineCombined {
-                        batch_id,
-                        messages,
-                        goal_revision,
+            let (kind, prompt) = if let Some(handoff) = state
+                .turn_renewal
+                .handoff
+                .as_ref()
+                .filter(|h| h.report_complete)
+            {
+                (
+                    AutomationActionKind::TurnRenewal,
+                    ActionPrompt::TurnRenewal {
+                        handoff_id: handoff.id.clone(),
                     },
-                ),
-                (Some(batch_id), None) => (
-                    AutomationActionKind::OfflineChat,
-                    ActionPrompt::OfflineChat { batch_id, messages },
-                ),
-                (None, Some(goal_revision)) => (
-                    AutomationActionKind::OfflineGoal,
-                    ActionPrompt::OfflineGoal { goal_revision },
-                ),
-                (None, None) => continue,
+                )
+            } else {
+                match (batch_id, goal_revision) {
+                    (Some(batch_id), Some(goal_revision)) => (
+                        AutomationActionKind::OfflineCombined,
+                        ActionPrompt::OfflineCombined {
+                            batch_id,
+                            messages,
+                            goal_revision,
+                        },
+                    ),
+                    (Some(batch_id), None) => (
+                        AutomationActionKind::OfflineChat,
+                        ActionPrompt::OfflineChat { batch_id, messages },
+                    ),
+                    (None, Some(goal_revision)) => (
+                        AutomationActionKind::OfflineGoal,
+                        ActionPrompt::OfflineGoal { goal_revision },
+                    ),
+                    (None, None) => continue,
+                }
+            };
+            let goal_revision = if kind == AutomationActionKind::TurnRenewal {
+                None
+            } else {
+                goal_revision
             };
             let mut queue = self.queue.lock().await;
             if let Some(position) = queue
@@ -1577,6 +1682,23 @@ impl AgentAutomationSupervisor {
                         &task.task,
                         &execution.request.action_id,
                         now_ms,
+                    )?;
+                }
+                if snapshot.send_accepted
+                    && snapshot.state == CompanionActionState::Idle
+                    && snapshot.attention.is_none()
+                    && !pair_verification
+                {
+                    task.store.record_turn_send(
+                        &task.task,
+                        super::turn_renewal::TurnSend {
+                            action_id: execution.request.action_id.clone(),
+                            at_ms: crate::markdown_chat::now_ms(),
+                            model: snapshot.selected.as_ref().map(|s| s.model.clone()),
+                            effort: snapshot.selected.as_ref().map(|s| s.effort.clone()),
+                            pairing_generation: execution.request.pairing_generation,
+                            owner_generation: execution.owner_generation,
+                        },
                     )?;
                 }
                 accumulator.send_accepted |= snapshot.send_accepted;
@@ -1888,6 +2010,31 @@ impl AgentAutomationSupervisor {
         accumulator: &mut EventAccumulator,
         event: CompanionEvent,
     ) -> Result<(), String> {
+        if let CompanionEventKind::ModelVerified {
+            ref model,
+            ref effort,
+        } = event.kind
+        {
+            accumulator.selected = Some(super::CompanionSelection {
+                model: model.clone(),
+                effort: effort.clone(),
+            });
+        }
+        if matches!(event.kind, CompanionEventKind::SendAccepted)
+            && let Some(task) = self.tasks.read().await.get(&execution.task_key)
+        {
+            task.store.record_turn_send(
+                &task.task,
+                super::turn_renewal::TurnSend {
+                    action_id: execution.request.action_id.clone(),
+                    at_ms: event.at_ms,
+                    model: accumulator.selected.as_ref().map(|s| s.model.clone()),
+                    effort: accumulator.selected.as_ref().map(|s| s.effort.clone()),
+                    pairing_generation: execution.request.pairing_generation,
+                    owner_generation: execution.owner_generation,
+                },
+            )?;
+        }
         if matches!(event.kind, CompanionEventKind::SendAccepted)
             && let Some(task) = self.tasks.read().await.get(&execution.task_key)
         {
@@ -2066,6 +2213,7 @@ impl AgentAutomationSupervisor {
 #[derive(Default)]
 struct EventAccumulator {
     submission_complete: bool,
+    selected: Option<super::CompanionSelection>,
     send_accepted: bool,
     answer_markdown: Option<String>,
     answer_truncated: bool,
@@ -2372,11 +2520,26 @@ async fn execution_matches(
         return Ok(false);
     }
     let activity = task.chat.offline_activity().await?;
+    let renewing = if let ActionPrompt::TurnRenewal { ref handoff_id } = execution.request.prompt {
+        if !task.store.turn_renewal_settings()?.enabled
+            || state
+                .turn_renewal
+                .handoff
+                .as_ref()
+                .is_none_or(|h| h.id != *handoff_id || !h.report_complete)
+        {
+            return Ok(false);
+        }
+        true
+    } else {
+        false
+    };
     if activity.agent_stop_requested
-        || activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
-        || activity
-            .agent_waiting_until_ms
-            .is_some_and(|until| now_ms < until)
+        || !renewing
+            && (activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+                || activity
+                    .agent_waiting_until_ms
+                    .is_some_and(|until| now_ms < until))
         || state.pairing.canonical_url.as_deref() != Some(execution.request.url.as_str())
         || state.pairing.verified_owner_generation != Some(execution.owner_generation)
     {
@@ -2433,7 +2596,8 @@ fn execution_goal_revision(execution: &AutomationExecution) -> Option<u64> {
         | ActionPrompt::OfflineCombined { goal_revision, .. } => Some(*goal_revision),
         ActionPrompt::PairVerify { .. }
         | ActionPrompt::CreateChat { .. }
-        | ActionPrompt::OfflineChat { .. } => None,
+        | ActionPrompt::OfflineChat { .. }
+        | ActionPrompt::TurnRenewal { .. } => None,
     }
 }
 
@@ -2442,6 +2606,7 @@ fn execution_kind(execution: &AutomationExecution) -> AutomationActionKind {
         ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. } => {
             AutomationActionKind::PairVerify
         }
+        ActionPrompt::TurnRenewal { .. } => AutomationActionKind::TurnRenewal,
         ActionPrompt::OfflineChat { .. } => AutomationActionKind::OfflineChat,
         ActionPrompt::OfflineGoal { .. } => AutomationActionKind::OfflineGoal,
         ActionPrompt::OfflineCombined { .. } => AutomationActionKind::OfflineCombined,
@@ -2452,7 +2617,7 @@ fn action_priority(kind: AutomationActionKind) -> u8 {
     match kind {
         AutomationActionKind::PairVerify => 0,
         AutomationActionKind::OfflineChat | AutomationActionKind::OfflineCombined => 1,
-        AutomationActionKind::OfflineGoal => 2,
+        AutomationActionKind::OfflineGoal | AutomationActionKind::TurnRenewal => 2,
     }
 }
 
@@ -2462,7 +2627,8 @@ fn execution_batch_id(execution: &AutomationExecution) -> Option<&str> {
         | ActionPrompt::OfflineCombined { batch_id, .. } => Some(batch_id),
         ActionPrompt::PairVerify { .. }
         | ActionPrompt::CreateChat { .. }
-        | ActionPrompt::OfflineGoal { .. } => None,
+        | ActionPrompt::OfflineGoal { .. }
+        | ActionPrompt::TurnRenewal { .. } => None,
     }
 }
 
@@ -2472,7 +2638,8 @@ fn execution_unread_messages(execution: &AutomationExecution) -> &[CompanionUnre
         | ActionPrompt::OfflineCombined { messages, .. } => messages,
         ActionPrompt::PairVerify { .. }
         | ActionPrompt::CreateChat { .. }
-        | ActionPrompt::OfflineGoal { .. } => &[],
+        | ActionPrompt::OfflineGoal { .. }
+        | ActionPrompt::TurnRenewal { .. } => &[],
     }
 }
 

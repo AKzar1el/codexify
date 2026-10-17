@@ -3,6 +3,7 @@ mod install;
 mod model_fallback;
 mod store;
 mod supervisor;
+pub mod turn_renewal;
 
 pub(crate) use store::conversation_url_for_retry;
 

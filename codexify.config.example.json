@@ -26,7 +26,13 @@
   },
   "tree": {
     "defaultDepth": 3,
-    "ignore": ["node_modules", ".git", "dist", ".next", "__pycache__"]
+    "ignore": [
+      "node_modules",
+      ".git",
+      "dist",
+      ".next",
+      "__pycache__"
+    ]
   },
   "ignore": {
     "useGitignore": true,
@@ -45,7 +51,9 @@
   "projectDoc": {
     "maxBytes": 32768,
     "fallbackFilenames": [],
-    "rootMarkers": [".git"]
+    "rootMarkers": [
+      ".git"
+    ]
   },
   "output": {
     "maxToolOutputTokens": 10000,
@@ -85,7 +93,9 @@
     "idleTimeoutMs": 30000,
     "maxRedirects": 3,
     "maxConcurrentDownloads": 2,
-    "allowedHosts": ["*"]
+    "allowedHosts": [
+      "*"
+    ]
   },
   "artifactEgress": {
     "enabled": true,
@@ -116,7 +126,9 @@
       "autoApproveToolCalls": false
     },
     "notifications": {
-      "urls": ["ntfys://ntfy.example/codexify?image=no"],
+      "urls": [
+        "ntfys://ntfy.example/codexify?image=no"
+      ],
       "pythonPath": "python3",
       "timeoutMs": 15000,
       "events": {
@@ -127,6 +139,87 @@
         "errors": true,
         "offline": false
       }
+    },
+    "rolloutEnabled": true,
+    "turnRenewal": {
+      "enabled": false,
+      "limits": [
+        {
+          "model": "gpt-6-astra",
+          "effort": "max",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "effort": "max",
+          "minutes": 115
+        },
+        {
+          "model": "gpt-6-sol",
+          "effort": "xhigh",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-6-sol",
+          "effort": "high",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-6-sol",
+          "effort": "medium",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "effort": "xhigh",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "effort": "high",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "effort": "medium",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.5-sol",
+          "effort": "max",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.5-sol",
+          "effort": "xhigh",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.5-sol",
+          "effort": "high",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.5-sol",
+          "effort": "medium",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-6-sol",
+          "effort": "low",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.6-sol",
+          "effort": "low",
+          "minutes": 55
+        },
+        {
+          "model": "gpt-5.5-sol",
+          "effort": "low",
+          "minutes": 55
+        }
+      ]
     }
   },
   "skills": {
@@ -148,7 +241,9 @@
       {
         "path": "example-project",
         "name": "Example project",
-        "aliases": ["example"],
+        "aliases": [
+          "example"
+        ],
         "description": "Optional searchable metadata for this project"
       }
     ]
@@ -171,7 +266,10 @@
   "mcpServers": {
     "local-example": {
       "command": "npx",
-      "args": ["-y", "example-mcp-server"],
+      "args": [
+        "-y",
+        "example-mcp-server"
+      ],
       "env": {
         "EXAMPLE_MODE": "1"
       },
@@ -191,7 +289,9 @@
         "recoveryDelayMs": 30000,
         "slowCancellationMs": 60000
       },
-      "tools": ["example_tool"],
+      "tools": [
+        "example_tool"
+      ],
       "disabledTools": [],
       "mode": "direct"
     },

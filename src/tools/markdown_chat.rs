@@ -307,6 +307,20 @@ impl Tool for ChatTool {
                 next_action,
             );
         }
+        if matches!(self, Self::Await | Self::Completed)
+            && let Some(task) = context.task_conversation.as_ref()
+            && let Ok(store) = crate::agent_automation::AgentAutomationStore::for_config(config)
+            && let Ok(Some(notice)) =
+                store.turn_renewal_notice(task, crate::markdown_chat::now_ms())
+        {
+            return result(
+                "continue",
+                notice,
+                chat.path(),
+                NotificationState::Suppressed,
+                NEXT_CONTINUE_OR_COMPLETED,
+            );
+        }
         let completion_hint = if matches!(self, Self::Await) {
             match chat.queue_completion_hint().await {
                 Ok(value) => value,

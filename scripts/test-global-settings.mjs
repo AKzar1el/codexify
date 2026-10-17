@@ -390,3 +390,30 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   assert.equal(document.agentChat.rolloutReminderInterval,undefined);assert.equal(await interval.getAttribute('placeholder'),'20 (default)');assert.equal(writes.length,2);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: renewal limits remain editable while off and independent from progress reporting`,{timeout:25000},async()=>{
+ const browser=await engine.launch();try{
+  const page=await browser.newPage();page.setDefaultTimeout(5000);
+  const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
+  let document={workDir:'/fixture',agentChat:{enabled:true}},revision=1;const writes=[],errors=[];page.on('pageerror',e=>errors.push(e.message));
+  const snapshot=()=>({path:'/fixture/config.json',defaults,document,raw:JSON.stringify(document),revision:String(revision),restartRequired:false});
+  await page.route('http://127.0.0.1:43317/**',async route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.0.0',plan:null,settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&req.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=req.postDataJSON();writes.push(body);for(const [key,val] of Object.entries(body.changes)){const parts=key.split('.');let target=document;for(const part of parts.slice(0,-1))target=target[part]??={};target[parts.at(-1)]=val;}
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43317/#fixture');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  const pro=dialog.getByLabel('gpt-5.6-sol max turn limit in minutes',{exact:true});assert.equal(await pro.inputValue(),'115');assert.equal(await pro.isEnabled(),true);assert.equal(await dialog.getByLabel('gpt-6-astra max turn limit in minutes',{exact:true}).inputValue(),'55');assert.equal(await dialog.locator('.setting-turn-limit').count(),15);
+  await pro.fill('110');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.turnRenewal.limits.find(l=>l.model==='gpt-5.6-sol'&&l.effort==='max').minutes,110);assert.equal(document.agentChat.turnRenewal.enabled,undefined);
+  await dialog.getByRole('group',{name:'agentChat.rolloutEnabled',exact:true}).getByRole('button',{name:'Off',exact:true}).click();await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  await dialog.getByRole('group',{name:'agentChat.turnRenewal.enabled',exact:true}).getByRole('button',{name:'On',exact:true}).click();await page.waitForFunction(()=>document.querySelector('[data-setting-row="agentChat.turnRenewal.enabled"] button[aria-pressed="true"]').textContent==='On');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.rolloutEnabled,false);assert.equal(document.agentChat.turnRenewal.enabled,true);
+  await page.setViewportSize({width:390,height:844});await pro.scrollIntoViewIfNeeded();await page.screenshot({path:`/tmp/turn-renewal-settings-${engineName}.png`});assert(await dialog.evaluate(e=>e.scrollWidth<=e.clientWidth));assert.deepEqual(errors,[]);assert.equal(writes.length,3);
+ }finally{await browser.close();}
+});

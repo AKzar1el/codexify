@@ -166,6 +166,8 @@ pub struct MarkdownChatConfig {
     pub max_wait_ms: u64,
     pub default_message_mode: MessageMode,
     pub rollout_reminder_interval: u64,
+    pub rollout_enabled: bool,
+    pub turn_renewal: crate::agent_automation::turn_renewal::TurnRenewalConfig,
     pub notifications: Option<NotificationsConfig>,
     pub automation: AgentAutomationConfig,
 }
@@ -178,6 +180,8 @@ impl Default for MarkdownChatConfig {
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
             default_message_mode: MessageMode::Steer,
             rollout_reminder_interval: rollout::DEFAULT_REMINDER_INTERVAL,
+            rollout_enabled: true,
+            turn_renewal: Default::default(),
             notifications: None,
             automation: AgentAutomationConfig::default(),
         }
@@ -272,6 +276,7 @@ impl MarkdownChatConfig {
         if !(1_000..=300_000).contains(&self.max_wait_ms) {
             return Err("agentChat.maxWaitMs must be between 1000 and 300000".into());
         }
+        self.turn_renewal.validate()?;
         if !(1..=10000).contains(&self.rollout_reminder_interval) {
             return Err("agentChat.rolloutReminderInterval must be between 1 and 10000".into());
         }

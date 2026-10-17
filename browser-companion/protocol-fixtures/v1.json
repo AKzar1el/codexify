@@ -1,19 +1,19 @@
 {
-  "schemaHash": "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
-  "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+  "schemaHash": "b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
+  "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
   "descriptor": {
     "version": 1,
     "kind": "codexify-browser-companion",
     "pid": 1234,
     "endpoint": "http://127.0.0.1:43123",
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "createdAt": "2026-10-09T12:00:00Z"
   },
   "health": {
     "protocolVersion": 1,
     "kind": "codexify-browser-companion",
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "status": "idle",
     "authenticated": true,
     "accountFingerprint": "fixture-account",
@@ -21,7 +21,7 @@
   },
   "capabilities": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "accountFingerprint": "fixture-account",
     "catalogRevision": "fixture-catalog",
     "models": [
@@ -50,7 +50,7 @@
   },
   "revealReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "revealed": true,
     "activeActionId": null
   },
@@ -131,11 +131,27 @@
         ],
         "goalRevision": 3
       }
+    },
+    {
+      "actionId": "fixture-renewal",
+      "idempotencyKey": "fixture-renewal-execute",
+      "url": "https://chatgpt.com/c/fixture",
+      "pairingGeneration": 7,
+      "connectorName": "Codexify",
+      "expectedAccountFingerprint": "fixture-account",
+      "model": "gpt-6-sol",
+      "effort": "high",
+      "expectedUrl": "https://chatgpt.com/c/fixture",
+      "autoApproveToolCalls": false,
+      "prompt": {
+        "kind": "turn_renewal",
+        "handoffId": "renew-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
     }
   ],
   "actionSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "actionId": "fixture-action",
     "state": "generating",
     "sendAccepted": true,
@@ -153,7 +169,7 @@
   },
   "cancelReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f",
+    "build": "fixture+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1",
     "actionId": "fixture-action",
     "state": "ambiguous",
     "cancelled": true

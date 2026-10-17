@@ -183,6 +183,28 @@ count. Recent recovery reads include up to five complete reports, capped at
 64 KiB. At 256 KiB or 50 reports, the active file rotates into a dated archive
 inside `rollouts/`; older history is preserved and recent reads span rotations.
 
+**Turn renewal** is independent of the progress journal and is **off by default**.
+Enable it in **Settings → Chats & goals → Turn renewal**. Its per-model/effort
+limits remain visible and editable while disabled: GPT-5.6 Sol Pro defaults to
+115 minutes; GPT-6 Astra Pro and every other selection default to 55 minutes.
+Unlisted model/effort selections use 55 minutes. Limits are measured from the
+last confirmed message sent to ChatGPT by Codexify, using the actual selected
+model (including fallback), and apply without a service restart.
+
+At the next tool response after the limit, the agent is asked to stop work and
+write a comprehensive handoff in its **normal final ChatGPT answer**. This is an
+explicit exception to the Markdown chat wait loop; the report is not sent with
+`chat_write` and does not complete or block a goal. Codexify waits for the new
+report to finish, then sends `Continue.` even without a goal. Queued messages
+stay private during the handoff and are not included in that continuation.
+Uncertain sends are not replayed automatically. User stop/cancellation and
+disabling turn renewal cancel its pending continuation. Saved pairing, timer
+and handoff state survive service restarts.
+
+Disable progress reporting separately with `agentChat.rolloutEnabled` (default
+`true`). Existing journals are preserved. Either feature can run alone, or both
+can run together.
+
 Restart Codexify, refresh the connector's tools in ChatGPT Settings, and start a
 new conversation. `get_agent_brief` reports that conversation's `CHAT.md` path,
 stored with project metadata outside the repository by default. Every

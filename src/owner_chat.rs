@@ -686,18 +686,32 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         let automation = tokio::task::spawn_blocking(move || {
             AgentAutomationStore::for_state_root(&goal_config, &goal_root)?.load(&goal_task)
         })
-        .await
-        .map_err(internal_error)?
-        .map_err(internal_error)?;
-        let automation_error = automation
-            .action_needs_attention_at(crate::markdown_chat::now_ms())
-            .then(|| {
-                automation
-                    .action
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "Browser action needs attention".into())
-            });
+        .await;
+        let (automation, state_error) = match automation {
+            Ok(Ok(automation)) => (automation, None),
+            Ok(Err(error)) => {
+                tracing::warn!(chat_id=%located.id, %error, "owner chat automation state unavailable");
+                (Default::default(), Some(error))
+            }
+            Err(error) => {
+                tracing::warn!(chat_id=%located.id, %error, "owner chat automation state task failed");
+                (
+                    Default::default(),
+                    Some("Automation state is unavailable; saved data was preserved".into()),
+                )
+            }
+        };
+        let automation_error = state_error.or_else(|| {
+            automation
+                .action_needs_attention_at(crate::markdown_chat::now_ms())
+                .then(|| {
+                    automation
+                        .action
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "Browser action needs attention".into())
+                })
+        });
         let goal = automation.goal;
         let goal_status = goal.as_ref().map(|goal| goal.status);
         let goal_completion_dismissed = goal.as_ref().is_some_and(|goal| {
@@ -1858,7 +1872,16 @@ async fn restore_chat_state(state: OwnerState) {
         return;
     };
     for located in chats {
-        if located.path.with_file_name("message-queue.json").exists()
+        let renewal_pending = automation_task(&located)
+            .ok()
+            .and_then(|task| {
+                AgentAutomationStore::for_state_root(&state.config, &located.state_root)
+                    .ok()?
+                    .load(&task)
+                    .ok()
+            })
+            .is_some_and(|s| s.turn_renewal.handoff.is_some());
+        if (located.path.with_file_name("message-queue.json").exists() || renewal_pending)
             && state.config.markdown_chat.automation.enabled
             && let Err(error) = automation_context(&state, &located).await
         {
@@ -2029,6 +2052,7 @@ pub async fn dashboard_url() -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    include!("owner_chat_catalog_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2042,7 +2066,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
 
     #[derive(Clone, Default)]
     struct OwnerCompanionState {

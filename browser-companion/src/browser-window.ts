@@ -61,6 +61,7 @@ export interface BrowserDriver {
   capabilities(signal?: AbortSignal): Promise<CapabilityCatalog>;
   prepareNewChat?(projectUrl:string | null, signal?: AbortSignal): Promise<CapabilityCatalog>;
   accountPlan?(epoch:string, signal?: AbortSignal): Promise<import("./account-settings").AccountPlan>;
+  turnHandoffComplete?(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean>;
   refreshConnector?(name:string, signal?: AbortSignal): Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
   refreshConnectorSteps?(name:string,run:BrowserStepRunner,signal?:AbortSignal):Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
   reveal(url: string | null, signal?: AbortSignal): Promise<void>;
@@ -269,6 +270,14 @@ export class SingleWindowCoordinator {
       if(!this.driver.accountPlan)throw new Error("Account plan inspection is unavailable");
       return this.driver.accountPlan(epoch, operationSignal);
     }, signal);
+  }
+
+  async turnHandoffComplete(url:string,account:string,handoffId:string,signal?:AbortSignal) {
+    const complete=await this.withWindowOperation(async operationSignal=>{
+      if(this.activeActionId || !this.driver.turnHandoffComplete)return false;
+      return this.driver.turnHandoffComplete(url,account,handoffId,operationSignal);
+    },signal);
+    return {protocolVersion:PROTOCOL_VERSION,build:this.build,complete};
   }
 
   async refreshConnector(name:string, signal?: AbortSignal) {

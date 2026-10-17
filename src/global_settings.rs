@@ -12,6 +12,43 @@ use crate::types::AppConfig;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 static EDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub fn turn_renewal_settings(
+    path: Option<&Path>,
+    fallback: &crate::agent_automation::turn_renewal::TurnRenewalConfig,
+) -> Result<crate::agent_automation::turn_renewal::TurnRenewalConfig, String> {
+    let Some(path) = path else {
+        return Ok(fallback.clone());
+    };
+    let document: Value =
+        serde_json::from_str(&read_raw(path)?).map_err(|_| "Cannot read turn renewal settings")?;
+    let config = match document
+        .pointer("/agentChat/turnRenewal")
+        .filter(|v| !v.is_null())
+    {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|e| format!("Invalid turn renewal settings: {e}"))?,
+        None => crate::agent_automation::turn_renewal::TurnRenewalConfig::default(),
+    };
+    config.validate()?;
+    Ok(config)
+}
+pub fn rollout_enabled(config: &AppConfig) -> Result<bool, String> {
+    let Some(path) = &config.loaded_config_path else {
+        return Ok(config.markdown_chat.rollout_enabled);
+    };
+    let document: Value = serde_json::from_str(&read_raw(path)?)
+        .map_err(|_| "Cannot read progress journal settings")?;
+    match document
+        .pointer("/agentChat/rolloutEnabled")
+        .filter(|v| !v.is_null())
+    {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "Progress journal enabled must be a boolean".into()),
+        None => Ok(true),
+    }
+}
+
 pub fn rollout_reminder_interval(config: &AppConfig) -> Result<u64, String> {
     let Some(path) = &config.loaded_config_path else {
         return Ok(config.markdown_chat.rollout_reminder_interval);
@@ -147,6 +184,8 @@ pub fn save(
         if let Some(chat) = value.get_mut("agentChat").and_then(Value::as_object_mut) {
             chat.remove("defaultMessageMode");
             chat.remove("rolloutReminderInterval");
+            chat.remove("rolloutEnabled");
+            chat.remove("turnRenewal");
         }
         if value
             .get("agentChat")

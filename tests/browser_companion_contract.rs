@@ -189,6 +189,14 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
             },
         ),
     ];
+    let mut requests = requests;
+    requests.push(base(
+        "fixture-renewal",
+        "fixture-renewal-execute",
+        ActionPrompt::TurnRenewal {
+            handoff_id: format!("renew-{}", "a".repeat(64)),
+        },
+    ));
     assert_eq!(
         serde_json::to_value(requests).unwrap(),
         fixture["executeRequests"]

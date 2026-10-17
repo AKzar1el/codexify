@@ -77,7 +77,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
 #settings-dialog .setting-editor-tools{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:var(--muted)}
 #settings-dialog .setting-editor-tools button,#settings-dialog .setting-reset{border:0;background:transparent;color:var(--muted);font-size:11px;padding:2px 0;border-radius:3px}
 #settings-dialog .setting-editor-tools button:hover,#settings-dialog .setting-reset:hover{color:var(--accent)}
-#settings-dialog .setting-control .setting-reset{margin-top:6px}
+.setting-turn-limits{display:grid;gap:10px;width:100%}.setting-turn-limit{display:grid;grid-template-columns:minmax(0,1fr) 80px 28px;align-items:center;gap:8px;font-size:13px}.setting-turn-limit input{min-width:0;width:100%;box-sizing:border-box}#settings-dialog .setting-control .setting-reset{margin-top:6px}
 #settings-dialog .setting-object-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}
 #settings-dialog .setting-object-summary button{font-size:12px;white-space:nowrap}
 #settings-dialog .settings-empty{padding:40px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
@@ -119,6 +119,9 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     'experimental.forceIdempotentToolAnnotations':['Set idempotentHint on every advertised tool. The default preserves existing hints.','advanced','Idempotent hint override'],
     'experimental.forceOpenWorldToolAnnotations':['Set openWorldHint on every advertised tool. The default preserves existing hints.','advanced','Open-world hint override'],
     workDir:['Project directory Codexify can access.','general'],projectCloneDir:['Where new Git repositories are cloned.','general'],multiProject:['Allow chats to work across projects.','general'],uiWidgets:['Show embedded chat interfaces in tool responses.','general'],port:['HTTP port used by the server.','general'],debug:['Include diagnostic timing information.','advanced'],
+    'agentChat.rolloutEnabled':['Keep chronological per-chat progress reports and checkpoint reminders. Independent of turn renewal. Applies immediately.','chats','Progress journal'],
+    'agentChat.turnRenewal.enabled':['Ask for a final handoff at the model limit, then continue automatically after the report finishes. Applies immediately.','chats','Turn renewal'],
+    'agentChat.turnRenewal.limits':['Minutes from the last accepted ChatGPT send. All limits remain editable while turn renewal is off. Unlisted selections use 55 minutes.','chats','Turn limits by model'],
     'agentChat.enabled':['Enable conversations and agent messaging.','chats'], 'agentChat.rolloutReminderInterval':['Agent work tool calls between progress checkpoint reminders. UI polling and idle wait loops do not count. Applies immediately.','chats','Progress report interval'], 'agentChat.defaultMessageMode':['Default composer action. Cmd+Enter on Mac or Ctrl+Enter on Windows/Linux uses the other mode for one message.','chats','Default message mode'], 'agentChat.port':['Port for the owner chat interface.','chats'], 'agentChat.maxWaitMs':['Maximum duration of a chat_await or turn_completed call, in milliseconds.','chats'],
     'agentChat.automation.enabled':['Use the browser companion to send messages and continue goals.','browser'], 'agentChat.automation.connectorName':['The connector to mention when sending messages in ChatGPT.','browser'], 'agentChat.automation.chatgptProjectUrl':['ChatGPT project used for new conversations.','browser'], 'agentChat.automation.descriptorPath':['Location of the browser companion connection descriptor.','browser'], 'agentChat.automation.requestBlockList':['One case-sensitive Chrome regex per line. Matching requests never reach the server. Restart the browser companion after changing this list.','browser','Blocked requests'], 'agentChat.automation.maxQueuedActions':['Maximum number of actions waiting to be sent.','chats'], 'agentChat.automation.autoApproveToolCalls':['Automatically approve tool calls in ChatGPT.','browser'],
     'agentChat.notifications.events.completed':['A chat or goal finishes.','notifications','Completion'], 'agentChat.notifications.events.inputRequired':['A chat needs your reply. Repeated alerts are deduplicated.','notifications','Input required'], 'agentChat.notifications.events.goalBlocked':['A goal becomes blocked.','notifications','Goal blocked'], 'agentChat.notifications.events.errors':['An error prevents a chat from continuing.','notifications','Chat errors'], 'agentChat.notifications.events.messages':['Notify for new agent messages.','notifications','New messages'], 'agentChat.notifications.events.offline':['Notify when an agent goes offline.','notifications','Agent offline'], 'agentChat.notifications.urls':['Apprise destination URLs, one per line.','notifications','Delivery destinations'], 'agentChat.notifications.pythonPath':['Python executable used to deliver notifications.','notifications','Python executable'], 'agentChat.notifications.timeoutMs':['Notification delivery timeout, in milliseconds.','notifications','Delivery timeout'],
@@ -140,6 +143,8 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     if(group==='general')section='Preferences';
     if(group==='notifications')section=path.includes('.events.')?'Events':'Delivery';
     if(group==='browser')section='Browser companion';
+    if(path.startsWith('agentChat.turnRenewal'))section='Turn renewal';
+    if(path==='agentChat.rolloutEnabled'||path==='agentChat.rolloutReminderInterval')section='Progress journal';
     if(group==='connections')section=['apiKey','conversationAuthToken','allowedHosts'].includes(root)?'Authentication & access':'Integrations';
     return {path,sample,category:group,section,name:meta?.[2]||label(key),help:meta?.[0]||'',secret:/(?:token|key|password|secret)/i.test(key)&&(sample==null||typeof sample!=='object')};
   }
@@ -175,7 +180,18 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     if(help){const description=document.createElement('p');description.className='setting-help';description.textContent=help;copy.append(description);}
     const controls=document.createElement('div');controls.className='setting-control';row.append(copy,controls);
     let control,read;
-    if(typeof sample==='boolean') {
+    if(path==='agentChat.turnRenewal.limits') {
+      control=document.createElement('div');control.className='setting-turn-limits';
+      const limits=structuredClone(value??storedAt(snapshot.defaults,path)??sample);
+      for(const limit of limits) {
+        const line=document.createElement('label');line.className='setting-turn-limit';
+        const name=document.createElement('span');name.textContent=`${limit.model} · ${limit.effort==='max'?'Pro':limit.effort}`;
+        const input=document.createElement('input');input.type='number';input.min='1';input.max='1440';input.step='1';input.value=limit.minutes;input.className='setting-input';input.setAttribute('aria-label',`${limit.model} ${limit.effort} turn limit in minutes`);
+        input.addEventListener('input',()=>{const n=Number(input.value);if(!Number.isInteger(n)||n<1||n>1440){input.setAttribute('aria-invalid','true');invalidFields.set(path,'Turn limits must be whole minutes between 1 and 1440.');message(invalidFields.get(path),true);return;}limit.minutes=n;input.removeAttribute('aria-invalid');queue(path,structuredClone(limits),control);});
+        const unit=document.createElement('span');unit.textContent='min';line.append(name,input,unit);control.append(line);
+      }
+      const reset=document.createElement('button');reset.type='button';reset.className='setting-reset';reset.textContent='Use defaults';reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});controls.append(control,reset);
+    } else if(typeof sample==='boolean') {
       control=document.createElement('div');control.className='setting-boolean';control.setAttribute('role','group');control.setAttribute('aria-label',path);
       const hintOverride=annotationHintOverrides.has(path);
       if(hintOverride)control.classList.add('setting-hint-override');

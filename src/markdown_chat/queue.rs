@@ -173,6 +173,19 @@ fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
     }
     let value: serde_json::Value = serde_json::from_reader(file.take(1024 * 1024 + 1))
         .map_err(|_| "Goal state cannot be read; queued messages remain private")?;
+    if value
+        .pointer("/turnRenewal/resumeWaitUntilMs")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|until| crate::markdown_chat::now_ms() < until)
+    {
+        return Ok(true);
+    }
+    if value
+        .pointer("/turnRenewal/handoff")
+        .is_some_and(|h| !h.is_null())
+    {
+        return Ok(true);
+    }
     match value.get("goal") {
         None | Some(serde_json::Value::Null) => Ok(false),
         Some(goal) => match goal.get("status").and_then(|s| s.as_str()) {

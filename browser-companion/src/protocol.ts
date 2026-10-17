@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f" as const;
+export const PROTOCOL_SCHEMA_HASH = "b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -119,6 +119,7 @@ export const actionPromptSchema = z.discriminatedUnion("kind", [
     batchId: opaqueIdSchema,
     messages: z.array(unreadMessageSchema).min(1).max(MAX_UNREAD_MESSAGES),
   }),
+  z.strictObject({kind:z.literal("turn_renewal"),handoffId:z.string().regex(/^renew-[a-f0-9]{64}$/)}),
   z.strictObject({
     kind: z.literal("offline_goal"),
     goalRevision: z.number().int().positive(),
@@ -162,7 +163,7 @@ const goalClause = [
   "turn merely to evaluate goal status.",
 ].join("\n");
 
-export const rolloutRestoreGuidance = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. Use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
+export const rolloutRestoreGuidance = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. When the progress journal is enabled (rollout_read reports if disabled), use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
 
 export function renderActionPrompt(raw: ActionPrompt): string {
   const prompt = actionPromptSchema.parse(raw);
@@ -180,6 +181,9 @@ export function renderActionPrompt(raw: ActionPrompt): string {
       break;
     case "offline_chat":
       rendered = unreadClause(prompt.batchId, prompt.messages);
+      break;
+    case "turn_renewal":
+      rendered = "Continue.";
       break;
     case "offline_goal":
       rendered = goalClause;

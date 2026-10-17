@@ -15,7 +15,8 @@
     "GET /v1/actions/{actionId}/events?after={sequence}",
     "POST /v1/new-chat/capabilities",
     "POST /v1/account/plan",
-    "POST /v1/connectors/refresh"
+    "POST /v1/connectors/refresh",
+    "POST /v1/turns/handoff"
   ],
   "sessionStatuses": [
     "idle",
@@ -59,6 +60,9 @@
       "continuationToken",
       "reference",
       "setupReference"
+    ],
+    "turn_renewal": [
+      "handoffId"
     ]
   },
   "fieldLimits": {
@@ -141,5 +145,11 @@
   },
   "launchConfiguration": {
     "requestBlockList": "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST: JSON array of RE2 URL patterns; verified browser-wide before navigation"
+  },
+  "turnRenewal": {
+    "handoffId": "renew-<64 lowercase hexadecimal characters>",
+    "completionProof": "Same account and conversation; latest assistant final begins with the exact handoff ID, has completion controls, no generation and stable content across two observations. Rechecked before continuation Send.",
+    "continuation": "Continue.",
+    "sendClock": "First confirmed Send acceptance, actual selected model and effort; pairing sends excluded."
   }
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub const DEFAULT_REMINDER_INTERVAL: u64 = 20;
 pub const REMINDER_FIELD: &str = "rollout_checkpoint_required";
 pub const REMINDER_DESCRIPTION: &str = "A progress checkpoint is due. Append current status, concrete progress and next steps using rollout_update before more work. Omitted when no checkpoint is due.";
-pub const RESTORE_GUIDANCE: &str = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. Use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
+pub const RESTORE_GUIDANCE: &str = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. When the progress journal is enabled (rollout_read reports if disabled), use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
 pub const ROTATE_BYTES: usize = 256 * 1024;
 pub const RECENT_REPORTS: usize = 5;
 const MAX_REPORT_BYTES: usize = 16 * 1024;

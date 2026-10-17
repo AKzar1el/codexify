@@ -105,6 +105,12 @@ impl Tool for RolloutTool {
                 Ok(c) => c,
                 Err(e) => return ToolResult::error(e),
             };
+        if !crate::global_settings::rollout_enabled(config).unwrap_or(false) {
+            return match self {
+                Self::Read=>ToolResult::text("Progress journal is disabled.").with_structured(json!({"rollout_file":"", "report_count":0,"archive_count":0,"content":"Progress journal is disabled. Continue using the current task and goal; no progress checkpoint is required."})),
+                Self::Update=>ToolResult::error("Progress journal is disabled; continue without progress checkpoints."),
+            };
+        }
         let result = match self {
             Self::Read => {
                 if let Err(e) = parse_tool_args::<EmptyArgs>(args) {

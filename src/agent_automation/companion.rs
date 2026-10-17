@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
+    "b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.702ce063e786b8a742a62bfa93c293db84aad242749dc63c24ef61b5ca95955f";
+    "+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -165,6 +165,9 @@ pub enum ActionPrompt {
     },
     OfflineGoal {
         goal_revision: u64,
+    },
+    TurnRenewal {
+        handoff_id: String,
     },
     OfflineCombined {
         batch_id: String,
@@ -422,6 +425,27 @@ impl BrowserCompanionClient {
             .await?;
         self.validate_health(&health)?;
         Ok(health)
+    }
+
+    pub async fn turn_handoff_complete(
+        &self,
+        url: &str,
+        account: &str,
+        handoff_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Receipt {
+            protocol_version: u32,
+            build: String,
+            complete: bool,
+        }
+        let receipt:Receipt=self.request_json(Method::POST,"/v1/turns/handoff",Some(&serde_json::json!({"url":url,"expectedAccountFingerprint":account,"handoffId":handoff_id})),cancellation).await?;
+        if receipt.protocol_version != PROTOCOL_VERSION || receipt.build != self.build.as_ref() {
+            return Err("Turn handoff receipt has an incompatible protocol".into());
+        }
+        Ok(receipt.complete)
     }
 
     pub async fn login(&self, cancellation: &CancellationToken) -> Result<CompanionHealth, String> {
@@ -1277,6 +1301,16 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
                 return Err("Browser pairing reference is invalid".into());
             }
         }
+        ActionPrompt::TurnRenewal { handoff_id } => {
+            if handoff_id.len() != 70
+                || !handoff_id.starts_with("renew-")
+                || !handoff_id[6..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("Turn handoff ID is invalid".into());
+            }
+        }
         ActionPrompt::OfflineChat { batch_id, messages } => {
             validate_batch(batch_id, messages)?;
         }
@@ -1415,6 +1449,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
         ),
         ActionPrompt::OfflineChat { batch_id, messages } => unread_clause(batch_id, messages),
         ActionPrompt::OfflineGoal { .. } => GOAL_CLAUSE.to_string(),
+        ActionPrompt::TurnRenewal { .. } => "Continue.".to_string(),
         ActionPrompt::OfflineCombined {
             batch_id, messages, ..
         } => format!("{}\n\n{GOAL_CLAUSE}", unread_clause(batch_id, messages)),

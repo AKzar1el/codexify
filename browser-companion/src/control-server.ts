@@ -17,6 +17,8 @@ import {validateNewChatProjectUrl} from "./new-chat";
 import { asCompanionError } from "./errors";
 import {
   COMPANION_KIND,
+  chatGptUrlSchema,
+  opaqueIdSchema,
   MAX_DESCRIPTOR_BYTES,
   MAX_EVENT_LINE_BYTES,
   MAX_JSON_BYTES,
@@ -182,6 +184,10 @@ async function route(
     const body=z.strictObject({epoch:z.string().min(1).max(128)}).parse(await readJson(request));
     try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal));}
     catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
+  }
+  if(request.method === "POST" && url.pathname === "/v1/turns/handoff") {
+    const body=z.strictObject({url:chatGptUrlSchema,expectedAccountFingerprint:opaqueIdSchema,handoffId:z.string().regex(/^renew-[a-f0-9]{64}$/)}).parse(await readJson(request));
+    json(response,200,await coordinator.turnHandoffComplete(body.url,body.expectedAccountFingerprint,body.handoffId,operation.signal));return;
   }
   if (request.method === "POST" && url.pathname === "/v1/connectors/refresh") {
     const body=z.strictObject({name:z.string().min(1).max(256)}).parse(await readJson(request));
