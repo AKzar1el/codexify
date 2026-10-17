@@ -220,11 +220,18 @@ silent and never block automation. Writes are buffered; a crash can lose the las
 few seconds of best-effort counters.
 
 Use **Share** in Analytics to preview a compact card for the selected period,
-then **Copy image** or **Download PNG**. The 1200 × 675 card includes turns, work
+then choose **Static PNG** or **Animated SVG**. The 1200 × 675 card includes turns, work
 tool calls, completed goals, an activity strip, and `codexify.dev` branding.
 Images are generated entirely in the browser, with no upload, hosting, public
 link, conversation names or project paths. PNG download remains available when
-image clipboard access is unsupported or denied.
+image clipboard access is unsupported or denied. The SVG is self-contained,
+with no scripts, fonts or images to fetch: counters race to the final totals,
+activity bars fill, and flames and sparks celebrate before the totals hold.
+The six-second loop respects the viewer's reduced-motion preference. You can
+pause the preview; **Copy PNG** always copies the still image for chat apps.
+Download the SVG and add it to your repository, then embed it in a README with
+`![Codexify stats](./codexify-stats.svg)`. Image animation support depends on the
+viewer; use the PNG where animations or SVG files are unsupported.
 
 **Model cutoff estimates** appear in **Settings → Chats & goals**. Passive local
 collection runs while Turn renewal is off, grouping inferred unfinished stops by

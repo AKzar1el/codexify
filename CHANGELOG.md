@@ -8,7 +8,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — planned for 2.1
 
-- Analytics share cards with a local preview, PNG download and copy-image action.
+- Colorful Analytics share cards with static PNG and animated SVG previews,
+  downloads and a copy-PNG action. The SVG counts up to the selected totals,
+  celebrates with flames and sparks, then holds the result in a six-second loop.
+  Motion can be paused in the preview and respects reduced-motion preferences.
   Cards contain aggregate totals and Codexify branding; no images are uploaded
   or made publicly accessible.
 

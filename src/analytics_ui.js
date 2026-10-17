@@ -140,7 +140,7 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,getEnabled,setE
 }
 
 
-// A browser-local PNG. No server endpoint, remote assets, or public URL is used.
+// Browser-local exports. No server endpoint, remote assets, or public URL is used.
 function createAnalyticsShareCard({bindBackdrop}) {
  const make=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!=null)n.textContent=text;return n;};
  const style=make('style');style.textContent=`
@@ -158,6 +158,10 @@ function createAnalyticsShareCard({bindBackdrop}) {
 #analytics-share-dialog :is(button,a):focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 #analytics-share-dialog .stats-share-preview{display:grid;place-items:center;aspect-ratio:16/9;border-radius:15px;background:var(--bg);overflow:hidden;border:1px solid var(--line)}
 #analytics-share-dialog .stats-share-preview img{display:block;width:100%;height:auto}
+#analytics-share-dialog .stats-share-formats{display:flex;gap:6px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+#analytics-share-dialog .stats-share-formats button{padding:7px 12px;font-size:12px}
+#analytics-share-dialog .stats-share-formats button[aria-pressed=true]{background:var(--selected);color:var(--accent);border-color:var(--accent)}
+#analytics-share-dialog #stats-share-motion{margin-left:auto;color:var(--muted);border:0;background:transparent}
 #analytics-share-dialog .stats-share-placeholder{padding:24px;text-align:center;color:var(--muted);font-size:12px}
 #analytics-share-dialog .stats-share-privacy{font-size:11px;color:var(--muted);line-height:1.6;margin:14px 0 0}
 #analytics-share-dialog .stats-share-footer{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;padding-top:18px;margin-top:18px;border-top:1px solid var(--line)}
@@ -172,17 +176,39 @@ function createAnalyticsShareCard({bindBackdrop}) {
  const description=make('p','stats-share-description');description.id='stats-share-description';copy.append(heading,description);dialog.setAttribute('aria-describedby',description.id);
  const close=make('button');close.id='stats-share-close';close.type='button';close.setAttribute('aria-label','Close share preview');close.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>';close.addEventListener('click',()=>dialog.close());header.append(copy,close);
  const preview=make('div','stats-share-preview'),image=make('img'),placeholder=make('span','stats-share-placeholder','Creating your card…');image.id='stats-share-image';image.hidden=true;preview.append(image,placeholder);
+ const formats=make('div','stats-share-formats');formats.setAttribute('role','group');formats.setAttribute('aria-label','Share image format');
+ const formatButtons=new Map();for(const [key,label]of [['png','Static PNG'],['svg','Animated SVG']]){const b=make('button','',label);b.type='button';b.setAttribute('aria-pressed',String(key==='png'));b.addEventListener('click',()=>{format=key;paused=false;show();});formatButtons.set(key,b);formats.append(b);}
+ const motion=make('button','','Pause preview');motion.id='stats-share-motion';motion.type='button';motion.hidden=true;motion.addEventListener('click',()=>{paused=!paused;show();});formats.append(motion);
+ const hint=make('p','stats-share-privacy');hint.id='stats-share-hint';
  const privacy=make('p','stats-share-privacy','Only aggregate totals appear on the card. Generated on this device, with no upload or public link.');
  const footer=make('div','stats-share-footer'),message=make('p','stats-share-status');message.id='stats-share-status';message.setAttribute('role','status');message.setAttribute('aria-live','polite');
  const download=make('a','','Download PNG');download.id='stats-share-download';download.setAttribute('aria-disabled','true');
- const copyButton=make('button','','Copy image');copyButton.id='stats-share-copy';copyButton.type='button';copyButton.disabled=true;copyButton.setAttribute('aria-describedby',message.id);footer.append(message,download,copyButton);dialog.append(header,preview,privacy,footer);document.body.append(dialog);bindBackdrop(dialog,()=>dialog.close());
- let blob=null,url=null,epoch=0,downloadUsed=false,copying=false;
+ const copyButton=make('button','','Copy image');copyButton.id='stats-share-copy';copyButton.type='button';copyButton.disabled=true;copyButton.setAttribute('aria-describedby',message.id);footer.append(message,download,copyButton);dialog.append(header,formats,preview,hint,privacy,footer);document.body.append(dialog);bindBackdrop(dialog,()=>dialog.close());
+ let assets={},snapshot=null,format='png',paused=false,epoch=0,copying=false;
+ const reducedMotion=matchMedia('(prefers-reduced-motion: reduce)');
  const canCopy=()=>window.isSecureContext&&typeof window.ClipboardItem==='function'&&typeof navigator.clipboard?.write==='function';
- function release(){const old=url;url=null;blob=null;image.removeAttribute('src');download.removeAttribute('href');if(old){if(downloadUsed)setTimeout(()=>URL.revokeObjectURL(old),60000);else URL.revokeObjectURL(old);}}
+ function release(){image.removeAttribute('src');download.removeAttribute('href');for(const asset of Object.values(assets)){if(asset.url){if(asset.downloaded)setTimeout(()=>URL.revokeObjectURL(asset.url),60000);else URL.revokeObjectURL(asset.url);}}assets={};}
+ function show(){
+  if(!snapshot)return;const asset=assets[format],animated=format==='svg',still=paused||reducedMotion.matches;
+  for(const [key,b]of formatButtons)b.setAttribute('aria-pressed',String(key===format));
+  description.textContent=`${snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`} · ${animated?'Animated SVG':'PNG image'}`;
+  hint.textContent=animated?(reducedMotion.matches?'Reduced motion: showing the final totals. The SVG respects the viewer’s motion preference.':'A 6-second loop: count up, celebrate, hold. Add the downloaded SVG to your GitHub README as an image.'):'A still image for chats, posts and anywhere you share images.';
+  motion.hidden=!animated;motion.disabled=reducedMotion.matches||!assets.still?.url;motion.textContent=reducedMotion.matches?'Motion reduced':paused?'Play preview':'Pause preview';motion.setAttribute('aria-pressed',String(!still));
+  // Some image engines do not propagate a page's emulated motion preference
+  // into SVG images. Choose an explicit still for the local preview as well.
+  const shown=animated&&still?(assets.png?.url?assets.png:assets.still):asset;image.hidden=!shown?.url;placeholder.hidden=!!shown?.url;placeholder.textContent=asset?.error?'The image could not be created.':'Creating your card…';
+  if(shown?.url&&image.getAttribute('src')!==shown.url)image.src=shown.url;
+  download.textContent=animated?'Download SVG':'Download PNG';download.setAttribute('aria-disabled',String(!asset?.url));
+  if(asset?.url){download.href=asset.url;download.download=`codexify-stats-${snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.${format}`;}else download.removeAttribute('href');
+  copyButton.textContent=animated?'Copy PNG':'Copy image';copyButton.disabled=!assets.png?.blob||copying||!canCopy();
+  message.textContent=asset?.error?'Close this preview and try again.':!asset?.url?'':canCopy()?'Ready to share.':'Copy isn’t available in this browser. Download the PNG instead.';
+ }
+ reducedMotion.addEventListener('change',()=>{if(dialog.open)show();});
  dialog.addEventListener('close',()=>{epoch++;release();copying=false;});
  document.getElementById('settings-dialog')?.addEventListener('close',()=>{if(dialog.open)dialog.close();});
- download.addEventListener('click',event=>{if(!blob||!url){event.preventDefault();return;}downloadUsed=true;message.textContent='PNG download started.';});
+ download.addEventListener('click',event=>{const asset=assets[format];if(!asset?.url){event.preventDefault();return;}asset.downloaded=true;message.textContent=`${format.toUpperCase()} download started.`;});
  copyButton.addEventListener('click',()=>{
+  const blob=assets.png?.blob;
   if(!blob||copying||!canCopy())return;
   const current=epoch;copying=true;copyButton.disabled=true;message.textContent='Copying image…';
   // Call write directly in the click gesture. Safari loses clipboard access if
@@ -193,14 +219,13 @@ function createAnalyticsShareCard({bindBackdrop}) {
  });
  return {
   isOpen:()=>dialog.open,
-  open(snapshot){
+  open(value){
    if(dialog.open)return;
-   release();const current=++epoch;downloadUsed=false;copying=false;image.hidden=true;placeholder.hidden=false;placeholder.textContent='Creating your card…';copyButton.disabled=true;download.setAttribute('aria-disabled','true');message.textContent='';description.textContent=`${snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`} · PNG image`;
-   dialog.showModal();
-   Promise.resolve().then(()=>renderAnalyticsSharePNG(snapshot)).then(png=>{
-    if(current!==epoch||!dialog.open)return;
-    blob=png;url=URL.createObjectURL(png);image.alt=`Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed.`;image.src=url;image.hidden=false;placeholder.hidden=true;download.href=url;download.download=`codexify-stats-${snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.png`;download.setAttribute('aria-disabled','false');copyButton.disabled=!canCopy();message.textContent=canCopy()?'Ready to share.':'Copy isn’t available in this browser. Download the PNG instead.';
-   }).catch(()=>{if(current===epoch&&dialog.open){placeholder.textContent='The image could not be created.';message.textContent='Close this preview and try again.';}});
+   release();snapshot=value;format='png';paused=false;const current=++epoch;copying=false;
+   image.alt=`Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed.`;show();dialog.showModal();
+   for(const [key,render]of [['png',()=>renderAnalyticsSharePNG(value)],['svg',()=>new Blob([renderAnalyticsShareSVG(value)],{type:'image/svg+xml'})],['still',()=>new Blob([renderAnalyticsShareSVG(value,true)],{type:'image/svg+xml'})]]){
+    Promise.resolve().then(render).then(blob=>{if(current!==epoch||!dialog.open)return;assets[key]={blob,url:URL.createObjectURL(blob)};show();}).catch(()=>{if(current===epoch&&dialog.open){assets[key]={error:true};show();}});
+   }
   }
  };
 }
@@ -238,4 +263,57 @@ function renderAnalyticsSharePNG(snapshot) {
  context.font='550 23px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText(dates,72,605);
  context.save();context.translate(1002,579);context.rotate(-.035);rounded(-142,-35,284,70,17);context.fillStyle=ink;context.fill();context.textAlign='center';context.font='750 35px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText('codexify.dev',0,12);context.restore();
  return new Promise((resolve,reject)=>{canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('PNG unavailable')),'image/png');});
+}
+
+// Declarative SVG animation also runs in an <img>; scripts and remote resources
+// do not. Final totals are the base drawing, so a still renderer stays useful.
+function renderAnalyticsShareSVG(snapshot,still=false) {
+ const escape=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
+ const format=n=>new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:n>=10000?1:0}).format(n||0);
+ const text=(x,y,value,size=23,weight=650,extra='')=>`<text x="${x}" y="${y}" font-size="${size}" font-weight="${weight}" ${extra}>${escape(value)}</text>`;
+ const rect=(x,y,w,h,r,fill,extra='')=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${fill}" ${extra}/>`;
+ const anim=(attr,values,times)=>`<animate attributeName="${attr}" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>`;
+ const star=(x,y,r,color,rotate=false)=>{const points=Array.from({length:16},(_,i)=>{const a=i*Math.PI/8-Math.PI/2,s=i%2?r*.52:r;return `${(Math.cos(a)*s).toFixed(2)},${(Math.sin(a)*s).toFixed(2)}`;}).join(' ');return `<g transform="translate(${x} ${y})"><polygon points="${points}" fill="${color}"/>${rotate?`<g class="motion" visibility="hidden"><set attributeName="visibility" to="visible" begin="0s"/><circle r="${r+2}" fill="#7651ed"/><polygon points="${points}" fill="${color}"><animateTransform attributeName="transform" type="rotate" values="0;0;90;90" keyTimes="0;.24;.4;1" dur="6s" repeatCount="indefinite"/></polygon></g>`:''}</g>`;};
+ const period=snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`,pillWidth=period.length*15+42;
+ let defs='<clipPath id="edge"><rect width="1200" height="675" rx="30"/></clipPath>',cards='';
+ for(const [i,card]of [{key:'turns',label:'Turns',x:66,y:200,angle:-1.43,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:1.15,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-1.03,color:'#80eadb'}].entries()){
+  const value=snapshot.totals[card.key]||0;
+  // Bounded text frames keep the SVG compact even for lifetime totals. Ease out
+  // over 1.7s, then hold the exact final value for the rest of the six-second loop.
+  const frames=Array.from({length:33},(_,n)=>format(Math.round(value*(1-Math.pow(1-n/32,2)))));
+  const size=Math.min(100,Math.floor(278/(Math.max(...frames.map(v=>v.length))*.66)));
+  const times=frames.map((_,n)=>(n/32*.28).toFixed(5)).concat('1').join(';');
+  const values=frames.map((_,n)=>`0 ${-n*126}`).concat(`0 ${-32*126}`).join(';');
+  defs+=`<clipPath id="digits-${i}"><rect x="20" y="45" width="290" height="122"/></clipPath>`;
+  cards+=`<g transform="translate(${card.x+165} ${card.y+124.5}) rotate(${card.angle}) translate(-165 -124.5)">
+   ${rect(8,9,330,249,22,'#241739')}${rect(0,0,330,249,22,card.color,'stroke="#241739" stroke-width="4"')}
+   ${text(25,144,format(value),size,850,'data-final="'+card.key+'"')}
+   <g class="motion" visibility="hidden" clip-path="url(#digits-${i})"><set attributeName="visibility" to="visible" begin="0s"/>
+    ${rect(20,45,290,122,0,card.color)}<g><animateTransform attributeName="transform" type="translate" calcMode="discrete" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>
+    ${frames.map((v,n)=>text(25,144+n*126,v,size,850)).join('')}</g>
+   </g>${text(27,204,card.label,31)}
+  </g>`;
+ }
+ const raw=snapshot.activity.length?snapshot.activity:[0,0,0,0,0,0,0],stride=Math.max(1,Math.ceil(raw.length/30)),bars=[];
+ for(let i=0;i<raw.length;i+=stride)bars.push(raw.slice(i,i+stride).reduce((a,b)=>a+b,0));
+ const max=Math.max(1,...bars),gap=bars.length<=7?12:5,w=(600-gap*(bars.length-1))/bars.length;
+ const strip=bars.map((v,i)=>{const h=v?Math.max(4,v/max*43):3,start=(.02+i/bars.length*.12).toFixed(4),end=(.12+i/bars.length*.16).toFixed(4);return `<rect x="${72+i*(w+gap)}" y="${554-h}" width="${w}" height="${h}" rx="${Math.min(4,h/2)}" fill="${v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50'}">${anim('height',`${h};0;${h};${h}`,`0;${start};${end};1`)}${anim('y',`${554-h};554;${554-h};${554-h}`,`0;${start};${end};1`)}</rect>`;}).join('');
+ const pretty=(iso,year)=>new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',...(year?{year:'numeric'}:{}),timeZone:'UTC'}).format(new Date(iso+'T12:00:00Z'));
+ const dates=snapshot.start===snapshot.today?pretty(snapshot.today,true):`${pretty(snapshot.start,snapshot.start.slice(0,4)!==snapshot.today.slice(0,4))} – ${pretty(snapshot.today,true)}`;
+ const sparks=Array.from({length:12},(_,i)=>{const angle=i/12*Math.PI*2,x=Math.cos(angle)*67,y=Math.sin(angle)*44;return `<g transform="translate(${754+x} ${539+y})"><path d="M-3 0h6M0-3v6" fill="none" stroke="${i%2?'#ff91c8':'#dfff75'}" stroke-width="4" stroke-linecap="round"/>${anim('opacity','0;0;1;0;0','0;.25;.32;.52;1')}<animateTransform attributeName="transform" type="translate" additive="sum" values="0 0;0 0;${x*.5} ${y*.5};${x*.5} ${y*.5}" keyTimes="0;.25;.52;1" dur="6s" repeatCount="indefinite"/></g>`;}).join('');
+ return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+ <title id="title">Codexify stats · ${escape(period)}</title><desc id="desc">${escape(`${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed. ${dates}.`)}</desc>
+ <style>text{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#241739}.cream{fill:#fff9ea}@media(prefers-reduced-motion:reduce){.motion{display:none}animate,animateTransform,set{display:none}}</style>
+ <defs>${defs}</defs><g clip-path="url(#edge)">${rect(0,0,1200,675,0,'#7651ed')}
+ ${star(1129,461,38,'#dfff75',true)}${star(407,160,23,'#ff91c8',true)}<circle cx="39" cy="495" r="13" fill="#ff91c8"/>
+ <g transform="translate(1099 157) rotate(-17)"><path d="M-17 0h34M0-17v34" stroke="#dfff75" stroke-width="10"/></g>
+ ${text(68,113,'Codexify stats',48,800,'class="cream"')}
+ <g transform="translate(${1128-pillWidth/2} 85) rotate(2.58)">${rect(-pillWidth/2+5,-22,pillWidth,54,14,'#241739')}${rect(-pillWidth/2,-27,pillWidth,54,14,'#fff9ea','stroke="#241739" stroke-width="3"')}${text(0,8,period,23,750,'text-anchor="middle"')}</g>
+ ${cards}<g class="motion">${sparks}<g transform="translate(754 568)" opacity="0">${anim('opacity','0;0;1;1;0;0','0;.24;.28;.5;.6;1')}<g>
+ <animateTransform attributeName="transform" type="scale" values="1 1;.9 1.08;1.04 .96;1 1" dur=".6s" repeatCount="indefinite"/>
+ <path d="M0 5C-39 5-38-29-19-47C-22-33-10-32-12-50C-13-64 4-70 3-84C30-64 8-48 27-39C29-48 26-52 26-52C53-24 35 5 0 5Z" fill="#ff763e" stroke="#241739" stroke-width="3" stroke-linejoin="round"/>
+ <path d="M0 0C-20 0-20-19-8-29C-8-15 1-24 1-41C21-25 21 0 0 0Z" fill="#ffe875"/></g></g></g>
+ <g class="motion">${strip}</g><g class="still-strip">${bars.map((v,i)=>{const h=v?Math.max(4,v/max*43):3;return rect(72+i*(w+gap),554-h,w,h,Math.min(4,h/2),v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50');}).join('')}</g>
+ ${text(72,605,dates,23,550,'class="cream"')}<g transform="translate(1002 579) rotate(-2)">${rect(-142,-35,284,70,17,'#241739')}${text(0,12,'codexify.dev',35,750,'class="cream" text-anchor="middle"')}</g>
+ </g><style>.still-strip{display:none}@media(prefers-reduced-motion:reduce){.still-strip{display:inline}}${still?'.motion{display:none}.still-strip{display:inline}':''}</style></svg>`;
 }

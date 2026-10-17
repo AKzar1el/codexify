@@ -82,3 +82,54 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   await dialog.getByRole('button',{name:'Close share preview',exact:true}).click();assert.equal(await settings.getByRole('button',{name:'Share analytics',exact:true}).isEnabled(),true);assert.equal(await settings.locator('#settings-save-state').getAttribute('data-error'),'false');assert.deepEqual(errors,[]);assert.deepEqual(posts,[]);
  }finally{await browser.close();}
 });
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: animated SVG downloads locally, counts up in an image, and retains PNG copying`,{timeout:45000},async()=>{
+ const {browser,page,settings,errors,requests,posts}=await fixture(engine),output=process.env.ANALYTICS_SHARE_SCREENSHOTS||mkdtempSync(join(tmpdir(),'analytics-motion-'));mkdirSync(output,{recursive:true});
+ try{
+  for(const period of ['7','30','90','all']){
+   await settings.getByLabel('Analytics date range').selectOption(period);await page.waitForFunction(()=>!document.querySelector('[aria-label="Share analytics"]').disabled);
+   const before=requests.length;await settings.getByRole('button',{name:'Share analytics',exact:true}).click();const dialog=await ready(page);
+   await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();await dialog.getByRole('link',{name:'Download SVG',exact:true}).waitFor();
+   const source=await dialog.locator('img').getAttribute('src');assert(source.startsWith('blob:'));
+   const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download SVG',exact:true}).click();const download=await pending;assert.equal(download.suggestedFilename(),`codexify-stats-${period==='all'?'lifetime':period+'-days'}-${today}.svg`);
+   const path=join(output,`${name.toLowerCase()}-${period}.svg`);await download.saveAs(path);const svg=readFileSync(path,'utf8');assert.equal(await page.evaluate(async source=>(await fetch(source)).text(),source),svg,'download and live preview use identical SVG bytes');
+   assert(svg.length<60000);assert(svg.includes('prefers-reduced-motion'));assert(!/secret|private|share-test-token|127\.0\.0\.1|chatgpt\.com|foreignObject|<script|<image|href=|@import|onload=/i.test(svg));
+   const xml=await page.evaluate(svg=>{const d=new DOMParser().parseFromString(svg,'image/svg+xml');return {error:!!d.querySelector('parsererror'),dimensions:[d.documentElement.getAttribute('width'),d.documentElement.getAttribute('height')],final:[...d.querySelectorAll('[data-final]')].map(n=>n.textContent),animated:d.querySelectorAll('animateTransform').length,desc:d.querySelector('desc')?.textContent};},svg);
+   assert.equal(xml.error,false);assert.deepEqual(xml.dimensions,['1200','675']);assert(xml.animated>=3);assert(xml.desc.includes(`${numbers[period].toolCalls} tool calls`));
+   assert.equal(xml.final[0],new Intl.NumberFormat('en-US',{notation:numbers[period].turns>=10000?'compact':'standard'}).format(numbers[period].turns));
+   await dialog.getByRole('button',{name:'Pause preview',exact:true}).click();assert.notEqual(await dialog.locator('img').getAttribute('src'),source);
+   await dialog.getByRole('button',{name:'Copy PNG',exact:true}).click();await dialog.getByText('Image copied.',{exact:true}).waitFor();const copied=await page.evaluate(async()=>Array.from(new Uint8Array(await(await window.__copied.getType('image/png')).arrayBuffer())));png(Buffer.from(copied));
+   await dialog.getByRole('button',{name:'Play preview',exact:true}).click();assert.equal(await dialog.locator('img').getAttribute('src'),source);
+   if(period==='7'){
+    await page.setViewportSize({width:375,height:850});assert.equal(await dialog.evaluate(n=>n.scrollWidth>n.clientWidth),false);await page.screenshot({path:join(output,`${name.toLowerCase()}-animated-mobile.png`)});await page.setViewportSize({width:1440,height:1000});
+    // Test the exported file in the same restricted image context used by a
+    // README: no SVG scripts execute, and no external resources are requested.
+    const context=await browser.newContext({javaScriptEnabled:false,viewport:{width:1200,height:675},deviceScaleFactor:1});const frame=await context.newPage();let imageRequests=0;
+    await frame.route('http://127.0.0.1:43330/**',route=>{imageRequests++;return route.fulfill({contentType:route.request().url().endsWith('.svg')?'image/svg+xml':'text/html',body:route.request().url().endsWith('.svg')?svg:'<style>body{margin:0}img{display:block;width:1200px;height:675px}</style><img src="/stats.svg" alt="Stats">'});});
+    await frame.goto('http://127.0.0.1:43330/');await frame.locator('img').waitFor();await frame.waitForTimeout(150);const early=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-start.png`)});await frame.waitForTimeout(700);const middle=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-count.png`)});assert.notDeepEqual(early,middle,'SVG must animate as an image without JavaScript');
+    await frame.waitForTimeout(1200);await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-fire.png`)});await frame.waitForTimeout(2100);const final=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-final.png`)});await frame.waitForTimeout(550);assert.equal(createHash('sha256').update(await frame.screenshot()).digest('hex'),createHash('sha256').update(final).digest('hex'),'final totals must hold still before the loop restarts');assert.equal(imageRequests,2);await context.close();
+   }
+   assert.equal(requests.length,before,'export makes no requests');await dialog.getByRole('button',{name:'Close share preview',exact:true}).click();
+  }
+  assert.deepEqual(errors,[]);assert.deepEqual(posts,[]);
+ }finally{await browser.close();}
+});
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: reduced-motion SVG is still and SVG export survives unavailable canvas`,{timeout:30000},async()=>{
+ const {browser,page,settings,errors,posts}=await fixture(engine);try{
+  await page.emulateMedia({reducedMotion:'reduce'});await settings.getByRole('button',{name:'Share analytics',exact:true}).click();const dialog=await ready(page);await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();
+  await dialog.getByRole('button',{name:'Motion reduced',exact:true}).waitFor();assert.equal(await dialog.getByRole('button',{name:'Motion reduced',exact:true}).isDisabled(),true);
+  await page.waitForFunction(()=>document.getElementById('stats-share-image').complete);const first=await dialog.locator('img').screenshot();await page.waitForTimeout(700);assert.equal(createHash('sha256').update(await dialog.locator('img').screenshot()).digest('hex'),createHash('sha256').update(first).digest('hex'),'reduced motion must keep exact final totals visible');
+  // Check the exported file's own media rule separately: page-level browser
+  // emulation is not inherited by SVG image subdocuments on every engine.
+  const svg=await page.evaluate(async()=>{const link=document.getElementById('stats-share-download');return(await fetch(link.href)).text();});
+  const context=await browser.newContext({reducedMotion:'reduce',viewport:{width:1200,height:675}}),standalone=await context.newPage();
+  await standalone.route('http://127.0.0.1:43331/stats.svg',r=>r.fulfill({contentType:'image/svg+xml',body:svg}));await standalone.goto('http://127.0.0.1:43331/stats.svg');
+  assert.equal(await standalone.evaluate(()=>[...document.querySelectorAll('.motion')].every(n=>getComputedStyle(n).display==='none')),true);
+  await standalone.evaluate(()=>document.documentElement.setCurrentTime(.5));const still=await standalone.screenshot();await standalone.evaluate(()=>document.documentElement.setCurrentTime(2.5));assert.equal(createHash('sha256').update(await standalone.screenshot()).digest('hex'),createHash('sha256').update(still).digest('hex'));await context.close();
+  await dialog.getByRole('button',{name:'Close share preview',exact:true}).click();
+  await page.evaluate(()=>{HTMLCanvasElement.prototype.getContext=()=>null;});await settings.getByRole('button',{name:'Share analytics',exact:true}).click();await dialog.getByText('The image could not be created.',{exact:true}).waitFor();
+  await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();await dialog.getByRole('link',{name:'Download SVG',exact:true}).waitFor();await page.waitForFunction(()=>document.getElementById('stats-share-image').naturalWidth===1200);assert.equal(await dialog.getByRole('button',{name:'Copy PNG',exact:true}).isDisabled(),true);
+  const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download SVG',exact:true}).click();await pending;assert.deepEqual(errors,[]);assert.deepEqual(posts,[]);
+ }finally{await browser.close();}
+});
