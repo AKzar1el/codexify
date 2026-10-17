@@ -2530,6 +2530,7 @@ mod tests {
                 "agentChat",
                 &[
                     "automation",
+                    "defaultMessageMode",
                     "enabled",
                     "maxWaitMs",
                     "notifications",

@@ -11,7 +11,9 @@ use crate::types::{AppConfig, ToolResult};
 
 pub const KEEP_WAITING: &str = "Markdown chat is still active. The required next action is chat_await. Do not emit a normal assistant final response or end the turn. Call chat_await again unless the user explicitly authorized ending this turn or a higher-priority instruction requires it.";
 
-const NEXT_CONTINUE_OR_AWAIT: &str = "continue_or_chat_await";
+const NEXT_CONTINUE_OR_COMPLETED: &str = "continue_or_turn_completed";
+const NEXT_TURN_COMPLETED: &str = "turn_completed";
+const KEEP_COMPLETED_WAITING: &str = "The request is complete. Call turn_completed again to wait for the next user request. Do not end the assistant turn.";
 const NEXT_CHAT_WRITE: &str = "chat_write";
 const NEXT_CHAT_AWAIT: &str = "chat_await";
 
@@ -70,6 +72,7 @@ pub enum ChatTool {
     Read,
     Write,
     Await,
+    Completed,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +149,7 @@ impl Tool for ChatTool {
             Self::Read => "chat_read",
             Self::Write => "chat_write",
             Self::Await => "chat_await",
+            Self::Completed => "turn_completed",
         }
     }
 
@@ -153,7 +157,8 @@ impl Tool for ChatTool {
         match self {
             Self::Read => "Read user messages",
             Self::Write => "Send a Markdown message",
-            Self::Await => "Wait for user message",
+            Self::Await => "Wait for needed user input",
+            Self::Completed => "Complete the current request and wait for the next",
         }
         .into()
     }
@@ -167,9 +172,10 @@ impl Tool for ChatTool {
 
     fn description(&self) -> String {
         match self {
-            Self::Read => "NON-TERMINAL TOOL. Read and acknowledge all new user text in this Codexify task's CHAT.md, without truncation. Prefer this over direct file reads. After handling all newly read messages, continue useful work if any remains; otherwise you MUST call chat_await and MUST NOT end the assistant turn. Whenever the user posts a new message, prioritize answering or acknowledging it with chat_write.",
-            Self::Write => "NON-TERMINAL TOOL. Append a Markdown message to this Codexify task's CHAT.md and optionally notify the user through configured notification services. This is the only supported way for the agent to write this file. You MUST NOT end the assistant turn after a successful chat_write. If new_chat_message_from_user is returned, answer or acknowledge it with chat_write before other work. Otherwise continue useful work if any remains; if not, your next action MUST be chat_await. A completion report is still non-terminal.",
-            Self::Await => "This is the only valid idle state while Markdown chat is active. Never substitute a normal assistant final response for chat_await. Wait for new user text in this Codexify task's CHAT.md, then return and acknowledge it in full without truncation. The server config controls the wait deadline; no tool argument can change it. If a user message is returned, answer or acknowledge it with chat_write. After a timeout or cancellation without a user message, call chat_await again unless the user explicitly authorized ending this turn or a higher-priority instruction requires it.",
+            Self::Read => "NON-TERMINAL TOOL. Read and acknowledge all new user text in this Codexify task's CHAT.md, without truncation. Prefer this over direct file reads. After handling all newly read messages, continue useful work if any remains; otherwise call turn_completed when the request is finished, or chat_await when you need the user to answer a question and MUST NOT end the assistant turn. Whenever the user posts a new message, prioritize answering or acknowledging it with chat_write.",
+            Self::Write => "NON-TERMINAL TOOL. Append a Markdown message to this Codexify task's CHAT.md and optionally notify the user through configured notification services. This is the only supported way for the agent to write this file. You MUST NOT end the assistant turn after a successful chat_write. If new_chat_message_from_user is returned, answer or acknowledge it with chat_write before other work. Otherwise continue useful work if any remains; if finished, your next action MUST be turn_completed; use chat_await only when user input is required. A completion report is still non-terminal.",
+            Self::Completed => "NON-TERMINAL TOOL. Call only when the current user request is complete. Deliver exactly one oldest eligible queued request, or wait for the next request when none is ready. Queued requests remain private while a goal is unfinished or blocked. Handle the returned request and report using chat_write before completing another request. On timeout call turn_completed again. Use chat_await instead when you need the user's answer to continue the current request.",
+            Self::Await => "Wait only when the current request needs the user's input; this does not complete the request or release queued requests. Use turn_completed when the request is finished. Never substitute a normal assistant final response for chat_await. Wait for new user text in this Codexify task's CHAT.md, then return and acknowledge it in full without truncation. The server config controls the wait deadline; no tool argument can change it. If a user message is returned, answer or acknowledge it with chat_write. After a timeout or cancellation without a user message, call chat_await again unless the user explicitly authorized ending this turn or a higher-priority instruction requires it.",
         }.into()
     }
 
@@ -182,7 +188,7 @@ impl Tool for ChatTool {
                 true,
                 "Appends a user-facing message outside the repository and may POST that message to the configured notification provider.",
             ),
-            Self::Read | Self::Await => ToolBehavior::new(
+            Self::Read | Self::Await | Self::Completed => ToolBehavior::new(
                 false,
                 false,
                 false,
@@ -204,11 +210,11 @@ impl Tool for ChatTool {
         Some(json!({
             "type":"object",
             "properties":{
-                "status":{"type":"string", "enum":["written","message","empty","timeout","cancelled","workspace_selected","workspace_selection"]},
+                "status":{"type":"string", "enum":["written","message","empty","timeout","cancelled","continue","workspace_selected","workspace_selection"]},
                 "content":{"type":"string"},
                 "chat_file":{"type":["string","null"]},
                 "notification":{"type":"string", "enum":["not_configured","suppressed","pending","accepted","failed","cancelled"]},
-                "required_next_action":{"type":"string", "enum":["continue_or_chat_await","chat_write","chat_await","get_agent_brief"]},
+                "required_next_action":{"type":"string", "enum":["continue_or_turn_completed","chat_write","chat_await","turn_completed","get_agent_brief"]},
                 "assistant_turn_may_end":{"type":"boolean", "const":false}
             },
             "required":["status","content","chat_file","notification","required_next_action","assistant_turn_may_end"],
@@ -221,7 +227,7 @@ impl Tool for ChatTool {
     }
 
     fn requires_project_root(&self) -> bool {
-        !matches!(self, Self::Await)
+        !matches!(self, Self::Await | Self::Completed)
     }
 
     async fn call(&self, _args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
@@ -240,7 +246,7 @@ impl Tool for ChatTool {
             return ToolResult::error("Markdown chat is disabled");
         }
         let effective;
-        let config = if matches!(self, Self::Await) {
+        let config = if matches!(self, Self::Await | Self::Completed) {
             if let Err(error) = parse_tool_args::<EmptyArgs>(args.clone()) {
                 return *error;
             }
@@ -288,10 +294,10 @@ impl Tool for ChatTool {
                 Err(error) => return ToolResult::error(error),
             };
         if context.cancellation.is_cancelled() {
-            let next_action = if matches!(self, Self::Await) {
-                NEXT_CHAT_AWAIT
-            } else {
-                NEXT_CONTINUE_OR_AWAIT
+            let next_action = match self {
+                Self::Await => NEXT_CHAT_AWAIT,
+                Self::Completed => NEXT_TURN_COMPLETED,
+                _ => NEXT_CONTINUE_OR_COMPLETED,
             };
             return result(
                 "cancelled",
@@ -301,16 +307,70 @@ impl Tool for ChatTool {
                 next_action,
             );
         }
+        let completion_hint = if matches!(self, Self::Await) {
+            match chat.queue_completion_hint().await {
+                Ok(value) => value,
+                Err(error) => return ToolResult::error(error),
+            }
+        } else {
+            false
+        };
+        if matches!(self, Self::Completed) {
+            match chat.queue_goal_holds().await {
+                Ok(true) => {
+                    return ToolResult::error(
+                        "The goal is unfinished. Continue its work and mark it complete with goal_finish before completing this turn. If the goal needs the user's input, call chat_await; queued requests remain private.",
+                    );
+                }
+                Err(error) => return ToolResult::error(error),
+                Ok(false) => {}
+            }
+            match chat.queue_turn_completed().await {
+                Ok(false) => return result("continue", "A user request has already been delivered for this turn. Handle it and report with chat_write before completing another turn.".into(), chat.path(), NotificationState::Suppressed, NEXT_CHAT_WRITE),
+                Err(error) => return ToolResult::error(error),
+                Ok(true) => {}
+            }
+        }
+        if matches!(self, Self::Await)
+            && let Err(error) = chat.queue_agent_work(false).await
+        {
+            return ToolResult::error(error);
+        }
         if matches!(self, Self::Write) {
             let WriteArgs { message, event } = match parse_tool_args(args) {
                 Ok(args) => args,
                 Err(error) => return *error,
             };
             let event = notification::NotificationEvent::from(event);
-            let receipt = match chat.append_with_event(message.clone(), event).await {
+            let mut receipt = match chat.append_with_event(message.clone(), event).await {
                 Ok(receipt) => receipt,
                 Err(error) => return ToolResult::error(error),
             };
+            let mut returned_end = receipt.end_offset;
+            let mut sent_before_write = true;
+            if event == notification::NotificationEvent::Completed && receipt.user_text.is_empty() {
+                let next = async {
+                    if !chat.queue_goal_holds().await? && chat.queue_turn_completed().await? {
+                        chat.release_queued_message(crate::markdown_chat::now_ms())
+                            .await?;
+                        let snapshot = chat.read(true).await?;
+                        return Ok::<_, String>(Some(snapshot));
+                    }
+                    Ok(None)
+                }
+                .await;
+                match next {
+                    Ok(Some(snapshot)) => {
+                        sent_before_write = false;
+                        receipt.user_text = snapshot.text;
+                        returned_end = snapshot.end;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "completed request did not release a queued message")
+                    }
+                }
+            }
             let notify = notification::enabled(&config.markdown_chat, event);
             let claimed = if notify && event == notification::NotificationEvent::InputRequired {
                 match chat.claim_input_notification().await {
@@ -359,11 +419,11 @@ impl Tool for ChatTool {
                     content,
                     chat.path(),
                     state,
-                    NEXT_CONTINUE_OR_AWAIT,
+                    NEXT_CONTINUE_OR_COMPLETED,
                 ),
                 receipt.user_text,
-                true,
-                receipt.end_offset,
+                sent_before_write,
+                returned_end,
             );
         }
         if let Err(error) = parse_tool_args::<EmptyArgs>(args) {
@@ -387,8 +447,8 @@ impl Tool for ChatTool {
                     let (status, content, next_action) = if snapshot.text.is_empty() {
                         (
                             "empty",
-                            "The user has not written in CHAT.md since the last chat operation. Continue useful work if any remains; otherwise call chat_await. Do not end the assistant turn.".to_string(),
-                            NEXT_CONTINUE_OR_AWAIT,
+                            "The user has not written in CHAT.md since the last chat operation. Continue useful work if any remains; otherwise call turn_completed when finished, or chat_await if user input is required. Do not end the assistant turn.".to_string(),
+                            NEXT_CONTINUE_OR_COMPLETED,
                         )
                     } else {
                         (
@@ -412,8 +472,8 @@ impl Tool for ChatTool {
                 }
                 Err(error) => ToolResult::error(error),
             },
-            Self::Await => match tokio::select! {
-                outcome = chat.wait(Duration::from_millis(config.markdown_chat.max_wait_ms), context.cancellation.clone()) => outcome,
+            Self::Await | Self::Completed => match tokio::select! {
+                outcome = async { if matches!(self, Self::Completed) { chat.wait_completed(Duration::from_millis(config.markdown_chat.max_wait_ms), context.cancellation.clone()).await } else { chat.wait(Duration::from_millis(config.markdown_chat.max_wait_ms), context.cancellation.clone()).await } } => outcome,
                 changed = workspace_transition(base_config, session, context, Some(&config.work_dir)) => {
                     return match changed {
                         Ok(root) => workspace_wait_result(if root.is_some() { "workspace_selected" } else { "workspace_selection" }, root.as_deref()),
@@ -435,20 +495,17 @@ impl Tool for ChatTool {
                 ),
                 Ok(WaitOutcome::TimedOut(state)) => result(
                     "timeout",
-                    format!(
-                        "The user has not replied yet. {} {KEEP_WAITING}",
-                        notification::description(state)
-                    ),
+                    if matches!(self, Self::Completed) || completion_hint { KEEP_COMPLETED_WAITING.into() } else { format!("The user has not replied yet. {} {KEEP_WAITING}",notification::description(state)) },
                     chat.path(),
                     state,
-                    NEXT_CHAT_AWAIT,
+                    if matches!(self, Self::Completed) || completion_hint { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
                 ),
                 Ok(WaitOutcome::Cancelled) => result(
                     "cancelled",
-                    KEEP_WAITING.into(),
+                    if matches!(self, Self::Completed) { KEEP_COMPLETED_WAITING.into() } else { KEEP_WAITING.into() },
                     chat.path(),
                     NotificationState::Cancelled,
-                    NEXT_CHAT_AWAIT,
+                    if matches!(self, Self::Completed) { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
                 ),
                 Err(error) => ToolResult::error(error),
             },

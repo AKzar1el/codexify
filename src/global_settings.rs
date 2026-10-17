@@ -12,6 +12,28 @@ use crate::types::AppConfig;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 static EDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub fn default_message_mode(
+    config: &AppConfig,
+) -> Result<crate::markdown_chat::MessageMode, String> {
+    let Some(path) = &config.loaded_config_path else {
+        return Ok(config.markdown_chat.default_message_mode);
+    };
+    let document: Value = serde_json::from_str(&read_raw(path)?)
+        .map_err(|_| "Cannot read the default message mode from configuration")?;
+    match document
+        .pointer("/agentChat/defaultMessageMode")
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| "Default message mode must be steer or queue".into()),
+        None => {
+            let defaults = crate::config::settings_defaults(config, &document);
+            serde_json::from_value(defaults["agentChat"]["defaultMessageMode"].clone())
+                .map_err(|_| "Default message mode is unavailable".into())
+        }
+    }
+}
+
 pub fn snapshot(config: &AppConfig) -> Result<Value, String> {
     let path = config
         .loaded_config_path
@@ -105,7 +127,22 @@ pub fn save(
     crate::config_cli::write_document(path, object)
         .map_err(|error| format!("Cannot save configuration: {error:#}"))?;
     let mut saved = snapshot(config)?;
-    saved["restartRequired"] = json!(true);
+    let mut previous: Value = serde_json::from_str(&before).map_err(|error| error.to_string())?;
+    let mut next = saved["document"].clone();
+    for value in [&mut previous, &mut next] {
+        if let Some(chat) = value.get_mut("agentChat").and_then(Value::as_object_mut) {
+            chat.remove("defaultMessageMode");
+        }
+        if value
+            .get("agentChat")
+            .and_then(Value::as_object)
+            .is_some_and(|chat| chat.is_empty())
+        {
+            value.as_object_mut().unwrap().remove("agentChat");
+        }
+        value.as_object_mut().unwrap().remove("schemaVersion");
+    }
+    saved["restartRequired"] = json!(previous != next);
     Ok(saved)
 }
 
@@ -457,5 +494,72 @@ mod tests {
                 .contains("changed on disk")
         );
         assert_eq!(saved["document"]["workDir"], initial["document"]["workDir"]);
+    }
+    #[test]
+    fn message_mode_changes_apply_immediately_and_do_not_require_restart() {
+        use crate::markdown_chat::MessageMode;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path);
+        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Steer);
+        let mut current = snapshot(&config).unwrap();
+        for mode in [json!("queue"), json!("steer")] {
+            current = save(
+                &config,
+                current["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "agentChat.defaultMessageMode".into(),
+                    mode.clone(),
+                )])),
+            )
+            .unwrap();
+            assert_eq!(current["restartRequired"], false);
+            assert_eq!(
+                default_message_mode(&config).unwrap(),
+                if mode == "queue" {
+                    MessageMode::Queue
+                } else {
+                    MessageMode::Steer
+                }
+            );
+        }
+        let mut reset = current["document"].clone();
+        reset["agentChat"]
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultMessageMode");
+        current = save(
+            &config,
+            current["revision"].as_str().unwrap(),
+            Some(reset.to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(current["restartRequired"], false);
+        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Steer);
+        let bytes = std::fs::read(config.loaded_config_path.as_ref().unwrap()).unwrap();
+        assert!(
+            save(
+                &config,
+                current["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "agentChat.defaultMessageMode".into(),
+                    json!("invalid")
+                )]))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(config.loaded_config_path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
     }
 }

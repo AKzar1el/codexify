@@ -14,6 +14,7 @@ const AWAIT_GRACE_MS: u64 = 20_000;
 pub(super) struct AgentWaiting {
     generation: u64,
     until_ms: Option<u64>,
+    input_required: bool,
 }
 
 struct WaitGuard<'a> {
@@ -58,12 +59,18 @@ pub enum WaitOutcome {
 }
 
 impl ChatFile {
+    #[cfg(test)]
     fn begin_agent_wait(&self, remaining: Duration) -> WaitGuard<'_> {
+        self.begin_wait(remaining, true)
+    }
+
+    fn begin_wait(&self, remaining: Duration, input_required: bool) -> WaitGuard<'_> {
         let mut state = self
             .waiting
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.generation = state.generation.wrapping_add(1);
+        state.input_required = input_required;
         // A disconnected UI must eventually discard the overlay even if the server disappears.
         state.until_ms = Some(
             super::now_ms()
@@ -87,10 +94,13 @@ impl ChatFile {
     }
 
     pub(crate) fn agent_waiting_until_ms(&self) -> Option<u64> {
-        self.waiting
+        let state = self
+            .waiting
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(|error| error.into_inner());
+        state
             .until_ms
+            .filter(|_| state.input_required)
             .filter(|until| *until > super::now_ms())
     }
 
@@ -102,16 +112,39 @@ impl ChatFile {
         self.wait_with_watcher(timeout, cancellation, true).await
     }
 
+    pub async fn wait_completed(
+        self: &Arc<Self>,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<WaitOutcome, String> {
+        self.wait_with_policy(timeout, cancellation, true, true)
+            .await
+    }
+
     async fn wait_with_watcher(
         self: &Arc<Self>,
         timeout: Duration,
         cancellation: CancellationToken,
         native: bool,
     ) -> Result<WaitOutcome, String> {
+        self.wait_with_policy(timeout, cancellation, native, false)
+            .await
+    }
+
+    async fn wait_with_policy(
+        self: &Arc<Self>,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        native: bool,
+        completed: bool,
+    ) -> Result<WaitOutcome, String> {
         let deadline = Instant::now() + timeout;
-        let mut waiting = self.begin_agent_wait(timeout);
+        let mut waiting = self.begin_wait(timeout, !completed);
         if cancellation.is_cancelled() {
             return Ok(WaitOutcome::Cancelled);
+        }
+        if completed {
+            self.release_queued_message(super::now_ms()).await?;
         }
         let first = self.read_cancellable(true, cancellation.clone()).await;
         if cancellation.is_cancelled() {
@@ -156,6 +189,9 @@ impl ChatFile {
         loop {
             if cancellation.is_cancelled() {
                 return Ok(WaitOutcome::Cancelled);
+            }
+            if completed {
+                self.release_queued_message(super::now_ms()).await?;
             }
             // Re-read after registration and at the deadline; event delivery is only a wake-up hint.
             let snapshot = self.read_cancellable(true, cancellation.clone()).await;

@@ -12,6 +12,7 @@ pub enum ChatUiTool {
     Send,
     State,
     File,
+    Queue,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +32,8 @@ struct SendArgs {
     stop_agent: bool,
     #[serde(default)]
     attachment_ids: Vec<String>,
+    #[serde(default)]
+    message_mode: Option<crate::markdown_chat::MessageMode>,
     expected_workspace: Option<String>,
     expected_chat_file: Option<String>,
 }
@@ -42,6 +45,17 @@ struct StateArgs {
     before: Option<u64>,
     #[serde(default)]
     revision: Option<String>,
+    expected_workspace: Option<String>,
+    expected_chat_file: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueArgs {
+    id: String,
+    revision: u64,
+    action: crate::markdown_chat::QueueSubmission,
+    message: Option<String>,
     expected_workspace: Option<String>,
     expected_chat_file: Option<String>,
 }
@@ -88,6 +102,7 @@ impl Tool for ChatUiTool {
             Self::Send => "chat_ui_send",
             Self::State => "chat_ui_state",
             Self::File => "chat_ui_file",
+            Self::Queue => "chat_ui_queue",
         }
     }
     fn title(&self) -> String {
@@ -95,6 +110,7 @@ impl Tool for ChatUiTool {
             Self::Send => "Send user chat message",
             Self::State => "Read chat widget state",
             Self::File => "Download referenced chat file",
+            Self::Queue => "Edit, remove, or steer a queued message",
         }
         .into()
     }
@@ -102,6 +118,7 @@ impl Tool for ChatUiTool {
         match self {
             Self::Send => "App-only: append the user's Markdown to this Codexify task's CHAT.md. Reusing request_id with the same text is idempotent. Does not acknowledge or deliver text to the agent.",
             Self::State => "App-only: read a page of this Codexify task's chat history and delivery receipts without acknowledging messages. No arbitrary path or task selector is accepted.",
+            Self::Queue => "App-only: edit, remove, or immediately steer one private queued message in the displayed conversation. Other queued messages are not changed.",
             Self::File => "App-only: resolve an exported or project-relative Markdown file link in the active workspace for a user-requested download. Sandbox names must match an unambiguous prior export. Does not read or acknowledge chat messages.",
         }.into()
     }
@@ -112,7 +129,7 @@ impl Tool for ChatUiTool {
     }
     fn behavior(&self) -> ToolBehavior {
         ToolBehavior::new(
-            !matches!(self, Self::Send),
+            !matches!(self, Self::Send | Self::Queue),
             false,
             true,
             false,
@@ -123,10 +140,17 @@ impl Tool for ChatUiTool {
         let mut schema = match self {
             Self::Send => json!({"type":"object", "properties":{
                 "request_id":{"type":"string", "pattern":"^[A-Za-z0-9_-]{1,80}$"},
+                "message_mode":{"type":"string","enum":["steer","queue"],"description":"Steer immediately or keep the message private until a completed turn. Defaults to the user's configured mode."},
                 "stop_agent":{"type":"boolean", "description":"Request that the current turn stop on its next tool response, pause its goal, and show this agent offline. The message field is ignored for this action."},
                 "message":{"type":"string", "writeOnly":true},
                 "attachment_ids":{"type":"array","maxItems":20,"uniqueItems":true,"items":{"type":"string","pattern":"^[a-fA-F0-9]{32}$"}}
             }, "required":["request_id","message"], "additionalProperties":false}),
+            Self::Queue => json!({"type":"object","properties":{
+                "id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,80}$"},
+                "revision":{"type":"integer","minimum":1},
+                "action":{"type":"string","enum":["steer","trash","edit"]},
+                "message":{"type":"string","writeOnly":true}
+            },"required":["id","revision","action"],"additionalProperties":false}),
             Self::State => json!({"type":"object", "properties":{
                 "before":{"type":"integer", "minimum":0},
                 "revision":{"type":"string", "maxLength":128}
@@ -217,6 +241,7 @@ impl Tool for ChatUiTool {
                     message,
                     stop_agent,
                     attachment_ids,
+                    message_mode,
                     expected_workspace,
                     expected_chat_file,
                 } = match parse_tool_args(args) {
@@ -263,11 +288,59 @@ impl Tool for ChatUiTool {
                         Err(error) => ToolResult::error(error),
                     };
                 }
+                let mode = match message_mode {
+                    Some(mode) => mode,
+                    None => match crate::global_settings::default_message_mode(config) {
+                        Ok(mode) => mode,
+                        Err(error) => return ToolResult::error(error),
+                    },
+                };
+                if mode == crate::markdown_chat::MessageMode::Queue {
+                    return match chat
+                        .queue_user_message(request_id, message, attachment_ids)
+                        .await
+                    {
+                        Ok(receipt) => match chat.queued_messages().await {
+                            Ok(messages) => private_result(
+                                json!({"queue_receipt":receipt,"queued_messages":messages}),
+                            ),
+                            Err(error) => ToolResult::error(error),
+                        },
+                        Err(error) => ToolResult::error(error),
+                    };
+                }
                 match chat
                     .append_user_with_attachments(request_id, message, attachment_ids)
                     .await
                 {
                     Ok(receipt) => private_result(json!({"sent":receipt})),
+                    Err(error) => ToolResult::error(error),
+                }
+            }
+            Self::Queue => {
+                let args: QueueArgs = match parse_tool_args(args) {
+                    Ok(args) => args,
+                    Err(error) => return *error,
+                };
+                if let Err(error) = check_destination(
+                    config,
+                    chat.path(),
+                    args.expected_workspace.as_deref(),
+                    args.expected_chat_file.as_deref(),
+                    true,
+                ) {
+                    return *error;
+                }
+                match chat
+                    .update_queued_message(args.id, args.revision, args.action, args.message)
+                    .await
+                {
+                    Ok(receipt) => match chat.queued_messages().await {
+                        Ok(messages) => private_result(
+                            json!({"queue_receipt":receipt,"queued_messages":messages}),
+                        ),
+                        Err(error) => ToolResult::error(error),
+                    },
                     Err(error) => ToolResult::error(error),
                 }
             }
@@ -300,6 +373,15 @@ impl Tool for ChatUiTool {
                 match chat.widget_page(before, revision).await {
                     Ok(page) => {
                         let mut page = serde_json::to_value(page).expect("chat page");
+                        page["queued_messages"] = match chat.queued_messages().await {
+                            Ok(messages) => json!(messages),
+                            Err(error) => return ToolResult::error(error),
+                        };
+                        page["default_message_mode"] =
+                            match crate::global_settings::default_message_mode(config) {
+                                Ok(mode) => json!(mode),
+                                Err(error) => return ToolResult::error(error),
+                            };
                         page["workspace_path"] = json!(config.work_dir);
                         page["retired"] = json!(context.conversation_retired);
                         private_result(page)

@@ -1786,7 +1786,7 @@ guarantee quota savings, or keep a host-terminated turn alive.
 standalone-chat listener. Set `port` to another integer from 1 to 65535, or to
 `null` to ask the OS for an available localhost port whenever the service
 starts. It cannot equal the main top-level `port` while agent chat is enabled.
-`maxWaitMs` controls the `chat_await` timeout and defaults to **55000 ms (55 s)**.
+`maxWaitMs` controls the `chat_await` and `turn_completed` timeout and defaults to **55000 ms (55 s)**.
 It must be between 1000 and 300000, including both limits. The setting applies
 both while waiting for a chat message and before a workspace has been selected.
 The tools do not accept a timeout override. Existing explicitly configured
@@ -2119,9 +2119,10 @@ commands still have the user's filesystem permissions.
 
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
-| `chat_read` | None | Returns all unread user Markdown and advances the cursor. It is explicitly non-terminal: after handling input, continue useful work or call `chat_await`. |
+| `chat_read` | None | Returns all unread user Markdown and advances the cursor. It is explicitly non-terminal: after handling input, continue useful work, call `turn_completed` when finished, or `chat_await` for needed input. |
 | `chat_write` | `message`: Markdown string | Reads pending user text, appends the agent message, optionally notifies, and returns that pending text explicitly labelled as sent before the agent wrote. A successful write is explicitly non-terminal. |
-| `chat_await` | None | Immediately returns pending text, otherwise waits for a user append, the configured deadline, or cancellation. It is the only valid idle state while Markdown chat is active; timeout or cancellation without a message directs another wait. |
+| `turn_completed` | None | Completes the current request, releases one oldest eligible queued message, or waits if none is ready. On timeout, call it again. An unfinished or blocked goal prevents completion and keeps the queue private. |
+| `chat_await` | None | Immediately returns pending text, otherwise waits for a user append, the configured deadline, or cancellation. It means user input is required and does not release queued messages; timeout or cancellation without a message directs another wait. |
 
 When enabled, **every top-level tool** advertises the optional string field
 `new_chat_message_from_user`, including bridged, gateway, catalog, and widget
@@ -2150,17 +2151,38 @@ large tool results. Historical `read_file` and `grep` results keep their normal
 pagination and output limits.
 
 Each chat-tool structured result includes `required_next_action` and
-`assistant_turn_may_end`. The next action is one of `continue_or_chat_await`,
-`chat_write`, or `chat_await`; `assistant_turn_may_end` is `false` while the
+`assistant_turn_may_end`. The next action is one of `continue_or_turn_completed`,
+`chat_write`, `chat_await`, or `turn_completed`; `assistant_turn_may_end` is `false` while the
 Markdown-chat protocol is active. If a chat tool returns unread user text, the
 next action is `chat_write` regardless of the tool's ordinary idle transition.
 
 The Markdown-chat state machine is placed at the start of the agent brief. It
 directs all user-facing output through `chat_write`, makes every successful
-`chat_write` non-terminal, and uses `chat_await` as the only idle state. A normal
+`chat_write` non-terminal, and distinguishes `chat_await` (user input needed) from `turn_completed` (finished and waiting for the next request). A normal
 final response is forbidden unless the user explicitly authorizes ending the turn
 or a higher-priority instruction requires it. No server-side instruction can
 guarantee that ChatGPT never ends a turn.
+
+### Private message queue
+
+`agentChat.defaultMessageMode` accepts `steer` (default) or `queue`. It is editable
+in global settings and applies immediately. Return/the send button uses that
+mode; Cmd+Return on macOS and Ctrl+Return on Windows/Linux uses the other mode
+for one message. Shift+Return inserts a newline.
+
+Queued messages are stored separately from CHAT.md. Their text and attachments
+are absent from native tool results, agent attachment listings, browser prompts,
+and automatic goal continuations until released. The queue appears above the
+composer: Steer sends the chosen message immediately, Edit updates its text in
+place, and Trash removes it. These actions leave other queued messages intact.
+
+Only one oldest message is released per completed request. `turn_completed`
+releases it and waits repeatedly when no request is queued. `chat_await` asks for
+input on unfinished work and holds the queue. The offline fallback releases one
+message after five minutes without tool activity. A stopped agent and any goal
+whose status is not completed hold the queue, even when the goal is blocked.
+Goal completion releases one eligible message. Steering takes priority over
+queued messages, and queued edits use revisions to reject stale changes.
 
 ### Chat widget
 

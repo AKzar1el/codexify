@@ -394,7 +394,39 @@ impl Tool for GoalTool {
                             state.goal = Some(goal.clone());
                             store.notify_state(&chat, &state).await;
                         }
-                        goal_result(Some(&goal), true)
+                        let mut terminal_result = goal_result(Some(&goal), true);
+                        if goal.status == GoalStatus::Completed {
+                            let released = async {
+                                if chat.queue_turn_completed().await? {
+                                    chat.release_queued_message(crate::markdown_chat::now_ms())
+                                        .await?;
+                                }
+                                chat.read(false).await
+                            }
+                            .await;
+                            match released {
+                                Ok(pending) if !pending.text.is_empty() => {
+                                    let content = format!(
+                                        "Goal revision {} is completed. Another user request is ready. Acknowledge it with chat_read, then handle it before calling turn_completed.",
+                                        goal.revision
+                                    );
+                                    terminal_result.content =
+                                        vec![crate::types::ToolContent::Text(content.clone())];
+                                    if let Some(value) = terminal_result.structured_content.as_mut()
+                                    {
+                                        value["terminal"] = json!(false);
+                                        value["content"] = json!(content);
+                                    }
+                                    terminal_result.new_chat_message_from_user = Some(pending.text);
+                                    terminal_result.chat_delivery_end = Some(pending.end);
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "completed goal left queued requests pending")
+                                }
+                            }
+                        }
+                        terminal_result
                     }
                     Err(error) => ToolResult::error(error),
                 }

@@ -1086,7 +1086,10 @@ input,select,textarea { font:inherit; }
           if (query.size) path += `?${query}`;
         } else if (name === "chat_ui_send") {
           path += "/send";
-          options = { method:"POST", body:JSON.stringify({request_id:args.request_id, message:args.message, ...(args.attachment_ids?.length ? {attachment_ids:args.attachment_ids} : {}), ...(args.stop_agent ? {stop_agent:true} : {})}) };
+          options = { method:"POST", body:JSON.stringify({request_id:args.request_id, message:args.message, ...(args.attachment_ids?.length ? {attachment_ids:args.attachment_ids} : {}), ...(args.stop_agent ? {stop_agent:true} : {}), ...(args.message_mode ? {message_mode:args.message_mode} : {})}) };
+        } else if (name === "chat_ui_queue") {
+          path += "/queue";
+          options = {method:"POST",body:JSON.stringify({id:args.id,revision:args.revision,action:args.action,...(args.message!==undefined?{message:args.message}:{})})};
         } else if (name === "chat_ui_file") {
           path += `/file?${new URLSearchParams({href:args.href})}`;
         } else throw new Error("Unknown chat operation");

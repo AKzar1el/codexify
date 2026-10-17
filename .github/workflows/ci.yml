@@ -148,6 +148,9 @@ jobs:
       - name: Test Markdown chat composer, synchronization, and receipts
         run: node --test scripts/test-markdown-chat-widget.mjs
 
+      - name: Test private message queue and composer modes
+        run: node --test scripts/test-message-queue.mjs
+
       - name: Test workspace picker, reuse, switching, refresh dialog, and owner sidebar
         run: node --test --test-concurrency=1 scripts/test-workspace-widget.mjs scripts/test-workspace-picker.mjs scripts/test-owner-chat.mjs scripts/test-owner-chat-organization.mjs scripts/test-owner-chat-polish.mjs scripts/test-chat-workspace-switch.mjs
 

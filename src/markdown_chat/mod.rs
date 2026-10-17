@@ -24,6 +24,7 @@ pub use storage::{
     NotificationState, OwnerChatOrganization, OwnerChatSummary, TranscriptCheckpoint,
     UnreadMessage, UnreadSnapshot, UserSendReceipt, WidgetPage,
 };
+pub use storage::{QueueReceipt, QueueSubmission, QueuedMessage};
 pub use wait::WaitOutcome;
 
 pub const DEFAULT_MAX_WAIT_MS: u64 = 55_000;
@@ -148,12 +149,21 @@ pub(crate) fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageMode {
+    #[default]
+    Steer,
+    Queue,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct MarkdownChatConfig {
     pub enabled: bool,
     pub port: Option<u16>,
     pub max_wait_ms: u64,
+    pub default_message_mode: MessageMode,
     pub notifications: Option<NotificationsConfig>,
     pub automation: AgentAutomationConfig,
 }
@@ -164,6 +174,7 @@ impl Default for MarkdownChatConfig {
             enabled: false,
             port: Some(DEFAULT_OWNER_CHAT_PORT),
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
+            default_message_mode: MessageMode::Steer,
             notifications: None,
             automation: AgentAutomationConfig::default(),
         }
@@ -384,10 +395,13 @@ impl MarkdownChatStore {
             .channels
             .lock()
             .map_err(|_| "Markdown chat store is unavailable")?;
-        Ok(channels
+        let chat = channels
             .entry(path.clone())
             .or_insert_with(|| Arc::new(ChatFile::new(path, persistent)))
-            .clone())
+            .clone();
+        drop(channels);
+        chat.start_queue_monitor();
+        Ok(chat)
     }
 
     pub(crate) fn monitor_offline(

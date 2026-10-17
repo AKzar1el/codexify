@@ -199,6 +199,18 @@ impl CodexHandler {
             !tool_name.starts_with("chat_"),
         )
         .await;
+        if !matches!(tool_name, "chat_await" | "turn_completed")
+            && let Some(root) = self.selected_project_root(task_conversation)
+            && let Ok(chat) = self
+                .effective_task_config(task_conversation, root)
+                .and_then(|config| {
+                    self.markdown_chat
+                        .chat(&config, task_conversation, &self.session)
+                })
+            && let Err(error) = chat.queue_agent_work(true).await
+        {
+            tracing::warn!(%error, "could not record queued-message turn progress");
+        }
         Some(activity)
     }
 
@@ -1412,8 +1424,10 @@ impl ServerHandler for CodexHandler {
 
         let mut delivery = None;
         let chat_delivery_root = if !result.is_error
-            && matches!(name.as_str(), "chat_read" | "chat_write" | "chat_await")
-        {
+            && matches!(
+                name.as_str(),
+                "chat_read" | "chat_write" | "chat_await" | "turn_completed"
+            ) {
             workspace_at_start
                 .as_ref()
                 .ok()
@@ -1448,7 +1462,7 @@ impl ServerHandler for CodexHandler {
                         if result.is_error
                             || !matches!(
                                 name.as_str(),
-                                "chat_read" | "chat_write" | "chat_await"
+                                "chat_read" | "chat_write" | "chat_await" | "turn_completed"
                             ) =>
                     {
                         chat.read(false).await.map(|snapshot| {

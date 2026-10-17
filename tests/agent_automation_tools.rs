@@ -973,3 +973,67 @@ async fn active_goal_adds_browser_specific_guidance_to_the_agent_brief() {
     assert!(text.contains("Do not request a separate turn"));
     assert!(!text.contains("Complete the active revision"));
 }
+
+#[tokio::test]
+async fn completed_goal_releases_one_private_message_and_blocked_goal_releases_none() {
+    let f = fixture("private-queue-goal-finish");
+    let chat = f
+        .context
+        .markdown_chat
+        .chat(&f.config, Some(&f.task), &f.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    let goal = f
+        .automation
+        .set_goal(&f.task, "Finish this goal first", now_ms())
+        .unwrap();
+    f.automation
+        .run_goal(&f.task, goal.revision, now_ms())
+        .unwrap();
+    for id in ["first", "second"] {
+        chat.queue_user_message(id.into(), format!("private {id}"), vec![])
+            .await
+            .unwrap();
+    }
+    let blocked = GoalTool::Finish
+        .call_with_context(
+            json!({"expectedRevision":goal.revision,"status":"blocked","reason":"Need input"}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!blocked.is_error, "{}", blocked.joined_text());
+    assert!(chat.read(true).await.unwrap().text.is_empty());
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
+    f.automation
+        .run_goal(&f.task, goal.revision, now_ms())
+        .unwrap();
+    let finished = GoalTool::Finish
+        .call_with_context(
+            json!({"expectedRevision":goal.revision,"status":"completed","summary":"Done"}),
+            &f.config,
+            &f.session,
+            &f.context,
+        )
+        .await;
+    assert!(!finished.is_error, "{}", finished.joined_text());
+    assert_eq!(payload(&finished)["terminal"], false);
+    assert!(
+        finished
+            .new_chat_message_from_user
+            .as_ref()
+            .unwrap()
+            .contains("private first")
+    );
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    assert!(
+        chat.read(true)
+            .await
+            .unwrap()
+            .text
+            .contains("private first")
+    );
+    assert!(!finished.joined_text().contains("private second"));
+}

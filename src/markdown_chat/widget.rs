@@ -974,48 +974,8 @@ impl ChatFile {
         message: String,
         attachment_ids: Vec<String>,
     ) -> Result<UserSendReceipt, String> {
-        if !valid_id(&id) {
-            return Err("Invalid chat message request ID.".into());
-        }
-        if message.trim().is_empty() && attachment_ids.is_empty() {
-            return Err("User message must not be blank.".into());
-        }
-        if message.len() > MAX_UNREAD_BYTES {
-            return Err(
-                "User message exceeds the 16 MiB safety ceiling; nothing was appended.".into(),
-            );
-        }
-        self.run(move |chat| chat.with_cursor(|cursor, file| {
-            check_cursor(file, cursor)?;
-            let created_at_ms = super::super::now_ms();
-            let message = if attachment_ids.is_empty() {message} else {
-                let committed = spans(file)?.into_iter().filter(|s| s.role=="user").map(|s|s.id).collect();
-                super::super::attachments::AttachmentStore::for_chat(&chat.path)?
-                    .prepare_message(&id,&message,&attachment_ids,&committed,created_at_ms)?.full_markdown
-            };
-            if message.len()>MAX_UNREAD_BYTES {return Err("Message and attachment metadata exceed the chat size limit".into());}
-            for span in spans(file)? {
-                if span.role == "user" && span.id == id {
-                    if read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)? != message.as_bytes() {
-                        return Err("This request ID already belongs to a different message.".into());
-                    }
-                    if span.end > cursor.offset { chat.clear_agent_waiting(); }
-                    return Ok(UserSendReceipt { id, end: span.end, created_at_ms: span.created_at_ms, tool_call_count: span.tool_call_count });
-                }
-            }
-            let tool_call_count = cursor.total_tool_calls;
-            let block = format!("{USER_START}{id}\" created_at_ms=\"{created_at_ms}\" tool_call_count=\"{tool_call_count}\" -->\n\n## User\n\n{message}\n\n<!-- codexify-user-message:v1:end id=\"{id}\" -->\n");
-            file.write_all(block.as_bytes()).map_err(io_error)?;
-            let end = file.stream_position().map_err(io_error)?;
-            file.sync_all().map_err(io_error)?;
-            let same = same_file::Handle::from_file(file.try_clone().map_err(io_error)?)
-                .and_then(|handle| same_file::Handle::from_path(&chat.path).map(|current| current == handle))
-                .map_err(io_error)?;
-            if !same { return Err("CHAT.md changed during send; reload and retry with the same request ID.".into()); }
-            resume_agent(chat, cursor)?;
-            chat.clear_agent_waiting();
-            Ok(UserSendReceipt { id, end, created_at_ms: Some(created_at_ms), tool_call_count: Some(tool_call_count) })
-        })).await
+        self.run(move |chat| super::queue::append_steering(chat, id, message, attachment_ids))
+            .await
     }
 
     pub async fn list_attachments(
@@ -1262,6 +1222,103 @@ pub(super) fn user_text(text: &str) -> Result<String, String> {
     }
     output.push_str(remaining);
     Ok(output)
+}
+
+pub(super) fn contains_user_message(file: &mut File, id: &str) -> Result<bool, String> {
+    Ok(spans(file)?
+        .iter()
+        .any(|span| span.role == "user" && span.id == id))
+}
+
+pub(super) fn user_receipt(file: &mut File, id: &str) -> Result<Option<UserSendReceipt>, String> {
+    Ok(spans(file)?
+        .into_iter()
+        .find(|span| span.role == "user" && span.id == id)
+        .map(|span| UserSendReceipt {
+            id: span.id,
+            end: span.end,
+            created_at_ms: span.created_at_ms,
+            tool_call_count: span.tool_call_count,
+        }))
+}
+
+pub(super) fn append_user_locked(
+    chat: &ChatFile,
+    cursor: &mut Cursor,
+    file: &mut File,
+    id: String,
+    message: String,
+    attachment_ids: Vec<String>,
+) -> Result<UserSendReceipt, String> {
+    if !valid_id(&id) {
+        return Err("Invalid chat message request ID.".into());
+    }
+    if message.trim().is_empty() && attachment_ids.is_empty() {
+        return Err("User message must not be blank.".into());
+    }
+    if message.len() > MAX_UNREAD_BYTES {
+        return Err("User message exceeds the 16 MiB safety ceiling; nothing was appended.".into());
+    }
+    check_cursor(file, cursor)?;
+    let created_at_ms = super::super::now_ms();
+    let message = if attachment_ids.is_empty() {
+        message
+    } else {
+        let committed = spans(file)?
+            .into_iter()
+            .filter(|s| s.role == "user")
+            .map(|s| s.id)
+            .collect();
+        super::super::attachments::AttachmentStore::for_chat(&chat.path)?
+            .prepare_message(&id, &message, &attachment_ids, &committed, created_at_ms)?
+            .full_markdown
+    };
+    if message.len() > MAX_UNREAD_BYTES {
+        return Err("Message and attachment metadata exceed the chat size limit".into());
+    }
+    for span in spans(file)? {
+        if span.role == "user" && span.id == id {
+            if read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)?
+                != message.as_bytes()
+            {
+                return Err("This request ID already belongs to a different message.".into());
+            }
+            if span.end > cursor.offset {
+                chat.clear_agent_waiting();
+            }
+            return Ok(UserSendReceipt {
+                id,
+                end: span.end,
+                created_at_ms: span.created_at_ms,
+                tool_call_count: span.tool_call_count,
+            });
+        }
+    }
+    let tool_call_count = cursor.total_tool_calls;
+    let block = format!(
+        "{USER_START}{id}\" created_at_ms=\"{created_at_ms}\" tool_call_count=\"{tool_call_count}\" -->\n\n## User\n\n{message}\n\n<!-- codexify-user-message:v1:end id=\"{id}\" -->\n"
+    );
+    file.write_all(block.as_bytes()).map_err(io_error)?;
+    let end = file.stream_position().map_err(io_error)?;
+    file.sync_all().map_err(io_error)?;
+    let same = same_file::Handle::from_file(file.try_clone().map_err(io_error)?)
+        .and_then(|handle| {
+            same_file::Handle::from_path(&chat.path).map(|current| current == handle)
+        })
+        .map_err(io_error)?;
+    if !same {
+        return Err(
+            "CHAT.md changed during send; reload and retry with the same request ID.".into(),
+        );
+    }
+    resume_agent(chat, cursor)?;
+    chat.clear_agent_waiting();
+    Ok(UserSendReceipt {
+        id,
+        end,
+        created_at_ms: Some(created_at_ms),
+        tool_call_count: Some(tool_call_count),
+    })
 }
 
 #[cfg(test)]

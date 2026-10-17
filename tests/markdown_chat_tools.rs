@@ -162,7 +162,7 @@ async fn attachment_tools_list_search_read_and_isolate_the_current_conversation(
 fn tools_are_opt_in_and_read_wait_have_no_parameters() {
     let (_root, mut config, _session, _context) = fixture();
     let enabled = load_tools_for_config(&config);
-    for name in ["chat_read", "chat_write", "chat_await"] {
+    for name in ["chat_read", "chat_write", "chat_await", "turn_completed"] {
         let tool = enabled.iter().find(|tool| tool.name() == name).unwrap();
         if name != "chat_write" {
             assert_eq!(tool.input_schema()["properties"], json!({}));
@@ -199,7 +199,7 @@ fn chat_tool_descriptions_define_a_non_terminal_state_machine() {
 
     let read_description = reader.description();
     assert!(read_description.contains("NON-TERMINAL TOOL"));
-    assert!(read_description.contains("MUST call chat_await"));
+    assert!(read_description.contains("call turn_completed"));
 
     let write_description = writer.description();
     assert!(write_description.contains("NON-TERMINAL TOOL"));
@@ -208,7 +208,7 @@ fn chat_tool_descriptions_define_a_non_terminal_state_machine() {
     assert!(write_description.contains("chat_await"));
 
     let await_description = waiter.description();
-    assert!(await_description.contains("only valid idle state"));
+    assert!(await_description.contains("does not complete the request or release queued requests"));
     assert!(await_description.contains("Never substitute a normal assistant final response"));
 }
 
@@ -274,7 +274,7 @@ async fn chat_tool_results_expose_the_required_next_action() {
         .await;
     assert_eq!(
         written.structured_content.as_ref().unwrap()["required_next_action"],
-        "continue_or_chat_await"
+        "continue_or_turn_completed"
     );
     assert_eq!(
         written.structured_content.as_ref().unwrap()["assistant_turn_may_end"],
@@ -305,7 +305,7 @@ async fn chat_tool_results_expose_the_required_next_action() {
         .await;
     assert_eq!(
         empty.structured_content.as_ref().unwrap()["required_next_action"],
-        "continue_or_chat_await"
+        "continue_or_turn_completed"
     );
 
     append(chat.path(), "Read me\n");
@@ -495,7 +495,7 @@ async fn apprise_runtime_failure_does_not_undo_or_duplicate_a_chat_write() {
 fn chat_widget_tools_are_app_only_and_chat_calls_never_link_a_widget() {
     let (_root, mut config, _session, _context) = fixture();
     let tools = load_tools_for_config(&config);
-    for name in ["chat_ui_send", "chat_ui_state"] {
+    for name in ["chat_ui_send", "chat_ui_state", "chat_ui_queue"] {
         let tool = tools
             .iter()
             .find(|tool| tool.name() == name)
@@ -505,7 +505,7 @@ fn chat_widget_tools_are_app_only_and_chat_calls_never_link_a_widget() {
         assert_eq!(meta.get("openai/visibility"), Some(&json!("private")));
         assert!(tool.input_schema()["properties"].get("path").is_none());
     }
-    for name in ["chat_read", "chat_write", "chat_await"] {
+    for name in ["chat_read", "chat_write", "chat_await", "turn_completed"] {
         let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
         let meta = serde_json::to_value(tool.meta()).unwrap();
         assert!(meta.get("openai/outputTemplate").is_none());
@@ -1430,4 +1430,156 @@ async fn chat_event_filters_and_repeated_awaits_deliver_only_requested_alerts() 
     );
     assert!(received.try_recv().is_err());
     server.abort();
+}
+
+#[tokio::test]
+async fn queued_widget_input_is_private_until_turn_completed_and_not_chat_await() {
+    let (_root, config, session, context) = fixture();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    let tools = load_tools_for_config(&config);
+    let find = |name| tools.iter().find(|t| t.name() == name).unwrap();
+    let sent = find("chat_ui_send")
+        .call_with_context(
+            json!({"request_id":"queued-one","message":"keep this private","message_mode":"queue"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert!(!sent.is_error, "{}", sent.joined_text());
+    assert!(!sent.joined_text().contains("keep this private"));
+    assert!(sent.structured_content.is_none());
+    let result = find("chat_read")
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(
+        result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("new_chat_message_from_user")
+            .is_none()
+    );
+    assert!(
+        !std::fs::read_to_string(chat.path())
+            .unwrap()
+            .contains("keep this private")
+    );
+    let result = find("chat_await")
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["status"],
+        "timeout"
+    );
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    let result = find("turn_completed")
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(!result.is_error, "{}", result.joined_text());
+    let value = result.structured_content.as_ref().unwrap();
+    assert!(
+        result
+            .new_chat_message_from_user
+            .as_ref()
+            .unwrap()
+            .contains("keep this private")
+    );
+    assert_eq!(value["required_next_action"], "chat_write");
+    assert!(jsonschema::is_valid(
+        &find("turn_completed").output_schema().unwrap(),
+        value
+    ));
+}
+
+#[tokio::test]
+async fn completed_waits_repeatedly_when_empty_and_unfinished_goals_hold_input() {
+    let (_root, config, session, context) = fixture();
+    let tools = load_tools_for_config(&config);
+    let complete = tools.iter().find(|t| t.name() == "turn_completed").unwrap();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    for _ in 0..2 {
+        let result = complete
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert!(!result.is_error);
+        let value = result.structured_content.as_ref().unwrap();
+        assert_eq!(value["status"], "timeout");
+        assert_eq!(value["required_next_action"], "turn_completed");
+        assert_eq!(value["assistant_turn_may_end"], false);
+        assert!(
+            chat.owner_summary()
+                .await
+                .unwrap()
+                .agent_waiting_until_ms
+                .is_none()
+        );
+    }
+    std::fs::write(
+        chat.path().with_file_name("automation.json"),
+        json!({"goal":{"status":"blocked"}}).to_string(),
+    )
+    .unwrap();
+    chat.queue_user_message("private-blocked".into(), "next task".into(), vec![])
+        .await
+        .unwrap();
+    let result = complete
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(result.is_error);
+    assert!(result.joined_text().contains("goal is unfinished"));
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_completion_releases_only_one_and_read_receipt_is_correct() {
+    let (_root, config, session, context) = fixture();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    for id in ["first", "second"] {
+        chat.queue_user_message(id.into(), format!("queued {id}"), vec![])
+            .await
+            .unwrap();
+    }
+    let tools = load_tools_for_config(&config);
+    let write = tools.iter().find(|t| t.name() == "chat_write").unwrap();
+    let result = write
+        .call_with_context(
+            json!({"message":"Finished current request","event":"completed"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert!(
+        result
+            .new_chat_message_from_user
+            .as_ref()
+            .unwrap()
+            .contains("queued first")
+    );
+    assert!(!result.joined_text().contains("queued second"));
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    assert!(chat.read(true).await.unwrap().text.is_empty());
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

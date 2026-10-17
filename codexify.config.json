@@ -15,6 +15,7 @@
     "enabled": false,
     "port": 3120,
     "maxWaitMs": 55000,
+    "defaultMessageMode": "steer",
     "notifications": null,
     "automation": {
       "enabled": false,

@@ -10,8 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::{MAX_UNREAD_BYTES, notification::NotificationEvent};
 
+#[path = "queue.rs"]
+mod queue;
 #[path = "widget.rs"]
 mod widget;
+pub use queue::{QueueReceipt, QueueSubmission, QueuedMessage};
 pub use widget::{
     AGENT_STOP_MESSAGE, BrowserAppendReceipt, OwnerChatOrganization, OwnerChatSummary,
     TranscriptCheckpoint, UnreadMessage, UnreadSnapshot, UserSendReceipt, WidgetPage,
@@ -144,6 +147,7 @@ pub struct ChatFile {
     cursor: Mutex<Option<Cursor>>,
     owner_summary_cache: Mutex<Option<OwnerSummaryCache>>,
     pub(super) waiting: Mutex<super::wait::AgentWaiting>,
+    queue_monitor_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,7 @@ impl ChatFile {
             cursor: Mutex::new(None),
             owner_summary_cache: Mutex::new(None),
             waiting: Mutex::new(super::wait::AgentWaiting::default()),
+            queue_monitor_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

@@ -86,6 +86,24 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 .ticks.read { color:var(--read); }
 .retry { border:0; background:transparent; color:var(--error); padding:0 4px; font-size:12px; }
 .footer { border-top:1px solid var(--border); padding:10px 12px 9px; background:var(--surface); }
+#queued-messages { max-height:min(200px,28dvh); overflow:auto; border:1px solid var(--border); border-radius:14px; margin:0 2px 8px; padding:3px 5px; background:var(--bg); }
+.queued-message { display:grid; grid-template-columns:16px minmax(0,1fr) auto; align-items:center; gap:7px; padding:6px 4px; font-size:13px; }
+.queued-message > svg { width:16px; height:16px; color:var(--muted); }
+.queued-message-preview { display:flex; align-items:center; min-width:0; gap:6px; }
+.queued-message-text { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.queued-actions,.queued-edit-actions { display:flex; align-items:center; gap:3px; }
+.queued-actions button,.queued-edit-actions button { border:0; border-radius:5px; background:transparent; color:var(--muted); padding:5px; font-size:12px; }
+.queued-actions button { display:inline-flex; align-items:center; justify-content:center; gap:4px; min-height:28px; }
+.queued-actions button:hover,.queued-edit-actions button:hover { color:var(--ink); background:var(--surface); }
+.queued-actions svg { width:15px; height:15px; flex:none; }
+
+.queued-editor { grid-column:2/-1; min-width:0; }
+.queued-editor textarea { width:100%; min-height:64px; max-height:120px; resize:vertical; padding:7px; background:var(--bg); color:var(--ink); border:1px solid var(--border); border-radius:7px; font:inherit; }
+.queued-error { grid-column:2/-1; margin:0; color:var(--error); font-size:11px; }
+.queued-attachments { display:flex; gap:3px; flex:none; }
+.queued-attachments .attachment-card { width:26px; height:26px; padding:0; border-radius:4px; }
+.queued-attachments .attachment-visual { width:26px; height:26px; border-radius:4px; }
+.queued-attachments .attachment-name,.queued-attachments .attachment-size { display:none; }
 #retained-sends { margin:0 0 9px; color:var(--muted); font-size:11px; }
 #retained-sends p { margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
 #composer { display:flex; gap:8px; align-items:flex-end; }
@@ -140,6 +158,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       <div id="empty">Loading this conversation...</div>
     </div>
     <div class="footer">
+      <section id="queued-messages" aria-label="Queued messages" hidden></section>
       <details id="retained-sends" hidden><summary id="retained-summary"></summary><div id="retained-messages"></div></details>
       <p id="retired-hint" hidden>This task continued in another ChatGPT conversation. This chat is read-only here.</p>
       <p id="awaiting-hint" hidden>The agent is waiting for your message.</p>
@@ -173,6 +192,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let agentStopped = false, stopping = false, stopRequestId = null;
   let messageClockTimer = null;
   let hostCapabilities = {};
+  let queuedMessages = [], defaultMessageMode = "steer", messageModeVersion = 0, queueVersion = 0, submitMode = null;
+  let queueEdit = null;
+  const queueNodes = new Map(), queueBusy = new Set();
+  const primaryModifier = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "metaKey" : "ctrlKey";
+  const modifierLabel = primaryModifier === "metaKey" ? "Cmd" : "Ctrl";
   let statusKind = "normal";
   let available = bridge === null;
   let externalReadOnly = false, pageRetired = false;
@@ -206,6 +230,81 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       path.setAttribute("d", d); svg.append(path);
     }
     return svg;
+  }
+  function queueSymbol(paths, className = "") { const mark = icon(paths,className); mark.setAttribute("viewBox","0 0 24 24"); return mark; }
+  function messageHint() {
+    return defaultMessageMode === "queue" ? `Enter to queue. ${modifierLabel}+Enter to steer. Shift + Enter for a new line.` : `Enter to send. ${modifierLabel}+Enter to queue. Shift + Enter for a new line.`;
+  }
+  function changeMessageMode(mode) {
+    if (!["steer","queue"].includes(mode)) return;
+    defaultMessageMode = mode; resizeInput();
+    if (statusKind === "normal") status(messageHint(),false,"normal");
+  }
+  const modeChanged = event => { messageModeVersion++; changeMessageMode(event.detail); };
+  window.addEventListener("codexify-message-mode-change",modeChanged);
+  function acceptQueue(messages) {
+    if (!Array.isArray(messages)) return;
+    if (messages.some(message=>typeof message.id!=="string" || typeof message.markdown!=="string" || !Number.isSafeInteger(message.revision))) throw new Error("Invalid private message queue");
+    queuedMessages = messages;
+    let confirmed=false;
+    for (const message of messages) {confirmed ||= pendingSends.get(message.id)?.message_mode === "queue";pendingSends.delete(message.id);}
+    if(confirmed)status("Message queued privately. It will be sent after the current request is complete.");
+  }
+  async function queueAction(message,action,text) {
+    if (queueBusy.has(message.id) || isReadOnly() || !available) return;
+    const origin=generation;
+    queueBusy.add(message.id); queueVersion++; renderQueue();
+    try {
+      const payload=await call("chat_ui_queue",{...requestDestination(),id:message.id,revision:message.revision,action,...(text!==undefined?{message:text}:{})});
+      if(!currentGeneration(origin))return;
+      queueVersion++; acceptQueue(payload.queued_messages);
+      if (queueEdit?.id===message.id) queueEdit=null;
+      status(action==="steer"?"Message sent to steer the current turn.":action==="trash"?"Queued message removed.":"Queued message updated.");
+      revision=null;void refresh();
+    } catch(error) { if(currentGeneration(origin)){queueVersion++;status(error.message||"Could not update the queued message.",true);revision=null;void refresh();} }
+    finally { queueBusy.delete(message.id);if(currentGeneration(origin)){renderQueue();resizeInput();} }
+  }
+  function renderQueue() {
+    const region=el("queued-messages");
+    const queuedIds=new Set(queuedMessages.map(message=>message.id));
+    const items=queuedMessages.concat([...pendingSends.values()].filter(message=>message.message_mode==="queue"&&message.chat_file===chatFile&&!queuedIds.has(message.id)));
+    if(queueEdit&&!items.some(message=>message.id===queueEdit.id))items.push({...queueEdit.entry,stale:true});
+    region.hidden=!items.length;
+    const liveIds=new Set();
+    for(const [index,message] of items.entries()){
+      liveIds.add(message.id);let row=queueNodes.get(message.id);
+      if(!row){
+        row=make("div","queued-message");row.dataset.queuedId=message.id;
+        row.append(queueSymbol(["M4 4h6M4 8h6M4 12v3h15m-4-4 4 4-4 4"]));
+        const preview=make("div","queued-message-preview"),files=make("div","queued-attachments"),text=make("span","queued-message-text");preview.append(files,text);
+        const actions=make("div","queued-actions");
+        for(const [action,label,paths] of [
+          ["steer","Steer queued message",["M4 5v6a4 4 0 0 0 4 4h12m-5-5 5 5-5 5"]],
+          ["trash","Delete queued message",["M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 10v7m4-7v7"]],
+          ["edit","Edit queued message",["m4 16 12-12 4 4-12 12H4ZM14 6l4 4"]],
+        ]){
+          const button=make("button");button.type="button";button.dataset.action=action;button.setAttribute("aria-label",label);button.title=label;button.append(queueSymbol(paths,action==="steer"?"queued-steer-symbol":""));if(action==="steer")button.append(document.createTextNode("Steer"));
+          button.addEventListener("click",()=>{const entry=queuedMessages.find(entry=>entry.id===message.id);if(!entry)return;if(action==="edit"){queueEdit={id:entry.id,revision:entry.revision,text:entry.markdown,entry};renderQueue();row.querySelector("textarea").focus();}else void queueAction(entry,action);});actions.append(button);
+        }
+        const editor=make("div","queued-editor");editor.hidden=true;const input=make("textarea");input.setAttribute("aria-label","Edit queued message text");input.addEventListener("input",()=>{if(queueEdit?.id===message.id)queueEdit.text=input.value;});
+        const editActions=make("div","queued-edit-actions");const saveButton=make("button","","Save"),cancelButton=make("button","","Cancel");saveButton.type=cancelButton.type="button";saveButton.setAttribute("aria-label","Save queued message");cancelButton.setAttribute("aria-label","Cancel editing queued message");
+        saveButton.addEventListener("click",()=>{if(queueEdit?.id===message.id)void queueAction({...queueEdit.entry,revision:queueEdit.revision},"edit",queueEdit.text);});cancelButton.addEventListener("click",()=>{queueEdit=null;renderQueue();});editActions.append(saveButton,cancelButton);editor.append(input,editActions);
+        const error=make("p","queued-error"),retry=make("button","","Retry");retry.type="button";retry.setAttribute("aria-label","Retry queuing message");retry.addEventListener("click",()=>{const pending=pendingSends.get(message.id);if(pending)void deliver(pending);});
+        row.append(preview,actions,editor,error,retry);queueNodes.set(message.id,row);
+      }
+      const isPending=!Number.isSafeInteger(message.revision),editing=queueEdit?.id===message.id;
+      row.querySelector(".queued-message-text").textContent=message.markdown||message.attachments?.[0]?.originalName||"Attachment";
+      row.querySelector(".queued-message-text").title=message.markdown;
+      const files=row.querySelector(".queued-attachments");if(attachments)attachments.renderMessage(files,message.attachments||[]);else files.hidden=true;
+      row.querySelector(".queued-actions").hidden=isPending||message.stale===true;
+      for(const button of row.querySelectorAll("button"))button.disabled=queueBusy.has(message.id)||isReadOnly()||!available;
+      const editor=row.querySelector(".queued-editor");editor.hidden=!editing;
+      if(editing){const input=editor.querySelector("textarea");if(input.value!==queueEdit.text)input.value=queueEdit.text;editor.querySelector('[aria-label="Save queued message"]').disabled=message.stale===true||queueBusy.has(message.id)||!queueEdit.text.trim()&&!message.attachment_ids?.length;}
+      const error=row.querySelector(".queued-error");error.textContent=message.stale?"This message is no longer queued. Copy your edits before closing.":isPending?(message.failed?"Queuing is unconfirmed. Retry with the same message ID.":"Queuing…"):"";error.hidden=!error.textContent;
+      row.querySelector('[aria-label="Retry queuing message"]').hidden=!isPending||!message.failed;
+      if(region.children[index]!==row)region.insertBefore(row,region.children[index]||null);
+    }
+    for(const [id,node]of queueNodes)if(!liveIds.has(id)){node.remove();queueNodes.delete(id);}
   }
   function post(message) { window.parent.postMessage({ jsonrpc:"2.0", ...message }, "*"); }
   function rpc(method, params, timeout = 8000) {
@@ -305,6 +404,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       send.replaceChildren(svg); send.dataset.mode = mode;
       send.setAttribute("aria-label", label); send.title = label;
     }
+    if(mode==="send") {const label=defaultMessageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=`${label}. ${modifierLabel}+Enter uses the other mode for this message.`;send.dataset.messageMode=defaultMessageMode;}
     send.disabled = !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
     attachments?.update();
     list.scrollTop = atBottom ? list.scrollHeight : historyTop;
@@ -505,7 +605,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function render() {
     if (tornDown) return;
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 50;
-    const messages = [...records.values()].sort((a, b) => a.start - b.start || Number(b.role === "goal") - Number(a.role === "goal")).concat([...pendingSends.values()].filter(message => chatFile && message.chat_file === chatFile));
+    const messages = [...records.values()].sort((a, b) => a.start - b.start || Number(b.role === "goal") - Number(a.role === "goal")).concat([...pendingSends.values()].filter(message => chatFile && message.chat_file === chatFile && message.message_mode !== "queue"));
     el("empty").hidden = messages.length > 0;
     if (!messages.length && chatFile) el("empty").textContent = "Messages here stay in this conversation. Send an instruction to the agent below.";
     let previousNode = el("empty");
@@ -588,18 +688,20 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     for (const [id, node] of nodes) {
       if (!messageIds.has(id)) { node.remove(); nodes.delete(id); }
     }
-    renderRetainedSends();
+    renderRetainedSends(); renderQueue();
     older.hidden = !hasMore; older.disabled = loadingOlder;
     if (atBottom && !loadingOlder) list.scrollTop = list.scrollHeight;
     scheduleMessageClock();
     size();
   }
-  function applyPage(page, history = false) {
+  function applyPage(page, history = false, modeVersion = messageModeVersion, expectedQueueVersion = queueVersion) {
     const pendingCount = pendingSends.size;
     if (typeof page.chat_file !== "string" || !Number.isSafeInteger(page.delivered_through)) throw new Error("Invalid chat state from connector.");
     if (page.retired !== undefined && typeof page.retired !== "boolean") throw new Error("Invalid chat retirement state from connector.");
     if (chatFile && chatFile !== page.chat_file) throw new Error("This widget's conversation binding changed. Open a new chat widget.");
     if (workspace && page.workspace_path && workspace !== page.workspace_path) throw new Error("Chat state belongs to a different workspace.");
+    if(modeVersion===messageModeVersion&&["steer","queue"].includes(page.default_message_mode))changeMessageMode(page.default_message_mode);
+    if(expectedQueueVersion===queueVersion&&page.queued_messages)acceptQueue(page.queued_messages);
     chatFile = page.chat_file;
     delivered = Math.max(delivered, page.delivered_through);
     if (Number.isSafeInteger(page.read_through)) readThrough = Math.max(readThrough, page.read_through);
@@ -682,7 +784,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     chatFile = null; revision = null; before = null; hasMore = false; failures = 0; snapshotEnd = 0;
     delivered = 0; readThrough = 0; lastAgentCall = null; totalToolCalls = null; clockOffset = 0;
     agentWaitingUntil = null; agentPresenceUntil = null; waitingReplyEnd = 0; pageRetired = false;
-    records.clear();
+    records.clear(); queuedMessages=[];queueEdit=null;queueVersion++;renderQueue();
     for (const node of nodes.values()) node.remove();
     for (const node of markerNodes.values()) node.remove();
     nodes.clear(); markerNodes.clear();
@@ -700,13 +802,13 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   async function refresh() {
     if (!available || refreshing || tornDown || !visible || document.hidden) return;
-    const origin = generation;
+    const origin = generation, modeVersion=messageModeVersion, expectedQueueVersion=queueVersion;
     refreshing = true;
     try {
       const page = await call("chat_ui_state", { ...requestDestination(), ...(revision ? { revision } : {}) });
       if (!currentGeneration(origin)) return;
-      applyPage(page); failures = 0;
-      if (statusKind !== "action") status(isReadOnly() ? "This chat is read-only here." : "Enter to send. Shift + Enter for a new line.", false, "normal");
+      applyPage(page,false,modeVersion,expectedQueueVersion); failures = 0;
+      if (statusKind !== "action") status(isReadOnly() ? "This chat is read-only here." : messageHint(), false, "normal");
     } catch (error) { if (currentGeneration(origin)) { failures++; status(error.message || "Connection unavailable. Messages are retained.", true, "connection"); workspaceMismatch(error); } }
     finally { if (currentGeneration(origin)) { refreshing = false; schedule(); } }
   }
@@ -716,10 +818,15 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     sending = true; message.failed = false; message.pending = true;
     pendingSends.set(message.id, message); render(); resizeInput(); save();
     try {
-      const args = { request_id:message.id, message:message.markdown, expected_chat_file:message.chat_file,
+      const args = { request_id:message.id, message:message.markdown, expected_chat_file:message.chat_file, message_mode:message.message_mode||"steer",
         ...(message.attachments?.length ? {attachment_ids:message.attachments.map(a=>a.id)} : {}) };
       if (message.workspace_path) args.expected_workspace = message.workspace_path;
       const payload = await call("chat_ui_send", args);
+      if(message.message_mode==="queue"&&payload.queue_receipt){
+        pendingSends.delete(message.id);
+        if(!currentGeneration(origin))return;
+        queueVersion++;acceptQueue(payload.queued_messages);status(payload.queue_receipt.sent?"This queued message has already been sent.":payload.queue_receipt.discarded?"This queued message was removed.":"Message queued privately. It will be sent after the current request is complete.");revision=null;void refresh();return;
+      }
       if (payload.sent?.id !== message.id || !Number.isSafeInteger(payload.sent.end)) throw new Error("The send receipt was incomplete. Retry uses the same message ID.");
       pendingSends.delete(message.id);
       if (!currentGeneration(origin)) return;
@@ -768,22 +875,22 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     event.preventDefault();
     if (!available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
     if (attachments?.blocked()) {status("Wait for uploads to finish, or remove failed attachments.",true,"action",false);return;}
-    const message = { id:crypto.randomUUID(), role:"user", markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
+    const message = { id:crypto.randomUUID(), role:"user", message_mode:submitMode||defaultMessageMode, markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
     input.value = ""; resizeInput(); void deliver(message); input.focus(); list.scrollTop = list.scrollHeight;
   });
   input.addEventListener("keydown", event => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); el("composer").requestSubmit(); }
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); submitMode=event[primaryModifier]?(defaultMessageMode==="steer"?"queue":"steer"):defaultMessageMode;el("composer").requestSubmit();submitMode=null; }
   });
   input.addEventListener("input", () => { resizeInput(); clearTimeout(saveTimer); saveTimer = setTimeout(save, 150); });
   older.addEventListener("click", async () => {
     if (!available || loadingOlder || before === null) return;
-    const origin = generation;
+    const origin = generation, modeVersion=messageModeVersion, expectedQueueVersion=queueVersion;
     loadingOlder = true; older.disabled = true;
     const height = list.scrollHeight, top = list.scrollTop;
     try {
       const page = await call("chat_ui_state", { before, ...requestDestination() });
       if (!currentGeneration(origin)) return;
-      applyPage(page, true); list.scrollTop = top + list.scrollHeight - height;
+      applyPage(page, true,modeVersion,expectedQueueVersion); list.scrollTop = top + list.scrollHeight - height;
     }
     catch (error) { if (currentGeneration(origin)) { status(error.message, true); workspaceMismatch(error); } }
     finally { if (currentGeneration(origin)) { loadingOlder = false; older.disabled = false; } }
@@ -798,6 +905,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     tornDown = true; clearTimeout(pollTimer); clearTimeout(saveTimer); clearTimeout(presenceTimer); clearTimeout(messageClockTimer);
     for (const waiter of rpcPending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("Widget closed.")); }
     rpcPending.clear();
+    window.removeEventListener("codexify-message-mode-change",modeChanged);
     window.removeEventListener("message", onMessage);
     window.removeEventListener("openai:set_globals", onGlobals);
     window.removeEventListener("focus", onFocus);

@@ -105,6 +105,7 @@
     "enabled": false,
     "port": 3120,
     "maxWaitMs": 55000,
+    "defaultMessageMode": "steer",
     "automation": {
       "enabled": false,
       "descriptorPath": "~/.codexify/browser/descriptor.json",

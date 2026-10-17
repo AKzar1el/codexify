@@ -167,7 +167,7 @@ sending another ChatGPT message. Enable the feature in your Codexify config:
 port `3120`. Set it to `null` to use an OS-assigned port instead. It must differ
 from the main top-level `port` when agent chat is enabled.
 
-`agentChat.maxWaitMs` controls the server-side `chat_await` timeout in milliseconds.
+`agentChat.maxWaitMs` controls the server-side `chat_await` and `turn_completed` timeout in milliseconds.
 It defaults to `55000` (55 seconds) and accepts values from `1000` to `300000`.
 Existing explicit values remain in effect; omit the setting to use the default.
 
@@ -178,9 +178,20 @@ conversation has its own file, even when several use the same checkout.
 
 With UI widgets enabled, `setup` opens one persistent chat panel beneath the
 setup controls. Chat tools update it without opening more cards. Send with the
-arrow button or Return; Shift+Return inserts a newline. One grey tick means saved
+arrow button or Return; Shift+Return inserts a newline. In **Settings → Chats & goals**,
+`agentChat.defaultMessageMode` selects **Steer** (the default) or **Queue**.
+**Cmd+Return** on macOS, or **Ctrl+Return** on Windows/Linux, uses the other mode
+for that message only. Queued messages appear above the composer with **Steer**,
+**Trash**, and **Edit** controls. Steering sends immediately ahead of the queue.
+
+Queued messages and their attachments stay private until released. Codexify sends
+one oldest queued message per completed request (`turn_completed`), or once the
+agent is offline. `chat_await` means the current request needs user input and does
+not release the queue. An unfinished or blocked goal holds all queued messages,
+including during automatic goal continuations, until marked complete.
+ One grey tick means saved
 to `CHAT.md`, two grey ticks mean returned to the agent, and two blue ticks mean
-acknowledged through `chat_read`, `chat_write`, or `chat_await`. The Agent indicator
+acknowledged through `chat_read`, `chat_write`, `chat_await`, or `turn_completed`. The Agent indicator
 shows online for calls under three minutes old, last seen from three to under five minutes,
 and offline thereafter. These are tool-activity receipts, not proof of model
 comprehension. A small header total counts model-visible Codexify tool calls in

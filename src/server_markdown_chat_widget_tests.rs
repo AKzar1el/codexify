@@ -646,3 +646,115 @@ async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presenc
     client.cancel().await.unwrap();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_release_one() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::default_config(root.path().into());
+    config.markdown_chat.enabled = true;
+    config.markdown_chat.max_wait_ms = 1000;
+    config.memory.dir = Some(root.path().join("metadata").display().to_string());
+    let mut handler = handler_with_tools(
+        root.path(),
+        crate::registry::load_tools_for_config(&config),
+        crate::types::ToolLogLevel::Info,
+    );
+    handler.config = Arc::new(config.clone());
+    let identity = ConversationIdentity::from_openai_session("queue-dispatch").unwrap();
+    let chat = handler
+        .markdown_chat
+        .chat(&config, Some(&identity), &handler.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(crate::markdown_chat::now_ms())
+        .await
+        .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let task = tokio::spawn(async move {
+        handler
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    let request = |name: &str, args: Value| {
+        let mut request = CallToolRequestParams::new(name.to_owned())
+            .with_arguments(args.as_object().unwrap().clone());
+        request.meta =
+            Some(serde_json::from_value(json!({"openai/session":"queue-dispatch"})).unwrap());
+        request
+    };
+    for id in ["first", "second"] {
+        let result=client.call_tool(request("chat_ui_send",json!({"request_id":id,"message":format!("secret queued {id}"),"message_mode":"queue"}))).await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            !result
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("secret queued")
+        );
+    }
+    for (name, args) in [
+        ("chat_read", json!({})),
+        ("get_agent_brief", json!({})),
+        ("chat_await", json!({})),
+    ] {
+        let result = client.call_tool(request(name, args)).await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("secret queued")
+        );
+    }
+    let first = client
+        .call_tool(request("turn_completed", json!({})))
+        .await
+        .unwrap();
+    assert_ne!(first.is_error, Some(true));
+    assert!(
+        first.structured_content.as_ref().unwrap()[crate::markdown_chat::USER_MESSAGE_FIELD]
+            .as_str()
+            .unwrap()
+            .contains("secret queued first")
+    );
+    assert!(
+        !serde_json::to_string(&first)
+            .unwrap()
+            .contains("secret queued second")
+    );
+    let repeat = client
+        .call_tool(request("turn_completed", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        repeat.structured_content.as_ref().unwrap()["required_next_action"],
+        "chat_write"
+    );
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    client
+        .call_tool(request(
+            "chat_write",
+            json!({"message":"Handled first request"}),
+        ))
+        .await
+        .unwrap();
+    let second = client
+        .call_tool(request("turn_completed", json!({})))
+        .await
+        .unwrap();
+    assert!(
+        second.structured_content.as_ref().unwrap()[crate::markdown_chat::USER_MESSAGE_FIELD]
+            .as_str()
+            .unwrap()
+            .contains("secret queued second")
+    );
+    assert!(chat.queued_messages().await.unwrap().is_empty());
+    client.cancel().await.unwrap();
+    task.await.unwrap();
+}

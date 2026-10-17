@@ -889,7 +889,13 @@ async fn chat_state(
         .widget_page(query.before, query.revision)
         .await
         .map_err(internal_error)?;
-    Ok(wrap(serde_json::to_value(page).expect("chat page")))
+    let mut page = serde_json::to_value(page).expect("chat page");
+    page["queued_messages"] =
+        serde_json::to_value(chat.queued_messages().await.map_err(internal_error)?)
+            .expect("queued messages");
+    page["default_message_mode"] =
+        json!(crate::global_settings::default_message_mode(&state.config).map_err(internal_error)?);
+    Ok(wrap(page))
 }
 
 async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String>) -> ApiResult {
@@ -1317,6 +1323,57 @@ struct SendBody {
     stop_agent: bool,
     #[serde(default)]
     attachment_ids: Vec<String>,
+    #[serde(default)]
+    message_mode: Option<crate::markdown_chat::MessageMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueActionBody {
+    id: String,
+    revision: u64,
+    action: crate::markdown_chat::QueueSubmission,
+    message: Option<String>,
+}
+
+async fn chat_queue_action(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<QueueActionBody>,
+) -> ApiResult {
+    let located = selected(&state, &id)?;
+    let automation = if body.action == crate::markdown_chat::QueueSubmission::Steer
+        && state.config.markdown_chat.automation.enabled
+    {
+        Some(automation_context(&state, &located).await?)
+    } else {
+        None
+    };
+    let chat = state
+        .chats
+        .chat_at_path(located.path, true)
+        .map_err(internal_error)?;
+    let receipt = chat
+        .update_queued_message(body.id, body.revision, body.action, body.message)
+        .await
+        .map_err(internal_error)?;
+    if let (Some(context), Some(sent)) = (automation, receipt.sent.as_ref()) {
+        if let Some(at) = sent.created_at_ms {
+            context
+                .store
+                .resume_cancelled_action_for_new_message(&context.task, at)
+                .map_err(internal_error)?;
+        }
+        chat.set_owner_organization(None, Some(false))
+            .await
+            .map_err(internal_error)?;
+        if let Some(supervisor) = state.automation.as_ref() {
+            supervisor.notify();
+        }
+    }
+    Ok(wrap(
+        json!({"queue_receipt":receipt,"queued_messages":chat.queued_messages().await.map_err(internal_error)?}),
+    ))
 }
 
 fn automation_task(
@@ -1494,6 +1551,24 @@ async fn chat_send(
     };
     match message {
         OwnerMessage::Chat(message) => {
+            let mode = match body.message_mode {
+                Some(mode) => mode,
+                None => crate::global_settings::default_message_mode(&state.config)
+                    .map_err(internal_error)?,
+            };
+            if mode == crate::markdown_chat::MessageMode::Queue {
+                let chat = state
+                    .chats
+                    .chat_at_path(located.path, true)
+                    .map_err(internal_error)?;
+                let receipt = chat
+                    .queue_user_message(body.request_id, message, body.attachment_ids)
+                    .await
+                    .map_err(internal_error)?;
+                return Ok(wrap(
+                    json!({"queue_receipt":receipt,"queued_messages":chat.queued_messages().await.map_err(internal_error)?}),
+                ));
+            }
             let automation = if state.config.markdown_chat.automation.enabled {
                 Some(automation_context(&state, &located).await?)
             } else {
@@ -1775,6 +1850,31 @@ pub async fn start(
     start_with_automation(config, chats, artifacts, continuations, None).await
 }
 
+async fn restore_message_queues(state: OwnerState) {
+    let scan = state.clone();
+    let Ok(chats) = tokio::task::spawn_blocking(move || {
+        locate(&scan.config, &scan.project_bindings)
+            .into_iter()
+            .filter(|chat| chat.path.with_file_name("message-queue.json").exists())
+            .collect::<Vec<_>>()
+    })
+    .await
+    else {
+        return;
+    };
+    for located in chats {
+        if state.config.markdown_chat.automation.enabled
+            && let Err(error) = automation_context(&state, &located).await
+        {
+            tracing::warn!(?error, "could not restore queued-message automation");
+        }
+        // Opening the durable queue resumes its completion/offline monitor without a widget.
+        if let Err(error) = state.chats.chat_at_path(located.path, true) {
+            tracing::warn!(%error, "could not restore private message queue");
+        }
+    }
+}
+
 pub(crate) async fn start_with_automation(
     config: Arc<AppConfig>,
     chats: Arc<MarkdownChatStore>,
@@ -1800,6 +1900,7 @@ pub(crate) async fn start_with_automation(
         global: Arc::default(),
         token: info.token,
     };
+    tokio::spawn(restore_message_queues(state.clone()));
     settings::start(state.clone());
     let app = router(state);
     let task = tokio::spawn(async move {
@@ -1853,6 +1954,7 @@ fn router(state: OwnerState) -> Router {
             "/api/chats/{id}/automation/selection",
             post(automation_selection),
         )
+        .route("/api/chats/{id}/queue", post(chat_queue_action))
         .route("/api/chats/{id}/automation/pair", post(automation_pair))
         .route("/api/chats/{id}/automation/unlink", post(automation_unlink))
         .route("/api/chats/{id}/automation/login", post(automation_login))
@@ -4073,5 +4175,75 @@ mod tests {
                 .unwrap_err()
                 .contains("10 KiB")
         );
+    }
+    #[tokio::test]
+    async fn private_queue_resumes_after_service_restart_without_opening_a_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::default_config(root.path().into());
+        config.memory.dir = Some(root.path().join("metadata").display().to_string());
+        config.markdown_chat.enabled = true;
+        let task = ConversationIdentity::from_openai_session("queue-restart-owner").unwrap();
+        let store = AgentAutomationStore::for_config(&config).unwrap();
+        let goal = store
+            .set_goal(&task, "Keep queued text private", 1)
+            .unwrap();
+        let old = MarkdownChatStore::default();
+        let chat = old
+            .chat(&config, Some(&task), &SessionState::new())
+            .unwrap();
+        chat.ensure().await.unwrap();
+        chat.record_agent_call(1).await.unwrap();
+        for id in ["first", "second"] {
+            chat.queue_user_message(id.into(), format!("private {id}"), vec![])
+                .await
+                .unwrap();
+        }
+        let path = chat.path().to_path_buf();
+        drop(chat);
+        drop(old);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        store.run_goal(&task, goal.revision, 2).unwrap();
+        store
+            .finish_goal(
+                &task,
+                goal.revision,
+                crate::agent_automation::GoalFinish::Completed { summary: None },
+                3,
+            )
+            .unwrap();
+        let chats = Arc::new(MarkdownChatStore::default());
+        let state = OwnerState {
+            project_bindings: Arc::new(crate::project_bindings::ProjectBindingStore::new(
+                root.path().join("bindings"),
+            )),
+            creation_lock: Arc::default(),
+            artifacts: Arc::new(ArtifactEgressStore::new_at(
+                config.artifact_egress.clone(),
+                root.path().join("artifacts"),
+            )),
+            continuations: Arc::new(
+                ConversationContinuationStore::new(root.path().join("continuations.json")).unwrap(),
+            ),
+            config: Arc::new(config),
+            chats,
+            automation: None,
+            open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
+            token: "fixture-token".into(),
+        };
+        restore_message_queues(state.clone()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let body = std::fs::read_to_string(&path).unwrap();
+                if body.contains("private first") {
+                    assert!(!body.contains("private second"));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
