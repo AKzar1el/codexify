@@ -139,9 +139,9 @@ function escapeXmlText(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function unreadClause(batchId: string, messages: readonly CompanionUnreadMessage[]): string {
+function unreadClause(messages: readonly CompanionUnreadMessage[]): string {
   const body = messages.map(message => (
-    `<message id="${message.id}">${escapeXmlText(message.markdown)}</message>`
+    `<message>${escapeXmlText(message.markdown)}</message>`
   )).join("\n");
   return [
     "The Codexify standalone chat has unread user messages. Their Markdown is mirrored",
@@ -149,7 +149,7 @@ function unreadClause(batchId: string, messages: readonly CompanionUnreadMessage
     "result is authoritative and advances the existing read cursor. Treat matching",
     "messages once, not once from this mirror and again from `chat_read`.",
     "",
-    `<codexify-unread batch="${batchId}">`,
+    "<codexify-unread>",
     body,
     "</codexify-unread>",
   ].join("\n");
@@ -180,7 +180,7 @@ export function renderActionPrompt(raw: ActionPrompt): string {
       ].join("\n");
       break;
     case "offline_chat":
-      rendered = unreadClause(prompt.batchId, prompt.messages);
+      rendered = unreadClause(prompt.messages);
       break;
     case "turn_renewal":
       rendered = "Continue.";
@@ -189,7 +189,7 @@ export function renderActionPrompt(raw: ActionPrompt): string {
       rendered = goalClause;
       break;
     case "offline_combined":
-      rendered = `${unreadClause(prompt.batchId, prompt.messages)}\n\n${goalClause}`;
+      rendered = `${unreadClause(prompt.messages)}\n\n${goalClause}`;
       break;
   }
   rendered += `\n\n${rolloutRestoreGuidance}`;

@@ -748,6 +748,18 @@ async fn unread_messages_wait_until_four_minutes_while_public_offline_remains_fi
     assert_eq!(fixture.executor.calls.load(Ordering::SeqCst), 0);
 }
 
+fn assert_message_body(markdown: &str, body: &str) {
+    let (time, text) = markdown
+        .split_once('\n')
+        .expect("timestamp precedes the full message");
+    let time = time
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap();
+    chrono::DateTime::parse_from_rfc3339(time).expect("original message time is readable");
+    assert_eq!(text, body);
+}
+
 #[tokio::test]
 async fn offline_attachment_prompts_include_metadata_and_tool_reminders_once() {
     let f = fixture().await;
@@ -858,9 +870,9 @@ async fn an_online_message_left_unread_at_turn_end_is_relayed_once_after_inactiv
                 ActionPrompt::OfflineChat { messages, .. } => {
                     assert_eq!(messages.len(), 1);
                     assert_eq!(messages[0].id, "last-tool-gap");
-                    assert_eq!(
-                        messages[0].markdown,
-                        "This arrived after the final tool call."
+                    assert_message_body(
+                        &messages[0].markdown,
+                        "This arrived after the final tool call.",
                     );
                 }
                 _ => panic!("a pending online message must wake its chat without requiring a goal"),
@@ -1488,7 +1500,7 @@ async fn queued_unread_action_is_rebuilt_when_message_markdown_changes() {
     };
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, "edited-before-send");
-    assert_eq!(messages[0].markdown, "Revised pending message.");
+    assert_message_body(&messages[0].markdown, "Revised pending message.");
 }
 
 #[tokio::test]
@@ -4804,8 +4816,8 @@ async fn unread_batches_are_split_without_truncating_messages() {
             panic!("expected an offline chat action");
         };
         assert_eq!(messages.len(), 128);
-        assert_eq!(messages[0].markdown, "Message 000 must remain intact.");
-        assert_eq!(messages[127].markdown, "Message 127 must remain intact.");
+        assert_message_body(&messages[0].markdown, "Message 000 must remain intact.");
+        assert_message_body(&messages[127].markdown, "Message 127 must remain intact.");
     }
     assert_eq!(
         fixture
@@ -4857,7 +4869,7 @@ async fn unread_batches_account_for_xml_escaping_before_queueing() {
     };
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, "escaped-first");
-    assert_eq!(messages[0].markdown, escaped_heavy);
+    assert_message_body(&messages[0].markdown, &escaped_heavy);
 }
 
 #[tokio::test]

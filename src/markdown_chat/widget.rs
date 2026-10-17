@@ -106,6 +106,12 @@ pub struct UnreadMessage {
     pub tool_call_count: Option<u64>,
 }
 
+impl UnreadMessage {
+    pub(crate) fn model_markdown(&self) -> String {
+        super::super::output::timestamped_user_message(&self.markdown, self.created_at_ms)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UnreadSnapshot {
@@ -826,6 +832,9 @@ impl ChatFile {
                     } else {
                         span.id
                     };
+                    let markdown =
+                        super::super::attachments::AttachmentStore::for_chat(&chat.path)?
+                            .model_message(&id, &markdown);
                     messages.push(UnreadMessage {
                         id,
                         markdown,
@@ -1181,7 +1190,8 @@ fn persist_agent_activity(
     Ok(())
 }
 
-pub(super) fn user_text(text: &str) -> Result<String, String> {
+pub(super) fn user_text(text: &str, chat_path: &Path) -> Result<String, String> {
+    let attachments = super::super::attachments::AttachmentStore::for_chat(chat_path)?;
     let mut output = String::new();
     let mut remaining = text;
     loop {
@@ -1207,7 +1217,7 @@ pub(super) fn user_text(text: &str) -> Result<String, String> {
         let Some((fields, body)) = marker.split_once(&opening) else {
             return Err("CHAT.md has an incomplete message; finish saving before retrying.".into());
         };
-        let Some((id, _, _)) = marker_fields(role, fields) else {
+        let Some((id, created_at_ms, _)) = marker_fields(role, fields) else {
             return Err("CHAT.md has a malformed message marker.".into());
         };
         let ending = format!("\n\n<!-- codexify-{role}-message:v1:end id=\"{id}\" -->\n");
@@ -1215,7 +1225,11 @@ pub(super) fn user_text(text: &str) -> Result<String, String> {
             return Err("CHAT.md has an incomplete message; finish saving before retrying.".into());
         };
         if role == "user" {
-            output.push_str(message);
+            let message = attachments.model_message(id, message);
+            output.push_str(&super::super::output::timestamped_user_message(
+                &message,
+                created_at_ms,
+            ));
             output.push_str("\n\n");
         }
         remaining = tail;
@@ -1856,7 +1870,13 @@ mod tests {
             1
         );
         assert!(chat.has_agent_message_after(&checkpoint).await.unwrap());
-        assert_eq!(chat.read(false).await.unwrap().text, "Please continue\n\n");
+        assert_eq!(
+            chat.read(false).await.unwrap().text,
+            format!(
+                "[{}]\nPlease continue\n\n",
+                crate::markdown_chat::attachments::date(before.messages[0].created_at_ms.unwrap())
+            )
+        );
     }
 
     #[tokio::test]

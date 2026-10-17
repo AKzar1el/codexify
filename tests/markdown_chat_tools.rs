@@ -568,10 +568,13 @@ async fn widget_send_is_idempotent_and_history_never_consumes_or_marks_delivery(
     assert!(!repeated.is_error);
     assert_eq!(std::fs::metadata(chat.path()).unwrap().len(), length);
     assert_eq!(receipt["sent"]["end"], length);
-    assert_eq!(
-        chat.read(false).await.unwrap().text,
-        format!("{markdown}\n\n")
+    let expected = format!(
+        "[{}]\n{markdown}\n\n",
+        codexify::markdown_chat::attachments::date(
+            receipt["sent"]["created_at_ms"].as_u64().unwrap()
+        )
     );
+    assert_eq!(chat.read(false).await.unwrap().text, expected);
     let page = reader
         .call_with_context(json!({}), &config, &session, &context)
         .await;
@@ -583,10 +586,7 @@ async fn widget_send_is_idempotent_and_history_never_consumes_or_marks_delivery(
     assert_eq!(page["messages"].as_array().unwrap().len(), 1);
     assert_eq!(page["messages"][0]["markdown"], markdown);
     assert_eq!(page["delivered_through"], 0);
-    assert_eq!(
-        chat.read(false).await.unwrap().text,
-        format!("{markdown}\n\n")
-    );
+    assert_eq!(chat.read(false).await.unwrap().text, expected);
     let other_conversation = ConversationIdentity::from_openai_session("other-widget");
     let other = ToolRequestContext {
         conversation: other_conversation.clone(),
@@ -908,12 +908,16 @@ async fn widget_history_pages_preserve_markdown_and_manual_file_appends() {
     assert_eq!(older.messages[0].markdown, "Plain file message\n");
     assert_eq!(older.messages[0].role, "user");
     let literal = "Literal delimiters:\n\n<!-- codexify-agent-message:v1:start id=\"123-4\" -->\n\n## Agent\n\ninside a user message\n\n<!-- codexify-agent-message:v1:end id=\"123-4\" -->\n";
-    chat.append_user("literal-markers".into(), literal.into())
+    let receipt = chat
+        .append_user("literal-markers".into(), literal.into())
         .await
         .unwrap();
     assert_eq!(
         chat.read(false).await.unwrap().text,
-        format!("{literal}\n\n")
+        format!(
+            "[{}]\n{literal}\n\n",
+            codexify::markdown_chat::attachments::date(receipt.created_at_ms.unwrap())
+        )
     );
     assert_eq!(
         chat.widget_page(None, None)
@@ -1269,7 +1273,13 @@ async fn stop_requests_persist_without_acknowledging_messages_and_resume_only_on
     assert_eq!(stopped.total_tool_calls, 2);
     assert_eq!(stopped.read_through, before.read_through);
     assert_eq!(stopped.delivered_through, before.delivered_through);
-    assert_eq!(chat.read(false).await.unwrap().text, "Pending message\n\n");
+    assert_eq!(
+        chat.read(false).await.unwrap().text,
+        format!(
+            "[{}]\nPending message\n\n",
+            codexify::markdown_chat::attachments::date(before.messages[0].created_at_ms.unwrap())
+        )
+    );
     let reopened = MarkdownChatStore::default()
         .chat(&config, context.conversation.as_ref(), &session)
         .unwrap();

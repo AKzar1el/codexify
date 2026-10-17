@@ -1417,7 +1417,7 @@ impl AgentAutomationSupervisor {
                 .iter()
                 .map(|message| CompanionUnreadMessage {
                     id: message.id.clone(),
-                    markdown: message.markdown.clone(),
+                    markdown: message.model_markdown(),
                 })
                 .collect::<Vec<_>>();
             let unread_message_ids = messages
@@ -2467,7 +2467,7 @@ fn bounded_unread_batch(
             .chain(std::iter::once(message))
             .map(|message| CompanionUnreadMessage {
                 id: message.id.clone(),
-                markdown: message.markdown.clone(),
+                markdown: message.model_markdown(),
             })
             .collect::<Vec<_>>();
         let prompt = if let Some(goal_revision) = goal_revision {
@@ -2631,7 +2631,7 @@ async fn execution_matches(
                 .iter()
                 .zip(current_messages)
                 .any(|(queued, current)| {
-                    current.id != queued.id || current.markdown != queued.markdown
+                    current.id != queued.id || current.model_markdown() != queued.markdown
                 })
         {
             return Ok(false);

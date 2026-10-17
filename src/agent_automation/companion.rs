@@ -1398,16 +1398,10 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
             .replace('>', "&gt;")
     }
 
-    fn unread_clause(batch_id: &str, messages: &[CompanionUnreadMessage]) -> String {
+    fn unread_clause(messages: &[CompanionUnreadMessage]) -> String {
         let body = messages
             .iter()
-            .map(|message| {
-                format!(
-                    "<message id=\"{}\">{}</message>",
-                    message.id,
-                    escape_xml_text(&message.markdown)
-                )
-            })
+            .map(|message| format!("<message>{}</message>", escape_xml_text(&message.markdown)))
             .collect::<Vec<_>>()
             .join("\n");
         format!(
@@ -1416,11 +1410,11 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
                 "below so you can see why you were woken. Call `chat_read` before acting; the tool\n",
                 "result is authoritative and advances the existing read cursor. Treat matching\n",
                 "messages once, not once from this mirror and again from `chat_read`.\n\n",
-                "<codexify-unread batch=\"{}\">\n",
+                "<codexify-unread>\n",
                 "{}\n",
                 "</codexify-unread>"
             ),
-            batch_id, body
+            body
         )
     }
 
@@ -1447,12 +1441,12 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
             ),
             reference
         ),
-        ActionPrompt::OfflineChat { batch_id, messages } => unread_clause(batch_id, messages),
+        ActionPrompt::OfflineChat { messages, .. } => unread_clause(messages),
         ActionPrompt::OfflineGoal { .. } => GOAL_CLAUSE.to_string(),
         ActionPrompt::TurnRenewal { .. } => "Continue.".to_string(),
-        ActionPrompt::OfflineCombined {
-            batch_id, messages, ..
-        } => format!("{}\n\n{GOAL_CLAUSE}", unread_clause(batch_id, messages)),
+        ActionPrompt::OfflineCombined { messages, .. } => {
+            format!("{}\n\n{GOAL_CLAUSE}", unread_clause(messages))
+        }
     };
     format!(
         "{rendered}\n\n{}",
@@ -1701,5 +1695,38 @@ mod conversation_url_tests {
             &friendly,
             "https://example.com/c/12345678-1234-4321-8765-123456789abc"
         ));
+    }
+}
+
+#[cfg(test)]
+mod prompt_display_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_omits_delivery_ids_but_keeps_message_times_and_xml_boundaries() {
+        let prompt = ActionPrompt::OfflineCombined {
+            batch_id: "private-batch-identity".into(),
+            messages: vec![CompanionUnreadMessage {
+                id: "private-message-identity".into(),
+                markdown: "[2026-10-17T14:00:00.123Z]\nKeep <data> & **all text**.".into(),
+            }],
+            goal_revision: 1,
+        };
+        let shown = render_action_prompt(&prompt);
+        for internal in [
+            "private-batch-identity",
+            "private-message-identity",
+            "batch=",
+            "id=",
+        ] {
+            assert!(!shown.contains(internal));
+        }
+        assert!(shown.contains("[2026-10-17T14:00:00.123Z]"));
+        assert!(shown.contains("Keep &lt;data&gt; &amp; **all text**."));
+        assert!(shown.contains("<codexify-unread>\n<message>"));
+        assert!(shown.contains("goal_read"));
+        let wire = serde_json::to_value(prompt).unwrap();
+        assert_eq!(wire["batchId"], "private-batch-identity");
+        assert_eq!(wire["messages"][0]["id"], "private-message-identity");
     }
 }

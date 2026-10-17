@@ -229,7 +229,7 @@ impl ChatFile {
                         "Markdown chat read was cancelled; no messages were consumed".into(),
                     );
                 }
-                let snapshot = snapshot(file, cursor)?;
+                let snapshot = snapshot(chat, file, cursor)?;
                 if !snapshot.text.is_empty() {
                     chat.clear_agent_waiting();
                 }
@@ -273,7 +273,7 @@ impl ChatFile {
                     || cursor.agent_stop_requested
                     || cursor.last_message_event == NotificationEvent::Completed
                     || cursor.last_agent_end.is_none()
-                    || !snapshot(file, cursor)?.text.is_empty()
+                    || !snapshot(chat, file, cursor)?.text.is_empty()
                 {
                     return Ok(false);
                 }
@@ -568,7 +568,7 @@ impl ChatFile {
             );
         }
         self.with_cursor(|cursor, file| {
-            let before = snapshot(file, cursor)?;
+            let before = snapshot(self, file, cursor)?;
             let block = agent_block(message, cursor.total_tool_calls);
             before_append();
             file.write_all(block.as_bytes()).map_err(io_error)?;
@@ -588,7 +588,7 @@ impl ChatFile {
             // The file descriptor's write position excludes later user appends; EOF does not.
             let gap = read_range(file, before.end, start, MAX_UNREAD_BYTES.saturating_sub(before.text.len()))?;
             let gap = String::from_utf8(gap).map_err(|_| "CHAT.md contains incomplete UTF-8; finish saving before retrying")?;
-            let user_text = before.text + &user_text(&gap)?;
+            let user_text = before.text + &user_text(&gap, &self.path)?;
             if !user_text.is_empty() {
                 self.clear_agent_waiting();
             }
@@ -724,7 +724,7 @@ fn advanced_cursor(file: &mut File, mut cursor: Cursor, end: u64) -> Result<Curs
     Ok(cursor)
 }
 
-fn snapshot(file: &mut File, cursor: &Cursor) -> Result<ChatSnapshot, String> {
+fn snapshot(chat: &ChatFile, file: &mut File, cursor: &Cursor) -> Result<ChatSnapshot, String> {
     check_cursor(file, cursor)?;
     let end = file.metadata().map_err(io_error)?.len();
     let bytes = read_range(file, cursor.offset, end, MAX_UNREAD_BYTES)?;
@@ -732,14 +732,14 @@ fn snapshot(file: &mut File, cursor: &Cursor) -> Result<ChatSnapshot, String> {
         |_| "CHAT.md contains incomplete UTF-8; finish saving and retry. Nothing was consumed.",
     )?;
     Ok(ChatSnapshot {
-        text: user_text(&text)?,
+        text: user_text(&text, &chat.path)?,
         end,
         notification: cursor.notification,
     })
 }
 
-fn user_text(text: &str) -> Result<String, String> {
-    widget::user_text(text)
+fn user_text(text: &str, chat_path: &Path) -> Result<String, String> {
+    widget::user_text(text, chat_path)
 }
 
 #[cfg(test)]
@@ -762,7 +762,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.user_text, "racing user text\n");
         assert!(
-            chat.with_cursor(|cursor, file| Ok(snapshot(file, cursor)?.text))
+            chat.with_cursor(|cursor, file| Ok(snapshot(&chat, file, cursor)?.text))
                 .unwrap()
                 .is_empty()
         );
@@ -778,7 +778,7 @@ mod tests {
         let reopened = ChatFile::new(path, false);
         assert_eq!(
             reopened
-                .with_cursor(|cursor, file| Ok(snapshot(file, cursor)?.text))
+                .with_cursor(|cursor, file| Ok(snapshot(&reopened, file, cursor)?.text))
                 .unwrap(),
             ""
         );

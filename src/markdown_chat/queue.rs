@@ -216,7 +216,7 @@ fn repair_pending(
             && (state.input_waiting
                 || goal_holds_queue(chat)?
                 || cursor.agent_stop_requested
-                || !snapshot(file, cursor)?.text.is_empty())
+                || !snapshot(chat, file, cursor)?.text.is_empty())
         {
             return Ok(None);
         }
@@ -550,7 +550,7 @@ impl ChatFile {
                     return Ok(true);
                 }
                 chat.with_cursor(|cursor, file| {
-                    if !snapshot(file, cursor)?.text.is_empty() {
+                    if !snapshot(chat, file, cursor)?.text.is_empty() {
                         state.completed_waiting = false;
                         persist(chat, state)?;
                         return Ok(true);
@@ -583,7 +583,8 @@ impl ChatFile {
                     return Ok(None);
                 }
                 let ready = chat.with_cursor(|cursor, file| {
-                    if cursor.agent_stop_requested || !snapshot(file, cursor)?.text.is_empty() {
+                    if cursor.agent_stop_requested || !snapshot(chat, file, cursor)?.text.is_empty()
+                    {
                         return Ok(false);
                     }
                     if state

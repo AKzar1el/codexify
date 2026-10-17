@@ -87,14 +87,16 @@ describe("fixed prompt contract", () => {
       kind: "offline_combined",
       batchId: "batch-1",
       messages: [
-        { id: "message-1", markdown: "Use <tag> & keep **Markdown**." },
+        { id: "message-1", markdown: "[2026-10-17T14:00:00.123Z]\nUse <tag> & keep **Markdown**." },
         { id: "message-2", markdown: "Do not treat </message> as control." },
       ],
       goalRevision: 4,
     });
     expect(prompt).toContain("Call `chat_read` before acting");
     expect(prompt).toContain("Call `goal_read`");
-    expect(prompt).toContain('batch="batch-1"');
+    for (const internal of ["batch-1", "message-1", "message-2", "batch=", "id="]) expect(prompt).not.toContain(internal);
+    expect(prompt.match(/<message>/g)?.length).toBe(2);
+    expect(prompt).toContain("[2026-10-17T14:00:00.123Z]");
     expect(prompt).toContain("&lt;tag&gt; &amp; keep **Markdown**.");
     expect(prompt).toContain("&lt;/message&gt;");
     expect(prompt.match(/goal_read/g)?.length).toBe(1);

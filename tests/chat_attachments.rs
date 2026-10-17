@@ -276,6 +276,27 @@ async fn submissions_expose_attachments_to_agents_and_render_clean_chat_messages
     ] {
         assert!(delivered.text.contains(part));
     }
+    for internal in [
+        "\"id\":",
+        "messageId",
+        "createdAtMs",
+        "submittedAtMs",
+        "toolCallCount",
+        "originalSize",
+        "pasted",
+        "exists",
+    ] {
+        assert!(
+            !delivered.text.contains(internal),
+            "agent display leaked {internal}"
+        );
+    }
+    let submitted = codexify::markdown_chat::attachments::date(receipt.created_at_ms.unwrap());
+    assert!(delivered.text.starts_with(&format!("[{submitted}]\n")));
+    // Presentation must not alter durable metadata, browser identities or retries.
+    let raw = std::fs::read_to_string(chat.path()).unwrap();
+    assert!(raw.contains("messageId"));
+    assert!(raw.contains("message-1"));
     assert_eq!(chat.unread_snapshot().await.unwrap().messages.len(), 1);
     let page = chat.widget_page(None, None).await.unwrap();
     assert_eq!(page.messages[0].markdown, "Analyze this file");

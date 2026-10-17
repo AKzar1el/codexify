@@ -4,6 +4,18 @@ use serde_json::{Map, Value, json};
 use super::USER_MESSAGE_FIELD;
 use crate::types::{ToolContent, ToolResult};
 
+pub(crate) fn timestamped_user_message(markdown: &str, at_ms: Option<u64>) -> String {
+    let Some(at_ms) = at_ms else {
+        return markdown.to_owned();
+    };
+    let time = i64::try_from(at_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| format!("Unix time {at_ms} ms"));
+    format!("[{time}]\n{markdown}")
+}
+
 fn needs_envelope(schema: Option<&Value>, field: &str) -> bool {
     let Some(schema) = schema.and_then(Value::as_object) else {
         return false;
@@ -133,6 +145,19 @@ pub(crate) fn attach_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_times_are_exact_and_unknown_times_are_not_invented() {
+        assert_eq!(
+            timestamped_user_message("  body\n", Some(0)),
+            "[1970-01-01T00:00:00.000Z]\n  body\n"
+        );
+        assert_eq!(timestamped_user_message("  body\n", None), "  body\n");
+        assert_eq!(
+            timestamped_user_message("body", Some(u64::MAX)),
+            format!("[Unix time {} ms]\nbody", u64::MAX)
+        );
+    }
 
     #[test]
     fn native_object_keeps_its_shape_and_optional_chat_field() {
