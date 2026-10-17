@@ -38,7 +38,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const before=await geometry();await toggle.click();
   const dialog=host.getByRole('dialog',{name:'Conversation settings',exact:true});await dialog.waitFor();
   assert.equal(await dialog.getByText('Bioshock optimization',{exact:true}).count(),1);
-  assert.deepEqual(await dialog.getByRole('heading',{level:3}).allTextContents(),['Browser connection','Paired conversation','Activity & recovery']);
+  assert.deepEqual(await dialog.getByRole('heading',{level:3}).allTextContents(),['Project','Browser connection','Paired conversation','Activity & recovery']);
   assert.equal(await dialog.evaluate(element=>element.open&&element.matches(':modal')),true);
   const box=await dialog.boundingBox();assert(Math.abs(box.x+box.width/2-720)<1&&Math.abs(box.y+box.height/2-490)<1,'dialog is centered in the viewport rather than over the composer');
   assert.deepEqual(await geometry(),before);
@@ -63,6 +63,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    await dialog.locator('.connection-settings-body').evaluate(element=>element.scrollTop=10000);
    assert.deepEqual(await dialog.locator('.connection-settings-header').boundingBox(),header);assert.deepEqual(await dialog.locator('.connection-settings-footer').boundingBox(),footer);
    assert.equal(await dialog.evaluate(element=>element.scrollWidth>element.clientWidth),false);
+   if(viewport.width<=760)for(const field of await dialog.locator('input,select,textarea').all())if(await field.isVisible())assert(await field.evaluate(element=>parseFloat(getComputedStyle(element).fontSize)>=16),'mobile settings fields avoid focus zoom');
    if(process.env.CODEXIFY_SETTINGS_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_SETTINGS_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.CODEXIFY_SETTINGS_SCREENSHOTS}/${engineName.toLowerCase()}-conversation-settings-${colorScheme}-${viewport.width}.png`});}
    await dialog.getByRole('button',{name:'Done',exact:true}).click();await dialog.waitFor({state:'hidden'});
   }

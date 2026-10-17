@@ -1484,7 +1484,8 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
 }
 
 async function mobileNavigationFixture(browser, options = {}) {
-  const page = await ownerTestPage(browser, {viewport:{width:390,height:844}, ...options});
+  const {awaiting=false,...pageOptions}=options;
+  const page = await ownerTestPage(browser, {viewport:{width:390,height:844}, ...pageOptions});
   page.setDefaultTimeout(6000);
   const errors = [], writes = [], now = Date.now(), origin = 'http://127.0.0.1:43228';
   const chats = Array.from({length:60}, (_, index) => ({
@@ -1509,7 +1510,7 @@ async function mobileNavigationFixture(browser, options = {}) {
       goal:{status:'active',revision:1,markdown:'Finish the implementation and verify the results.',elapsedActiveMs:281900000,turnCount:84},
       companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:now},serverTimeMs:Date.now(),
     }});
-    return route.fulfill({json:{_meta:{[META]:{chat_file:`/fixture/${chat.id}/CHAT.md`,revision:'200',read_through:200,delivered_through:200,total_tool_calls:16998,last_agent_call_at_ms:now,server_time_ms:Date.now(),has_more:false,unchanged:false,messages:[
+    return route.fulfill({json:{_meta:{[META]:{chat_file:`/fixture/${chat.id}/CHAT.md`,revision:'200',read_through:200,delivered_through:200,total_tool_calls:16998,last_agent_call_at_ms:now,agent_waiting_until_ms:awaiting?Date.now()+60000:null,server_time_ms:Date.now(),has_more:false,unchanged:false,messages:[
       {id:'update',role:'agent',markdown:`Update for ${chat.title}. The focused checks pass. I’m reviewing the remaining results before proceeding.`,start:0,end:200,tool_call_count:16998,created_at_ms:now},
     ]}}}});
   });
@@ -1567,6 +1568,48 @@ for (const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
       assert(await page.locator('#layout > main').isHidden(),'returning from archived chats stays in the chat list');
       await page.locator(`[data-chat-id="${chats[0].id}"] [data-action="pin"]`).click();
       assert(await page.locator('#layout > main').isHidden(),'pinning a chat does not open it');assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+}
+
+
+for (const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
+  test(`${name}: mobile viewport is fixed and composer focus outlines are rounded`, {timeout:30000}, async()=>{
+    const browser=await engine.launch();
+    try {
+      for(const awaiting of [false,true]){
+        const {page,chats,errors,origin}=await mobileNavigationFixture(browser,{awaiting});
+        await page.goto(origin+'/?chat='+chats[0].id+'#test-token');
+        const host=page.locator('#chat-host'),input=host.locator('#draft');await input.waitFor();
+        if(awaiting)await host.locator('#chat[data-awaiting="true"]').waitFor();
+        const viewport=()=>page.locator('meta[name="viewport"]').getAttribute('content');
+        assert((await viewport()).includes('maximum-scale=1'));assert((await viewport()).includes('user-scalable=no'));
+        assert.equal(await page.locator('html').evaluate(e=>getComputedStyle(e).touchAction),'pan-x pan-y');
+        assert.equal(await page.locator('body').evaluate(e=>getComputedStyle(e).overflow),'hidden');
+        const scale=await page.evaluate(()=>visualViewport.scale);
+        await input.fill('Keep this draft while the viewport changes.');await input.focus();
+        const appearance=await input.evaluate(e=>{const s=getComputedStyle(e);return {radius:s.borderTopLeftRadius,size:s.fontSize,outline:s.outlineColor,width:s.outlineWidth};});
+        assert.equal(appearance.radius,'12px');assert.equal(appearance.size,'16px');assert.equal(appearance.width,'2px');
+        assert.equal(appearance.outline,awaiting?'rgb(196, 49, 59)':'rgb(19, 111, 80)');
+        assert.equal(await page.evaluate(()=>visualViewport.scale),scale);
+        for(const height of [500,844]){
+          await page.setViewportSize({width:390,height});
+          await page.waitForFunction(()=>Math.abs(document.querySelector('#layout').getBoundingClientRect().height-visualViewport.height)<1);
+          const send=await host.locator('#send').boundingBox();assert(send.y>=0&&send.y+send.height<=height,'composer remains inside the visible viewport');
+          assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+          assert.equal(await input.inputValue(),'Keep this draft while the viewport changes.');
+        }
+        assert.equal(await page.evaluate(()=>document.dispatchEvent(new Event('gesturestart',{cancelable:true}))),false,'single-pane mode suppresses Safari pinch gestures');
+        await page.setViewportSize({width:761,height:900});
+        await page.waitForFunction(()=>!document.querySelector('meta[name="viewport"]').content.includes('maximum-scale'));
+        assert.equal(await page.locator('html').evaluate(e=>getComputedStyle(e).touchAction),'auto');
+        assert.equal(await page.evaluate(()=>document.dispatchEvent(new Event('gesturestart',{cancelable:true}))),true,'desktop zoom stays available');
+        await page.setViewportSize({width:760,height:844});
+        await page.waitForFunction(()=>document.querySelector('meta[name="viewport"]').content.includes('maximum-scale'));
+        for(const field of await page.locator('input,select,textarea').all())if(await field.isVisible())assert(await field.evaluate(e=>parseFloat(getComputedStyle(e).fontSize)>=16),'every visible mobile form field avoids focus zoom');
+        if(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS,{recursive:true});await input.focus();await page.screenshot({path:`${process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS}/${name.toLowerCase()}-composer-${awaiting?'red':'green'}.png`});}
+        assert.deepEqual(errors,[]);await page.close();
+      }
     }finally{await browser.close();}
   });
 }
