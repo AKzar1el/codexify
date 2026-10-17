@@ -30,7 +30,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
 #global-update{display:inline-flex;align-items:center;justify-content:center;min-height:32px;margin-left:4px;border:0;background:var(--selected);color:var(--accent);padding:0 10px;border-radius:8px;font:inherit;font-size:13px;line-height:20px;cursor:pointer}
 #global-footer [hidden]{display:none!important}
 #global-footer button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-@media(max-width:680px){#global-footer{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;padding:10px}#global-footer-actions{min-width:0;flex-wrap:wrap}#global-version{margin-left:auto}#global-update{width:100%;margin-left:0}}
+@media(max-width:760px),(hover:none) and (pointer:coarse){#global-footer{flex:none;gap:8px;min-height:49px;padding:2px 14px;font-size:13px}#global-footer-actions{gap:4px}#global-settings{width:44px;height:44px}#global-version{font-size:12px}#global-update{font-size:12px}}
 #settings-dialog{--settings-error:#b42328;--settings-shadow:0 24px 90px #0003;width:min(1040px,calc(100vw - 48px));height:min(790px,calc(100dvh - 64px));max-width:none;max-height:none;margin:auto;padding:0;border:1px solid var(--line);border-radius:20px;background:var(--panel);color:var(--ink);box-shadow:var(--settings-shadow);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}
 #settings-dialog::backdrop{background:#10191673;backdrop-filter:blur(5px)}
 #settings-dialog [hidden]{display:none!important}
