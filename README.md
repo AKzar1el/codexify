@@ -171,7 +171,9 @@ from the main top-level `port` when agent chat is enabled.
 It defaults to `55000` (55 seconds) and accepts values from `1000` to `300000`.
 Existing explicit values remain in effect; omit the setting to use the default.
 
-Every chat also keeps a private `rollout.md` progress journal beside `CHAT.md`.
+Every chat keeps a private `rollout.md` progress journal beside `CHAT.md`, enabled
+by default. It is a chronological activity timeline of completed work, current
+work and next steps, and can reference supporting files.
 Agents read recent progress with `rollout_read` when a turn starts and append
 status, progress and next steps using `rollout_update`. Tool results request a
 checkpoint after **20 agent work calls** by default. Change

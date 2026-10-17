@@ -2165,8 +2165,10 @@ guarantee that ChatGPT never ends a turn.
 
 ### Per-chat progress and recovery
 
-Each chat has a `rollout.md` file next to its `CHAT.md`, including chats created
-before this feature. It belongs to the stable task identity, so continuation
+Progress journals are enabled by default. Each chat has a `rollout.md` file next
+to its `CHAT.md`, including chats created before this feature. The journal is a
+chronological timeline of what the agent did, is doing and plans next; reports
+can reference supporting files. It belongs to the stable task identity, so continuation
 handoffs preserve progress while separate conversations have separate journals.
 `get_agent_brief` gives its exact path and recovery instructions. Every browser
 wake-up prompt also instructs the agent to read recent progress before task work,

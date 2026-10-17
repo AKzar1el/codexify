@@ -41,7 +41,7 @@ impl Tool for RolloutTool {
     fn description(&self) -> String {
         match self {
   Self::Read=>"Read up to five recent progress reports from this chat's rollout.md, bounded to 64 KiB and spanning rotated archives when necessary. Call at the start of each new turn and after context loss, before task work. Use the current goal too, if configured. This does not read queued messages or acknowledge CHAT.md.",
-  Self::Update=>"Append a durable progress report to this chat's rollout.md. Include current status, concrete progress/findings and verification, and next steps or blockers. Update regularly and whenever rollout_checkpoint_required appears in a tool result. Use a fresh request_id for each report; reuse it only for an identical retry. Reports rotate automatically at 256 KiB or 50 reports. This does not change the goal, send a chat message, complete a turn, or expose queued messages."
+  Self::Update=>"Append to this chat's chronological activity timeline in rollout.md. Record what was done or learned, what is underway, and what comes next or is blocked. Reports may reference supporting files. Update regularly and whenever rollout_checkpoint_required appears in a tool result. Use a fresh request_id for each report; reuse it only for an identical retry. Reports rotate automatically at 256 KiB or 50 reports. This does not change the goal, send a chat message, complete a turn, or expose queued messages."
  }.into()
     }
     fn behavior(&self) -> ToolBehavior {
@@ -70,7 +70,7 @@ impl Tool for RolloutTool {
             Self::Read => empty_object_schema(),
             Self::Update => json!({"type":"object","properties":{
  "request_id":{"type":"string","minLength":1,"maxLength":80,"pattern":"^[A-Za-z0-9_-]+$","description":"Unique report identity, reused only for an identical retry."},
- "status":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true},"progress":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true},"next_steps":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true}
+ "status":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true,"description":"What is currently happening or blocked."},"progress":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true,"description":"What was done or learned since the previous report; may reference supporting files."},"next_steps":{"type":"string","minLength":1,"maxLength":16384,"writeOnly":true,"description":"Intended next actions or input needed to proceed."}
  },"required":["request_id","status","progress","next_steps"],"additionalProperties":false}),
         }
     }
