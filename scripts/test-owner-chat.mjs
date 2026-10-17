@@ -1606,7 +1606,12 @@ for (const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
         assert.equal(await page.evaluate(()=>document.dispatchEvent(new Event('gesturestart',{cancelable:true}))),true,'desktop zoom stays available');
         await page.setViewportSize({width:760,height:844});
         await page.waitForFunction(()=>document.querySelector('meta[name="viewport"]').content.includes('maximum-scale'));
-        for(const field of await page.locator('input,select,textarea').all())if(await field.isVisible())assert(await field.evaluate(e=>parseFloat(getComputedStyle(e).fontSize)>=16),'every visible mobile form field avoids focus zoom');
+        for(const field of await page.locator('input,select,textarea').all())if(await field.isVisible()){
+          const picker=['automation-model','automation-effort'].includes(await field.getAttribute('id'));
+          if(picker)assert.equal(await field.evaluate(e=>getComputedStyle(e).fontSize),'13px','composer pickers use compact mobile text');
+          else assert(await field.evaluate(e=>parseFloat(getComputedStyle(e).fontSize)>=16),'other visible mobile form fields retain focus-zoom protection');
+          await field.focus();assert.equal(await page.evaluate(()=>visualViewport.scale),scale,'focusing mobile fields preserves the fixed viewport');
+        }
         if(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS,{recursive:true});await input.focus();await page.screenshot({path:`${process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS}/${name.toLowerCase()}-composer-${awaiting?'red':'green'}.png`});}
         assert.deepEqual(errors,[]);await page.close();
       }
