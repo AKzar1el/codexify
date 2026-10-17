@@ -162,6 +162,8 @@ const goalClause = [
   "turn merely to evaluate goal status.",
 ].join("\n");
 
+export const rolloutRestoreGuidance = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. Use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
+
 export function renderActionPrompt(raw: ActionPrompt): string {
   const prompt = actionPromptSchema.parse(raw);
   let rendered: string;
@@ -186,6 +188,7 @@ export function renderActionPrompt(raw: ActionPrompt): string {
       rendered = `${unreadClause(prompt.batchId, prompt.messages)}\n\n${goalClause}`;
       break;
   }
+  rendered += `\n\n${rolloutRestoreGuidance}`;
   if (utf8Length(rendered) > MAX_PROMPT_BYTES) throw new Error("Browser automation prompt exceeds the safety limit");
   return rendered;
 }

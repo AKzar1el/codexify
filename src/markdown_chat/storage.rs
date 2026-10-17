@@ -12,6 +12,8 @@ use super::{MAX_UNREAD_BYTES, notification::NotificationEvent};
 
 #[path = "queue.rs"]
 mod queue;
+#[path = "rollout.rs"]
+pub mod rollout;
 #[path = "widget.rs"]
 mod widget;
 pub use queue::{QueueReceipt, QueueSubmission, QueuedMessage};
@@ -455,6 +457,9 @@ impl ChatFile {
             .ok_or("CHAT.md has no parent directory")?;
         private_directory(directory.parent().ok_or("Chat directory has no parent")?)?;
         private_directory(directory)?;
+        if let Err(error) = rollout::ensure(self) {
+            tracing::warn!(%error, "could not initialize this chat's progress file");
+        }
         let has_cursor = self.cursor_path.as_ref().is_some_and(|path| path.exists());
         let mut file = match std::fs::symlink_metadata(&self.path) {
             Ok(_) => open_regular(&self.path, true)?,

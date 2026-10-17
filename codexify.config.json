@@ -16,6 +16,7 @@
     "port": 3120,
     "maxWaitMs": 55000,
     "defaultMessageMode": "steer",
+    "rolloutReminderInterval": 20,
     "notifications": null,
     "automation": {
       "enabled": false,

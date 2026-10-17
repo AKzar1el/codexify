@@ -29,6 +29,7 @@ pub mod markdown_chat_ui;
 pub mod read_file;
 pub mod recall;
 pub mod remember;
+pub mod rollout;
 pub mod self_update;
 pub mod self_update_status;
 pub mod set_project_root;

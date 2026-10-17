@@ -19,6 +19,7 @@ use crate::exec_sessions::SessionState;
 use crate::project_bindings::ConversationIdentity;
 use crate::types::AppConfig;
 
+pub use storage::rollout;
 pub use storage::{
     AGENT_STOP_MESSAGE, AppendReceipt, BrowserAppendReceipt, ChatFile, ChatSnapshot,
     NotificationState, OwnerChatOrganization, OwnerChatSummary, TranscriptCheckpoint,
@@ -164,6 +165,7 @@ pub struct MarkdownChatConfig {
     pub port: Option<u16>,
     pub max_wait_ms: u64,
     pub default_message_mode: MessageMode,
+    pub rollout_reminder_interval: u64,
     pub notifications: Option<NotificationsConfig>,
     pub automation: AgentAutomationConfig,
 }
@@ -175,6 +177,7 @@ impl Default for MarkdownChatConfig {
             port: Some(DEFAULT_OWNER_CHAT_PORT),
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
             default_message_mode: MessageMode::Steer,
+            rollout_reminder_interval: rollout::DEFAULT_REMINDER_INTERVAL,
             notifications: None,
             automation: AgentAutomationConfig::default(),
         }
@@ -268,6 +271,9 @@ impl MarkdownChatConfig {
         }
         if !(1_000..=300_000).contains(&self.max_wait_ms) {
             return Err("agentChat.maxWaitMs must be between 1000 and 300000".into());
+        }
+        if !(1..=10000).contains(&self.rollout_reminder_interval) {
+            return Err("agentChat.rolloutReminderInterval must be between 1 and 10000".into());
         }
         if let Some(notifications) = &self.notifications {
             notifications.validate()?;

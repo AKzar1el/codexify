@@ -12,6 +12,20 @@ use crate::types::AppConfig;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 static EDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub fn rollout_reminder_interval(config: &AppConfig) -> Result<u64, String> {
+    let Some(path) = &config.loaded_config_path else {
+        return Ok(config.markdown_chat.rollout_reminder_interval);
+    };
+    let document: Value = serde_json::from_str(&read_raw(path)?)
+        .map_err(|_| "Cannot read progress report settings")?;
+    let value = document.pointer("/agentChat/rolloutReminderInterval").filter(|v|!v.is_null()).cloned()
+        .unwrap_or_else(||crate::config::settings_defaults(config, &document)["agentChat"]["rolloutReminderInterval"].clone());
+    value
+        .as_u64()
+        .filter(|v| (1..=10000).contains(v))
+        .ok_or_else(|| "Progress report interval must be between 1 and 10000".into())
+}
+
 pub fn default_message_mode(
     config: &AppConfig,
 ) -> Result<crate::markdown_chat::MessageMode, String> {
@@ -132,6 +146,7 @@ pub fn save(
     for value in [&mut previous, &mut next] {
         if let Some(chat) = value.get_mut("agentChat").and_then(Value::as_object_mut) {
             chat.remove("defaultMessageMode");
+            chat.remove("rolloutReminderInterval");
         }
         if value
             .get("agentChat")
@@ -561,5 +576,63 @@ mod tests {
             std::fs::read(config.loaded_config_path.as_ref().unwrap()).unwrap(),
             bytes
         );
+    }
+    #[test]
+    fn progress_interval_is_validated_and_applies_without_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().into());
+        config.loaded_config_path = Some(path.clone());
+        assert_eq!(rollout_reminder_interval(&config).unwrap(), 20);
+        let mut current = snapshot(&config).unwrap();
+        for interval in [1, 50, 10000] {
+            current = save(
+                &config,
+                current["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "agentChat.rolloutReminderInterval".into(),
+                    json!(interval),
+                )])),
+            )
+            .unwrap();
+            assert_eq!(current["restartRequired"], false);
+            assert_eq!(rollout_reminder_interval(&config).unwrap(), interval);
+        }
+        let before = std::fs::read(&path).unwrap();
+        for invalid in [json!(0), json!(10001), json!(-1), json!(1.5), json!("20")] {
+            assert!(
+                save(
+                    &config,
+                    current["revision"].as_str().unwrap(),
+                    None,
+                    Some(Map::from_iter([(
+                        "agentChat.rolloutReminderInterval".into(),
+                        invalid
+                    )]))
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let mut document = current["document"].clone();
+        document["agentChat"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rolloutReminderInterval");
+        let reset = save(
+            &config,
+            current["revision"].as_str().unwrap(),
+            Some(document.to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reset["restartRequired"], false);
+        assert_eq!(rollout_reminder_interval(&config).unwrap(), 20);
     }
 }

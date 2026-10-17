@@ -1390,7 +1390,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
         )
     }
 
-    match prompt {
+    let rendered = match prompt {
         ActionPrompt::CreateChat {
             continuation_token,
             reference,
@@ -1418,7 +1418,11 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
         ActionPrompt::OfflineCombined {
             batch_id, messages, ..
         } => format!("{}\n\n{GOAL_CLAUSE}", unread_clause(batch_id, messages)),
-    }
+    };
+    format!(
+        "{rendered}\n\n{}",
+        crate::markdown_chat::rollout::RESTORE_GUIDANCE
+    )
 }
 
 fn validate_event(

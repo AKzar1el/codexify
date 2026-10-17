@@ -1850,27 +1850,28 @@ pub async fn start(
     start_with_automation(config, chats, artifacts, continuations, None).await
 }
 
-async fn restore_message_queues(state: OwnerState) {
+async fn restore_chat_state(state: OwnerState) {
     let scan = state.clone();
-    let Ok(chats) = tokio::task::spawn_blocking(move || {
-        locate(&scan.config, &scan.project_bindings)
-            .into_iter()
-            .filter(|chat| chat.path.with_file_name("message-queue.json").exists())
-            .collect::<Vec<_>>()
-    })
-    .await
+    let Ok(chats) =
+        tokio::task::spawn_blocking(move || locate(&scan.config, &scan.project_bindings)).await
     else {
         return;
     };
     for located in chats {
-        if state.config.markdown_chat.automation.enabled
+        if located.path.with_file_name("message-queue.json").exists()
+            && state.config.markdown_chat.automation.enabled
             && let Err(error) = automation_context(&state, &located).await
         {
             tracing::warn!(?error, "could not restore queued-message automation");
         }
         // Opening the durable queue resumes its completion/offline monitor without a widget.
-        if let Err(error) = state.chats.chat_at_path(located.path, true) {
-            tracing::warn!(%error, "could not restore private message queue");
+        match state.chats.chat_at_path(located.path, true) {
+            Ok(chat) => {
+                if let Err(error) = chat.ensure_rollout().await {
+                    tracing::warn!(%error, "could not initialize chat progress history");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not restore chat state"),
         }
     }
 }
@@ -1900,7 +1901,7 @@ pub(crate) async fn start_with_automation(
         global: Arc::default(),
         token: info.token,
     };
-    tokio::spawn(restore_message_queues(state.clone()));
+    tokio::spawn(restore_chat_state(state.clone()));
     settings::start(state.clone());
     let app = router(state);
     let task = tokio::spawn(async move {
@@ -4211,6 +4212,13 @@ mod tests {
                 3,
             )
             .unwrap();
+        let legacy_id = ConversationIdentity::from_openai_session("legacy-chat-rollout").unwrap();
+        let legacy = MarkdownChatStore::default()
+            .chat(&config, Some(&legacy_id), &SessionState::new())
+            .unwrap();
+        legacy.ensure().await.unwrap();
+        let legacy_rollout = legacy.path().with_file_name("rollout.md");
+        std::fs::remove_file(&legacy_rollout).unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
         let state = OwnerState {
             project_bindings: Arc::new(crate::project_bindings::ProjectBindingStore::new(
@@ -4232,7 +4240,11 @@ mod tests {
             global: Arc::default(),
             token: "fixture-token".into(),
         };
-        restore_message_queues(state.clone()).await;
+        restore_chat_state(state.clone()).await;
+        assert!(
+            legacy_rollout.exists(),
+            "all legacy chats get a progress file without opening the UI"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let body = std::fs::read_to_string(&path).unwrap();

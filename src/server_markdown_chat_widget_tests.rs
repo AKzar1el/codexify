@@ -758,3 +758,223 @@ async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_rel
     client.cancel().await.unwrap();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_queue() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::default_config(root.path().into());
+    config.markdown_chat.enabled = true;
+    config.markdown_chat.max_wait_ms = 1000;
+    config.memory.dir = Some(root.path().join("metadata").display().to_string());
+    let mut handler = handler_with_tools(
+        root.path(),
+        crate::registry::load_tools_for_config(&config),
+        crate::types::ToolLogLevel::Info,
+    );
+    handler.config = Arc::new(config.clone());
+    let identity = ConversationIdentity::from_openai_session("rollout-dispatch").unwrap();
+    let chat = handler
+        .markdown_chat
+        .chat(&config, Some(&identity), &handler.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    std::fs::write(
+        chat.path().with_file_name("automation.json"),
+        r#"{"goal":{"status":"blocked"}}"#,
+    )
+    .unwrap();
+    chat.queue_user_message(
+        "hidden".into(),
+        "Private queued work must stay hidden".into(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let task = tokio::spawn(async move {
+        handler
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    let request = |name: &str, args: Value| {
+        let mut request = CallToolRequestParams::new(name.to_owned())
+            .with_arguments(args.as_object().unwrap().clone());
+        request.meta =
+            Some(serde_json::from_value(json!({"openai/session":"rollout-dispatch"})).unwrap());
+        request
+    };
+    let field = crate::markdown_chat::rollout::REMINDER_FIELD;
+    for count in 1..=20 {
+        let result = client
+            .call_tool(request("chat_read", json!({})))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let body = result.structured_content.as_ref().unwrap();
+        assert_eq!(body.get(field).is_some(), count == 20);
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("Private queued work")
+        );
+        let ui = client
+            .call_tool(request("chat_ui_state", json!({})))
+            .await
+            .unwrap();
+        assert!(ui.structured_content.as_ref().unwrap().get(field).is_none());
+    }
+    for _ in 0..2 {
+        let wait = client
+            .call_tool(request("chat_await", json!({})))
+            .await
+            .unwrap();
+        assert!(
+            wait.structured_content
+                .as_ref()
+                .unwrap()
+                .get(field)
+                .is_none()
+        );
+    }
+    let saved=client.call_tool(request("rollout_update",json!({"request_id":"checkpoint-1","status":"Working","progress":"Completed verification","next_steps":"Continue the goal once input arrives"}))).await.unwrap();
+    assert_ne!(saved.is_error, Some(true));
+    assert!(
+        saved
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get(field)
+            .is_none()
+    );
+    let read = client
+        .call_tool(request("rollout_read", json!({})))
+        .await
+        .unwrap();
+    assert_ne!(read.is_error, Some(true));
+    assert!(
+        read.structured_content.as_ref().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("Completed verification")
+    );
+    assert!(
+        !serde_json::to_string(&read)
+            .unwrap()
+            .contains("Private queued work")
+    );
+    assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    for index in 1..=19 {
+        let result = client
+            .call_tool(request("chat_read", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get(field)
+                .is_some(),
+            index == 19,
+            "rollout_read is also a model work call"
+        );
+    }
+    let brief = client
+        .call_tool(request("get_agent_brief", json!({})))
+        .await
+        .unwrap();
+    let text = serde_json::to_string(&brief).unwrap();
+    assert!(
+        text.contains("rollout.md")
+            && text.contains("rollout_read")
+            && text.contains("rollout_update")
+    );
+    std::fs::write(chat.path().with_file_name("rollout-state.json"), "{").unwrap();
+    let successful = client
+        .call_tool(request("chat_read", json!({})))
+        .await
+        .unwrap();
+    assert_ne!(successful.is_error, Some(true));
+    assert!(
+        successful.structured_content.as_ref().unwrap()[field]
+            .as_str()
+            .unwrap()
+            .contains("original tool operation")
+    );
+    chat.request_agent_stop("stop-before-checkpoint".into())
+        .await
+        .unwrap();
+    let stopped = client
+        .call_tool(request("chat_read", json!({})))
+        .await
+        .unwrap();
+    assert!(
+        stopped
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get(field)
+            .is_none(),
+        "a checkpoint reminder must not override an explicit stop"
+    );
+    client.cancel().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn rollout_recovery_returns_complete_reports_with_a_small_ordinary_tool_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = crate::config::default_config(root.path().into());
+    config.markdown_chat.enabled = true;
+    config.memory.dir = Some(root.path().join("metadata").display().to_string());
+    config.output.max_tool_output_tokens = Some(20);
+    let mut handler = handler_with_tools(
+        root.path(),
+        crate::registry::load_tools_for_config(&config),
+        crate::types::ToolLogLevel::Info,
+    );
+    handler.config = Arc::new(config.clone());
+    let identity = ConversationIdentity::from_openai_session("rollout-budget").unwrap();
+    let chat = handler
+        .markdown_chat
+        .chat(&config, Some(&identity), &handler.session)
+        .unwrap();
+    chat.append_rollout(
+        "large-report".into(),
+        "Current status".into(),
+        "Verified result. ".repeat(400),
+        "Finish with the exact remaining work".into(),
+    )
+    .await
+    .unwrap();
+    let (server_transport, client_transport) = tokio::io::duplex(128 * 1024);
+    let task = tokio::spawn(async move {
+        handler
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    let mut request =
+        CallToolRequestParams::new("rollout_read").with_arguments(serde_json::Map::new());
+    request.meta =
+        Some(serde_json::from_value(json!({"openai/session":"rollout-budget"})).unwrap());
+    let result = client.call_tool(request).await.unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let body = result.structured_content.as_ref().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(body.matches("Verified result.").count(), 400);
+    assert!(body.contains("Finish with the exact remaining work"));
+    assert!(!body.contains("truncated"));
+    client.cancel().await.unwrap();
+    task.await.unwrap();
+}

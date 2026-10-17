@@ -106,6 +106,7 @@
     "port": 3120,
     "maxWaitMs": 55000,
     "defaultMessageMode": "steer",
+    "rolloutReminderInterval": 20,
     "automation": {
       "enabled": false,
       "descriptorPath": "~/.codexify/browser/descriptor.json",

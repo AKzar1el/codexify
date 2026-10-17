@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdirSync} from 'node:fs';
+import {mkdirSync,readFileSync} from 'node:fs';
 import test from 'node:test';
 import {createRequire} from 'node:module';
 import {ownerHtml} from './owner-chat-source.mjs';
@@ -357,5 +357,36 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   plan={label:'',sourceLabel:'',kind:'unknown'};await page.clock.fastForward(15000);await label.waitFor({state:'hidden'});assert.equal(await label.textContent(),'');assert.equal(await label.getAttribute('title'),'');
   fail=true;await page.reload();
   assert.equal(await label.isVisible(),false);assert.equal(await label.textContent(),'');assert.equal(await page.getByText('Plan unavailable',{exact:true}).count(),0);
+ }finally{await browser.close();}
+});
+
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: progress report interval defaults to twenty and saves without restart`,{timeout:20000},async()=>{
+ const browser=await engine.launch();try{
+  const page=await browser.newPage();page.setDefaultTimeout(5000);
+  const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
+  let document={workDir:'/fixture',agentChat:{enabled:true},codexMcp:{enabled:false}},revision=1;
+  const writes=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
+  const snapshot=()=>({path:'/fixture/config.json',defaults,document,raw:JSON.stringify(document),revision:String(revision),restartRequired:false});
+  await page.route('http://127.0.0.1:43316/**',async route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.0.0',plan:null,settingsAvailable:true,restartAvailable:true,latest:{updateAvailable:false}}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=request.postDataJSON();writes.push([path,body]);
+    if(body.raw)document=JSON.parse(body.raw);else{assert.deepEqual(Object.keys(body.changes),['agentChat.rolloutReminderInterval']);document.agentChat.rolloutReminderInterval=body.changes['agentChat.rolloutReminderInterval'];}
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   if(request.method()!=='GET')writes.push([path,request.postData()]);return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43316/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  const interval=dialog.getByLabel('agentChat.rolloutReminderInterval',{exact:true});await interval.waitFor();assert.equal(await interval.inputValue(),'');assert.equal(await interval.getAttribute('placeholder'),'20 (default)');
+  await interval.fill('50');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.rolloutReminderInterval,50);
+  assert.deepEqual(writes[0][1].changes,{'agentChat.rolloutReminderInterval':50});
+  await interval.fill('');await dialog.getByText('All changes saved.',{exact:true}).waitFor();await page.waitForFunction(()=>document.querySelector('[data-setting="agentChat.rolloutReminderInterval"]').dataset.default==='true');
+  assert.equal(document.agentChat.rolloutReminderInterval,undefined);assert.equal(await interval.getAttribute('placeholder'),'20 (default)');assert.equal(writes.length,2);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });

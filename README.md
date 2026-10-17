@@ -171,6 +171,16 @@ from the main top-level `port` when agent chat is enabled.
 It defaults to `55000` (55 seconds) and accepts values from `1000` to `300000`.
 Existing explicit values remain in effect; omit the setting to use the default.
 
+Every chat also keeps a private `rollout.md` progress journal beside `CHAT.md`.
+Agents read recent progress with `rollout_read` when a turn starts and append
+status, progress and next steps using `rollout_update`. Tool results request a
+checkpoint after **20 agent work calls** by default. Change
+`agentChat.rolloutReminderInterval` in **Settings → Chats & goals → Progress
+report interval**; it applies immediately. UI polling and idle chat waits do not
+count. Recent recovery reads include up to five complete reports, capped at
+64 KiB. At 256 KiB or 50 reports, the active file rotates into a dated archive
+inside `rollouts/`; older history is preserved and recent reads span rotations.
+
 Restart Codexify, refresh the connector's tools in ChatGPT Settings, and start a
 new conversation. `get_agent_brief` reports that conversation's `CHAT.md` path,
 stored with project metadata outside the repository by default. Every

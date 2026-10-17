@@ -162,7 +162,13 @@ async fn attachment_tools_list_search_read_and_isolate_the_current_conversation(
 fn tools_are_opt_in_and_read_wait_have_no_parameters() {
     let (_root, mut config, _session, _context) = fixture();
     let enabled = load_tools_for_config(&config);
-    for name in ["chat_read", "chat_write", "chat_await", "turn_completed"] {
+    for name in [
+        "chat_read",
+        "chat_write",
+        "chat_await",
+        "turn_completed",
+        "rollout_read",
+    ] {
         let tool = enabled.iter().find(|tool| tool.name() == name).unwrap();
         if name != "chat_write" {
             assert_eq!(tool.input_schema()["properties"], json!({}));
@@ -176,7 +182,8 @@ fn tools_are_opt_in_and_read_wait_have_no_parameters() {
     assert!(
         load_tools_for_config(&config)
             .iter()
-            .all(|tool| !tool.name().starts_with("chat_"))
+            .all(|tool| !tool.name().starts_with("chat_")
+                && !["turn_completed", "rollout_read", "rollout_update"].contains(&tool.name()))
     );
 }
 
@@ -505,7 +512,13 @@ fn chat_widget_tools_are_app_only_and_chat_calls_never_link_a_widget() {
         assert_eq!(meta.get("openai/visibility"), Some(&json!("private")));
         assert!(tool.input_schema()["properties"].get("path").is_none());
     }
-    for name in ["chat_read", "chat_write", "chat_await", "turn_completed"] {
+    for name in [
+        "chat_read",
+        "chat_write",
+        "chat_await",
+        "turn_completed",
+        "rollout_read",
+    ] {
         let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
         let meta = serde_json::to_value(tool.meta()).unwrap();
         assert!(meta.get("openai/outputTemplate").is_none());
@@ -1582,4 +1595,70 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[tokio::test]
+async fn rollout_tools_use_only_the_current_chat_and_validate_their_public_schemas() {
+    let (_root, config, session, context) = fixture();
+    let tools = load_tools_for_config(&config);
+    let update = tools.iter().find(|t| t.name() == "rollout_update").unwrap();
+    let read = tools.iter().find(|t| t.name() == "rollout_read").unwrap();
+    let args = json!({"request_id":"checkpoint","status":"Investigating","progress":"Verified the current behavior","next_steps":"Implement and test the fix"});
+    assert!(jsonschema::is_valid(&update.input_schema(), &args));
+    let saved = update
+        .call_with_context(args.clone(), &config, &session, &context)
+        .await;
+    assert!(!saved.is_error);
+    assert!(jsonschema::is_valid(
+        &update.output_schema().unwrap(),
+        saved.structured_content.as_ref().unwrap()
+    ));
+    let retry = update
+        .call_with_context(args, &config, &session, &context)
+        .await;
+    assert_eq!(
+        retry.structured_content.as_ref().unwrap()["already_recorded"],
+        true
+    );
+    let recent = read
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert!(!recent.is_error);
+    assert_eq!(
+        recent.structured_content.as_ref().unwrap()["report_count"],
+        1
+    );
+    assert!(jsonschema::is_valid(
+        &read.output_schema().unwrap(),
+        recent.structured_content.as_ref().unwrap()
+    ));
+    assert!(
+        recent
+            .joined_text()
+            .contains("Verified the current behavior")
+    );
+    let mut other = context.clone();
+    other.task_conversation = ConversationIdentity::from_openai_session("different-rollout");
+    let isolated = read
+        .call_with_context(json!({}), &config, &session, &other)
+        .await;
+    assert_eq!(
+        isolated.structured_content.as_ref().unwrap()["report_count"],
+        0
+    );
+    assert!(
+        !isolated
+            .joined_text()
+            .contains("Verified the current behavior")
+    );
+    assert!(
+        read.call_with_context(
+            json!({"path":"../foreign/rollout.md"}),
+            &config,
+            &session,
+            &context
+        )
+        .await
+        .is_error
+    );
 }

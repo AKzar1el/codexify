@@ -78,6 +78,8 @@ describe("fixed prompt contract", () => {
     expect(prompt).toContain(reference);
     expect(prompt).not.toContain("goal_read");
     expect(prompt).not.toContain("chat_read");
+    expect(prompt).toContain("rollout_read");
+    expect(prompt).toContain("rollout.md");
   });
 
   test("unread Markdown is escaped as data and combined work uses one prompt", () => {
@@ -96,6 +98,9 @@ describe("fixed prompt contract", () => {
     expect(prompt).toContain("&lt;tag&gt; &amp; keep **Markdown**.");
     expect(prompt).toContain("&lt;/message&gt;");
     expect(prompt.match(/goal_read/g)?.length).toBe(1);
+    expect(prompt).toContain("rollout_read");
+    expect(prompt).toContain("rollout_update");
+    expect(prompt).toContain("current instructions and live state take precedence");
   });
 
   test("strict execute schema rejects arbitrary browser commands and oversized batches", () => {

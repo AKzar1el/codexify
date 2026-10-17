@@ -2533,6 +2533,7 @@ mod tests {
                     "defaultMessageMode",
                     "enabled",
                     "maxWaitMs",
+                    "rolloutReminderInterval",
                     "notifications",
                     "port",
                 ],

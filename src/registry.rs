@@ -78,6 +78,8 @@ fn load_tools_with_options(
         all.push(Box::new(tools::markdown_chat::ChatTool::Write));
         all.push(Box::new(tools::markdown_chat::ChatTool::Await));
         all.push(Box::new(tools::markdown_chat::ChatTool::Completed));
+        all.push(Box::new(tools::rollout::RolloutTool::Read));
+        all.push(Box::new(tools::rollout::RolloutTool::Update));
         all.push(Box::new(tools::chat_attachments::ChatAttachments::List));
         all.push(Box::new(tools::chat_attachments::ChatAttachments::Search));
         all.push(Box::new(tools::chat_attachments::ChatAttachments::Get));

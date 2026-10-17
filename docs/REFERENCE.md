@@ -2163,6 +2163,39 @@ final response is forbidden unless the user explicitly authorizes ending the tur
 or a higher-priority instruction requires it. No server-side instruction can
 guarantee that ChatGPT never ends a turn.
 
+### Per-chat progress and recovery
+
+Each chat has a `rollout.md` file next to its `CHAT.md`, including chats created
+before this feature. It belongs to the stable task identity, so continuation
+handoffs preserve progress while separate conversations have separate journals.
+`get_agent_brief` gives its exact path and recovery instructions. Every browser
+wake-up prompt also instructs the agent to read recent progress before task work,
+in addition to the live goal when configured. Setup and pairing still finish
+before task work begins. Reports are historical context; current user instructions
+and live state take precedence.
+
+| Tool | Arguments | Behavior |
+| --- | --- | --- |
+| `rollout_read` | None | Reads up to five most recent complete progress reports, in chronological order, capped at 64 KiB. Reads span dated archives when needed. |
+| `rollout_update` | `request_id`, `status`, `progress`, `next_steps` | Appends a timestamped report. The combined text limit is 16 KiB. A request ID may be retried with identical arguments without duplicating a report, including after rotation. |
+
+`agentChat.rolloutReminderInterval` defaults to **20** and accepts integers from
+1 to 10000. It is editable under **Settings → Chats & goals → Progress report
+interval** and applies without a restart. Agent work calls, including errors,
+count; app-only polling, `chat_await`, `turn_completed`, and pairing verification
+do not. When due, tool results include an optional `rollout_checkpoint_required`
+string instructing the agent to append current status, concrete progress or
+verification, and next steps before more work. A saved report resets the interval;
+unanswered reminders repeat at that interval. The count survives service restarts.
+
+At **256 KiB or 50 reports**, the active file rotates into
+`rollouts/rollout-<UTC timestamp>-<content hash>.md`. Rotation publishes the archive
+before replacing the active file and retains all archived history. Recovery reads
+are bounded and never cut a report in half. Corrupt or incomplete progress files
+are preserved and reported explicitly; they do not undo successful tool operations
+or prevent ordinary chat messages from being delivered. Progress tools do not
+change goal state, complete turns, acknowledge chat input, or expose queued work.
+
 ### Private message queue
 
 `agentChat.defaultMessageMode` accepts `steer` (default) or `queue`. It is editable

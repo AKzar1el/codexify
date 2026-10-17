@@ -211,6 +211,18 @@ impl CodexHandler {
         {
             tracing::warn!(%error, "could not record queued-message turn progress");
         }
+        if !matches!(
+            tool_name,
+            "chat_await" | "turn_completed" | "automation_verify_pairing"
+        ) && let Some(root) = self.selected_project_root(task_conversation)
+            && let Ok(config) = self.effective_task_config(task_conversation, root)
+            && let Ok(chat) = self
+                .markdown_chat
+                .chat(&config, task_conversation, &self.session)
+            && let Err(error) = chat.record_rollout_work().await
+        {
+            tracing::warn!(%error, "could not record progress-report work count");
+        }
         Some(activity)
     }
 
@@ -463,6 +475,12 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
             crate::markdown_chat::USER_MESSAGE_FIELD,
             crate::markdown_chat::output::USER_MESSAGE_DESCRIPTION,
         ));
+        if !app_only_tool(tool) {
+            fields.push((
+                crate::markdown_chat::rollout::REMINDER_FIELD,
+                crate::markdown_chat::rollout::REMINDER_DESCRIPTION,
+            ));
+        }
     }
     if config.multi_project && !app_only_tool(tool) {
         fields.push((WORKSPACE_CHANGE_FIELD, WORKSPACE_CHANGE_DESCRIPTION));
@@ -1552,6 +1570,33 @@ impl ServerHandler for CodexHandler {
                 crate::markdown_chat::USER_MESSAGE_FIELD,
                 result.new_chat_message_from_user.take(),
             ));
+            if agent_call
+                && !context.ct.is_cancelled()
+                && self
+                    .conversation_auth_error("chat_read", conversation.as_ref())
+                    .is_none()
+                && let Some(root) = self.selected_project_root(task_conversation.as_ref())
+                && let Ok(config) = self.effective_task_config(task_conversation.as_ref(), root)
+                && let Ok(chat) =
+                    self.markdown_chat
+                        .chat(&config, task_conversation.as_ref(), &self.session)
+            {
+                let notice = if chat.agent_stop_requested().await.unwrap_or(true) {
+                    Ok(None)
+                } else {
+                    match crate::global_settings::rollout_reminder_interval(&config) {
+                        Ok(interval) => chat.rollout_reminder(interval).await,
+                        Err(error) => Err(error),
+                    }
+                };
+                let notice = match notice {
+                    Ok(notice) => notice,
+                    Err(error) => Some(format!(
+                        "Progress checkpoint storage is unavailable: {error}. Existing reports are preserved. The original tool operation above is unchanged; do not repeat it to repair progress storage."
+                    )),
+                };
+                output_fields.push((crate::markdown_chat::rollout::REMINDER_FIELD, notice));
+            }
         }
         if !context.ct.is_cancelled()
             && let Some((chat, end)) = delivery
