@@ -909,6 +909,7 @@ async fn chat_state(
     page["queued_messages"] =
         serde_json::to_value(chat.queued_messages().await.map_err(internal_error)?)
             .expect("queued messages");
+    page["input_required"] = json!(chat.queue_input_required().await.map_err(internal_error)?);
     page["default_message_mode"] =
         json!(crate::global_settings::default_message_mode(&state.config).map_err(internal_error)?);
     Ok(wrap(page))
@@ -1569,8 +1570,18 @@ async fn chat_send(
         OwnerMessage::Chat(message) => {
             let mode = match body.message_mode {
                 Some(mode) => mode,
-                None => crate::global_settings::default_message_mode(&state.config)
-                    .map_err(internal_error)?,
+                None => {
+                    let chat = state
+                        .chats
+                        .chat_at_path(located.path.clone(), true)
+                        .map_err(internal_error)?;
+                    if chat.queue_input_required().await.map_err(internal_error)? {
+                        crate::markdown_chat::MessageMode::Steer
+                    } else {
+                        crate::global_settings::default_message_mode(&state.config)
+                            .map_err(internal_error)?
+                    }
+                }
             };
             if mode == crate::markdown_chat::MessageMode::Queue {
                 let chat = state
@@ -2542,6 +2553,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(temp.path().into());
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Queue;
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-api-test").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
@@ -2549,6 +2561,7 @@ mod tests {
             .chat(&config, Some(&identity), &SessionState::new())
             .unwrap();
         chat.ensure().await.unwrap();
+        chat.queue_agent_work(false).await.unwrap();
         let artifacts = Arc::new(ArtifactEgressStore::new_at(
             config.artifact_egress.clone(),
             temp.path().join("artifacts"),
@@ -2667,6 +2680,16 @@ mod tests {
         assert_eq!(list["chats"].as_array().unwrap().len(), 1);
         let id = list["chats"][0]["id"].as_str().unwrap();
         assert_eq!(list["chats"][0]["title"], "Untitled conversation");
+        let waiting: Value = client
+            .get(format!("{base}/api/chats/{id}"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(waiting["_meta"][CHAT_WIDGET_META]["input_required"], true);
         let sent: Value = client
             .post(format!("{base}/api/chats/{id}/send"))
             .bearer_auth("test-token")
@@ -2681,6 +2704,11 @@ mod tests {
         assert_eq!(
             sent["_meta"][CHAT_WIDGET_META]["sent"]["tool_call_count"],
             0
+        );
+        assert!(!chat.queue_input_required().await.unwrap());
+        assert!(
+            chat.queued_messages().await.unwrap().is_empty(),
+            "an answer must send even when Queue is the configured default"
         );
         let same_chat = chat.read(false).await.unwrap();
         assert!(same_chat.text.contains("Check the build"));
@@ -2923,7 +2951,7 @@ mod tests {
         assert!(!failed_send.status().is_success());
         assert!(chat.owner_summary().await.unwrap().archived_at_ms.is_some());
         let restored: Value = client.post(format!("{base}/api/chats/{id}/send"))
-            .bearer_auth("test-token").json(&json!({"request_id":"restore-with-message","message":"Continue this conversation"})).send().await.unwrap().json().await.unwrap();
+            .bearer_auth("test-token").json(&json!({"request_id":"restore-with-message","message":"Continue this conversation","message_mode":"steer"})).send().await.unwrap().json().await.unwrap();
         assert!(restored["_meta"][CHAT_WIDGET_META]["organization"]["archivedAtMs"].is_null());
         assert!(chat.owner_summary().await.unwrap().archived_at_ms.is_none());
         assert!(chat.owner_summary().await.unwrap().pinned_at_ms.is_none());

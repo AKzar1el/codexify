@@ -259,6 +259,8 @@ With UI widgets enabled, `setup` opens one persistent chat panel beneath the
 setup controls. Chat tools update it without opening more cards. Send with the
 arrow button or Return; Shift+Return inserts a newline. In **Settings → Chats & goals**,
 `agentChat.defaultMessageMode` selects **Steer** (the default) or **Queue**.
+When the agent needs your answer, Return and the send button deliver it immediately
+even if Queue is configured. The saved preference returns after your reply.
 **Cmd+Return** on macOS, or **Ctrl+Return** on Windows/Linux, uses the other mode
 for that message only. Queued messages appear above the composer with **Steer**,
 **Trash**, and **Edit** controls. Steering sends immediately ahead of the queue.

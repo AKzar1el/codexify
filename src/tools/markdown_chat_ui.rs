@@ -290,8 +290,12 @@ impl Tool for ChatUiTool {
                 }
                 let mode = match message_mode {
                     Some(mode) => mode,
-                    None => match crate::global_settings::default_message_mode(config) {
-                        Ok(mode) => mode,
+                    None => match chat.queue_input_required().await {
+                        Ok(true) => crate::markdown_chat::MessageMode::Steer,
+                        Ok(false) => match crate::global_settings::default_message_mode(config) {
+                            Ok(mode) => mode,
+                            Err(error) => return ToolResult::error(error),
+                        },
                         Err(error) => return ToolResult::error(error),
                     },
                 };
@@ -382,6 +386,10 @@ impl Tool for ChatUiTool {
                                 Ok(mode) => json!(mode),
                                 Err(error) => return ToolResult::error(error),
                             };
+                        page["input_required"] = match chat.queue_input_required().await {
+                            Ok(required) => json!(required),
+                            Err(error) => return ToolResult::error(error),
+                        };
                         page["workspace_path"] = json!(config.work_dir);
                         page["retired"] = json!(context.conversation_retired);
                         private_result(page)

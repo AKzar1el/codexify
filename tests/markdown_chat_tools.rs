@@ -1521,6 +1521,129 @@ async fn queued_widget_input_is_private_until_turn_completed_and_not_chat_await(
 }
 
 #[tokio::test]
+async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_directly() {
+    for blocked_goal in [false, true] {
+        let (_root, mut config, session, context) = fixture();
+        config.markdown_chat.default_message_mode = codexify::markdown_chat::MessageMode::Queue;
+        let chat = context
+            .markdown_chat
+            .chat(&config, context.task_conversation.as_ref(), &session)
+            .unwrap();
+        chat.ensure().await.unwrap();
+        chat.record_agent_call(now_ms()).await.unwrap();
+        if blocked_goal {
+            std::fs::write(
+                chat.path().with_file_name("automation.json"),
+                json!({"goal":{"status":"blocked"}}).to_string(),
+            )
+            .unwrap();
+        }
+        for id in ["first", "second"] {
+            chat.queue_user_message(id.into(), format!("private {id}"), vec![])
+                .await
+                .unwrap();
+        }
+        let tools = load_tools_for_config(&config);
+        let find = |name: &str| tools.iter().find(|t| t.name() == name).unwrap();
+        let question = find("chat_write")
+            .call_with_context(
+                json!({"message":"Does the app freeze?","event":"input_required"}),
+                &config,
+                &session,
+                &context,
+            )
+            .await;
+        assert!(!question.is_error);
+        assert_eq!(
+            question.structured_content.as_ref().unwrap()["required_next_action"],
+            "chat_await"
+        );
+        assert!(chat.queue_input_required().await.unwrap());
+        assert!(
+            chat.release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .is_none(),
+            "a question blocks queued tasks even before chat_await and after presence expires"
+        );
+        let reopened = MarkdownChatStore::default()
+            .chat(&config, context.task_conversation.as_ref(), &session)
+            .unwrap();
+        assert!(
+            reopened.queue_input_required().await.unwrap(),
+            "the input request survives a restart"
+        );
+        let state = find("chat_ui_state")
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert_eq!(
+            state
+                .meta
+                .as_ref()
+                .unwrap()
+                .get(codexify::markdown_chat_ui::CHAT_WIDGET_META)
+                .unwrap()["input_required"],
+            true
+        );
+        let waiting = find("chat_await")
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert_eq!(
+            waiting.structured_content.as_ref().unwrap()["required_next_action"],
+            "chat_await"
+        );
+        assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
+        let answer = find("chat_ui_send")
+            .call_with_context(
+                json!({"request_id":"answer","message":"Freezes too"}),
+                &config,
+                &session,
+                &context,
+            )
+            .await;
+        assert!(!answer.is_error);
+        assert!(!chat.queue_input_required().await.unwrap());
+        assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
+        let read = find("chat_read")
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        let text = read.new_chat_message_from_user.unwrap();
+        assert!(text.contains("Freezes too"));
+        assert!(!text.contains("private first"));
+        if blocked_goal {
+            let complete = find("turn_completed")
+                .call_with_context(json!({}), &config, &session, &context)
+                .await;
+            assert!(complete.is_error);
+            assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
+            std::fs::write(
+                chat.path().with_file_name("automation.json"),
+                json!({"goal":{"status":"completed"}}).to_string(),
+            )
+            .unwrap();
+        }
+        let complete = find("turn_completed")
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert!(
+            complete
+                .new_chat_message_from_user
+                .unwrap()
+                .contains("private first")
+        );
+        assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+        let repeated = find("turn_completed")
+            .call_with_context(json!({}), &config, &session, &context)
+            .await;
+        assert_eq!(
+            repeated.structured_content.as_ref().unwrap()["required_next_action"],
+            "chat_write"
+        );
+        assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn completed_waits_repeatedly_when_empty_and_unfinished_goals_hold_input() {
     let (_root, config, session, context) = fixture();
     let tools = load_tools_for_config(&config);
@@ -1548,6 +1671,33 @@ async fn completed_waits_repeatedly_when_empty_and_unfinished_goals_hold_input()
                 .is_none()
         );
     }
+    let finished = tools
+        .iter()
+        .find(|t| t.name() == "chat_write")
+        .unwrap()
+        .call_with_context(
+            json!({"message":"The task is complete","event":"completed"}),
+            &config,
+            &session,
+            &context,
+        )
+        .await;
+    assert_eq!(
+        finished.structured_content.as_ref().unwrap()["required_next_action"],
+        "turn_completed"
+    );
+    // An explicit input wait must not be reinterpreted from an earlier completion.
+    let needed = tools
+        .iter()
+        .find(|t| t.name() == "chat_await")
+        .unwrap()
+        .call_with_context(json!({}), &config, &session, &context)
+        .await;
+    assert_eq!(
+        needed.structured_content.as_ref().unwrap()["required_next_action"],
+        "chat_await"
+    );
+    assert!(chat.queue_input_required().await.unwrap());
     std::fs::write(
         chat.path().with_file_name("automation.json"),
         json!({"goal":{"status":"blocked"}}).to_string(),

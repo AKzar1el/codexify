@@ -2203,7 +2203,11 @@ change goal state, complete turns, acknowledge chat input, or expose queued work
 `agentChat.defaultMessageMode` accepts `steer` (default) or `queue`. It is editable
 in global settings and applies immediately. Return/the send button uses that
 mode; Cmd+Return on macOS and Ctrl+Return on Windows/Linux uses the other mode
-for one message. Shift+Return inserts a newline.
+for one message. While the agent needs your answer, the composer temporarily
+uses Steer so Return and the send button deliver your reply immediately, even
+when Queue is configured. The modifier shortcut can explicitly queue a separate
+task during that wait. The saved preference is restored after the reply.
+Shift+Return inserts a newline.
 
 Queued messages are stored separately from CHAT.md. Their text and attachments
 are absent from native tool results, agent attachment listings, browser prompts,
@@ -2213,7 +2217,10 @@ place, and Trash removes it. These actions leave other queued messages intact.
 
 Only one oldest message is released per completed request. `turn_completed`
 releases it and waits repeatedly when no request is queued. `chat_await` asks for
-input on unfinished work and holds the queue. The offline fallback releases one
+input on unfinished work and holds the queue, including after its wait times out.
+`chat_write` with `event: "input_required"` starts this hold immediately and
+directs the agent to `chat_await`; `event: "completed"` directs `turn_completed`
+when the request is finished. The offline fallback releases one
 message after five minutes without tool activity. A stopped agent and any goal
 whose status is not completed hold the queue, even when the goal is blocked.
 Goal completion releases one eligible message. Steering takes priority over

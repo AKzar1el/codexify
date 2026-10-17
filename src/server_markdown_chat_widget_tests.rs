@@ -160,11 +160,22 @@ async fn markdown_chat_widget_send_poll_and_agent_delivery_are_separate() {
     let (wait, send) = tokio::join!(
         client.call_tool(request("chat_await", json!({}), "widget-owner")),
         async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let during = client
-                .call_tool(request("chat_ui_state", json!({}), "widget-owner"))
-                .await
-                .unwrap();
+            let during = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let state = client
+                        .call_tool(request("chat_ui_state", json!({}), "widget-owner"))
+                        .await
+                        .unwrap();
+                    if payload(&state)["input_required"] == true
+                        && payload(&state)["agent_waiting_until_ms"].is_u64()
+                    {
+                        break state;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
             let started = payload(&during)["last_agent_call_at_ms"].as_u64().unwrap();
             assert_eq!(payload(&during)["total_tool_calls"], 3);
             assert!(payload(&during)["agent_waiting_until_ms"].as_u64().unwrap() > started);

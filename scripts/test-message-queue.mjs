@@ -8,17 +8,17 @@ const META='io.github.devnoname120/codexify/markdown-chat';
 const id='a'.repeat(64),base='http://127.0.0.1:43314';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(predicate){for(let i=0;i<100;i++){if(await predicate())return;await pause(40);}assert.fail('Expected state did not arrive');}
-async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[]}={}){
+async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[],inputRequired=false,waiting=false}={}){
  const context=await browser.newContext({viewport:{width,height:900}});
  await context.addInitScript(platform=>Object.defineProperty(navigator,'platform',{value:platform}),platform);
  const page=await context.newPage();page.setDefaultTimeout(6000);
  const errors=[],calls=[],messages=[{id:'agent-progress',role:'agent',markdown:'The current request is still running.',start:0,end:100,created_at_ms:Date.now(),tool_call_count:1}];
  page.on('pageerror',error=>errors.push(error.message));
- const backend={queue:queued.map((markdown,i)=>({id:`queue-${i}`,revision:1,markdown,attachment_ids:[],attachments:[],created_at_ms:Date.now()+i})),mode,revision:1,settingsRevision:1,end:100,failAfterQueue:false,pollDelay:null};
+ const backend={queue:queued.map((markdown,i)=>({id:`queue-${i}`,revision:1,markdown,attachment_ids:[],attachments:[],created_at_ms:Date.now()+i})),mode,inputRequired,waiting,readThrough:0,revision:1,settingsRevision:1,end:100,failAfterQueue:false,pollDelay:null};
  const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
  const document={workDir:'/fixture',agentChat:{enabled:true,defaultMessageMode:mode},codexMcp:{enabled:false}};
  const settings=()=>({path:'/fixture/settings.json',defaults,document,raw:JSON.stringify(document),revision:String(backend.settingsRevision),restartRequired:false});
- const state=()=>({_meta:{[META]:{chat_file:'/fixture/chats/CHAT.md',workspace_path:'/fixture',revision:String(backend.revision),messages:[...messages],delivered_through:0,read_through:0,total_tool_calls:1,last_agent_call_at_ms:Date.now(),server_time_ms:Date.now(),has_more:false,unchanged:false,queued_messages:structuredClone(backend.queue),default_message_mode:backend.mode}}});
+ const state=()=>({_meta:{[META]:{chat_file:'/fixture/chats/CHAT.md',workspace_path:'/fixture',revision:String(backend.revision),messages:[...messages],delivered_through:0,read_through:backend.readThrough,input_required:backend.inputRequired,agent_waiting_until_ms:backend.waiting?Date.now()+300000:null,total_tool_calls:1,last_agent_call_at_ms:Date.now(),server_time_ms:Date.now(),has_more:false,unchanged:false,queued_messages:structuredClone(backend.queue),default_message_mode:backend.mode}}});
  const append=(entry)=>{const msg={...entry,role:'user',start:backend.end,end:backend.end+100,tool_call_count:1};backend.end=msg.end;messages.push(msg);backend.revision++;return msg;};
  const receipt=(entry)=>({id:entry.id,end:entry.end,created_at_ms:entry.created_at_ms,tool_call_count:entry.tool_call_count});
  await routeOwner(page, `${base}/**`,async route=>{
@@ -42,7 +42,7 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
     if(backend.failAfterQueue){backend.failAfterQueue=false;return route.fulfill({status:503,body:'Connection lost after private save'});}
     return route.fulfill({json:{_meta:{[META]:{queue_receipt:{queued:entry,sent:null,discarded:false},queued_messages:backend.queue}}}});
    }
-   const sent=append({id:body.request_id,markdown:body.message,created_at_ms:Date.now()});return route.fulfill({json:{_meta:{[META]:{sent:receipt(sent)}}}});
+   backend.inputRequired=false;backend.waiting=false;const sent=append({id:body.request_id,markdown:body.message,created_at_ms:Date.now()});backend.readThrough=sent.end;return route.fulfill({json:{_meta:{[META]:{sent:receipt(sent)}}}});
   }
   if(path===`/api/chats/${id}/queue`){
    const body=request.postDataJSON();calls.push({path,body});const entry=backend.queue.find(e=>e.id===body.id);
@@ -92,6 +92,20 @@ for(const[engineName,engine]of[['Chromium',chromium],['WebKit',webkit]]){
     await send('Override to steer',`${modifier}+Enter`);await until(()=>f.messages.length===4);assert.equal(calls.at(-1).body.message_mode,'steer');assert.equal(backend.queue.length,1);
     await send('Still queue by default');await until(()=>backend.queue.length===2);assert.equal(calls.at(-1).body.message_mode,'queue');
     await input.fill('A multiline draft');await input.press('Shift+Enter');await input.type('Second line');assert.equal(await input.inputValue(),'A multiline draft\nSecond line');
+    assert.deepEqual(errors,[]);await f.context.close();
+   }
+  }finally{await browser.close();}
+ });
+ test(`${engineName}: answers bypass the queue preference while explicit queued tasks remain private`,{timeout:45000},async()=>{
+  const browser=await engine.launch();try{
+   for(const platform of ['MacIntel','Win32']){
+    const f=await fixture(browser,{platform,width:390,mode:'queue',inputRequired:true,waiting:true,queued:['Separate next task']});const{host,backend,calls,errors}=f,input=host.locator('#draft'),send=host.locator('#send'),modifier=platform==='MacIntel'?'Meta':'Control';
+    await input.fill('Freezes too');assert.equal(await send.getAttribute('aria-label'),'Send message');await input.press('Enter');
+    await until(()=>f.messages.length===2);assert.equal(calls.at(-1).body.message_mode,'steer');assert.deepEqual(backend.queue.map(m=>m.markdown),['Separate next task']);assert.equal(backend.mode,'queue');
+    await until(()=>input.isEnabled());await input.fill('A future task');await until(async()=>await send.getAttribute('data-message-mode')==='queue');await input.press('Enter');await until(()=>backend.queue.length===2);
+    // The durable input request still applies between waits or when presence expires.
+    backend.inputRequired=true;await input.fill('Another future task');await until(async()=>await send.getAttribute('data-message-mode')==='steer');await input.press(`${modifier}+Enter`);await until(()=>backend.queue.length===3);assert.equal(f.messages.length,2);
+    await until(()=>input.isEnabled());await input.fill('Answer from the send button');await send.click();await until(()=>f.messages.length===3);assert.equal(calls.at(-1).body.message_mode,'steer');assert.equal(backend.queue.length,3);assert.equal(backend.mode,'queue');
     assert.deepEqual(errors,[]);await f.context.close();
    }
   }finally{await browser.close();}

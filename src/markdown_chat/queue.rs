@@ -288,21 +288,13 @@ pub(super) fn append_steering(
 }
 
 impl ChatFile {
+    pub async fn queue_input_required(self: &Arc<Self>) -> Result<bool, String> {
+        self.run(|chat| with_queue(chat, false, |state| Ok(state.input_waiting)))
+            .await
+    }
     pub async fn queue_goal_holds(self: &Arc<Self>) -> Result<bool, String> {
         self.run(|chat| with_queue(chat, true, |_| goal_holds_queue(chat)))
             .await
-    }
-    pub async fn queue_completion_hint(self: &Arc<Self>) -> Result<bool, String> {
-        self.run(|chat| {
-            with_queue(chat, false, |state| {
-                chat.with_cursor(|cursor, _| {
-                    Ok(state.completed_waiting
-                        || cursor.last_message_event
-                            == crate::markdown_chat::notification::NotificationEvent::Completed)
-                })
-            })
-        })
-        .await
     }
     pub async fn queue_user_message(
         self: &Arc<Self>,

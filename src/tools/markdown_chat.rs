@@ -200,7 +200,7 @@ impl Tool for ChatTool {
 
     fn input_schema(&self) -> Value {
         if matches!(self, Self::Write) {
-            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."},"event":{"type":"string","enum":["message","completed","input_required"],"default":"message","description":"Use completed for a finished chat request, input_required for a question that needs the user's reply, and message for progress or ordinary messages. Notification filters use this explicit event. This does not change turn termination or goal status; use goal_finish for a goal."}}, "required":["message"], "additionalProperties":false})
+            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."},"event":{"type":"string","enum":["message","completed","input_required"],"default":"message","description":"Use completed for a finished chat request, input_required for a question that needs the user's reply, and message for progress or ordinary messages. input_required holds queued tasks and makes the next user message a direct reply. completed makes one queued task eligible when no goal holds it. After input_required call chat_await; after completed call turn_completed. Neither event ends the assistant turn or changes goal status; use goal_finish for a goal."}}, "required":["message"], "additionalProperties":false})
         } else {
             empty_object_schema()
         }
@@ -321,14 +321,6 @@ impl Tool for ChatTool {
                 NEXT_CONTINUE_OR_COMPLETED,
             );
         }
-        let completion_hint = if matches!(self, Self::Await) {
-            match chat.queue_completion_hint().await {
-                Ok(value) => value,
-                Err(error) => return ToolResult::error(error),
-            }
-        } else {
-            false
-        };
         if matches!(self, Self::Completed) {
             match chat.queue_goal_holds().await {
                 Ok(true) => {
@@ -360,11 +352,24 @@ impl Tool for ChatTool {
                 Ok(receipt) => receipt,
                 Err(error) => return ToolResult::error(error),
             };
+            let mut next_action = NEXT_CONTINUE_OR_COMPLETED;
+            if event == notification::NotificationEvent::InputRequired
+                && receipt.user_text.is_empty()
+            {
+                // A question holds the queue before the following chat_await is called.
+                if let Err(error) = chat.queue_agent_work(false).await {
+                    return ToolResult::error(format!(
+                        "The message was appended, but its input-wait state could not be saved: {error}. Do not append it again."
+                    ));
+                }
+                next_action = NEXT_CHAT_AWAIT;
+            }
             let mut returned_end = receipt.end_offset;
             let mut sent_before_write = true;
             if event == notification::NotificationEvent::Completed && receipt.user_text.is_empty() {
                 let next = async {
                     if !chat.queue_goal_holds().await? && chat.queue_turn_completed().await? {
+                        next_action = NEXT_TURN_COMPLETED;
                         chat.release_queued_message(crate::markdown_chat::now_ms())
                             .await?;
                         let snapshot = chat.read(true).await?;
@@ -428,13 +433,7 @@ impl Tool for ChatTool {
                 content.push_str(&format!(" The append succeeded, but cursor/notification persistence failed: {warning}. Do not send the same message again merely to retry persistence."));
             }
             return with_message(
-                result(
-                    "written",
-                    content,
-                    chat.path(),
-                    state,
-                    NEXT_CONTINUE_OR_COMPLETED,
-                ),
+                result("written", content, chat.path(), state, next_action),
                 receipt.user_text,
                 sent_before_write,
                 returned_end,
@@ -509,10 +508,10 @@ impl Tool for ChatTool {
                 ),
                 Ok(WaitOutcome::TimedOut(state)) => result(
                     "timeout",
-                    if matches!(self, Self::Completed) || completion_hint { KEEP_COMPLETED_WAITING.into() } else { format!("The user has not replied yet. {} {KEEP_WAITING}",notification::description(state)) },
+                    if matches!(self, Self::Completed) { KEEP_COMPLETED_WAITING.into() } else { format!("The user has not replied yet. {} {KEEP_WAITING}",notification::description(state)) },
                     chat.path(),
                     state,
-                    if matches!(self, Self::Completed) || completion_hint { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
+                    if matches!(self, Self::Completed) { NEXT_TURN_COMPLETED } else { NEXT_CHAT_AWAIT },
                 ),
                 Ok(WaitOutcome::Cancelled) => result(
                     "cancelled",

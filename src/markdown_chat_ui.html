@@ -189,7 +189,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let revision = null, before = null, hasMore = false, delivered = 0, readThrough = 0, chatFile = null, failures = 0, snapshotEnd = 0;
   let lastAgentCall = null, totalToolCalls = null, clockOffset = 0, presenceTimer = null;
   let waitingForPresenceRefresh = false;
-  let agentWaitingUntil = null, agentPresenceUntil = null, waitingReplyEnd = 0;
+  let agentWaitingUntil = null, agentPresenceUntil = null, waitingReplyEnd = 0, inputRequired = false;
   let agentStopped = false, stopping = false, stopRequestId = null;
   let messageClockTimer = null;
   let hostCapabilities = {};
@@ -233,8 +233,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     return svg;
   }
   function queueSymbol(paths, className = "") { const mark = icon(paths,className); mark.setAttribute("viewBox","0 0 24 24"); return mark; }
+  function composerMessageMode() {
+    return inputRequired || Number.isSafeInteger(agentWaitingUntil) && Date.now() + clockOffset < agentWaitingUntil ? "steer" : defaultMessageMode;
+  }
   function messageHint() {
-    return defaultMessageMode === "queue" ? `Enter to queue. ${modifierLabel}+Enter to steer. Shift + Enter for a new line.` : `Enter to send. ${modifierLabel}+Enter to queue. Shift + Enter for a new line.`;
+    return composerMessageMode() === "queue" ? `Enter to queue. ${modifierLabel}+Enter to steer. Shift + Enter for a new line.` : `Enter to send. ${modifierLabel}+Enter to queue. Shift + Enter for a new line.`;
   }
   function changeMessageMode(mode) {
     if (!["steer","queue"].includes(mode)) return;
@@ -405,7 +408,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       send.replaceChildren(svg); send.dataset.mode = mode;
       send.setAttribute("aria-label", label); send.title = label;
     }
-    if(mode==="send") {const label=defaultMessageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=`${label}. ${modifierLabel}+Enter uses the other mode for this message.`;send.dataset.messageMode=defaultMessageMode;}
+    if(mode==="send") {const messageMode=composerMessageMode(),label=messageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=`${label}. ${modifierLabel}+Enter uses the other mode for this message.`;send.dataset.messageMode=messageMode;}
     send.disabled = !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
     attachments?.update();
     list.scrollTop = atBottom ? list.scrollHeight : historyTop;
@@ -710,6 +713,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       lastAgentCall = Number.isSafeInteger(page.last_agent_call_at_ms) ? page.last_agent_call_at_ms : null;
       agentStopped = page.agent_stop_requested === true;
       agentPresenceUntil = Number.isSafeInteger(page.agent_presence_until_ms) ? page.agent_presence_until_ms : null;
+      inputRequired = page.input_required === true && page.read_through >= waitingReplyEnd;
       agentWaitingUntil = Number.isSafeInteger(page.agent_waiting_until_ms) && page.read_through >= waitingReplyEnd ? page.agent_waiting_until_ms : null;
       if (!Number.isSafeInteger(page.total_tool_calls) || page.total_tool_calls < 0) throw new Error("Invalid tool-call count from connector.");
       totalToolCalls = page.total_tool_calls;
@@ -784,7 +788,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     refreshing = false; sending = false; stopping = false; agentStopped = false; stopRequestId = null; loadingOlder = false;
     chatFile = null; revision = null; before = null; hasMore = false; failures = 0; snapshotEnd = 0;
     delivered = 0; readThrough = 0; lastAgentCall = null; totalToolCalls = null; clockOffset = 0;
-    agentWaitingUntil = null; agentPresenceUntil = null; waitingReplyEnd = 0; pageRetired = false;
+    agentWaitingUntil = null; agentPresenceUntil = null; waitingReplyEnd = 0; inputRequired = false; pageRetired = false;
     records.clear(); queuedMessages=[];queueEdit=null;queueVersion++;renderQueue();
     for (const node of nodes.values()) node.remove();
     for (const node of markerNodes.values()) node.remove();
@@ -835,7 +839,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       waitingForPresenceRefresh = false;
       if (payload.sent.end > readThrough) {
         waitingReplyEnd = Math.max(waitingReplyEnd, payload.sent.end);
-        agentWaitingUntil = null;
+        agentWaitingUntil = null; inputRequired = false;
         updatePresence();
       }
       if (!records.has(message.id)) records.set(message.id, { ...message, pending:false, failed:false, start:payload.sent.end - 1, end:payload.sent.end, created_at_ms:payload.sent.created_at_ms, tool_call_count:payload.sent.tool_call_count ?? null });
@@ -876,11 +880,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     event.preventDefault();
     if (!available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
     if (attachments?.blocked()) {status("Wait for uploads to finish, or remove failed attachments.",true,"action",false);return;}
-    const message = { id:crypto.randomUUID(), role:"user", message_mode:submitMode||defaultMessageMode, markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
+    const message = { id:crypto.randomUUID(), role:"user", message_mode:submitMode||composerMessageMode(), markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
     input.value = ""; resizeInput(); void deliver(message); input.focus(); list.scrollTop = list.scrollHeight;
   });
   input.addEventListener("keydown", event => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); submitMode=event[primaryModifier]?(defaultMessageMode==="steer"?"queue":"steer"):defaultMessageMode;el("composer").requestSubmit();submitMode=null; }
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); const mode=composerMessageMode();submitMode=event[primaryModifier]?(mode==="steer"?"queue":"steer"):mode;el("composer").requestSubmit();submitMode=null; }
   });
   input.addEventListener("input", () => { resizeInput(); clearTimeout(saveTimer); saveTimer = setTimeout(save, 150); });
   older.addEventListener("click", async () => {
