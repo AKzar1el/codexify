@@ -219,6 +219,13 @@ without message content or conversation URLs. Failed collection or reads remain
 silent and never block automation. Writes are buffered; a crash can lose the last
 few seconds of best-effort counters.
 
+Use **Share** in Analytics to preview a compact card for the selected period,
+then **Copy image** or **Download PNG**. The 1200 × 675 card includes turns, work
+tool calls, completed goals, an activity strip, and `codexify.dev` branding.
+Images are generated entirely in the browser, with no upload, hosting, public
+link, conversation names or project paths. PNG download remains available when
+image clipboard access is unsupported or denied.
+
 **Model cutoff estimates** appear in **Settings → Chats & goals**. Passive local
 collection runs while Turn renewal is off, grouping inferred unfinished stops by
 the actual model and effort (including fallback). Durations run from the confirmed

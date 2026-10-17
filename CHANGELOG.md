@@ -8,6 +8,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — planned for 2.1
 
+- Analytics share cards with a local preview, PNG download and copy-image action.
+  Cards contain aggregate totals and Codexify branding; no images are uploaded
+  or made publicly accessible.
+
 - A local Analytics dashboard in global settings with daily stacked model/effort
   charts for turns, estimated active time and native tool calls; date ranges,
   lifetime totals, conversation leaderboards, goal completions and milestones.

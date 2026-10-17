@@ -252,7 +252,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     const request=++cutoffRequest;
     try {const response=await api('/api/analytics/turn-cutoffs');if(!response.ok)return;const data=await response.json();if(request!==cutoffRequest)return;cutoffEstimates=data;const card=byId('cutoff-estimates');if(card)card.replaceWith(cutoffCard());}catch{/* Optional analytics must never affect settings or display errors. */}
   }
-  const usageDashboard=createUsageAnalytics({api,getChats,onOpenChat:id=>{dialog.close();onOpenChat(id);},isVisible:()=>dialog.open&&category==='analytics'&&!rawMode,getEnabled:()=>draftAt('agentChat.analyticsEnabled')??snapshot?.defaults?.agentChat?.analyticsEnabled??true,setEnabled:value=>queue('agentChat.analyticsEnabled',value),cutoffCard});
+  const usageDashboard=createUsageAnalytics({api,getChats,bindBackdrop,onOpenChat:id=>{dialog.close();onOpenChat(id);},isVisible:()=>dialog.open&&category==='analytics'&&!rawMode,getEnabled:()=>draftAt('agentChat.analyticsEnabled')??snapshot?.defaults?.agentChat?.analyticsEnabled??true,setEnabled:value=>queue('agentChat.analyticsEnabled',value),cutoffCard});
   function renderForm() {
     for(const button of byId('settings-nav').children)button.setAttribute('aria-current',String(!rawMode&&button.dataset.category===category));
     byId('settings-sidebar').hidden=rawMode;byId('settings-form').hidden=rawMode;byId('settings-raw-panel').hidden=!rawMode;byId('settings-dialog').querySelector('.settings-body').style.gridTemplateColumns=rawMode?'minmax(0,1fr)':'';

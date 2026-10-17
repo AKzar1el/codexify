@@ -1,7 +1,8 @@
-function createUsageAnalytics({api,getChats,onOpenChat,isVisible,getEnabled,setEnabled,cutoffCard}) {
+function createUsageAnalytics({api,getChats,onOpenChat,isVisible,getEnabled,setEnabled,cutoffCard,bindBackdrop=()=>{}}) {
  const svgNS='http://www.w3.org/2000/svg',palette=['#5684dd','#a07bda','#db9361','#46a18d','#c36b93','#8c9c43','#628eaa','#bd7b51','#7880bb','#b5a050','#638769','#b57373'];
  const metricNames={turns:'Turns',activeMs:'Active time',toolCalls:'Tool calls'};
  const rangeCache=new Map();
+ let shareCard=null;
  let root=null,data=null,range='7',leaderMetric='turns',request=0,loading=false,hiddenModels=new Set(),mountedRange=null;
  const el=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!=null)n.textContent=text;return n;};
  const svg=(tag,attrs={})=>{const n=document.createElementNS(svgNS,tag);for(const [key,value]of Object.entries(attrs))n.setAttribute(key,String(value));return n;};
@@ -118,7 +119,12 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,getEnabled,setE
   const hero=el('section','analytics-hero'),copy=el('div','');copy.append(el('p','analytics-eyebrow','Agent activity'),el('h4','',range==='all'?'The bigger picture':`The last ${range} days`),el('p','',d.since?`Collecting since ${new Date(d.since).toLocaleDateString()} · ${d.timezone}`:'A fresh start. New activity only.'));
   const controls=el('div','analytics-controls'),select=el('select','analytics-select');select.setAttribute('aria-label','Analytics date range');select.dataset.analyticsFocus='range';for(const [value,label]of [['7','Last 7 days'],['30','Last 30 days'],['90','Last 90 days'],['all','Lifetime']]){const option=el('option','',label);option.value=value;select.append(option);}select.value=range;select.addEventListener('change',()=>{range=select.value;data=rangeCache.get(range)||null;void load();});
   const toggle=el('button','',enabled?'Pause collection':'Resume collection');toggle.type='button';toggle.setAttribute('aria-label','Collect analytics');toggle.setAttribute('aria-pressed',String(enabled));toggle.addEventListener('click',()=>{setEnabled(!getEnabled());render();});
-  const refresh=el('button','','↻');refresh.type='button';refresh.setAttribute('aria-label','Refresh analytics');refresh.disabled=loading;refresh.addEventListener('click',()=>void load());const state=el('span','analytics-status',enabled?'Collecting':'Paused');state.dataset.paused=String(!enabled);controls.append(state,select,toggle,refresh);hero.append(copy,controls);root.append(hero);
+  const refresh=el('button','','↻');refresh.type='button';refresh.setAttribute('aria-label','Refresh analytics');refresh.disabled=loading;refresh.addEventListener('click',()=>void load());const state=el('span','analytics-status',enabled?'Collecting':'Paused');state.dataset.paused=String(!enabled);const share=el('button','','Share');share.type='button';share.setAttribute('aria-label','Share analytics');share.disabled=!data||loading;share.addEventListener('click',()=>{
+    if(!data||loading)return;
+    const bins=dayBins(),values=bins.map(bin=>[...bin.models.values()].reduce((sum,t)=>sum+t.turns,0));
+    shareCard??=createAnalyticsShareCard({bindBackdrop});
+    shareCard.open({period:range,today:data.today,start:bins[0]?.start||data.today,totals:{...data.totals},activity:values});
+  });controls.append(state,select,share,toggle,refresh);hero.append(copy,controls);root.append(hero);
   const kpis=el('div','analytics-kpis');for(const [key,title]of [['turns','Confirmed turns'],['activeMs','Active time · estimated'],['toolCalls','Tool calls'],['goals','Goals completed']]){const card=el('div','analytics-kpi');const value=el('strong','analytics-kpi-value',valueText(key,d.totals[key]));value.title=key==='activeMs'?`${Math.round(d.totals[key]/1000)} seconds`:`${d.totals[key]}`;card.append(el('p','analytics-kpi-label',title),value,el('span','analytics-kpi-foot',`${valueText(key,d.lifetime[key])} lifetime`));kpis.append(card);}root.append(kpis);
   if(!d.totals.turns&&!d.totals.toolCalls&&!d.totals.goals)root.append(el('div','analytics-empty',loading?'Loading your activity…':'Your next turn starts the story. New turns, tools and completed goals will appear here. No history has been backfilled.'));
   const charts=el('div','analytics-grid');charts.append(chart('turns',range==='all'?'Turns over time':'Daily turns','Confirmed ChatGPT sends, stacked by model and effort.'),chart('activeMs','Time in motion','Estimated active time; waiting loops and long idle gaps excluded.'),chart('toolCalls',range==='all'?'Tool calls over time':'Daily tool calls','Agent work requests. Idle waits and interface polling are excluded.',true),league(),mix());root.append(charts);
@@ -128,7 +134,108 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,getEnabled,setE
   if(focused)for(const node of root.querySelectorAll('[data-analytics-focus]'))if(node.dataset.analyticsFocus===focused){node.focus({preventScroll:true});break;}
  }
  async function load(){const epoch=++request;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${range}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);mountedRange=range;rangeCache.set(range,data);}catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
- const timer=setInterval(()=>{if(isVisible()&&!document.hidden&&!loading)void load();},30000);
+ const timer=setInterval(()=>{if(isVisible()&&!document.hidden&&!loading&&!shareCard?.isOpen())void load();},30000);
  window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});
  return {mount(parent){root=el('div','analytics');root.id='usage-analytics';parent.append(root);render();if(!data||mountedRange!==range)void load();}};
+}
+
+
+// A browser-local PNG. No server endpoint, remote assets, or public URL is used.
+function createAnalyticsShareCard({bindBackdrop}) {
+ const make=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!=null)n.textContent=text;return n;};
+ const style=make('style');style.textContent=`
+#analytics-share-dialog{width:min(650px,calc(100vw - 32px));max-width:none;max-height:calc(100dvh - 32px);box-sizing:border-box;overflow:auto;margin:auto;padding:24px;border:1px solid var(--line);border-radius:20px;background:var(--panel);color:var(--ink);box-shadow:0 24px 90px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#analytics-share-dialog::backdrop{background:#1019168c;backdrop-filter:blur(5px)}
+#analytics-share-dialog [hidden]{display:none!important}
+#analytics-share-dialog .stats-share-heading{display:flex;gap:16px;align-items:flex-start;margin-bottom:18px}
+#analytics-share-dialog h2{font-size:21px;line-height:1.3;letter-spacing:-.4px;margin:0;font-weight:650}
+#analytics-share-dialog .stats-share-description{font-size:12px;color:var(--muted);margin:6px 0 0}
+#analytics-share-dialog button,#analytics-share-dialog a{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;font:inherit;line-height:1.3;border:1px solid var(--line);border-radius:9px;padding:10px 14px;color:var(--ink);background:var(--panel);text-decoration:none;cursor:pointer}
+#analytics-share-dialog button:hover,#analytics-share-dialog a:hover{background:var(--bg)}
+#analytics-share-dialog button:disabled,#analytics-share-dialog a[aria-disabled=true]{opacity:.5;cursor:default}
+#analytics-share-dialog #stats-share-close{margin-left:auto;flex:none;width:32px;height:32px;border:0;background:transparent;padding:6px;color:var(--muted)}
+#analytics-share-dialog #stats-share-close svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}
+#analytics-share-dialog :is(button,a):focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+#analytics-share-dialog .stats-share-preview{display:grid;place-items:center;aspect-ratio:16/9;border-radius:15px;background:var(--bg);overflow:hidden;border:1px solid var(--line)}
+#analytics-share-dialog .stats-share-preview img{display:block;width:100%;height:auto}
+#analytics-share-dialog .stats-share-placeholder{padding:24px;text-align:center;color:var(--muted);font-size:12px}
+#analytics-share-dialog .stats-share-privacy{font-size:11px;color:var(--muted);line-height:1.6;margin:14px 0 0}
+#analytics-share-dialog .stats-share-footer{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;padding-top:18px;margin-top:18px;border-top:1px solid var(--line)}
+#analytics-share-dialog #stats-share-copy{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+#analytics-share-dialog #stats-share-copy:hover{filter:brightness(.95)}
+#analytics-share-dialog .stats-share-status{margin:0 auto 0 0;color:var(--muted);font-size:12px;flex:1;min-width:130px}
+@media(max-width:580px){#analytics-share-dialog{width:calc(100vw - 20px);max-height:calc(100dvh - 20px);padding:18px;border-radius:16px}#analytics-share-dialog h2{font-size:20px}#analytics-share-dialog .stats-share-footer{display:grid;grid-template-columns:1fr 1fr}#analytics-share-dialog .stats-share-status{grid-column:1/-1;margin:0 0 2px;min-width:0}#analytics-share-dialog button,#analytics-share-dialog a{padding:10px 8px;font-size:13px}}
+`;
+ document.head.append(style);
+ const dialog=make('dialog');dialog.id='analytics-share-dialog';dialog.setAttribute('aria-labelledby','stats-share-title');
+ const header=make('div','stats-share-heading'),copy=make('div'),heading=make('h2','','Share your stats');heading.id='stats-share-title';
+ const description=make('p','stats-share-description');description.id='stats-share-description';copy.append(heading,description);dialog.setAttribute('aria-describedby',description.id);
+ const close=make('button');close.id='stats-share-close';close.type='button';close.setAttribute('aria-label','Close share preview');close.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>';close.addEventListener('click',()=>dialog.close());header.append(copy,close);
+ const preview=make('div','stats-share-preview'),image=make('img'),placeholder=make('span','stats-share-placeholder','Creating your card…');image.id='stats-share-image';image.hidden=true;preview.append(image,placeholder);
+ const privacy=make('p','stats-share-privacy','Only aggregate totals appear on the card. Generated on this device, with no upload or public link.');
+ const footer=make('div','stats-share-footer'),message=make('p','stats-share-status');message.id='stats-share-status';message.setAttribute('role','status');message.setAttribute('aria-live','polite');
+ const download=make('a','','Download PNG');download.id='stats-share-download';download.setAttribute('aria-disabled','true');
+ const copyButton=make('button','','Copy image');copyButton.id='stats-share-copy';copyButton.type='button';copyButton.disabled=true;copyButton.setAttribute('aria-describedby',message.id);footer.append(message,download,copyButton);dialog.append(header,preview,privacy,footer);document.body.append(dialog);bindBackdrop(dialog,()=>dialog.close());
+ let blob=null,url=null,epoch=0,downloadUsed=false,copying=false;
+ const canCopy=()=>window.isSecureContext&&typeof window.ClipboardItem==='function'&&typeof navigator.clipboard?.write==='function';
+ function release(){const old=url;url=null;blob=null;image.removeAttribute('src');download.removeAttribute('href');if(old){if(downloadUsed)setTimeout(()=>URL.revokeObjectURL(old),60000);else URL.revokeObjectURL(old);}}
+ dialog.addEventListener('close',()=>{epoch++;release();copying=false;});
+ document.getElementById('settings-dialog')?.addEventListener('close',()=>{if(dialog.open)dialog.close();});
+ download.addEventListener('click',event=>{if(!blob||!url){event.preventDefault();return;}downloadUsed=true;message.textContent='PNG download started.';});
+ copyButton.addEventListener('click',()=>{
+  if(!blob||copying||!canCopy())return;
+  const current=epoch;copying=true;copyButton.disabled=true;message.textContent='Copying image…';
+  // Call write directly in the click gesture. Safari loses clipboard access if
+  // rasterization or other async work is awaited before this call.
+  let result;try{result=navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);}
+  catch{result=Promise.reject(new Error('clipboard unavailable'));}
+  Promise.resolve(result).then(()=>{if(current===epoch)message.textContent='Image copied.';},()=>{if(current===epoch)message.textContent='Couldn’t copy the image. Use Download PNG, or try again.';}).finally(()=>{if(current===epoch){copying=false;copyButton.disabled=!canCopy();}});
+ });
+ return {
+  isOpen:()=>dialog.open,
+  open(snapshot){
+   if(dialog.open)return;
+   release();const current=++epoch;downloadUsed=false;copying=false;image.hidden=true;placeholder.hidden=false;placeholder.textContent='Creating your card…';copyButton.disabled=true;download.setAttribute('aria-disabled','true');message.textContent='';description.textContent=`${snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`} · PNG image`;
+   dialog.showModal();
+   Promise.resolve().then(()=>renderAnalyticsSharePNG(snapshot)).then(png=>{
+    if(current!==epoch||!dialog.open)return;
+    blob=png;url=URL.createObjectURL(png);image.alt=`Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed.`;image.src=url;image.hidden=false;placeholder.hidden=true;download.href=url;download.download=`codexify-stats-${snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.png`;download.setAttribute('aria-disabled','false');copyButton.disabled=!canCopy();message.textContent=canCopy()?'Ready to share.':'Copy isn’t available in this browser. Download the PNG instead.';
+   }).catch(()=>{if(current===epoch&&dialog.open){placeholder.textContent='The image could not be created.';message.textContent='Close this preview and try again.';}});
+  }
+ };
+}
+
+function renderAnalyticsSharePNG(snapshot) {
+ const canvas=document.createElement('canvas');canvas.width=1200;canvas.height=675;
+ const context=canvas.getContext('2d');if(!context)return Promise.reject(new Error('canvas unavailable'));
+ const W=1200,H=675,ink='#241739';
+ const rounded=(x,y,w,h,r)=>{r=Math.min(r,w/2,h/2);context.beginPath();context.moveTo(x+r,y);context.lineTo(x+w-r,y);context.quadraticCurveTo(x+w,y,x+w,y+r);context.lineTo(x+w,y+h-r);context.quadraticCurveTo(x+w,y+h,x+w-r,y+h);context.lineTo(x+r,y+h);context.quadraticCurveTo(x,y+h,x,y+h-r);context.lineTo(x,y+r);context.quadraticCurveTo(x,y,x+r,y);context.closePath();};
+ const star=(x,y,r,color)=>{context.beginPath();for(let i=0;i<16;i++){const angle=i*Math.PI/8-Math.PI/2,rad=i%2?r*.52:r;const px=x+Math.cos(angle)*rad,py=y+Math.sin(angle)*rad;if(i)context.lineTo(px,py);else context.moveTo(px,py);}context.closePath();context.fillStyle=color;context.fill();};
+ rounded(0,0,W,H,30);context.clip();context.fillStyle='#7651ed';context.fillRect(0,0,W,H);
+ // Flat, saturated sticker colors keep the PNG small and the numbers legible.
+ star(1129,461,38,'#dfff75');star(407,160,23,'#ff91c8');
+ context.fillStyle='#ff91c8';context.beginPath();context.arc(39,495,13,0,Math.PI*2);context.fill();
+ context.fillStyle='#dfff75';context.save();context.translate(1099,157);context.rotate(-.3);context.fillRect(-5,-17,10,34);context.fillRect(-17,-5,34,10);context.restore();
+ context.textBaseline='alphabetic';context.fillStyle='#fff9ea';context.font='800 48px system-ui, -apple-system, sans-serif';context.fillText('Codexify stats',68,113);
+ const period=snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`;context.font='750 23px system-ui, -apple-system, sans-serif';const pillWidth=context.measureText(period).width+42;
+ context.save();context.translate(W-72-pillWidth/2,85);context.rotate(.045);rounded(-pillWidth/2+5,-27+5,pillWidth,54,14);context.fillStyle=ink;context.fill();rounded(-pillWidth/2,-27,pillWidth,54,14);context.fillStyle='#fff9ea';context.fill();context.strokeStyle=ink;context.lineWidth=3;context.stroke();context.fillStyle=ink;context.textAlign='center';context.fillText(period,0,8);context.restore();
+ const format=n=>new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:n>=10000?1:0}).format(n||0);
+ const cards=[{key:'turns',label:'Turns',x:66,y:200,angle:-.025,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:.02,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-.018,color:'#80eadb'}];
+ for(const card of cards){
+  const width=330,height=249;context.save();context.translate(card.x+width/2,card.y+height/2);context.rotate(card.angle);
+  rounded(-width/2+8,-height/2+9,width,height,22);context.fillStyle=ink;context.fill();rounded(-width/2,-height/2,width,height,22);context.fillStyle=card.color;context.fill();context.strokeStyle=ink;context.lineWidth=4;context.stroke();
+  const text=format(snapshot.totals[card.key]);let size=100;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;while(context.measureText(text).width>278&&size>34){size-=2;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;}
+  context.fillStyle=ink;context.fillText(text,-width/2+25,19);context.font='650 31px system-ui, -apple-system, sans-serif';context.fillText(card.label,-width/2+27,79);context.restore();
+ }
+ // One aggregate activity strip, with no model labels or private details.
+ const raw=snapshot.activity.length?snapshot.activity:[0,0,0,0,0,0,0],stride=Math.max(1,Math.ceil(raw.length/30)),bars=[];
+ for(let i=0;i<raw.length;i+=stride)bars.push(raw.slice(i,i+stride).reduce((a,b)=>a+b,0));
+ const max=Math.max(1,...bars),plotWidth=600,gap=bars.length<=7?12:5,barW=(plotWidth-gap*(bars.length-1))/bars.length;
+ for(const [index,value]of bars.entries()){const height=value?Math.max(4,value/max*43):3;context.fillStyle=value?(index===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50';rounded(72+index*(barW+gap),554-height,barW,height,Math.min(4,height/2));context.fill();}
+ const date=iso=>{const value=new Date(iso+'T12:00:00Z');return Number.isFinite(value.getTime())?value:null;};
+ const first=date(snapshot.start),last=date(snapshot.today),pretty=(d,year)=>new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',...(year?{year:'numeric'}:{}),timeZone:'UTC'}).format(d);
+ const dates=first&&last?(snapshot.start===snapshot.today?pretty(last,true):`${pretty(first,first.getUTCFullYear()!==last.getUTCFullYear())} – ${pretty(last,true)}`):'Your agent activity';
+ context.font='550 23px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText(dates,72,605);
+ context.save();context.translate(1002,579);context.rotate(-.035);rounded(-142,-35,284,70,17);context.fillStyle=ink;context.fill();context.textAlign='center';context.font='750 35px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText('codexify.dev',0,12);context.restore();
+ return new Promise((resolve,reject)=>{canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('PNG unavailable')),'image/png');});
 }
