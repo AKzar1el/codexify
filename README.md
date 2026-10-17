@@ -201,7 +201,11 @@ Uncertain user-message sends are not replayed automatically. A stalled goal
 continuation can retry after three minutes only after fresh completed-report
 checks; native activity acknowledges delivery and prevents replay. User stop/cancellation and
 disabling turn renewal cancel its pending continuation. Saved pairing, timer
-and handoff state survive service restarts.
+and handoff state survive service restarts. Active goals are registered with the
+automation supervisor at startup even without queued messages or a handoff. A
+background discovery pass retries every 30 seconds, so restoring goals does not
+require opening their conversations. Paused and blocked goals remain paused or
+blocked.
 
 **Analytics**, planned for 2.1, is the last tab in global settings. Collection is
 always active and starts with new activity; nothing

@@ -229,11 +229,13 @@ struct RuntimeInfo {
 
 pub struct OwnerServer {
     task: tokio::task::JoinHandle<()>,
+    maintenance: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
         self.task.abort();
+        self.maintenance.abort();
     }
 }
 
@@ -1878,6 +1880,78 @@ pub async fn start(
     start_with_automation(config, chats, artifacts, continuations, None).await
 }
 
+async fn restore_missing_automation(state: &OwnerState, chats: &[LocatedChat]) {
+    let Some(supervisor) = state
+        .automation
+        .as_ref()
+        .filter(|_| state.config.markdown_chat.automation.enabled)
+    else {
+        return;
+    };
+    for located in chats {
+        let task = match automation_task(located) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(?error, "could not identify persisted chat automation");
+                continue;
+            }
+        };
+        if supervisor.is_registered(&task).await {
+            continue;
+        }
+        let saved = match AgentAutomationStore::for_state_root(&state.config, &located.state_root)
+            .and_then(|store| store.load(&task))
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                tracing::warn!(task=task.stable_key(), %error, "could not read persisted chat automation; discovery will retry");
+                continue;
+            }
+        };
+        let active_goal = saved
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == crate::agent_automation::GoalStatus::Active);
+        if !active_goal
+            && saved.turn_renewal.handoff.is_none()
+            && !located.path.with_file_name("message-queue.json").exists()
+        {
+            continue;
+        }
+        match automation_context(state, located).await {
+            Ok(_) => tracing::info!(
+                task = task.stable_key(),
+                active_goal,
+                "restored persisted chat automation"
+            ),
+            Err(error) => tracing::warn!(
+                task = task.stable_key(),
+                ?error,
+                "could not restore persisted chat automation; discovery will retry"
+            ),
+        }
+    }
+}
+
+async fn maintain_chat_automation(state: OwnerState, interval: std::time::Duration) {
+    restore_chat_state(state.clone()).await;
+    if state.automation.is_none() || !state.config.markdown_chat.automation.enabled {
+        return;
+    }
+    loop {
+        tokio::time::sleep(interval).await;
+        let scan = state.clone();
+        match tokio::task::spawn_blocking(move || locate(&scan.config, &scan.project_bindings))
+            .await
+        {
+            Ok(chats) => restore_missing_automation(&state, &chats).await,
+            Err(error) => {
+                tracing::warn!(%error, "persisted chat discovery failed; discovery will retry")
+            }
+        }
+    }
+}
+
 async fn restore_chat_state(state: OwnerState) {
     let scan = state.clone();
     let Ok(chats) =
@@ -1885,22 +1959,8 @@ async fn restore_chat_state(state: OwnerState) {
     else {
         return;
     };
+    restore_missing_automation(&state, &chats).await;
     for located in chats {
-        let renewal_pending = automation_task(&located)
-            .ok()
-            .and_then(|task| {
-                AgentAutomationStore::for_state_root(&state.config, &located.state_root)
-                    .ok()?
-                    .load(&task)
-                    .ok()
-            })
-            .is_some_and(|s| s.turn_renewal.handoff.is_some());
-        if (located.path.with_file_name("message-queue.json").exists() || renewal_pending)
-            && state.config.markdown_chat.automation.enabled
-            && let Err(error) = automation_context(&state, &located).await
-        {
-            tracing::warn!(?error, "could not restore queued-message automation");
-        }
         // Opening the durable queue resumes its completion/offline monitor without a widget.
         match state.chats.chat_at_path(located.path, true) {
             Ok(chat) => {
@@ -1939,7 +1999,10 @@ pub(crate) async fn start_with_automation(
         global: Arc::default(),
         token: info.token,
     };
-    tokio::spawn(restore_chat_state(state.clone()));
+    let maintenance = tokio::spawn(maintain_chat_automation(
+        state.clone(),
+        std::time::Duration::from_secs(30),
+    ));
     settings::start(state.clone());
     let app = router(state);
     let task = tokio::spawn(async move {
@@ -1947,7 +2010,7 @@ pub(crate) async fn start_with_automation(
             tracing::error!("owner chat listener stopped: {error}");
         }
     });
-    Ok(OwnerServer { task })
+    Ok(OwnerServer { task, maintenance })
 }
 
 async fn bind_owner_listener(config: &AppConfig) -> anyhow::Result<tokio::net::TcpListener> {
@@ -4297,6 +4360,306 @@ mod tests {
                 .contains("10 KiB")
         );
     }
+    #[derive(Default)]
+    struct GoalRecoveryExecutor {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl AutomationExecutor for GoalRecoveryExecutor {
+        async fn execute(
+            &self,
+            execution: AutomationExecution,
+            events: tokio::sync::mpsc::UnboundedSender<crate::agent_automation::CompanionEvent>,
+            _cancellation: CancellationToken,
+        ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+            assert!(matches!(
+                execution.request.prompt,
+                crate::agent_automation::ActionPrompt::OfflineGoal { .. }
+            ));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            for (index, kind) in [
+                crate::agent_automation::CompanionEventKind::SendAccepted,
+                crate::agent_automation::CompanionEventKind::SubmissionComplete {
+                    canonical_url: execution.request.expected_url.clone(),
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                events
+                    .send(crate::agent_automation::CompanionEvent {
+                        sequence: index as u64 + 1,
+                        action_id: execution.request.action_id.clone(),
+                        at_ms: crate::markdown_chat::now_ms(),
+                        kind,
+                    })
+                    .unwrap();
+            }
+
+            Ok(CompanionActionSnapshot {
+                protocol_version: PROTOCOL_VERSION,
+                build: "goal-recovery-test".into(),
+                action_id: execution.request.action_id,
+                state: crate::agent_automation::CompanionActionState::Idle,
+                send_accepted: true,
+                canonical_url: Some(execution.request.expected_url),
+                selected: Some(crate::agent_automation::CompanionSelection {
+                    model: execution.request.model.unwrap(),
+                    effort: execution.request.effort.unwrap(),
+                }),
+                last_event_sequence: 2,
+                attention: None,
+            })
+        }
+    }
+    fn goal_recovery_state(
+        root: &FilePath,
+        multi_project: bool,
+        executor: Arc<GoalRecoveryExecutor>,
+    ) -> OwnerState {
+        let mut config = crate::config::default_config(root.join("project"));
+        std::fs::create_dir_all(&config.work_dir).unwrap();
+        config.multi_project = multi_project;
+        config.markdown_chat.enabled = true;
+        config.markdown_chat.automation.enabled = true;
+        config.memory.dir = Some(root.join("metadata").display().to_string());
+        let supervisor =
+            AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), executor);
+        OwnerState {
+            project_bindings: Arc::new(crate::project_bindings::ProjectBindingStore::new(
+                root.join("bindings"),
+            )),
+            creation_lock: Arc::default(),
+            artifacts: Arc::new(ArtifactEgressStore::new_at(
+                config.artifact_egress.clone(),
+                root.join("artifacts"),
+            )),
+            continuations: Arc::new(
+                ConversationContinuationStore::new(root.join("continuations.json")).unwrap(),
+            ),
+            config: Arc::new(config),
+            chats: Arc::new(MarkdownChatStore::default()),
+            automation: Some(supervisor),
+            open_browser: Arc::new(|_| Ok(())),
+            catalog_cache: Arc::default(),
+            global: Arc::default(),
+            token: "recovery-fixture".into(),
+        }
+    }
+    async fn persisted_recovery_goal(
+        state: &OwnerState,
+        name: &str,
+        status: crate::agent_automation::GoalStatus,
+    ) -> (
+        ConversationIdentity,
+        Arc<crate::markdown_chat::ChatFile>,
+        AgentAutomationStore,
+    ) {
+        let task = ConversationIdentity::from_openai_session(name).unwrap();
+        let store = AgentAutomationStore::for_config(&state.config).unwrap();
+        let chat = state
+            .chats
+            .chat(&state.config, Some(&task), &SessionState::new())
+            .unwrap();
+        chat.ensure().await.unwrap();
+        chat.record_agent_call(1).await.unwrap();
+        store
+            .set_selection(
+                &task,
+                "gpt-5.6-sol",
+                "max",
+                "recovery-catalog",
+                "recovery-account",
+                1,
+            )
+            .unwrap();
+        let url = format!("https://chatgpt.com/c/{name}");
+        let issue = store.issue_pairing(&task, &url, 0, 1).unwrap();
+        store
+            .record_pairing_canonical_url(&task, issue.generation, &url, 1)
+            .unwrap();
+        store
+            .verify_pairing(&task, issue.generation, 0, &issue.reference, 1)
+            .unwrap();
+        let goal = store
+            .set_goal(&task, "Continue this enabled objective", 1)
+            .unwrap();
+        if status != crate::agent_automation::GoalStatus::Configured {
+            store.run_goal(&task, goal.revision, 2).unwrap();
+        }
+        match status {
+            crate::agent_automation::GoalStatus::Blocked => {
+                store
+                    .finish_goal(
+                        &task,
+                        goal.revision,
+                        crate::agent_automation::GoalFinish::Blocked {
+                            reason: "Needs the user's answer".into(),
+                        },
+                        3,
+                    )
+                    .unwrap();
+            }
+            crate::agent_automation::GoalStatus::Completed => {
+                store
+                    .finish_goal(
+                        &task,
+                        goal.revision,
+                        crate::agent_automation::GoalFinish::Completed { summary: None },
+                        3,
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        assert!(!chat.path().with_file_name("message-queue.json").exists());
+        assert!(store.load(&task).unwrap().turn_renewal.handoff.is_none());
+        (task, chat, store)
+    }
+
+    #[tokio::test]
+    async fn active_goals_restore_and_continue_without_opening_a_chat_or_having_a_queue() {
+        use crate::agent_automation::GoalStatus;
+        for (multi, orphaned) in [(false, false), (true, false), (false, true), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let executor = Arc::new(GoalRecoveryExecutor::default());
+            let state = goal_recovery_state(root.path(), multi, executor.clone());
+            let (active, chat, store) =
+                persisted_recovery_goal(&state, "restart-active-goal", GoalStatus::Active).await;
+            let (paused, _, _) =
+                persisted_recovery_goal(&state, "restart-paused-goal", GoalStatus::Configured)
+                    .await;
+            let (blocked, _, _) =
+                persisted_recovery_goal(&state, "restart-blocked-goal", GoalStatus::Blocked).await;
+            let (completed, _, _) =
+                persisted_recovery_goal(&state, "restart-completed-goal", GoalStatus::Completed)
+                    .await;
+            let (stopped, stopped_chat, _) =
+                persisted_recovery_goal(&state, "restart-stopped-goal", GoalStatus::Active).await;
+            stopped_chat
+                .request_agent_stop("explicit-stop".into())
+                .await
+                .unwrap();
+            if orphaned {
+                let saved = store.load(&active).unwrap();
+                store
+                    .queue_action(
+                        &active,
+                        "interrupted-before-restart",
+                        crate::agent_automation::AutomationActionKind::OfflineGoal,
+                        saved.pairing.generation,
+                        Some(saved.goal.unwrap().revision),
+                        1,
+                    )
+                    .unwrap();
+            }
+            // These are new in-memory registries over the same saved state, as after restart.
+            let mut restarted = state.clone();
+            restarted.chats = Arc::new(MarkdownChatStore::default());
+            let supervisor = restarted.automation.as_ref().unwrap();
+            let worker = supervisor.start();
+            restore_chat_state(restarted.clone()).await;
+            assert!(supervisor.is_registered(&active).await);
+            for task in [&paused, &blocked, &completed] {
+                assert!(!supervisor.is_registered(task).await);
+            }
+            assert!(supervisor.is_registered(&stopped).await);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let saved = store.load(&active).unwrap();
+                    if executor.calls.load(Ordering::SeqCst) == 1
+                        && saved.action.send_accepted == Some(true)
+                        && saved.action.status
+                            == crate::agent_automation::AutomationActionStatus::Idle
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                supervisor.queued_count().await,
+                0,
+                "only the active, unstopped goal resumes"
+            );
+            let now = crate::markdown_chat::now_ms();
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                store.load(&active).unwrap().goal.unwrap().status,
+                GoalStatus::Active
+            );
+            supervisor.scan_once(now + 1000).await.unwrap();
+            assert_eq!(
+                supervisor.queued_count().await,
+                0,
+                "discovery must not duplicate a submitted continuation"
+            );
+            drop(worker);
+            assert!(
+                !std::fs::read_to_string(chat.path())
+                    .unwrap()
+                    .contains("Continue this enabled objective")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_discovery_retries_an_unreadable_goal_without_needing_the_ui() {
+        use crate::agent_automation::GoalStatus;
+        let root = tempfile::tempdir().unwrap();
+        let state =
+            goal_recovery_state(root.path(), true, Arc::new(GoalRecoveryExecutor::default()));
+        let (task, chat, store) =
+            persisted_recovery_goal(&state, "retry-discovery-goal", GoalStatus::Active).await;
+        let path = chat.path().with_file_name("automation.json");
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"temporarily incomplete JSON").unwrap();
+        let rollout = chat.path().with_file_name("rollout.md");
+        std::fs::remove_file(&rollout).unwrap();
+        let maintenance = tokio::spawn(maintain_chat_automation(
+            state.clone(),
+            std::time::Duration::from_millis(30),
+        ));
+        let supervisor = state.automation.as_ref().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !rollout.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!supervisor.is_registered(&task).await);
+        let (other, _, _) =
+            persisted_recovery_goal(&state, "late-discovered-goal", GoalStatus::Active).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !supervisor.is_registered(&other).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(&path, saved).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !supervisor.is_registered(&task).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        supervisor
+            .scan_once(crate::markdown_chat::now_ms())
+            .await
+            .unwrap();
+        assert_eq!(supervisor.queued_count().await, 2);
+        assert_eq!(
+            store.load(&task).unwrap().goal.unwrap().status,
+            GoalStatus::Active
+        );
+        maintenance.abort();
+    }
+
     #[tokio::test]
     async fn private_queue_resumes_after_service_restart_without_opening_a_chat() {
         let root = tempfile::tempdir().unwrap();

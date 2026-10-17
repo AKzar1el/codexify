@@ -577,6 +577,10 @@ impl AgentAutomationSupervisor {
         self.wake.notify_one();
     }
 
+    pub(crate) async fn is_registered(&self, task: &ConversationIdentity) -> bool {
+        self.tasks.read().await.contains_key(task.stable_key())
+    }
+
     pub async fn register_task(&self, task: AutomationTaskHandle) -> Result<(), String> {
         if !self.config.enabled {
             return Err("Agent-chat browser automation is disabled".into());
