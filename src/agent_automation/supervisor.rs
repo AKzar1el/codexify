@@ -546,6 +546,7 @@ impl AgentAutomationSupervisor {
     }
 
     pub fn start(self: &Arc<Self>) -> AutomationSupervisorWorker {
+        super::turn_analytics::initialize();
         let supervisor = self.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -982,6 +983,16 @@ impl AgentAutomationSupervisor {
             let mut state = task.store.load(&task.task)?;
             task.store.notify_state(&task.chat, &state).await;
             let renewal_config = task.store.turn_renewal_settings()?;
+            super::turn_analytics::observe(
+                task.chat.path(),
+                task.task.stable_key(),
+                task.owner_generation,
+                &state,
+                activity.last_call_at_ms,
+                activity.agent_stop_requested,
+                renewal_config.enabled,
+                now_ms,
+            );
             let renewal_invalid = activity.agent_stop_requested
                 || !renewal_config.enabled
                 || state.turn_renewal.send.as_ref().is_some_and(|send| {

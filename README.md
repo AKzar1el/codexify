@@ -203,6 +203,19 @@ checks; native activity acknowledges delivery and prevents replay. User stop/can
 disabling turn renewal cancel its pending continuation. Saved pairing, timer
 and handoff state survive service restarts.
 
+**Model cutoff estimates** appear in **Settings → Chats & goals**. Passive local
+collection runs while Turn renewal is off, grouping inferred unfinished stops by
+the actual model and effort (including fallback). Durations run from the confirmed
+ChatGPT send to the last native tool call, excluding the offline detection delay.
+Running tools, completed turns, requests for input, stopped/blocked goals, user
+stops, renewal handoffs and durations over five hours are excluded. Resumed
+activity withdraws the current estimate. These are inactivity-based estimates,
+not proof of a ChatGPT timeout; the table shows count, median, P90 and range.
+Up to 256 historical observations per chat are kept in a separate private
+`turn-cutoff-estimates.json` sidecar, without message content or conversation URLs.
+Collection and display are best effort: failures stay silent and cannot affect
+chat delivery, goals, continuation, or configured turn limits.
+
 Disable progress reporting separately with `agentChat.rolloutEnabled` (default
 `true`). Existing journals are preserved. Either feature can run alone, or both
 can run together.

@@ -1,6 +1,7 @@
 //! Local-only owner view of the persisted agent chats. This is deliberately not
 //! nested under `/mcp` and never shares the connector's tunnel listener.
 
+mod analytics;
 mod attachments;
 mod creation;
 mod settings;
@@ -1951,6 +1952,7 @@ fn router(state: OwnerState) -> Router {
         .route("/api/health", get(settings::health))
         .route("/api/global", get(settings::status))
         .route("/api/settings", get(settings::read).post(settings::save))
+        .route("/api/analytics/turn-cutoffs", get(analytics::read))
         .route("/api/settings/restart", post(settings::restart))
         .route("/api/settings/update", post(settings::update))
         .route(

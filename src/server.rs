@@ -957,6 +957,17 @@ impl ServerHandler for CodexHandler {
         } else {
             Ok((None, None))
         };
+        let _analytics_tool_guard = if agent_call && authorized_before && name != ContinueTask::NAME
+        {
+            task_conversation
+                .as_ref()
+                .zip(task_owner_generation)
+                .map(|(task, owner)| {
+                    crate::agent_automation::turn_analytics::begin_tool(task.stable_key(), owner)
+                })
+        } else {
+            None
+        };
         let activity = if agent_call && authorized_before && name != ContinueTask::NAME {
             self.record_chat_activity(
                 task_conversation.as_ref(),

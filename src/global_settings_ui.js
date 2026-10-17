@@ -80,6 +80,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
 .setting-turn-limits{display:grid;gap:10px;width:100%}.setting-turn-limit{display:grid;grid-template-columns:minmax(0,1fr) 80px 28px;align-items:center;gap:8px;font-size:13px}.setting-turn-limit input{min-width:0;width:100%;box-sizing:border-box}#settings-dialog .setting-control .setting-reset{margin-top:6px}
 #settings-dialog .setting-object-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}
 #settings-dialog .setting-object-summary button{font-size:12px;white-space:nowrap}
+#settings-dialog .cutoff-body{padding:14px 18px}#settings-dialog .cutoff-body p{margin:0 0 12px}#settings-dialog .cutoff-body p:last-child{margin-bottom:0}#settings-dialog .cutoff-scroll{overflow-x:auto;margin:14px 0}#settings-dialog .cutoff-scroll table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#settings-dialog .cutoff-scroll :is(th,td){text-align:right;white-space:nowrap;padding:9px 8px;border-bottom:1px solid var(--line)}#settings-dialog .cutoff-scroll :is(th,td):first-child{text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:120px}#settings-dialog .cutoff-scroll th{color:var(--muted);font-weight:500}
 #settings-dialog .settings-empty{padding:40px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
 #settings-dialog .settings-empty p{margin:8px 0 0;font-size:13px}
 #settings-raw-panel p{color:var(--muted);font-size:13px;margin:0 0 16px}
@@ -222,6 +223,30 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     if(invalidFields.has(path))control.setAttribute('aria-invalid','true');
     return row;
   }
+  let cutoffEstimates=null,cutoffRequest=0;
+  function cutoffCard() {
+    const card=document.createElement('section');card.className='settings-card';card.id='cutoff-estimates';
+    const heading=document.createElement('h4');heading.className='settings-card-heading';heading.textContent='Model cutoff estimates';
+    const body=document.createElement('div');body.className='cutoff-body';
+    const help=document.createElement('p');help.className='setting-help';help.textContent='Inferred from unfinished turns while Turn renewal is off. Duration runs from the confirmed send to the last tool call; the offline detection delay is excluded. These are estimates, not proof of a ChatGPT timeout. Intentional endings and durations over five hours are excluded.';
+    body.append(help);
+    const rows=Array.isArray(cutoffEstimates?.models)?cutoffEstimates.models.filter(row=>row&&typeof row.model==='string'&&typeof row.effort==='string'&&['samples','medianMs','p90Ms','minMs','maxMs'].every(key=>Number.isFinite(row[key])&&row[key]>0)):[];
+    if(!rows.length){const empty=document.createElement('p');empty.className='setting-help';empty.textContent='No cutoff estimates yet.';body.append(empty);}
+    else {
+      const scroll=document.createElement('div');scroll.className='cutoff-scroll';
+      const table=document.createElement('table');table.setAttribute('aria-label','Model cutoff estimates');
+      const head=table.createTHead().insertRow();for(const label of ['Model / effort','Samples','Median','P90','Range']){const cell=document.createElement('th');cell.scope='col';cell.textContent=label;head.append(cell);}
+      const duration=ms=>{const minutes=Math.max(1,Math.round(ms/60000));return minutes<60?`${minutes}m`:`${Math.floor(minutes/60)}h${minutes%60?` ${minutes%60}m`:''}`;};
+      const tbody=table.createTBody();for(const row of rows){const tr=tbody.insertRow();for(const value of [`${row.model} / ${row.effort}`,row.samples,duration(row.medianMs),duration(row.p90Ms),`${duration(row.minMs)}–${duration(row.maxMs)}`]){const cell=tr.insertCell();cell.textContent=String(value);}}
+      scroll.append(table);body.append(scroll);
+      const note=document.createElement('p');note.className='setting-help';note.textContent='P90 is the duration below which 90% of these observations fall. Small sample counts are uncertain. Collection never changes turn limits or continuation behavior.';body.append(note);
+    }
+    card.append(heading,body);return card;
+  }
+  async function loadCutoffEstimates() {
+    const request=++cutoffRequest;
+    try {const response=await api('/api/analytics/turn-cutoffs');if(!response.ok)return;const data=await response.json();if(request!==cutoffRequest)return;cutoffEstimates=data;const card=byId('cutoff-estimates');if(card)card.replaceWith(cutoffCard());}catch{/* Optional analytics must never affect settings or display errors. */}
+  }
   function renderForm() {
     for(const button of byId('settings-nav').children)button.setAttribute('aria-current',String(!rawMode&&button.dataset.category===category));
     byId('settings-sidebar').hidden=rawMode;byId('settings-form').hidden=rawMode;byId('settings-raw-panel').hidden=!rawMode;byId('settings-dialog').querySelector('.settings-body').style.gridTemplateColumns=rawMode?'minmax(0,1fr)':'';
@@ -236,6 +261,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     matching.sort((a,b)=>{const aEvent=a.category==='notifications'&&a.section==='Events',bEvent=b.category==='notifications'&&b.section==='Events';return Number(bEvent)-Number(aEvent)||(aEvent&&bEvent?eventOrder.indexOf(a.path.split('.').at(-1))-eventOrder.indexOf(b.path.split('.').at(-1)):0);});
     const sections=new Map();for(const field of matching){const title=query?`${categories.find(item=>item.id===field.category).name} · ${field.section}`:field.section;if(!sections.has(title))sections.set(title,[]);sections.get(title).push(field);}
     for(const [title,items] of sections){const card=document.createElement('section');card.className='settings-card';const heading=document.createElement('h4');heading.className='settings-card-heading';heading.textContent=title;card.append(heading,...items.map(drawField));form.append(card);}
+    if(category==='chats'&&!query)form.append(cutoffCard());
     if(!matching.length){const empty=document.createElement('div');empty.className='settings-empty';empty.innerHTML='<strong>No settings found</strong><p>Try another search or choose a category.</p>';form.append(empty);}
   }
   for(const item of categories){const button=document.createElement('button');button.type='button';button.dataset.category=item.id;button.innerHTML=`${icon(item.id)}<span>${item.name}</span>`;button.addEventListener('click',()=>{category=item.id;byId('settings-search').value='';renderForm();byId('settings-main').scrollTop=0;});byId('settings-nav').append(button);}
@@ -246,7 +272,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{}}) {
     message(snapshot.restartRequired?'Saved. Restart Codexify to apply changes.':'All changes saved.');
     if(global?.connectorRefresh?.source==='manual'||['queued','running'].includes(global?.connectorRefresh?.phase)){shownRefreshState=null;renderRefresh(global.connectorRefresh);}
   }
-  async function load(){snapshot=await(await api('/api/settings')).json();dirty={};saveError=null;renderEditor();}
+  async function load(){snapshot=await(await api('/api/settings')).json();dirty={};saveError=null;renderEditor();void loadCutoffEstimates();}
   function changeDocument(changes) {
     const document=JSON.parse(JSON.stringify(snapshot.document));
     for(const [path,value] of Object.entries(changes)){const parts=path.split('.');let target=document;for(const part of parts.slice(0,-1)){if(!target[part]||typeof target[part]!=='object')target[part]={};target=target[part];}if(value===RESET)delete target[parts.at(-1)];else target[parts.at(-1)]=value;}

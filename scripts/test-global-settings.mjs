@@ -120,6 +120,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     else for(const [key,value] of Object.entries(body.changes)){const parts=key.split('.');let target=document;for(const part of parts.slice(0,-1))target=target[part]??={};target[parts.at(-1)]=value;}
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43229/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -198,6 +199,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     else for(const [key,value] of Object.entries(body.changes)){const parts=key.split('.');let target=document;for(const part of parts.slice(0,-1))target=target[part]??={};target[parts.at(-1)]=value;}
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43230/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -255,6 +257,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     submissions++;refresh={refreshId:`refresh-${submissions}`,source:'manual',phase:'queued'};
     return route.fulfill({json:refresh});
    }
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43231/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -301,6 +304,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     else for(const [path,value]of Object.entries(body.changes)){const parts=path.split('.');let target=document;for(const part of parts.slice(0,-1))target=target[part]??={};target[parts.at(-1)]=value;}
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
    throw Error('Unexpected request: '+path);
   });
   await page.goto('http://127.0.0.1:43240/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -339,6 +343,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(path==='/api/global')return fail?route.fulfill({status:503,body:'Unavailable'}):route.fulfill({json:{version:'1.7.0',plan,latest:{updateAvailable:false}}});
    if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
    throw Error('Unexpected request: '+path);
   });
   await page.goto('http://127.0.0.1:43241/#test-token');await page.getByText('v1.7.0',{exact:true}).waitFor();
@@ -415,5 +420,39 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   await dialog.getByRole('group',{name:'agentChat.rolloutEnabled',exact:true}).getByRole('button',{name:'Off',exact:true}).click();await dialog.getByText('All changes saved.',{exact:true}).waitFor();
   await dialog.getByRole('group',{name:'agentChat.turnRenewal.enabled',exact:true}).getByRole('button',{name:'On',exact:true}).click();await page.waitForFunction(()=>document.querySelector('[data-setting-row="agentChat.turnRenewal.enabled"] button[aria-pressed="true"]').textContent==='On');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.rolloutEnabled,false);assert.equal(document.agentChat.turnRenewal.enabled,true);
   await page.setViewportSize({width:390,height:844});await pro.scrollIntoViewIfNeeded();await page.screenshot({path:`/tmp/turn-renewal-settings-${engineName}.png`});assert(await dialog.evaluate(e=>e.scrollWidth<=e.clientWidth));assert.deepEqual(errors,[]);assert.equal(writes.length,3);
+ }finally{await browser.close();}
+});
+
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: cutoff estimates are read-only and optional failures stay silent`,{timeout:30000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
+  const errors=[],writes=[];page.on('pageerror',error=>errors.push(error.message));let fail=false;
+  const config={agentChat:{turnRenewal:{enabled:false,limits:[]}}};
+  await page.route('http://127.0.0.1:43242/**',async route=>{
+   const path=new URL(route.request().url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(route.request().method()!=='GET')writes.push(path);
+   if(path==='/api/global')return route.fulfill({json:{version:'2.0.0',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings')return route.fulfill({json:{document:config,defaults:config,revision:'1',raw:JSON.stringify(config),path:'/fixture/config.json'}});
+   if(path==='/api/analytics/turn-cutoffs')return fail==='malformed'?route.fulfill({json:{models:[null,{},42,{model:'invalid',effort:'max',samples:-1}]}}):fail?route.fulfill({status:500,body:'private disk error'}):route.fulfill({json:{samples:6,models:[{model:'gpt-5.6-sol',effort:'max',samples:6,medianMs:6900000,p90Ms:7200000,minMs:6600000,maxMs:7200000}]}});
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43242/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  const table=dialog.getByRole('table',{name:'Model cutoff estimates'});await table.getByText('gpt-5.6-sol / max',{exact:true}).waitFor();
+  assert.deepEqual(await table.locator('tbody td').allTextContents(),['gpt-5.6-sol / max','6','1h 55m','2h','1h 50m–2h']);
+  await page.setViewportSize({width:375,height:850});const card=dialog.locator('#cutoff-estimates');const box=await card.boundingBox();assert(box&&box.width<=375);assert.equal(await dialog.evaluate(el=>el.scrollWidth>el.clientWidth),false);
+  assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
+  await dialog.getByRole('button',{name:'Close settings',exact:true}).click();fail=true;
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  await dialog.locator('#cutoff-estimates').waitFor();assert.equal(await dialog.locator('#settings-save-state').getAttribute('data-error'),'false');assert.equal(await page.getByText('private disk error').count(),0);assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
+  await dialog.getByRole('button',{name:'Close settings',exact:true}).click();fail='malformed';
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  await dialog.getByText('No cutoff estimates yet.',{exact:true}).waitFor();
+  await dialog.getByRole('button',{name:'General',exact:true}).click();await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  assert.equal(await dialog.locator('#settings-save-state').getAttribute('data-error'),'false');assert.deepEqual(errors,[]);assert.deepEqual(writes,[]);
  }finally{await browser.close();}
 });
