@@ -2535,7 +2535,6 @@ mod tests {
                     "maxWaitMs",
                     "rolloutReminderInterval",
                     "rolloutEnabled",
-                    "analyticsEnabled",
                     "turnRenewal",
                     "notifications",
                     "port",

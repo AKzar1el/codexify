@@ -171,6 +171,9 @@ pub fn save(
         "schemaVersion".into(),
         json!(crate::config_migration::CONFIG_SCHEMA_VERSION),
     );
+    if let Some(chat) = object.get_mut("agentChat").and_then(Value::as_object_mut) {
+        chat.remove("analyticsEnabled");
+    }
     validate(path, object)?;
     if read_raw(path)? != before {
         return Err("Configuration changed on disk; reload it before saving".into());

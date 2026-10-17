@@ -204,7 +204,7 @@ disabling turn renewal cancel its pending continuation. Saved pairing, timer
 and handoff state survive service restarts.
 
 **Analytics**, planned for 2.1, is the last tab in global settings. Collection is
-on by default (`agentChat.analyticsEnabled`) and starts with new activity; nothing
+always active and starts with new activity; nothing
 is backfilled. Choose seven days (default), 30 days, 90 days or lifetime to see
 stacked model/effort charts, completed goals, conversation leaderboards, activity
 streaks and milestones. Turns are confirmed ChatGPT sends, excluding pairing and
@@ -213,7 +213,7 @@ loops and UI polling. Active time is an estimate from confirmed sends and native
 intervals; it excludes chat wait loops and long unexplained idle gaps, and is not
 a measurement of internal model reasoning or billed usage. Days use the server's
 local timezone. Analytics works independently of turn renewal and the progress
-journal. Pausing collection applies within a few seconds and preserves totals.
+journal. There is no collection toggle; older `analyticsEnabled` values are ignored.
 Private `usage-analytics.json` sidecars contain counters and opaque event IDs,
 without message content or conversation URLs. Failed collection or reads remain
 silent and never block automation. Writes are buffered; a crash can lose the last

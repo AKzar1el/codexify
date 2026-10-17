@@ -20,25 +20,12 @@ const FILE: &str = "usage-analytics.json";
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INTERVAL: u64 = 5 * 60 * 60 * 1000;
 const UNKNOWN: &str = "unattributed\u{1f}unknown";
-#[derive(Clone, Debug)]
-pub(crate) struct Options {
-    enabled: bool,
-    settings: Option<PathBuf>,
-}
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            settings: None,
-        }
-    }
-}
+// Collection is always active; keep the context type for existing call sites.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Options {}
 impl Options {
-    pub(crate) fn from_config(c: &AppConfig) -> Self {
-        Self {
-            enabled: c.markdown_chat.analytics_enabled,
-            settings: c.loaded_config_path.clone(),
-        }
+    pub(crate) fn from_config(_config: &AppConfig) -> Self {
+        Self {}
     }
 }
 #[derive(Clone)]
@@ -49,7 +36,6 @@ enum Event {
     End { id: String },
 }
 struct Packet {
-    options: Options,
     chat: PathBuf,
     at: u64,
     event: Event,
@@ -63,40 +49,28 @@ pub(crate) fn initialize() {
             .name("usage-analytics".into())
             .spawn(move || {
                 let mut cache: HashMap<PathBuf, Option<Tracker>> = HashMap::new();
-                let mut settings = HashMap::new();
                 let mut flushed = Instant::now();
                 loop {
                     match rx.recv_timeout(Duration::from_secs(2)) {
                         Ok(p) => {
-                            let enabled = enabled(&p.options, &mut settings);
-                            if !enabled {
-                                if let Some(Some(t)) = cache.get_mut(&p.chat) {
-                                    t.pause();
-                                }
-                            } else {
-                                if cache.len() >= 64
-                                    && !cache.contains_key(&p.chat)
-                                    && let Some(victim) = cache
-                                        .iter()
-                                        .min_by_key(|(_, entry)| {
-                                            entry.as_ref().map(|t| t.last_seen)
-                                        })
-                                        .map(|(path, _)| path.clone())
-                                    && let Some(Some(t)) = cache.remove(&victim)
-                                    && t.dirty
-                                {
-                                    let _ = save(&victim.with_file_name(FILE), &t.data);
-                                }
-                                let entry = cache.entry(p.chat.clone()).or_insert_with(|| {
-                                    load(&p.chat.with_file_name(FILE))
-                                        .map(|d| {
-                                            Tracker::new(d.unwrap_or_else(|| Data::new(started)))
-                                        })
-                                        .ok()
-                                });
-                                if let Some(t) = entry {
-                                    t.apply(&p);
-                                }
+                            if cache.len() >= 64
+                                && !cache.contains_key(&p.chat)
+                                && let Some(victim) = cache
+                                    .iter()
+                                    .min_by_key(|(_, entry)| entry.as_ref().map(|t| t.last_seen))
+                                    .map(|(path, _)| path.clone())
+                                && let Some(Some(t)) = cache.remove(&victim)
+                                && t.dirty
+                            {
+                                let _ = save(&victim.with_file_name(FILE), &t.data);
+                            }
+                            let entry = cache.entry(p.chat.clone()).or_insert_with(|| {
+                                load(&p.chat.with_file_name(FILE))
+                                    .map(|d| Tracker::new(d.unwrap_or_else(|| Data::new(started))))
+                                    .ok()
+                            });
+                            if let Some(t) = entry {
+                                t.apply(&p);
                             }
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -119,18 +93,10 @@ pub(crate) fn initialize() {
             .map(|_| tx)
     });
 }
-fn enqueue(options: &Options, chat: PathBuf, at: u64, event: Event) {
-    if !options.enabled && options.settings.is_none() {
-        return;
-    }
+fn enqueue(_options: &Options, chat: PathBuf, at: u64, event: Event) {
     initialize();
     if let Some(tx) = SINK.get().and_then(Option::as_ref) {
-        let _ = tx.try_send(Packet {
-            options: options.clone(),
-            chat,
-            at,
-            event,
-        });
+        let _ = tx.try_send(Packet { chat, at, event });
     }
 }
 pub(crate) fn sent(options: &Options, chat: PathBuf, send: TurnSend) {
@@ -186,31 +152,6 @@ pub(crate) fn tool(
         },
     );
     ToolGuard { options, chat, id }
-}
-fn enabled(options: &Options, cache: &mut HashMap<PathBuf, (Instant, bool)>) -> bool {
-    let Some(path) = &options.settings else {
-        return options.enabled;
-    };
-    if let Some((at, value)) = cache.get(path)
-        && at.elapsed() < Duration::from_secs(2)
-    {
-        return *value;
-    }
-    let value = match read(path, 1024 * 1024) {
-        Ok(None) => options.enabled,
-        Ok(Some(bytes)) => serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| match v.pointer("/agentChat/analyticsEnabled") {
-                None | Some(serde_json::Value::Null) => Some(true),
-                Some(value) => value.as_bool(),
-            })
-            .unwrap_or(false),
-        Err(()) => false,
-    };
-    if cache.len() < 128 || cache.contains_key(path) {
-        cache.insert(path.clone(), (Instant::now(), value));
-    }
-    value
 }
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -276,12 +217,6 @@ impl Tracker {
             idle: true,
             last_seen: Instant::now(),
         }
-    }
-    fn pause(&mut self) {
-        self.last_work = None;
-        self.pending.clear();
-        self.coverage.clear();
-        self.idle = true;
     }
     fn total(&mut self, at: u64, model: &str, delta: Totals) {
         if let Some(date) = date(at) {
@@ -620,7 +555,6 @@ fn save(path: &Path, data: &Data) -> Result<(), ()> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Dashboard {
     pub since: Option<u64>,
-    pub enabled: bool,
     pub timezone: String,
     pub today: String,
     pub daily: Vec<Daily>,
@@ -657,7 +591,7 @@ pub(crate) fn dashboard(
     chats: impl IntoIterator<Item = (String, PathBuf)>,
     days: Option<u32>,
     now: u64,
-    options: &Options,
+    _options: &Options,
 ) -> Dashboard {
     let today = Local
         .timestamp_millis_opt(now as i64)
@@ -670,7 +604,6 @@ pub(crate) fn dashboard(
         })
         .map(|d| d.to_string());
     let mut result = Dashboard {
-        enabled: enabled(options, &mut HashMap::new()),
         timezone: Local::now().format("%Z").to_string(),
         today: today.to_string(),
         ..Default::default()
@@ -762,7 +695,6 @@ mod tests {
     }
     fn p(at: u64, event: Event) -> Packet {
         Packet {
-            options: Options::default(),
             chat: PathBuf::from("/absent/CHAT.md"),
             at,
             event,
@@ -862,10 +794,10 @@ mod tests {
         assert_eq!(sum(&t).active_ms, 41 * 60_000);
     }
     #[test]
-    fn pause_and_restart_never_credit_downtime_or_replay_deduped_events() {
+    fn restarts_never_credit_downtime_or_replay_deduped_events() {
         let mut t = tracker();
         t.apply(&tool("a", BASE, false));
-        t.pause();
+        t = Tracker::new(t.data);
         t.apply(&end("a", BASE + 10_000));
         assert_eq!(sum(&t).active_ms, 0);
         let mut t = Tracker::new(t.data);
@@ -992,22 +924,16 @@ mod tests {
         assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
     }
     #[test]
-    fn collection_defaults_on_and_live_pause_is_best_effort_fail_closed() {
-        let config = crate::config::default_config(PathBuf::from("/fixture"));
-        assert!(config.markdown_chat.analytics_enabled);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        let options = Options {
-            enabled: true,
-            settings: Some(path.clone()),
-        };
-        for (bytes, want) in [
-            (r#"{"agentChat":{"analyticsEnabled":false}}"#, false),
-            (r#"{"agentChat":{"analyticsEnabled":true}}"#, true),
-            ("invalid", false),
-        ] {
-            std::fs::write(&path, bytes).unwrap();
-            assert_eq!(enabled(&options, &mut HashMap::new()), want);
+    fn retired_collection_switch_is_accepted_but_not_advertised() {
+        for value in [false, true] {
+            let config: crate::markdown_chat::MarkdownChatConfig =
+                serde_json::from_value(serde_json::json!({"analyticsEnabled":value})).unwrap();
+            assert!(
+                serde_json::to_value(config)
+                    .unwrap()
+                    .get("analyticsEnabled")
+                    .is_none()
+            );
         }
     }
     #[test]
@@ -1031,34 +957,38 @@ mod tests {
         assert_eq!(ids.front().unwrap(), "952");
     }
     #[test]
-    fn analytics_toggle_saves_without_restart_and_defaults_on_when_config_is_missing() {
+    fn saving_settings_removes_the_retired_collection_switch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut config = crate::config::default_config(dir.path().to_owned());
         config.loaded_config_path = Some(path.clone());
-        assert!(enabled(&Options::from_config(&config), &mut HashMap::new()));
-        std::fs::write(
-            &path,
-            serde_json::json!({"workDir":dir.path(),"codexMcp":{"enabled":false}}).to_string(),
-        )
+        std::fs::write(&path, serde_json::json!({"workDir":dir.path(),"codexMcp":{"enabled":false},"agentChat":{"analyticsEnabled":false}}).to_string()).unwrap();
+        let cli = <crate::config::Cli as clap::Parser>::try_parse_from([
+            "codexify",
+            "--config",
+            path.to_str().unwrap(),
+        ])
         .unwrap();
+        crate::config::validate_config_quiet(&cli).unwrap();
         let initial = crate::global_settings::snapshot(&config).unwrap();
-        assert_eq!(initial["defaults"]["agentChat"]["analyticsEnabled"], true);
+        assert!(
+            initial["defaults"]["agentChat"]
+                .get("analyticsEnabled")
+                .is_none()
+        );
         let saved = crate::global_settings::save(
             &config,
             initial["revision"].as_str().unwrap(),
+            Some(initial["raw"].as_str().unwrap().into()),
             None,
-            Some(serde_json::Map::from_iter([(
-                "agentChat.analyticsEnabled".into(),
-                serde_json::json!(false),
-            )])),
         )
         .unwrap();
+        assert!(
+            saved["document"]["agentChat"]
+                .get("analyticsEnabled")
+                .is_none()
+        );
         assert_eq!(saved["restartRequired"], false);
-        assert!(!enabled(
-            &Options::from_config(&config),
-            &mut HashMap::new()
-        ));
     }
     #[test]
     fn real_buffered_collector_publishes_private_counts_without_automation_files() {
@@ -1067,7 +997,10 @@ mod tests {
         let chat = dir.path().join("CHAT.md");
         std::fs::write(&chat, b"protected chat").unwrap();
         let now = crate::markdown_chat::now_ms();
-        let options = Options::default();
+        let mut config = crate::config::default_config(dir.path().into());
+        config.markdown_chat =
+            serde_json::from_value(serde_json::json!({"analyticsEnabled":false})).unwrap();
+        let options = Options::from_config(&config);
         sent(
             &options,
             chat.clone(),

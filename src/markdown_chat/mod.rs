@@ -167,7 +167,9 @@ pub struct MarkdownChatConfig {
     pub default_message_mode: MessageMode,
     pub rollout_reminder_interval: u64,
     pub rollout_enabled: bool,
-    pub analytics_enabled: bool,
+    #[serde(rename = "analyticsEnabled", skip_serializing)]
+    #[doc(hidden)]
+    pub _legacy_analytics_enabled: Option<bool>,
     pub turn_renewal: crate::agent_automation::turn_renewal::TurnRenewalConfig,
     pub notifications: Option<NotificationsConfig>,
     pub automation: AgentAutomationConfig,
@@ -182,7 +184,7 @@ impl Default for MarkdownChatConfig {
             default_message_mode: MessageMode::Steer,
             rollout_reminder_interval: rollout::DEFAULT_REMINDER_INTERVAL,
             rollout_enabled: true,
-            analytics_enabled: true,
+            _legacy_analytics_enabled: None,
             turn_renewal: Default::default(),
             notifications: None,
             automation: AgentAutomationConfig::default(),
