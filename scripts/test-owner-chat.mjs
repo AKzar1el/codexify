@@ -264,7 +264,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     const host=page.locator('#chat-host'),inline=host.locator('#automation-retry-inline');
     await inline.waitFor();
     assert.equal(await host.locator('#goal-bar').isVisible(),false);
-    assert.equal(await host.getByRole('button',{name:'Cancel failed action',exact:true}).isVisible(),true);
+    assert.equal(await host.getByRole('button',{name:'Dismiss error',exact:true}).isVisible(),true);
     assert.equal(await host.locator('#automation-settings').isVisible(),false);
     assert.equal(await inline.textContent(),'Retry');
     assert((await host.locator('#automation-error').textContent()).includes('All three automatic retries failed'));
@@ -1100,7 +1100,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await panel.locator("#automation-action").getByText("Retrying automatically",{exact:true}).waitFor();
     assert.equal(await panel.locator("#goal-retry").isVisible(),false);
     assert.equal(await panel.locator("#automation-error").isVisible(),true);
-    assert((await panel.locator("#automation-error").textContent()).includes("Retrying automatically in"));
+    assert((await panel.locator("#automation-error").textContent()).includes("Retrying the goal automatically in"));
     assert.equal(await panel.locator("#goal-caption").textContent(),"Pursuing goal");
     await panel.getByRole("button",{name:"Close connection settings",exact:true}).click();
     automation.action = { id:"pre-send-attention", kind:"offline_combined", status:"interference", goalRevision:1, lastError:"Clear the draft before retrying", retryMode:"retry", sendAccepted:false };
@@ -1384,7 +1384,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
 
 
 for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
-  test(`${engineName}: Cancel dismisses failed actions and retry countdowns while preserving goals`, {timeout:30000}, async()=>{
+  test(`${engineName}: Dismissing errors preserves the goal and retries across polling`, {timeout:30000}, async()=>{
     const browser=await engine.launch();
     try {
       const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
@@ -1406,27 +1406,33 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
         return route.fulfill({json:{_meta:{[META]:{chat_file:'/private/test/CHAT.md',revision:'1',delivered_through:0,read_through:0,last_agent_call_at_ms:null,total_tool_calls:1,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
       });
       await page.goto(`http://127.0.0.1:43225/?chat=${id}#test-token`);
-      const host=page.locator('#chat-host'),cancel=host.getByRole('button',{name:'Cancel failed action',exact:true}),error=host.locator('#automation-error');
+      const host=page.locator('#chat-host'),dismiss=host.getByRole('button',{name:'Dismiss error',exact:true}),error=host.locator('#automation-error');
       for(const failure of [action,{...action,id:'exhausted',automaticRetryAtMs:null,automaticRetryAttempts:3},{...action,id:'uncertain',status:'ambiguous',sendAccepted:true,retryMode:null,automaticRetryAtMs:null}]) {
         action=failure;
-        await error.waitFor();await cancel.waitFor();
+        await error.waitFor();await dismiss.waitFor();
         const controls=host.locator('#automation-error-row');
-        const row=await controls.boundingBox(),cancelBox=await cancel.boundingBox();
+        const row=await controls.boundingBox(),cancelBox=await dismiss.boundingBox();
         assert(cancelBox.x>=row.x&&cancelBox.x+cancelBox.width<=row.x+row.width+1);
         if(failure.id==='backoff') {
-          await error.getByText(/Retrying automatically/).waitFor();
+          await error.getByText(/Retrying the goal automatically/).waitFor();
           const retryBox=await host.locator('#automation-retry-inline').boundingBox();
-          assert(Math.abs(retryBox.y-cancelBox.y)<2,'Cancel and Retry align on the same row');
+          assert(Math.abs(retryBox.y-cancelBox.y)<2,'Dismiss and Retry align on the same row');
           mkdirSync('/tmp/chat-error-cancel-ui',{recursive:true});
           await page.screenshot({path:`/tmp/chat-error-cancel-ui/${engineName.toLowerCase()}-before.png`});
         }
-        await cancel.click();await error.waitFor({state:'hidden'});await cancel.waitFor({state:'hidden'});
-        await page.locator('.conversation .presence.error').waitFor({state:'detached'});
-        assert.equal(await host.locator('#goal-caption').textContent(),'Pursuing goal');
+        const before=structuredClone(action);
+        await dismiss.click();await error.waitFor({state:'hidden'});await dismiss.waitFor({state:'hidden'});
+        await page.waitForTimeout(1700);
+        assert.equal(await error.isVisible(),false,'polling and countdown changes do not restore a dismissed error');
+        assert.deepEqual(action,before,'dismissing must not change the saved action or retry deadline');
+        assert.equal(goal.status,'active');
+        await host.getByRole('button',{name:'Connection settings',exact:true}).click();
+        assert.equal(await host.locator('#connection-settings-error').isVisible(),true,'diagnostics remain available in settings');
+        await host.getByRole('button',{name:'Close connection settings',exact:true}).click();
         assert.equal(await host.locator('#goal-text').textContent(),goal.markdown);
         if(failure.id==='backoff')await page.screenshot({path:`/tmp/chat-error-cancel-ui/${engineName.toLowerCase()}-after.png`});
       }
-      assert.equal(cancellations.length,3);assert.equal(action.sendAccepted,true);assert.deepEqual(errors,[]);
+      assert.equal(cancellations.length,0);assert.equal(action.sendAccepted,true);assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });
 }

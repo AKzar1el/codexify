@@ -12,7 +12,9 @@ use super::companion::{
     MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES, rendered_action_prompt_bytes,
     same_chatgpt_conversation_url,
 };
-use super::store::{MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure};
+use super::store::{
+    GOAL_RETRY_AFTER_MS, MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure,
+};
 use super::{
     AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AutomationActionKind,
     AutomationActionStatus, BrowserCompanionClient, CompanionActionSnapshot, CompanionActionState,
@@ -958,7 +960,9 @@ impl AgentAutomationSupervisor {
             )?;
             let mut state = task.store.load(&task.task)?;
             task.store.notify_state(&task.chat, &state).await;
-            if state.action.status == AutomationActionStatus::Cancelled {
+            if state.action.status == AutomationActionStatus::Cancelled
+                && state.goal_retry_at_ms().is_none()
+            {
                 continue;
             }
             if !activity.agent_stop_requested
@@ -1101,6 +1105,20 @@ impl AgentAutomationSupervisor {
             {
                 state = task.store.load(&task.task)?;
             }
+            if let Some(retry_at) = state.goal_retry_at_ms() {
+                if now_ms < retry_at {
+                    continue;
+                }
+                if task
+                    .store
+                    .reset_offline_goal_for_retry(&task.task, &state, now_ms)?
+                {
+                    self.live.write().await.remove(task.task.stable_key());
+                    state = task.store.load(&task.task)?;
+                } else {
+                    continue;
+                }
+            }
             if let Some(retry_at) = state.automatic_retry_at_ms() {
                 if now_ms < retry_at {
                     continue;
@@ -1240,6 +1258,10 @@ impl AgentAutomationSupervisor {
                 && goal_revision.is_some()
                 && state.goal_wake.nudged_epoch.as_deref() == Some(activity_epoch.as_str())
                 && state.goal_wake.nudged_sequence == Some(activity_sequence)
+                && state
+                    .goal_wake
+                    .last_nudged_at_ms
+                    .is_none_or(|last| now_ms < last.saturating_add(GOAL_RETRY_AFTER_MS))
             {
                 continue;
             }
@@ -1634,7 +1656,9 @@ impl AgentAutomationSupervisor {
                             &execution.request.action_id,
                             &execution.activity_epoch,
                             execution.activity_sequence,
-                            now_ms,
+                            now_ms.saturating_add(
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            ),
                         )?;
                         let _ = task
                             .chat
@@ -1735,7 +1759,7 @@ impl AgentAutomationSupervisor {
                 &execution.request.action_id,
                 &execution.activity_epoch,
                 execution.activity_sequence,
-                now_ms,
+                now_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
             )?;
             let _ = task
                 .chat

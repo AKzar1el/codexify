@@ -998,7 +998,7 @@ async fn offline_unread_messages_enqueue_without_a_goal_and_remain_unread() {
 }
 
 #[tokio::test]
-async fn goal_only_action_runs_once_per_activity_epoch_and_stalls_without_tool_activity() {
+async fn goal_only_action_waits_before_retry_when_no_tool_activity() {
     let fixture = fixture().await;
     let goal = fixture
         .store
@@ -6004,7 +6004,7 @@ async fn recovery_requires_an_exact_accepted_terminal_goal_receipt() {
 }
 
 #[tokio::test]
-async fn a_recovered_goal_without_agent_progress_stays_stalled() {
+async fn a_recovered_goal_without_agent_progress_waits_for_the_retry_interval() {
     let f = orphaned_goal_fixture(false).await;
     let (restarted, _) = restarted_goal_supervisor(&f, Some(retained_goal_snapshot())).await;
     restarted
@@ -6303,15 +6303,17 @@ async fn an_overall_deadline_bounds_even_an_action_that_keeps_emitting_progress(
 }
 
 #[tokio::test]
-async fn abandoned_unconfirmed_actions_expire_without_replaying_and_can_reconcile_later() {
+async fn abandoned_goal_actions_retry_and_skip_the_wake_if_agent_activity_returns() {
     let f = orphaned_goal_fixture(false).await;
     let (restarted, executor) = restarted_goal_supervisor(&f, None).await;
     restarted.scan_once(2001 + 32 * 60 * 1000).await.unwrap();
-    let expired = f.store.load(&f.task).unwrap();
-    assert_eq!(expired.action.status, AutomationActionStatus::Ambiguous);
-    assert_eq!(expired.action.updated_at_ms, Some(2001));
-    assert!(expired.action.last_error.unwrap().contains("time limit"));
-    assert_eq!(restarted.queued_count().await, 0);
+    let retried = f.store.load(&f.task).unwrap();
+    assert_eq!(retried.action.status, AutomationActionStatus::Queued);
+    assert_ne!(retried.action.id.as_deref(), Some("orphaned-goal-action"));
+    assert_eq!(
+        restarted.next_queued_kind().await,
+        Some(codexify::agent_automation::AutomationActionKind::OfflineGoal)
+    );
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     f.chat
         .record_agent_call(2002 + 32 * 60 * 1000)
@@ -6319,11 +6321,17 @@ async fn abandoned_unconfirmed_actions_expire_without_replaying_and_can_reconcil
         .unwrap();
     *executor.retained.lock().unwrap() = Some(retained_goal_snapshot());
     restarted.scan_once(2002 + 32 * 60 * 1000).await.unwrap();
+    restarted.run_next(2003 + 32 * 60 * 1000).await.unwrap();
     assert_eq!(
         f.store.load(&f.task).unwrap().action.status,
         AutomationActionStatus::Idle
     );
     assert_eq!(restarted.queued_count().await, 0);
+    assert_eq!(
+        executor.calls.load(Ordering::SeqCst),
+        0,
+        "returning native activity makes the queued wake stale"
+    );
     assert_eq!(f.store.load(&f.task).unwrap().goal.unwrap().turn_count, 2);
 }
 
@@ -7490,5 +7498,272 @@ async fn native_delivery_does_not_reuse_an_older_submission_intent_for_a_new_act
     assert_eq!(
         f.chat.unread_snapshot().await.unwrap().messages[0].id,
         "new-unread-intent"
+    );
+}
+
+#[tokio::test]
+async fn offline_goal_retries_every_three_minutes_without_tool_activity_across_restart() {
+    for submitted_only in [false, true] {
+        let f = fixture().await;
+        let goal = f
+            .store
+            .set_goal(&f.task, "Finish the objective", 100)
+            .unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        f.chat.record_agent_call(1_000).await.unwrap();
+        f.executor.events.lock().unwrap().push(if submitted_only {
+            CompanionEventKind::SubmissionComplete {
+                canonical_url: "https://chatgpt.com/c/example".into(),
+            }
+        } else {
+            CompanionEventKind::GenerationComplete {
+                final_markdown: None,
+                canonical_url: Some("https://chatgpt.com/c/example".into()),
+            }
+        });
+        let first = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+        f.supervisor.scan_once(first).await.unwrap();
+        f.supervisor.run_next(first + 1).await.unwrap();
+        let mut previous_action = f.store.load(&f.task).unwrap().action.id;
+        for retry in 0..5 {
+            let state = f.store.load(&f.task).unwrap();
+            let deadline = state
+                .goal_wake
+                .last_nudged_at_ms
+                .unwrap()
+                .max(state.action.updated_at_ms.unwrap())
+                + 180_000;
+            let restarted = AgentAutomationSupervisor::new(
+                f.config.markdown_chat.automation.clone(),
+                f.executor.clone(),
+            );
+            restarted
+                .register_task(AutomationTaskHandle::new(
+                    f.task.clone(),
+                    0,
+                    f.store.clone(),
+                    f.chat.clone(),
+                ))
+                .await
+                .unwrap();
+            restarted.scan_once(deadline - 1).await.unwrap();
+            assert_eq!(
+                restarted.queued_count().await,
+                0,
+                "do not retry before three minutes"
+            );
+            restarted.scan_once(deadline).await.unwrap();
+            assert_eq!(
+                restarted.queued_count().await,
+                1,
+                "an unchanged activity epoch must not suppress retry {retry}"
+            );
+            let queued = f.store.load(&f.task).unwrap();
+            assert_ne!(queued.action.id, previous_action);
+            restarted.scan_once(deadline).await.unwrap();
+            assert_eq!(
+                restarted.queued_count().await,
+                1,
+                "only one pending wake per goal"
+            );
+            restarted.run_next(deadline + 1).await.unwrap();
+            previous_action = queued.action.id;
+        }
+        let executions = f.executor.executions.lock().unwrap();
+        assert_eq!(executions.len(), 6);
+        assert!(executions.iter().all(|e| matches!(
+            e.request.prompt,
+            ActionPrompt::OfflineGoal { .. }
+        ) && e.unread_message_ids.is_empty()));
+        assert_eq!(f.store.load(&f.task).unwrap().goal.unwrap().turn_count, 7);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_goal_only_action_does_not_strand_an_active_objective() {
+    use codexify::agent_automation::AutomationActionKind;
+    for later_activity in [false, true] {
+        let f = fixture().await;
+        let goal = f
+            .store
+            .set_goal(&f.task, "Keep pursuing the goal", 100)
+            .unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        f.store
+            .queue_action(
+                &f.task,
+                "cancelled-goal",
+                AutomationActionKind::OfflineGoal,
+                1,
+                Some(goal.revision),
+                1000,
+            )
+            .unwrap();
+        f.store
+            .cancel_action(&f.task, "cancelled-goal", 1001)
+            .unwrap();
+        if later_activity {
+            f.chat.record_agent_call(1010).await.unwrap();
+        }
+        let deadline = if later_activity {
+            1010 + AUTOMATION_OFFLINE_AFTER_MS
+        } else {
+            1001 + 180_000
+        };
+        let restarted = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            f.executor.clone(),
+        );
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        restarted.scan_once(deadline - 1).await.unwrap();
+        assert_eq!(restarted.queued_count().await, 0);
+        restarted.scan_once(deadline).await.unwrap();
+        assert_eq!(restarted.queued_count().await, 1);
+        assert_eq!(
+            restarted.next_queued_kind().await,
+            Some(AutomationActionKind::OfflineGoal)
+        );
+        restarted.run_next(deadline + 1).await.unwrap();
+        assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn offline_goal_retry_respects_activity_pause_stop_and_completion() {
+    use codexify::agent_automation::GoalFinish;
+    for change in ["online", "paused", "stopped", "blocked", "completed"] {
+        let f = fixture().await;
+        let goal = f
+            .store
+            .set_goal(&f.task, "Keep pursuing the goal", 100)
+            .unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        f.supervisor.scan_once(1000).await.unwrap();
+        f.supervisor.run_next(1001).await.unwrap();
+        let deadline = f
+            .store
+            .load(&f.task)
+            .unwrap()
+            .goal_wake
+            .last_nudged_at_ms
+            .unwrap()
+            + 180_000;
+        match change {
+            "online" => {
+                f.chat.record_agent_call(deadline - 1).await.unwrap();
+            }
+            "paused" => {
+                f.store.stop_goal(&f.task, goal.revision, 1002).unwrap();
+            }
+            "stopped" => {
+                f.chat.request_agent_stop("stop-goal".into()).await.unwrap();
+            }
+            "blocked" => {
+                f.store
+                    .finish_goal(
+                        &f.task,
+                        goal.revision,
+                        GoalFinish::Blocked {
+                            reason: "Need input".into(),
+                        },
+                        1002,
+                    )
+                    .unwrap();
+            }
+            "completed" => {
+                f.store
+                    .finish_goal(
+                        &f.task,
+                        goal.revision,
+                        GoalFinish::Completed { summary: None },
+                        1002,
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        f.supervisor.scan_once(deadline).await.unwrap();
+        assert_eq!(f.supervisor.queued_count().await, 0, "{change}");
+        assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1, "{change}");
+    }
+}
+
+#[tokio::test]
+async fn offline_goal_retry_never_replays_a_previously_accepted_user_batch() {
+    let f = fixture().await;
+    let goal = f.store.set_goal(&f.task, "Complete the goal", 100).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    f.chat
+        .append_user("accepted-once".into(), "Keep this instruction".into())
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1000).await.unwrap();
+    f.supervisor.run_next(1001).await.unwrap();
+    let accepted = f.store.load(&f.task).unwrap();
+    assert!(accepted.action.messages_fenced);
+    let deadline = accepted.goal_wake.last_nudged_at_ms.unwrap() + 180_000;
+    f.supervisor.scan_once(deadline - 1).await.unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    f.supervisor.scan_once(deadline).await.unwrap();
+    f.supervisor.run_next(deadline + 1).await.unwrap();
+    let executions = f.executor.executions.lock().unwrap();
+    assert_eq!(executions.len(), 2);
+    assert_eq!(executions[0].unread_message_ids, vec!["accepted-once"]);
+    assert!(executions[1].unread_message_ids.is_empty());
+    assert!(matches!(
+        executions[1].request.prompt,
+        ActionPrompt::OfflineGoal { .. }
+    ));
+    assert_eq!(
+        f.store.load(&f.task).unwrap().chat_mirror,
+        accepted.chat_mirror
+    );
+}
+
+#[tokio::test]
+async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_objective() {
+    let f = fixture().await;
+    let goal = f
+        .store
+        .set_goal(&f.task, "Keep pursuing the goal", 100)
+        .unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    let executor = Arc::new(PreSendFailureExecutor::default());
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    let mut now = 1000;
+    for _ in 0..5 {
+        supervisor.scan_once(now).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        assert!(supervisor.run_next(now + 1).await.is_err());
+        let failed = f.store.load(&f.task).unwrap();
+        let retry_at = failed.automatic_retry_at_ms().unwrap();
+        assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + 180_000);
+        supervisor.scan_once(retry_at - 1).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+        now = retry_at;
+    }
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        f.store.load(&f.task).unwrap().goal.unwrap().turn_count,
+        1,
+        "a failed Send does not count as another goal turn"
     );
 }

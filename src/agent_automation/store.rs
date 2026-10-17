@@ -20,6 +20,7 @@ const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
 const CHAT_SUBMISSION_FILE: &str = "chat-submission.json";
+pub(crate) const GOAL_RETRY_AFTER_MS: u64 = 180_000;
 const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
@@ -317,7 +318,48 @@ impl AutomationTaskState {
             && self.pairing.verified_owner_generation == Some(owner_generation)
     }
 
+    pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
+        let goal = self.goal.as_ref()?;
+        let action = &self.action;
+        if goal.status != GoalStatus::Active
+            || action.goal_revision != Some(goal.revision)
+            || action.id.is_none()
+            || action.status == AutomationActionStatus::Idle
+                && self.goal_wake.last_nudged_at_ms.is_none()
+            || !matches!(
+                action.status,
+                AutomationActionStatus::Idle
+                    | AutomationActionStatus::Stalled
+                    | AutomationActionStatus::Failed
+                    | AutomationActionStatus::Ambiguous
+                    | AutomationActionStatus::Cancelled
+            )
+            || !(action.kind == Some(AutomationActionKind::OfflineGoal)
+                || action.kind == Some(AutomationActionKind::OfflineCombined)
+                    && action.status != AutomationActionStatus::Cancelled
+                    && action.send_accepted == Some(true)
+                    && action.messages_fenced)
+        {
+            return None;
+        }
+        action
+            .updated_at_ms
+            .into_iter()
+            .chain(self.goal_wake.last_nudged_at_ms)
+            .max()
+            .map(|last| last.saturating_add(GOAL_RETRY_AFTER_MS))
+    }
+
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
+        if matches!(
+            self.action.status,
+            AutomationActionStatus::Failed
+                | AutomationActionStatus::Ambiguous
+                | AutomationActionStatus::Stalled
+        ) && let Some(deadline) = self.goal_retry_at_ms()
+        {
+            return Some(deadline);
+        }
         let action = &self.action;
         if action.status != AutomationActionStatus::Failed
             || action.send_accepted != Some(false)
@@ -1779,6 +1821,34 @@ impl AgentAutomationStore {
                 ..Default::default()
             };
             Ok(state.action.clone())
+        })
+    }
+
+    pub(crate) fn reset_offline_goal_for_retry(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.goal != expected.goal
+                || state.goal_wake != expected.goal_wake
+                || state
+                    .goal_retry_at_ms()
+                    .is_none_or(|deadline| now_ms < deadline)
+            {
+                return Ok(false);
+            }
+            // The active goal authorizes another turn. Keep the accepted-message
+            // ledger so continuing a goal never replays an earlier user batch.
+            state.action = AutomationActionState {
+                updated_at_ms: Some(now_ms),
+                ..Default::default()
+            };
+            state.goal_wake = GoalWakeState::default();
+            Ok(true)
         })
     }
 

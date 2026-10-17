@@ -423,7 +423,7 @@ input,select,textarea { font:inherit; }
         <div class="automation-actions"><button type="button" id="automation-set-goal">Set goal</button></div>
         <p id="goal-status" class="automation-detail"></p>
       </div>
-      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button><button type="button" class="composer-button" id="automation-cancel-inline" aria-label="Cancel failed action" title="Cancel this action and stop automatic retries" hidden>Cancel</button></div>
+      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button><button type="button" class="composer-button" id="automation-dismiss-inline" aria-label="Dismiss error" title="Hide this error; the goal and automatic retries keep running" hidden>Dismiss</button></div>
       <div id="goal-bar" hidden>
         <span id="goal-icon" aria-hidden="true"></span><span id="goal-caption"></span><span id="goal-text"></span><span id="goal-metrics" aria-label="Goal active time and turns" title="Counts while this goal is enabled and the agent is online, away, or waiting. Pauses when the agent is offline."></span>
         <button type="button" class="composer-button" id="goal-retry" hidden>Retry</button>
@@ -454,7 +454,16 @@ input,select,textarea { font:inherit; }
     };
     let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, catalogAttempted = false, loadingModels = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
     let pairingSubmitting = false, pairingRevision = 0, pairingSubmissionError = "", lastSubmittedPairingUrl = "";
-    const setError = message => { for (const node of [nodes.error,byId("connection-settings-error")]) { node.hidden = !message; node.textContent = message || ""; } };
+    let dismissedError = null, shownErrorSignature = null;
+    const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
+    const setError = (message, signature = message) => {
+      if (!message) dismissedError = null;
+      nodes.error.textContent = message || "";
+      shownErrorSignature = signature;
+      nodes.error.hidden = !message || dismissedError === signature;
+      byId("automation-dismiss-inline").hidden = nodes.error.hidden;
+      const detail = byId("connection-settings-error"); detail.hidden = !message; detail.textContent = message || "";
+    };
     const post = async (operation, body = {}) => {
       const response = await api(`/api/chats/${id}/automation/${operation}`, { method:"POST", body:JSON.stringify(body) });
       return response.json();
@@ -512,6 +521,7 @@ input,select,textarea { font:inherit; }
       // Goal controls can arrive after the history has already scrolled to its end.
       const atBottom = history.scrollHeight - history.scrollTop - history.clientHeight < 50;
       current = state;
+      const setStateError = message => setError(message, errorSignature(message));
       panel.hidden = tools.hidden = !state?.enabled;
       settingsToggle.hidden = !state?.enabled;
       if (!state?.enabled) { showSettings(false); return; }
@@ -592,7 +602,8 @@ input,select,textarea { font:inherit; }
       nodes.toggleGoal.setAttribute("aria-label", toggleLabel); nodes.toggleGoal.title = toggleLabel;
       byId("goal-toggle-icon").setAttribute("d", goal?.status === "active" ? "M9 8v8m6-8v8" : "m10 8 6 4-6 4Z");
       const retrySeconds = automaticRetry ? Math.max(0, Math.ceil((state.action.automaticRetryAtMs - Date.now() - clockOffset) / 1000)) : null;
-      const retryStatus = automaticRetry ? `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of 3). You can also retry now.` : "";
+      const goalRetry = goal?.status === "active" && (state.action?.kind === "offline_goal" || state.action?.kind === "offline_combined" && state.action.sendAccepted && state.action.messagesFenced);
+      const retryStatus = automaticRetry ? goalRetry ? `Retrying the goal automatically in ${retrySeconds}s. You can also continue now.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of 3). You can also retry now.` : "";
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
@@ -602,17 +613,18 @@ input,select,textarea { font:inherit; }
       nodes.cancelAction.textContent = actionFailed ? "Cancel failed action" : "Cancel queued action";
       nodes.retryAction.disabled = !retryMode;
       nodes.retryAction.textContent = retryLabel;
-      if (pairingWaiting || verified && state.action?.kind === "pair_verify") setError("");
-      else if (pairingSubmissionError) setError(pairingSubmissionError);
-      else if (automaticRetry) setError(`${failure} ${retryStatus}`);
+      if (pairingWaiting || verified && state.action?.kind === "pair_verify") setStateError("");
+      else if (pairingSubmissionError) setStateError(pairingSubmissionError);
+      else if (automaticRetry) setStateError(`${failure} ${retryStatus}`);
       else if (actionNeedsAttention) {
         const preparation = state.action?.status === "authentication_required" ? "Sign in from connection settings, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
         const exhausted = state.action?.automaticRetryAttempts >= 3 ? "All three automatic retries failed. " : "";
         const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? "Use Continue to start another goal turn. Previously submitted messages will not be resent." : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
-        setError(`${failure} ${nextStep}`);
-      } else if (state.action?.lastError) setError(state.action.lastError);
-      else setError("");
-      byId("automation-cancel-inline").hidden = nodes.error.hidden;
+        setStateError(`${failure} ${nextStep}`);
+      } else if (state.action?.lastError) setStateError(state.action.lastError);
+      else setStateError("");
+      if (nodes.error.hidden) inlineRetry.hidden = true;
+      byId("automation-dismiss-inline").hidden = nodes.error.hidden;
       if (atBottom) history.scrollTop = history.scrollHeight;
     }
     async function loadModels(refresh = false) {
@@ -772,9 +784,11 @@ input,select,textarea { font:inherit; }
     nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); pairingSubmissionError = ""; }));
     nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     byId("automation-retry-inline").addEventListener("click", () => nodes.retryAction.click());
-    byId("automation-cancel-inline").addEventListener("click", () => {
-      if (!nodes.cancelAction.disabled) nodes.cancelAction.click();
-      else { pairingSubmissionError = ""; setError(""); byId("automation-cancel-inline").hidden = true; }
+    byId("automation-dismiss-inline").addEventListener("click", () => {
+      dismissedError = shownErrorSignature;
+      nodes.error.hidden = true;
+      byId("automation-retry-inline").hidden = true;
+      byId("automation-dismiss-inline").hidden = true;
     });
     byId("goal-retry").addEventListener("click", () => {
       if (!nodes.retryAction.disabled) nodes.retryAction.click();
