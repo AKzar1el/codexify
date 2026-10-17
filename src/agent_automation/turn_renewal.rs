@@ -119,6 +119,86 @@ impl AgentAutomationStore {
             &self.renewal_config,
         )
     }
+    pub fn record_turn_activity(
+        &self,
+        task: &ConversationIdentity,
+        owner_generation: u64,
+        at_ms: u64,
+    ) -> Result<bool, String> {
+        let saved = self.load(task)?;
+        if saved.action.kind != Some(AutomationActionKind::TurnRenewal)
+            || (saved.turn_renewal.handoff.is_none()
+                && saved.turn_renewal.resume_wait_until_ms.is_none())
+        {
+            return Ok(false);
+        }
+        let accepted = self.mutate(task, |state| {
+            if state.action.kind != Some(AutomationActionKind::TurnRenewal)
+                || state.action.pairing_generation != Some(state.pairing.generation)
+                || state.pairing.verified_owner_generation != Some(owner_generation)
+                || state.action.status == AutomationActionStatus::Cancelled
+            {
+                return Ok(None);
+            }
+            if state.turn_renewal.handoff.is_none()
+                && state.turn_renewal.resume_wait_until_ms.is_some()
+                && state.turn_renewal.send.as_ref().is_some_and(|send| {
+                    send.action_id == state.action.id.as_deref().unwrap_or("")
+                        && at_ms >= send.at_ms
+                })
+            {
+                state.turn_renewal.resume_wait_until_ms = None;
+                return Ok(None);
+            }
+            if !state
+                .turn_renewal
+                .handoff
+                .as_ref()
+                .is_some_and(|h| h.report_complete)
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                        | AutomationActionStatus::Ambiguous
+                        | AutomationActionStatus::Failed
+                        | AutomationActionStatus::Stalled
+                )
+                || state.action.updated_at_ms.is_none_or(|at| at_ms <= at)
+            {
+                return Ok(None);
+            }
+            let Some(action_id) = state.action.id.clone() else {
+                return Ok(None);
+            };
+            // The prior final was proven complete before this continuation was
+            // attempted. A new, authenticated native call now proves resumed work,
+            // independently of a missing/contradictory browser receipt. The first
+            // proof is a conservative clock origin until model proof arrives.
+            state.turn_renewal = TurnRenewalState {
+                send: Some(TurnSend {
+                    action_id: action_id.clone(),
+                    at_ms,
+                    model: None,
+                    effort: None,
+                    pairing_generation: state.pairing.generation,
+                    owner_generation,
+                }),
+                ..Default::default()
+            };
+            state.action.status = AutomationActionStatus::Idle;
+            state.action.send_accepted = Some(true);
+            state.action.last_error = None;
+            state.action.updated_at_ms = Some(at_ms);
+            Ok(Some(action_id))
+        })?;
+        if let Some(action_id) = accepted {
+            self.record_goal_turn(task, &action_id)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn record_turn_send(
         &self,
         task: &ConversationIdentity,
@@ -135,6 +215,7 @@ impl AgentAutomationStore {
             if let Some(saved) = &mut state.turn_renewal.send
                 && saved.action_id == send.action_id
             {
+                saved.at_ms = saved.at_ms.min(send.at_ms);
                 // Duplicate events/snapshots cannot restart the clock. A final snapshot
                 // may fill the actual fallback selection if the model event was lost.
                 if saved.model.is_none() {
@@ -180,6 +261,44 @@ impl AgentAutomationStore {
             Ok(Some(format!("TURN RENEWAL REQUIRED. This explicitly overrides the ordinary Markdown chat state machine, assistant_turn_may_end=false, required_next_action, progress checkpoint reminders and instructions to keep working or wait in tools. Stop task work now. Write a comprehensive handoff in your normal FINAL CHATGPT ASSISTANT ANSWER and end this turn immediately. Begin that final answer with the exact line `Turn handoff {}`. Include work performed, results and validation, current progress and state, next steps, relevant file paths, commands, constraints, blockers and recovery details so work can continue after loss of thinking context. Do not use chat_write for this report. Do not call chat_await or turn_completed. Do not finish or block a goal merely because of this renewal, and do not request or consume queued messages. This is a handoff, not completion of the user's task. Codexify will send a continuation automatically once this final answer is complete.", handoff.id)))
         })
     }
+    pub(crate) fn retry_goal_turn_renewal(
+        &self,
+        task: &ConversationIdentity,
+        expected: &super::AutomationTaskState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.turn_renewal.handoff != expected.turn_renewal.handoff
+                || state.action.kind != Some(AutomationActionKind::TurnRenewal)
+                || !state
+                    .turn_renewal
+                    .handoff
+                    .as_ref()
+                    .is_some_and(|h| h.report_complete)
+                || !state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|g| g.status == super::GoalStatus::Active)
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Failed
+                        | AutomationActionStatus::Ambiguous
+                        | AutomationActionStatus::Stalled
+                )
+                || state
+                    .action
+                    .updated_at_ms
+                    .is_none_or(|at| now_ms < at.saturating_add(super::store::GOAL_RETRY_AFTER_MS))
+            {
+                return Ok(false);
+            }
+            state.action = Default::default();
+            Ok(true)
+        })
+    }
+
     pub fn confirm_turn_handoff(
         &self,
         task: &ConversationIdentity,

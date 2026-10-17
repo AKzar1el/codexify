@@ -6,7 +6,7 @@ use codexify::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 struct Executor {
     complete: AtomicBool,
+    accepted_at_ms: AtomicU64,
     sent: Mutex<Vec<AutomationExecution>>,
     fail: AtomicBool,
     ambiguous: AtomicBool,
@@ -51,7 +52,10 @@ impl AutomationExecutor for Executor {
             .send(CompanionEvent {
                 sequence: 2,
                 action_id: e.request.action_id.clone(),
-                at_ms: 100_000,
+                at_ms: match self.accepted_at_ms.load(Ordering::SeqCst) {
+                    0 => 100_000,
+                    at => at,
+                },
                 kind: CompanionEventKind::SendAccepted,
             })
             .unwrap();
@@ -151,6 +155,12 @@ async fn fixture(enabled: bool) -> Fixture {
     }
 }
 const DUE: u64 = 1000 + 55 * 60_000;
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 #[test]
 fn opt_in_defaults_and_strict_model_limits() {
@@ -448,4 +458,148 @@ async fn unlisted_or_unavailable_selection_uses_fifty_five_minutes() {
             .is_none()
     );
     assert!(f.store.turn_renewal_notice(&f.task, DUE).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn native_activity_after_verified_handoff_clears_uncertain_receipt_and_late_errors() {
+    let f = fixture(true).await;
+    f.store.turn_renewal_notice(&f.task, DUE).unwrap();
+    f.executor.complete.store(true, Ordering::SeqCst);
+    f.executor.fail.store(true, Ordering::SeqCst);
+    f.executor.ambiguous.store(true, Ordering::SeqCst);
+    f.supervisor.scan_once(DUE + 10_000).await.unwrap();
+    let _ = f.supervisor.run_next(DUE + 10_000).await;
+    let state = f.store.load(&f.task).unwrap();
+    let at = state.action.updated_at_ms.unwrap() + 1;
+    assert!(f.store.record_turn_activity(&f.task, 0, at).unwrap());
+    let id = state.action.id.unwrap();
+    let state = f.store.load(&f.task).unwrap();
+    assert!(state.turn_renewal.handoff.is_none());
+    assert_eq!(state.action.status, AutomationActionStatus::Idle);
+    assert_eq!(state.action.send_accepted, Some(true));
+    f.store
+        .update_action_status(
+            &f.task,
+            &id,
+            AutomationActionStatus::Ambiguous,
+            Some("Late browser error"),
+            None,
+            at + 1,
+        )
+        .unwrap();
+    assert!(f.store.load(&f.task).unwrap().action.last_error.is_none());
+    let before = f.store.load(&f.task).unwrap();
+    f.store
+        .record_turn_send(
+            &f.task,
+            TurnSend {
+                action_id: id,
+                at_ms: at - 10,
+                model: Some("gpt-5.6-sol".into()),
+                effort: Some("max".into()),
+                pairing_generation: before.pairing.generation,
+                owner_generation: 0,
+            },
+        )
+        .unwrap();
+    let confirmed = f.store.load(&f.task).unwrap().turn_renewal.send.unwrap();
+    assert_eq!(confirmed.at_ms, at - 10);
+    assert_eq!(confirmed.model.as_deref(), Some("gpt-5.6-sol"));
+    assert!(
+        f.store
+            .turn_renewal_notice(&f.task, at + 55 * 60_000)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.store
+            .turn_renewal_notice(&f.task, at + 1)
+            .unwrap()
+            .is_none()
+    );
+}
+#[tokio::test]
+async fn first_native_call_releases_continuation_grace_for_normal_completion() {
+    let f = fixture(true).await;
+    f.executor.accepted_at_ms.store(wall_ms(), Ordering::SeqCst);
+    f.store.turn_renewal_notice(&f.task, DUE).unwrap();
+    f.chat
+        .queue_user_message(
+            "after-renewal".into(),
+            "Private later request".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    f.executor.complete.store(true, Ordering::SeqCst);
+    f.supervisor.scan_once(DUE + 10_000).await.unwrap();
+    f.supervisor.run_next(DUE + 10_000).await.unwrap();
+    assert!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .turn_renewal
+            .resume_wait_until_ms
+            .is_some()
+    );
+    let now = wall_ms();
+    f.chat.record_agent_call(now).await.unwrap();
+    f.store.record_turn_activity(&f.task, 0, now).unwrap();
+    assert!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .turn_renewal
+            .resume_wait_until_ms
+            .is_none()
+    );
+    assert!(f.chat.queue_turn_completed().await.unwrap());
+    assert_eq!(
+        f.chat
+            .release_queued_message(now)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "after-renewal"
+    );
+}
+
+#[tokio::test]
+async fn stalled_goal_renewal_retries_after_three_minutes_only_with_fresh_report_proof() {
+    let f = fixture(true).await;
+    let goal = f.store.set_goal(&f.task, "Keep working", 1000).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 1000).unwrap();
+    f.store.turn_renewal_notice(&f.task, DUE).unwrap();
+    f.executor.complete.store(true, Ordering::SeqCst);
+    f.executor.fail.store(true, Ordering::SeqCst);
+    f.executor.ambiguous.store(true, Ordering::SeqCst);
+    f.supervisor.scan_once(DUE + 10_000).await.unwrap();
+    let _ = f.supervisor.run_next(DUE + 10_000).await;
+    let failed_at = f.store.load(&f.task).unwrap().action.updated_at_ms.unwrap();
+    f.supervisor
+        .scan_once(failed_at + 180_000 - 1)
+        .await
+        .unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    f.executor.complete.store(false, Ordering::SeqCst);
+    f.supervisor.scan_once(failed_at + 180_000).await.unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    f.executor.complete.store(true, Ordering::SeqCst);
+    f.supervisor.scan_once(failed_at + 180_001).await.unwrap();
+    assert_eq!(
+        f.supervisor.next_queued_kind().await,
+        Some(AutomationActionKind::TurnRenewal)
+    );
+    f.executor.fail.store(false, Ordering::SeqCst);
+    f.supervisor.run_next(failed_at + 180_001).await.unwrap();
+    assert_eq!(f.executor.sent.lock().unwrap().len(), 2);
+    assert!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .turn_renewal
+            .handoff
+            .is_none()
+    );
 }

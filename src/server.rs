@@ -253,6 +253,7 @@ impl CodexHandler {
                 if clear_waiting {
                     chat.clear_agent_waiting();
                 }
+                let activity_at_ms = activity.at_ms;
                 if let Err(error) = chat.sync_agent_activity(activity).await {
                     tracing::warn!(%error, "could not persist Markdown chat agent activity");
                 } else {
@@ -275,6 +276,16 @@ impl CodexHandler {
                         match crate::agent_automation::AgentAutomationStore::for_config(&effective)
                         {
                             Ok(store) => {
+                                // The durable presence update above must precede releasing
+                                // the renewal queue hold. Reconcile before registration can
+                                // notify an obsolete browser error.
+                                if let Err(error) = store.record_turn_activity(
+                                    task,
+                                    owner_generation,
+                                    activity_at_ms,
+                                ) {
+                                    tracing::warn!(%error,"could not reconcile resumed turn activity");
+                                }
                                 if let Err(error) = supervisor
                                     .register_task(
                                         crate::agent_automation::AutomationTaskHandle::new(

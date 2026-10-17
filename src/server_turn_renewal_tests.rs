@@ -17,6 +17,10 @@ async fn renewal_control_reaches_real_mcp_results_without_queue_or_progress_depe
         crate::types::ToolLogLevel::Info,
     );
     handler.config = Arc::new(config.clone());
+    handler.agent_automation = Some(crate::agent_automation::AgentAutomationSupervisor::new(
+        config.markdown_chat.automation.clone(),
+        Arc::new(ServerAutomationNoopExecutor),
+    ));
     let identity = ConversationIdentity::from_openai_session("mcp-renewal").unwrap();
     let store = AgentAutomationStore::for_config(&config).unwrap();
     let now = crate::markdown_chat::now_ms();
@@ -126,6 +130,66 @@ async fn renewal_control_reaches_real_mcp_results_without_queue_or_progress_depe
     }
     assert_eq!(chat.queued_messages().await.unwrap().len(), 1);
     assert!(chat.unread_snapshot().await.unwrap().messages.is_empty());
+    let handoff = store.load(&identity).unwrap().turn_renewal.handoff.unwrap();
+    store.confirm_turn_handoff(&identity, &handoff.id).unwrap();
+    store
+        .queue_action(
+            &identity,
+            "uncertain-resume",
+            AutomationActionKind::TurnRenewal,
+            pair.generation,
+            None,
+            now - 10,
+        )
+        .unwrap();
+    store
+        .update_action_status(
+            &identity,
+            "uncertain-resume",
+            AutomationActionStatus::Ambiguous,
+            Some("Uncertain browser receipt"),
+            None,
+            now - 5,
+        )
+        .unwrap();
+    let response = client
+        .call_tool(automation_request(
+            "get_agent_brief",
+            json!({}),
+            "mcp-renewal",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(response.is_error, Some(true));
+    assert!(
+        response
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("turn_renewal_required")
+            .is_none_or(|v| v.is_null())
+    );
+    let after = store.load(&identity).unwrap();
+    assert!(after.turn_renewal.handoff.is_none());
+    assert!(after.action.last_error.is_none());
+    let completed = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call_tool(automation_request(
+            "turn_completed",
+            json!({}),
+            "mcp-renewal",
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(completed.is_error, Some(true));
+    assert!(
+        completed.structured_content.as_ref().unwrap()["new_chat_message_from_user"]
+            .as_str()
+            .unwrap()
+            .contains("Do not expose this queued message")
+    );
     client.cancel().await.unwrap();
     server.await.unwrap();
 }

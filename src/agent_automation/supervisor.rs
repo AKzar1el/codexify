@@ -1000,10 +1000,48 @@ impl AgentAutomationSupervisor {
                 state = task.store.load(&task.task)?;
             }
             if let Some(handoff) = state.turn_renewal.handoff.clone() {
-                if state.action.kind == Some(AutomationActionKind::TurnRenewal)
-                    && state.action.send_accepted == Some(true)
-                {
-                    continue;
+                if state.action.kind == Some(AutomationActionKind::TurnRenewal) {
+                    let retry_goal = handoff.report_complete
+                        && state
+                            .goal
+                            .as_ref()
+                            .is_some_and(|g| g.status == GoalStatus::Active)
+                        && !activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+                        && matches!(
+                            state.action.status,
+                            AutomationActionStatus::Failed
+                                | AutomationActionStatus::Ambiguous
+                                | AutomationActionStatus::Stalled
+                        )
+                        && state
+                            .action
+                            .updated_at_ms
+                            .is_some_and(|at| now_ms >= at.saturating_add(GOAL_RETRY_AFTER_MS));
+                    if retry_goal {
+                        // A goal retry contains only Continue, never user messages. Require
+                        // fresh proof that its final handoff is still the latest completed
+                        // answer; never stop an active response to retry renewal.
+                        if let (Some(url), Some(account)) = (
+                            state.pairing.canonical_url.as_deref(),
+                            state.pairing.account_fingerprint.as_deref(),
+                        ) && let Ok(_browser_guard) = self.run_lock.try_lock()
+                            && let Ok(Ok(true)) = tokio::time::timeout(
+                                Duration::from_secs(15),
+                                self.executor
+                                    .turn_handoff_complete(url, account, &handoff.id),
+                            )
+                            .await
+                            && task
+                                .store
+                                .retry_goal_turn_renewal(&task.task, &state, now_ms)?
+                        {
+                            state = task.store.load(&task.task)?;
+                        } else {
+                            continue;
+                        }
+                    } else if state.action.send_accepted == Some(true) {
+                        continue;
+                    }
                 }
                 if !handoff.report_complete {
                     if let (Some(url), Some(account)) = (

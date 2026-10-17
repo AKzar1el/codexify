@@ -197,7 +197,9 @@ explicit exception to the Markdown chat wait loop; the report is not sent with
 `chat_write` and does not complete or block a goal. Codexify waits for the new
 report to finish, then sends `Continue.` even without a goal. Queued messages
 stay private during the handoff and are not included in that continuation.
-Uncertain sends are not replayed automatically. User stop/cancellation and
+Uncertain user-message sends are not replayed automatically. A stalled goal
+continuation can retry after three minutes only after fresh completed-report
+checks; native activity acknowledges delivery and prevents replay. User stop/cancellation and
 disabling turn renewal cancel its pending continuation. Saved pairing, timer
 and handoff state survive service restarts.
 
