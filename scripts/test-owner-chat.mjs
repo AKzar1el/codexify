@@ -451,9 +451,12 @@ test(`${engineName}: opening a goal chat stays at the bottom after controls load
       await page.waitForTimeout(100);
       assert(await bottomGap()<1,`${width}px ${order}: loading goal controls must keep the last reply fully visible`);
 
+      const showList=async()=>{const back=page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true});if(await back.isVisible())await back.click();};
+      await showList();
       await page.locator(".conversation").filter({ hasText:/Other chat/ }).click();
       await page.locator("#chat-host #composer").waitFor();
       hold("automation");
+      await showList();
       await page.locator(".conversation").filter({ hasText:/Running goal chat/ }).click();
       await history.locator(".message").last().waitFor();
       releaseGate();
@@ -1476,6 +1479,93 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
       await host.locator('#automation-error').waitFor({state:'hidden'});
       await page.locator('.conversation .presence.error').waitFor({state:'detached'});
       assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+}
+
+async function mobileNavigationFixture(browser, options = {}) {
+  const page = await ownerTestPage(browser, {viewport:{width:390,height:844}, ...options});
+  page.setDefaultTimeout(6000);
+  const errors = [], writes = [], now = Date.now(), origin = 'http://127.0.0.1:43228';
+  const chats = Array.from({length:60}, (_, index) => ({
+    id:(index+1).toString(16).padStart(64,'0'), title:index ? `Conversation ${index+1}` : 'Bioshock optimization',
+    workspace:'mach-o-vita',projectPath:'/Volumes/data/dev/mach-o-vita',lastEntryEnd:200,
+    lastEntryAtMs:now-index*1000,lastAgentCallAtMs:now,totalToolCalls:16998,
+  }));
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route(origin+'/**', route => {
+    const request=route.request(), url=new URL(request.url());
+    if(request.method()==='POST')writes.push(url.pathname);
+    if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+    if(url.pathname==='/api/chats')return route.fulfill({json:{chats,matchedChatIds:chats.filter(chat=>chat.title.toLowerCase().includes((url.searchParams.get('q')||'').toLowerCase())).map(chat=>chat.id),serverTimeMs:Date.now()}});
+    const chat=chats.find(chat=>chat.id===url.pathname.split('/')[3]);assert(chat,'known mobile chat request: '+url.pathname);
+    if(url.pathname.endsWith('/organization')){
+      Object.assign(chat,request.postDataJSON().pinned ? {pinnedAtMs:now} : {pinnedAtMs:null});
+      return route.fulfill({json:{pinnedAtMs:chat.pinnedAtMs,archivedAtMs:null}});
+    }
+    if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,
+      pairing:{status:'verified'},selection:{model:'gpt-5.6-sol',effort:'max'},action:{status:'idle'},
+      catalog:{models:[{id:'gpt-5.6-sol',label:'GPT-5.6',efforts:[{id:'max',label:'Pro',available:true}]}]},
+      goal:{status:'active',revision:1,markdown:'Finish the implementation and verify the results.',elapsedActiveMs:281900000,turnCount:84},
+      companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:now},serverTimeMs:Date.now(),
+    }});
+    return route.fulfill({json:{_meta:{[META]:{chat_file:`/fixture/${chat.id}/CHAT.md`,revision:'200',read_through:200,delivered_through:200,total_tool_calls:16998,last_agent_call_at_ms:now,server_time_ms:Date.now(),has_more:false,unchanged:false,messages:[
+      {id:'update',role:'agent',markdown:`Update for ${chat.title}. The focused checks pass. I’m reviewing the remaining results before proceeding.`,start:0,end:200,tool_call_count:16998,created_at_ms:now},
+    ]}}}});
+  });
+  return {page,chats,errors,writes,origin};
+}
+
+for (const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
+  test(`${name}: mobile navigation gives the list and chat separate full-width views`, {timeout:30000}, async()=>{
+    const browser=await engine.launch();
+    try {
+      const {page,chats,errors,writes,origin}=await mobileNavigationFixture(browser);
+      await page.goto(origin+'/#test-token');
+      const host=page.locator('#chat-host'),nav=page.locator('#conversations'),sidebar=page.locator('#layout > aside'),main=page.locator('#layout > main');
+      const row=chat=>page.locator(`[data-chat-id="${chat.id}"] .conversation`);
+      const fullWidth=async node=>{const box=await node.boundingBox();assert(box&&Math.abs(box.x)<1&&Math.abs(box.width-page.viewportSize().width)<1,'the visible pane fills the viewport');};
+      const capture=async label=>{if(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.CODEXIFY_MOBILE_NAV_SCREENSHOTS}/${name.toLowerCase()}-${label}.png`});}};
+      await row(chats[0]).waitFor();assert(await main.isHidden());await fullWidth(sidebar);await capture('list');
+      await page.getByRole('button',{name:'Recent',exact:true}).click();
+      const search=page.getByRole('searchbox',{name:'Search chats',exact:true});await search.fill('Conversation');
+      await row(chats[20]).scrollIntoViewIfNeeded();const scroll=await nav.evaluate(node=>node.scrollTop);
+      await row(chats[20]).click();await host.locator('#draft').waitFor();await host.locator('#goal-metrics').getByText(/84 turns/).waitFor();
+      assert(await sidebar.isHidden());await fullWidth(main);
+      const back=host.getByRole('button',{name:'Back to chats',exact:true});await back.waitFor();assert((await back.boundingBox()).width>=44);
+      for(const width of [320,390,760]){
+        await page.setViewportSize({width,height:844});await fullWidth(main);
+        assert.equal(await page.locator('body').evaluate(node=>node.scrollWidth>innerWidth),false);
+        const send=await host.locator('#send').boundingBox();assert(send.x>=0&&send.x+send.width<=width,'composer action fits');
+      }
+      await page.setViewportSize({width:390,height:844});await capture('chat');
+      await host.locator('#draft').fill('Keep this unsent draft');await back.click();
+      assert(await main.isHidden());await fullWidth(sidebar);assert.equal(new URL(page.url()).searchParams.get('chat'),null);
+      assert.equal(await search.inputValue(),'Conversation');assert.equal(await page.getByRole('button',{name:'Recent',exact:true}).getAttribute('aria-pressed'),'true');
+      assert(Math.abs(await nav.evaluate(node=>node.scrollTop)-scroll)<2,'back restores list scroll');
+      await row(chats[20]).click();await host.locator('#draft').waitFor();assert.equal(await host.locator('#draft').inputValue(),'Keep this unsent draft');
+      await page.goBack();await sidebar.waitFor();assert(await main.isHidden());
+      await page.goForward();await host.locator('#draft').waitFor();assert(await sidebar.isHidden());
+      await page.reload();await host.locator('#draft').waitFor();assert(await sidebar.isHidden());assert.equal(await host.locator('#draft').inputValue(),'Keep this unsent draft');
+      await host.getByRole('button',{name:'Back to chats',exact:true}).click();
+      await row(chats[21]).click();await host.locator('#draft').waitFor();assert.equal(await host.locator('#draft').inputValue(),'');
+      assert((await host.locator('#messages').textContent()).includes(chats[21].title));
+      await page.setViewportSize({width:1280,height:900});await sidebar.waitFor();assert(await main.isVisible());assert(await host.getByRole('button',{name:'Back to chats',exact:true}).isHidden());await capture('desktop');
+      assert(!writes.some(path=>path.endsWith('/send')||path.includes('/goal')||path.endsWith('/action/cancel')),'navigation never sends, cancels, or pauses agent work');assert.deepEqual(errors,[]);
+    }finally{await browser.close();}
+  });
+  test(`${name}: touch landscape and archived-list navigation remain single-pane`, {timeout:20000}, async()=>{
+    const browser=await engine.launch();
+    try {
+      const {page,chats,errors,origin}=await mobileNavigationFixture(browser,{viewport:{width:844,height:390},isMobile:true,hasTouch:true});
+      await page.goto(origin+'/?chat='+chats[0].id+'#test-token');
+      const host=page.locator('#chat-host');await host.locator('#draft').waitFor();
+      assert(await page.locator('#layout > aside').isHidden());assert.equal(Math.round((await page.locator('#layout > main').boundingBox()).width),844);
+      await host.getByRole('button',{name:'Back to chats',exact:true}).click();assert(await page.locator('#layout > main').isHidden());
+      await page.getByRole('button',{name:'Archived chats',exact:true}).click();await page.getByRole('button',{name:'Back to agent chats',exact:true}).click();
+      assert(await page.locator('#layout > main').isHidden(),'returning from archived chats stays in the chat list');
+      await page.locator(`[data-chat-id="${chats[0].id}"] [data-action="pin"]`).click();
+      assert(await page.locator('#layout > main').isHidden(),'pinning a chat does not open it');assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });
 }

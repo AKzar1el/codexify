@@ -101,8 +101,11 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
    await page.getByRole('button',{name:'Recent',exact:true}).click();await page.waitForTimeout(2200);
    for(const width of [1280,390]) for(const theme of ['light','dark']) for(const archived of [false,true]) {
     await page.setViewportSize({width,height:900});await page.emulateMedia({colorScheme:theme});
+    const showList=async()=>{const back=page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true});if(await back.isVisible())await back.click();};
+    await showList();
     if(archived){await page.getByRole('button',{name:'Archived chats',exact:true}).click();await row(page,chats[4]).locator('.conversation').click();}
     else if(await page.locator('#archive-back').isVisible())await page.getByRole('button',{name:'Back to agent chats',exact:true}).click();
+    await showList();
     await page.mouse.move(width-10,10);
     const bounds=await page.locator('aside').evaluate(aside=>({overflow:aside.scrollWidth>aside.clientWidth,rows:[...aside.querySelectorAll('.conversation-row')].map(row=>({overflow:row.scrollWidth>row.clientWidth,actions:[...row.querySelectorAll('.conversation-action')].map(button=>{const box=button.getBoundingClientRect();return {right:box.right,left:box.left,width:box.width};})})),right:aside.getBoundingClientRect().right}));
     assert.equal(bounds.overflow,false,`${width} ${theme} sidebar must fit`);

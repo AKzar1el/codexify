@@ -792,6 +792,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   if (canCopyChat) el("copy-chat").addEventListener("click", () => { void copyWholeChat(); });
   el("refresh").addEventListener("click", () => { revision = null; void refresh(); });
   function teardown() {
+    save();
     attachments?.close();
     clearCopyFeedback();
     tornDown = true; clearTimeout(pollTimer); clearTimeout(saveTimer); clearTimeout(presenceTimer); clearTimeout(messageClockTimer);

@@ -164,6 +164,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
    const fill=await page.locator('.restore-action .archive-body').evaluate(path=>getComputedStyle(path).fill);assert.notEqual(fill,'none');
    for(const width of [1280,390]){
     await page.setViewportSize({width,height:960});
+    const back=page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true});if(await back.isVisible())await back.click();
     assert.equal(await page.locator('body').evaluate(body=>body.scrollWidth>innerWidth),false,'no horizontal overflow');
     if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS)await page.screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-archived-${width}.png`});
    }

@@ -74,7 +74,14 @@ input,select,textarea { font:inherit; }
 #list-view button[aria-pressed="true"] { background:var(--selected); color:var(--ink); }
 .project-heading { margin:14px 9px 4px; font-size:12px; font-weight:600; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .chat-shell { flex:1; min-height:0; }
-@media(max-width:680px) { #layout { grid-template-columns:minmax(145px,33%) minmax(0,1fr); } main { padding:0; } #chat-host { border:0; border-radius:0; } .conversation { grid-template-columns:16px minmax(0,1fr) 7px; gap:5px; padding:9px 5px; } aside header { padding:12px 8px; } aside h1 { font-size:14px; } #list-view { flex-direction:column; } }
+@media(max-width:760px),(hover:none) and (pointer:coarse) {
+  #layout { display:block; min-height:0; }
+  #layout > aside,#layout > main { width:100%; height:100%; }
+  #layout[data-view="chat"] > aside,#layout[data-view="list"] > main { display:none; }
+  aside { border:0; }
+  main { padding:0; }
+  #chat-host { width:100%; border:0; border-radius:0; }
+}
 
 .sidebar-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .sidebar-heading-title,.sidebar-heading-actions { display:flex; align-items:center; gap:4px; min-width:0; }
@@ -84,7 +91,6 @@ input,select,textarea { font:inherit; }
 .sidebar-icon:hover { background:var(--bg); }
 #archive-back { margin-left:-7px; }
 @media(hover:none) { .conversation-action { opacity:1; pointer-events:auto; } .conversation-main,.conversation-row[data-pinned="true"] .conversation-main { padding-right:54px; } .unread { visibility:hidden; } }
-@media(max-width:680px) { .sidebar-heading { gap:2px; flex-wrap:wrap; } .sidebar-heading-title { flex:1; flex-basis:100%; } .sidebar-heading-actions { margin-left:auto; } .sidebar-icon { width:25px; height:28px; } .conversation-action { width:22px; height:26px; } .conversation-action svg { width:15px; height:15px; } .conversation-row:hover .conversation-main,.conversation-row:has(:focus-visible) .conversation-main { padding-right:46px; } .conversation-row[data-pinned="true"] .conversation { grid-template-columns:16px minmax(0,1fr) 34px; } }
 #new-chat-dialog { width:min(600px,calc(100vw - 24px)); max-height:90dvh; overflow:auto; border:1px solid var(--line); border-radius:16px; padding:20px; color:var(--ink); background:var(--panel); }
 #new-chat-dialog::backdrop { background:#0006; }
 #new-chat-dialog h2 { margin:0; font-size:18px; }
@@ -103,7 +109,7 @@ input,select,textarea { font:inherit; }
 </style>
 </head>
 <body>
-<div id="layout">
+<div id="layout" data-view="list">
   <aside aria-label="Conversations">
     <header><div class="sidebar-heading"><div class="sidebar-heading-title"><button type="button" class="sidebar-icon" id="archive-back" aria-label="Back to agent chats" title="Back to agent chats" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7M5 12h14"/></svg></button><h1 id="sidebar-title">Agent chats</h1></div><div class="sidebar-heading-actions" id="sidebar-actions"><button type="button" class="sidebar-icon" id="archived-chats" aria-label="Archived chats" title="Archived chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h18v4H3zM5 7v14h14V7M10 11h4"/></svg></button><button type="button" class="sidebar-icon" id="new-chat" aria-label="New chat" title="New chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></div><input id="chat-search" type="search" aria-label="Search chats" placeholder="Search chats…" maxlength="1024"><div id="list-view" aria-label="Chat list view"><button type="button" id="view-projects" aria-pressed="true">Projects</button><button type="button" id="view-recent" aria-pressed="false">Recent</button></div></header>
     <div id="error" hidden></div>
@@ -140,6 +146,11 @@ input,select,textarea { font:inherit; }
 .composer-button:hover { background:var(--agent); }
 #attach-files { margin-right:auto; }
 .header-actions #automation-settings-toggle { display:grid; place-items:center; }
+.mobile-chat-back { display:none; flex:none; }
+@media(max-width:760px),(hover:none) and (pointer:coarse) {
+  .header { gap:8px; padding:12px; }
+  .mobile-chat-back { display:grid; place-items:center; width:44px; height:44px; padding:11px; color:var(--ink); }
+}
 #automation-pair-chat:disabled { cursor:default; }
 #automation-pair-chat:disabled:hover { background:transparent; }
 #goal-bar { display:flex; align-items:center; gap:8px; margin:0 16px -10px; padding:10px 12px 18px; border:1px solid var(--border); border-bottom:0; border-radius:18px 18px 0 0; font-size:var(--chat-label-size); }
@@ -230,6 +241,8 @@ input,select,textarea { font:inherit; }
   const errorNode = document.getElementById("error");
   const search = document.getElementById("chat-search");
   let selected = null, controller = null, chats = [], clockOffset = 0, presenceTimer = null;
+  let chatListScrollTop = 0;
+  const mobileLayout = matchMedia("(max-width:760px),(hover:none) and (pointer:coarse)");
   let listMode = "projects", matchedIds = null, matchedQuery = "", searchTimer = null, listRequest = 0, pendingList = null;
   let archiveView = false, lastNormalSelection = null, normalSearch = "", archivedSearch = "";
   let waitingForPresenceRefresh = false;
@@ -868,10 +881,10 @@ input,select,textarea { font:inherit; }
       ++listRequest; pendingList = null;
       const current = chats.find(item => item.id === chat.id);
       if (current) Object.assign(current, organization);
-      if (operation === "archive") {
+      if (operation === "archive" && (!mobileLayout.matches || selected !== null)) {
         if (next) select(next.id);
         else { clearSelection(); const url = new URL(location.href); url.searchParams.delete("chat"); history.pushState(null, "", url.pathname + url.search + url.hash); }
-      } else if (operation === "pin") select(chat.id);
+      } else if (operation === "pin" && (!mobileLayout.matches || selected !== null)) select(chat.id);
       renderList();
     } catch (error) { showError(error.message || "Could not update this chat."); }
     finally { organizing.delete(chat.id); renderList(); void refresh(); }
@@ -887,7 +900,7 @@ input,select,textarea { font:inherit; }
       if (value) url.searchParams.set("archived", "1"); else url.searchParams.delete("archived");
       history.pushState(null, "", url.pathname + url.search + url.hash);
     }
-    if (!value && restoreSelection) {
+    if (!value && restoreSelection && (!mobileLayout.matches || selected !== null)) {
       const current = chats.find(chat => chat.id === selected && chat.archivedAtMs == null);
       const previous = chats.find(chat => chat.id === lastNormalSelection && chat.archivedAtMs == null);
       const target = current || previous || chatGroups().flatMap(group => group.chats)[0];
@@ -977,19 +990,31 @@ input,select,textarea { font:inherit; }
   }
   function clearSelection(message = "Select a conversation to view its chat.") {
     controller?.close(); controller = null; selected = null;
+    document.getElementById("layout").dataset.view = "list";
     const placeholder = textNode("div", "", message);
     placeholder.id = "placeholder";
     host.replaceChildren(placeholder);
     renderList();
+    list.scrollTop = chatListScrollTop;
+  }
+  function showChatList() {
+    const previous = selected;
+    const url = new URL(location.href);
+    url.searchParams.delete("chat");
+    history.pushState(null, "", url.pathname + url.search + url.hash);
+    clearSelection();
+    (list.querySelector(`[data-chat-id="${previous}"] .conversation`) || search).focus({preventScroll:true});
   }
   function select(id, updateUrl = true) {
     if (id === selected) return;
+    if (list.getClientRects().length) chatListScrollTop = list.scrollTop;
     if (updateUrl) {
       const url = new URL(location.href);
       url.searchParams.set("chat", id);
       history.pushState(null, "", url.pathname + url.search + url.hash);
     }
     controller?.close(); controller = null; selected = id;
+    document.getElementById("layout").dataset.view = "chat";
     if (!archiveView && chats.find(chat => chat.id === id)?.archivedAtMs == null) lastNormalSelection = id;
     host.replaceChildren();
     const shell = document.createElement("div");
@@ -998,6 +1023,12 @@ input,select,textarea { font:inherit; }
     scope.append(document.getElementById("chat-template").content.cloneNode(true));
     scope.append(document.getElementById("owner-composer-style").content.cloneNode(true));
     host.append(shell);
+    const back = document.createElement("button");
+    back.type = "button"; back.className = "icon-button mobile-chat-back";
+    back.setAttribute("aria-label", "Back to chats"); back.title = "Back to chats";
+    back.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7M5 12h14"/></svg>`;
+    back.addEventListener("click", showChatList);
+    scope.querySelector(".header").prepend(back);
     const automation = createAutomationPanel(id, scope);
     const rename = document.createElement("button");
     rename.id = "rename-chat"; rename.type = "button"; rename.className = "icon-button";
