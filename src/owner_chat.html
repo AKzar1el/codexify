@@ -37,7 +37,6 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .conversation-action svg,.sidebar-icon svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
 .conversation-row:hover .conversation-action,.conversation-row:has(:focus-visible) .conversation-action,.conversation-row[data-pinned="true"] .pin-action,.conversation-row[data-archived="true"] .restore-action { opacity:1; pointer-events:auto; }
 .conversation-row[data-pinned="true"] .pin-action path { fill:currentColor; }
-.pinned-divider { border:0; border-top:1px solid var(--line); margin:8px 10px; }
 .recent-heading { display:flex; align-items:center; gap:10px; margin:12px 10px 6px; color:var(--muted); font-size:11px; font-weight:500; }
 .recent-heading::after { content:""; flex:1; border-top:1px solid var(--line); }
 .conversation-row[data-archived="true"] .restore-action .archive-body { fill:currentColor; }
@@ -976,10 +975,7 @@ input,select,textarea { font:inherit; }
     }
     const groups = chatGroups();
     if (!groups.some(group => group.chats.length)) list.append(textNode("p", "list-empty", query ? "No matching chats." : archiveView ? "No archived chats." : "No persisted conversations yet."));
-    for (const [groupIndex,group] of groups.entries()) {
-      if (!archiveView && listMode === "recent" && groupIndex === 1 && groups[0].heading === "Pinned") {
-        const separator = document.createElement("hr"); separator.className = "pinned-divider"; separator.setAttribute("aria-hidden", "true"); list.append(separator);
-      }
+    for (const group of groups) {
       if (group.heading) {
         const heading = textNode("h2", !archiveView && listMode === "recent" ? "recent-heading" : "project-heading", group.heading);
         heading.title = group.title || group.heading;

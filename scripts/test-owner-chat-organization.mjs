@@ -149,7 +149,15 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${nam
   for(const kind of ['archive','pin'])assert.equal(await row(page,a).locator(`[data-action="${kind}"]`).evaluate(node=>getComputedStyle(node).opacity),'0','mouse selection must not leave hover actions visible');
   await row(page,b).hover();for(const kind of ['archive','pin'])assert.equal(await row(page,b).locator(`[data-action="${kind}"]`).evaluate(node=>getComputedStyle(node).opacity),'1');
   await action(page,b,'pin');await page.getByRole('button',{name:'Recent',exact:true}).click();await page.mouse.move(1000,20);
-  await page.locator('.pinned-divider').waitFor();assert.equal(await page.locator('.pinned-divider').count(),1);
+  await page.getByRole('heading',{name:'Pinned',exact:true}).waitFor();
+  assert.deepEqual(await page.locator('.recent-heading').allTextContents(),['Pinned','Today']);
+  assert.equal(await page.locator('#conversations hr').count(),0,'section headings provide the separator without an extra horizontal rule');
+  for(const width of [390,1280]){
+   await page.setViewportSize({width,height:900});
+   if(width===390)await page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true}).click();
+   assert.equal(await page.getByRole('heading',{name:'Today',exact:true}).evaluate(node=>getComputedStyle(node,'::after').borderTopWidth),'1px');
+   if(process.env.CODEXIFY_ORGANIZATION_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_ORGANIZATION_SCREENSHOTS,{recursive:true});await page.locator('aside').screenshot({path:`${process.env.CODEXIFY_ORGANIZATION_SCREENSHOTS}/${name.toLowerCase()}-${width}-single-divider.png`});}
+  }
   assert.notEqual(await row(page,b).locator('.pin-action path').evaluate(node=>getComputedStyle(node).fill),'none');
   assert.equal(await row(page,b).locator('[data-action="archive"]').evaluate(node=>getComputedStyle(node).opacity),'0');
   await row(page,a).locator('.conversation').click();await action(page,b,'archive');await row(page,b).waitFor({state:'detached'});
