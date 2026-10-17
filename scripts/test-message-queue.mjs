@@ -115,6 +115,10 @@ for(const[engineName,engine]of[['Chromium',chromium],['WebKit',webkit]]){
   const browser=await engine.launch();try{
    const f=await fixture(browser,{width:390,queued:['Please investigate a particularly long request which must truncate without squeezing the controls','Keep this separate for the next turn']});
    const{page,host,errors}=f;
+   f.backend.queue[0].attachments=[{id:'f'.repeat(32),originalName:'Queued notes.txt',mimeType:'text/plain',size:1200}];
+   await host.locator('.queued-attachments .attachment-card').waitFor();
+   const visual=host.locator('.queued-attachments .attachment-visual'),glyph=visual.locator('svg');
+   const visualBox=await visual.boundingBox(),glyphBox=await glyph.boundingBox();assert(glyphBox.width<=visualBox.width&&glyphBox.height<=visualBox.height,'queued file icons fit without clipping');
    for(const colorScheme of ['light','dark'])for(const width of [390,1280]){
     await page.emulateMedia({colorScheme});await page.setViewportSize({width,height:900});
     const region=host.locator('#queued-messages');await region.waitFor();
