@@ -66,7 +66,7 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     state.goal = Some(active.clone());
     state.action.kind = Some(AutomationActionKind::OfflineGoal);
     state.action.goal_revision = Some(active.revision);
-    assert_eq!(state.automatic_retry_at_ms(), Some(180_100));
+    assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
     active.status = GoalStatus::Configured;
     state.goal = Some(active.clone());
     assert!(state.automatic_retry_at_ms().is_none());
