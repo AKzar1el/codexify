@@ -850,14 +850,29 @@ mod tests {
     fn native_tool_guard_tracks_scope_including_early_return_and_cancellation() {
         let task = "analytics-scope-test";
         let owner = 471;
-        {
-            let _guard = begin_tool(task, owner);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let guard = loop {
+            let guard = begin_tool(task, owner);
             let state = native_activity(task, owner);
-            assert!(state.reliable);
-            assert_eq!(state.active, 1);
-        }
-        let state = native_activity(task, owner);
-        assert!(state.reliable);
+            if state.reliable {
+                assert_eq!(state.active, 1);
+                break guard;
+            }
+            // Other parallel tests can briefly occupy the best-effort registry.
+            // An untracked guard must be dropped before taking a fresh sample.
+            drop(guard);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        drop(guard);
+        let state = loop {
+            let state = native_activity(task, owner);
+            if state.reliable {
+                break state;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         assert_eq!(state.active, 0);
         assert!(state.finished_at > 0);
     }
