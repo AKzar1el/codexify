@@ -495,20 +495,21 @@ export class SingleWindowCoordinator {
     }
   }
 
-  private async bounded<T>(operation:(signal:AbortSignal)=>Promise<T>, parent?:AbortSignal,
+  private async bounded<T>(operation:(signal:AbortSignal,progress:()=>void)=>Promise<T>, parent?:AbortSignal,
     mayHaveSent:()=>boolean=()=>false):Promise<T> {
     const abort = new AbortController();
     const cancel = () => abort.abort(new BrowserCompanionError("Browser action was cancelled", "cancelled"));
     if (parent?.aborted) cancel(); else parent?.addEventListener("abort",cancel,{once:true});
     const timer = setTimeout(() => abort.abort(new BrowserCompanionError(
-      `Browser operation timed out after ${this.timeouts.operationMs / 1000} seconds`, "failed")), this.timeouts.operationMs);
+      `Browser operation timed out after ${this.timeouts.operationMs / 1000} seconds without progress`, "failed")), this.timeouts.operationMs);
     timer.unref?.();
     let onAbort!:()=>void;
     const interrupted = new Promise<{interrupted:true}>(resolve => {
       onAbort=()=>resolve({interrupted:true});
       if (abort.signal.aborted) onAbort(); else abort.signal.addEventListener("abort",onAbort,{once:true});
     });
-    const pending = Promise.resolve().then(() => { abort.signal.throwIfAborted(); return operation(abort.signal); })
+    const progress = () => { if (!abort.signal.aborted) timer.refresh(); };
+    const pending = Promise.resolve().then(() => { abort.signal.throwIfAborted(); return operation(abort.signal,progress); })
       .then(value=>({ok:true as const,value}),error=>({ok:false as const,error}));
     const wait = async <V>(promise:Promise<V>, ms:number):Promise<V|undefined> => {
       let timer!:ReturnType<typeof setTimeout>;
@@ -562,12 +563,22 @@ export class SingleWindowCoordinator {
   }
 
   private async run(record: ActionRecord): Promise<void> {
+    const completedSteps = new Set<string>();
     try {
-      await this.bounded(signal=>this.driver.execute({
+      await this.bounded((signal,progress)=>this.driver.execute({
         request:record.request,
         renderedPrompt:renderActionPrompt(record.request.prompt as ActionPrompt),
         signal,
-        emit:event => this.emit(record, event),
+        emit:event => {
+          this.emit(record,event);
+          // Only a newly verified stage renews the stall deadline. Repeated
+          // events and response output cannot keep browser ownership alive.
+          if (!record.terminal && !completedSteps.has(event.type)
+            && ["navigating","composer_ready","model_verified","connector_verified","send_accepted","conversation_created"].includes(event.type)) {
+            completedSteps.add(event.type);
+            progress();
+          }
+        },
       }),record.abort.signal,()=>this.driver.submissionMayHaveBeenAccepted?.(record.request.actionId)??false);
       if (!record.terminal) {
         this.emit(record, {

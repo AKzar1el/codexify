@@ -512,6 +512,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     let selectedConnector: SelectedConnector | undefined;
     let pairingSelection: PairingMediumSelection | undefined;
     let restoreUrl: string | undefined;
+    let submissionStep = "opening conversation";
+    const step = (name:string) => {
+      submissionStep = name;
+      if (process.env.CODEXIFY_BROWSER_TRACE_SUBMISSION === "1") console.error(`[submission-step] ${execution.request.actionId} ${name}`);
+    };
     try {
       execution.emit({ type:"navigating" });
       const creating = execution.request.prompt.kind === "create_chat";
@@ -575,20 +580,25 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       execution.emit({ type:"connector_verified" });
       // Read history before inserting a prompt: unsupported markers must not
       // make a newly filled composer flash and disappear during failure cleanup.
+      step("reading submission baseline");
       await verifyHandoff();
       const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       insertionAttempted = true;
+      step("inserting prompt");
       try {await insertExactPrompt(selectedConnector.composer, execution.renderedPrompt);}
       catch(error){
         if(error instanceof BrowserCompanionError)throw error;
         throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent","external_interference",{cause:error});
       }
+      step("waiting for Send control");
       const send = await uniqueSendButton(await activeComposer(page, 30_000, execution.signal), 30_000, execution.signal);
+      step("checking model and connector");
       if (pairingSelection) await pairingSelection.verify(execution.signal);
       else if (selected) await assertSelectedModelAndEffort(page, selected, execution.signal, creating);
       if (!await connectorIsSelected(await activeComposer(page, 30_000, execution.signal), execution.request.connectorName, selectedConnector.identity)) {
         throw new BrowserCompanionError("ChatGPT changed the selected connector before Send", "external_interference");
       }
+      step("checking prompt and conversation");
       if (await composerText(await activeComposer(page, 30_000, execution.signal)) !== execution.renderedPrompt) {
         throw new BrowserCompanionError("ChatGPT composer text changed before Send", "external_interference");
       }
@@ -600,7 +610,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       await verifyHandoff();
       sendActivated = true;
       if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
+      step("clicking Send");
       await send.click({ timeout:10_000, signal:execution.signal });
+      step("confirming Send acceptance");
       try {
         await waitForSubmissionAcceptance(page, baseline, Date.now() + 30_000, execution.signal);
       } catch (error) {
@@ -636,6 +648,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       }
       execution.emit({ type:"submission_complete", canonicalUrl });
     } catch (error) {
+      if (process.env.CODEXIFY_BROWSER_TRACE_SUBMISSION === "1") console.error(`[submission-step] ${execution.request.actionId} failed at ${submissionStep}; sendActivated=${sendActivated}; sendAccepted=${sendAccepted}`);
       if (!sendActivated && insertionAttempted && ownedPage) {
         // A failed readiness check must not leave our own unchanged prompt blocking retries.
         // Never clear a draft that was edited, moved, or might already have been submitted.

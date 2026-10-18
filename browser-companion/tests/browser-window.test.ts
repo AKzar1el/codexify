@@ -654,6 +654,53 @@ test("a stopped browser is not reported as a ChatGPT authentication failure",asy
 });
 
 const shortBudget = {operationMs:45,cleanupMs:40,hardStopMs:30};
+
+test('verified submission phases each receive the operation timeout budget',async()=>{
+ class ProgressDriver extends DeferredDriver {
+  override async execute(execution:DriverExecution) {
+   execution.emit({type:'navigating'});
+   for(const event of [
+    {type:'composer_ready'},
+    {type:'model_verified',model:execution.request.model!,effort:execution.request.effort!},
+    {type:'connector_verified'},
+   ] as const) {
+    await new Promise(resolve=>setTimeout(resolve,70));
+    execution.signal.throwIfAborted();
+    execution.emit(event);
+   }
+   await new Promise(resolve=>setTimeout(resolve,70));
+   execution.signal.throwIfAborted();
+   execution.emit({type:'send_accepted'});
+   execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});
+  }
+ }
+ const coordinator=new SingleWindowCoordinator(new ProgressDriver(),TEST_BUILD,{...shortBudget,operationMs:120});
+ await coordinator.execute(request('progressing-submission'));
+ const events=await collect(coordinator,'progressing-submission');
+ expect(events.at(-1)?.type).toBe('submission_complete');
+ expect((await coordinator.action('progressing-submission'))?.sendAccepted).toBeTrue();
+ await coordinator.close();
+});
+
+test('repeating one submission phase cannot keep a stalled action alive',async()=>{
+ class RepeatingDriver extends DeferredDriver {
+  override async execute(execution:DriverExecution) {
+   execution.emit({type:'navigating'});
+   for(let attempt=0;attempt<30;attempt++) {
+    execution.signal.throwIfAborted();
+    execution.emit({type:'composer_ready'});
+    await new Promise(resolve=>setTimeout(resolve,10));
+   }
+  }
+ }
+ const coordinator=new SingleWindowCoordinator(new RepeatingDriver(),TEST_BUILD,shortBudget);
+ await coordinator.execute(request('repeated-phase'));
+ const events=await collect(coordinator,'repeated-phase');
+ expect(events.at(-1)?.type).toBe('failed');
+ expect((events.at(-1) as any).message).toContain('timed out');
+ await coordinator.close();
+});
+
 class TimedSubmissionDriver extends DeferredDriver {
   attempted = false;
   constructor(private readonly phase:'before-send'|'attempted'|'accepted') { super(); }

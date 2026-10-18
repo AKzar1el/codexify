@@ -301,6 +301,11 @@ impl Default for AutomationTaskState {
 }
 
 impl AutomationTaskState {
+    fn can_resume_cancelled_action(&self) -> bool {
+        self.action.status == AutomationActionStatus::Cancelled
+            && (self.action.send_accepted == Some(false) || self.action.messages_fenced)
+    }
+
     pub fn retry_mode(&self) -> Option<&'static str> {
         action_retry_mode(self)
     }
@@ -1816,15 +1821,14 @@ impl AgentAutomationStore {
         created_at_ms: u64,
     ) -> Result<(), String> {
         self.mutate(task, |state| {
-            if state.action.status == AutomationActionStatus::Cancelled
-                && state.action.send_accepted == Some(false)
+            if state.can_resume_cancelled_action()
                 && state
                     .action
                     .updated_at_ms
                     .is_some_and(|cancelled| created_at_ms > cancelled)
             {
-                // New user intent can resume confirmed-unsent work. Preserve any accepted
-                // batch fence; cancellation never proves that an uncertain send failed.
+                // New intent may resume unsent work or follow an accepted, fenced batch.
+                // Retain the mirror ledger so an accepted message is never sent again.
                 state.action = AutomationActionState::default();
             }
             Ok(())
@@ -2522,19 +2526,20 @@ fn start_goal(
     }
     let result = goal.clone();
     state.goal_wake = GoalWakeState::default();
-    if was_blocked
-        && state.action.goal_revision == Some(expected_revision)
-        && state.action.kind == Some(AutomationActionKind::OfflineGoal)
-        && !matches!(
-            state.action.status,
-            AutomationActionStatus::Queued
-                | AutomationActionStatus::Navigating
-                | AutomationActionStatus::Sending
-                | AutomationActionStatus::Generating
-        )
+    if state.can_resume_cancelled_action()
+        || (was_blocked
+            && state.action.goal_revision == Some(expected_revision)
+            && state.action.kind == Some(AutomationActionKind::OfflineGoal)
+            && !matches!(
+                state.action.status,
+                AutomationActionStatus::Queued
+                    | AutomationActionStatus::Navigating
+                    | AutomationActionStatus::Sending
+                    | AutomationActionStatus::Generating
+            ))
     {
-        // Play requests a new goal turn. Release the previous goal-only failure,
-        // while retaining user-message actions whose submission may be uncertain.
+        // Play requests new work. Keep the accepted-message ledger when releasing
+        // cancellation, and retain user-message sends without a confirmed fence.
         state.action = AutomationActionState::default();
     }
     Ok(result)

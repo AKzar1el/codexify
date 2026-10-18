@@ -1454,7 +1454,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
             reference,
             setup_reference,
         } => format!(
-            "{}Call `continue_task` with continuationToken `{}` to attach this new conversation to the workspace already selected by the user. Then call `automation_verify_pairing` with the one-time reference `{}`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.",
+            "{}Call `continue_task` with the non-secret `{}` to attach this new conversation to the workspace already selected by the user. Then call `automation_verify_pairing` with the non-secret `{}`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.",
             setup_reference
                 .as_ref()
                 .map(|reference| format!("First call `setup` with ref `{reference}`.\n"))
@@ -1466,7 +1466,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
         ActionPrompt::PairVerify { reference } => format!(
             concat!(
                 "Verify that this ChatGPT conversation is paired with the intended Codexify task by\n",
-                "calling `automation_verify_pairing` with the supplied one-time reference: {}\n",
+                "calling `automation_verify_pairing` with the non-secret: {}\n",
                 "Do not inspect project files or perform task work in this verification turn."
             ),
             reference

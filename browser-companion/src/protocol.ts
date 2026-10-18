@@ -170,12 +170,12 @@ export function renderActionPrompt(raw: ActionPrompt): string {
   let rendered: string;
   switch (prompt.kind) {
     case "create_chat":
-      rendered = `${prompt.setupReference ? `First call \`setup\` with ref \`${prompt.setupReference}\`.\n` : ""}Call \`continue_task\` with continuationToken \`${prompt.continuationToken}\` to attach this new conversation to the workspace already selected by the user. Then call \`automation_verify_pairing\` with the one-time reference \`${prompt.reference}\`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.`;
+      rendered = `${prompt.setupReference ? `First call \`setup\` with ref \`${prompt.setupReference}\`.\n` : ""}Call \`continue_task\` with the non-secret \`${prompt.continuationToken}\` to attach this new conversation to the workspace already selected by the user. Then call \`automation_verify_pairing\` with the non-secret \`${prompt.reference}\`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.`;
       break;
     case "pair_verify":
       rendered = [
         "Verify that this ChatGPT conversation is paired with the intended Codexify task by",
-        `calling \`automation_verify_pairing\` with the supplied one-time reference: ${prompt.reference}`,
+        `calling \`automation_verify_pairing\` with the non-secret: ${prompt.reference}`,
         "Do not inspect project files or perform task work in this verification turn.",
       ].join("\n");
       break;

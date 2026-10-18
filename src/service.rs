@@ -893,13 +893,15 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(any(target_os = "macos", test))]
 fn launchd_plist(spec: &ServiceSpec) -> String {
+    // MCP requests serve an interactive client. Background policy also throttles
+    // child-process I/O, while stdio/HTTP cannot activate Adaptive XPC policy.
     let executable = xml_escape(&spec.executable.to_string_lossy());
     let config = xml_escape(&spec.config.to_string_lossy());
     let working_dir = xml_escape(&spec.working_dir.to_string_lossy());
     let home = xml_escape(&spec.home.to_string_lossy());
     let path = xml_escape(&spec.path);
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{SERVICE_LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{executable}</string>\n    <string>service</string>\n    <string>run</string>\n    <string>--config</string>\n    <string>{config}</string>\n  </array>\n  <key>WorkingDirectory</key>\n  <string>{working_dir}</string>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>HOME</key>\n    <string>{home}</string>\n    <key>PATH</key>\n    <string>{path}</string>\n  </dict>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>ThrottleInterval</key>\n  <integer>5</integer>\n  <key>ExitTimeOut</key>\n  <integer>15</integer>\n  <key>AbandonProcessGroup</key>\n  <false/>\n  <key>ProcessType</key>\n  <string>Background</string>\n</dict>\n</plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{SERVICE_LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{executable}</string>\n    <string>service</string>\n    <string>run</string>\n    <string>--config</string>\n    <string>{config}</string>\n  </array>\n  <key>WorkingDirectory</key>\n  <string>{working_dir}</string>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>HOME</key>\n    <string>{home}</string>\n    <key>PATH</key>\n    <string>{path}</string>\n  </dict>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>ThrottleInterval</key>\n  <integer>5</integer>\n  <key>ExitTimeOut</key>\n  <integer>15</integer>\n  <key>AbandonProcessGroup</key>\n  <false/>\n  <key>ProcessType</key>\n  <string>Interactive</string>\n</dict>\n</plist>\n"
     )
 }
 
@@ -2348,6 +2350,7 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>AbandonProcessGroup</key>"));
+        assert!(plist.contains("<key>ProcessType</key>\n  <string>Interactive</string>"));
         assert!(plist.contains(&xml_escape(&spec.config.to_string_lossy())));
 
         let script = windows_install_script(&spec);

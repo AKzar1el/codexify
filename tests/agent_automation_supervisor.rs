@@ -3340,8 +3340,10 @@ async fn successful_execute_receipt_stays_ambiguous_when_status_returns_not_foun
     server.abort();
 }
 
-#[tokio::test]
-async fn terminal_idle_receipt_without_send_proof_is_ambiguous() {
+async fn terminal_receipt_without_send_proof(
+    terminal_state: &'static str,
+    attention: serde_json::Value,
+) -> AutomationExecutionError {
     let app = Router::new()
         .route(
             "/v1/health",
@@ -3388,22 +3390,25 @@ async fn terminal_idle_receipt_without_send_proof_is_ambiguous() {
         )
         .route(
             "/v1/actions/execute",
-            post(|headers: HeaderMap| async move {
-                if !authorized(&headers) {
-                    return StatusCode::UNAUTHORIZED.into_response();
+            post(move |headers: HeaderMap| {
+                let attention = attention.clone();
+                async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                        "build":COMPANION_BUILD,
+                        "actionId":"idle-without-send-action",
+                        "state":terminal_state,
+                        "sendAccepted":false,
+                        "canonicalUrl":null,
+                        "selected":null,
+                        "lastEventSequence":0,
+                        "attention":attention
+                    }))
+                    .into_response()
                 }
-                axum::Json(serde_json::json!({
-                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
-                    "build":COMPANION_BUILD,
-                    "actionId":"idle-without-send-action",
-                    "state":"idle",
-                    "sendAccepted":false,
-                    "canonicalUrl":null,
-                    "selected":null,
-                    "lastEventSequence":0,
-                    "attention":null
-                }))
-                .into_response()
             }),
         );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3462,8 +3467,25 @@ async fn terminal_idle_receipt_without_send_proof_is_ambiguous() {
     };
 
     assert!(error.send_accepted);
-    assert!(error.message.contains("Send acceptance"));
     server.abort();
+    error
+}
+
+#[tokio::test]
+async fn terminal_idle_receipt_without_send_proof_is_ambiguous() {
+    let error = terminal_receipt_without_send_proof("idle", serde_json::Value::Null).await;
+    assert!(error.message.contains("Send acceptance"));
+}
+
+#[tokio::test]
+async fn ambiguous_receipt_preserves_the_browser_failure_instead_of_a_generic_protocol_error() {
+    let message = "Browser operation timed out after 20 seconds";
+    let error = terminal_receipt_without_send_proof(
+        "ambiguous",
+        serde_json::json!({"code":"ambiguous_send", "message":message}),
+    )
+    .await;
+    assert_eq!(error.message, message);
 }
 
 #[tokio::test]
@@ -6733,6 +6755,127 @@ async fn cancelling_a_failed_action_stops_retries_across_restart_without_consumi
         restarted.next_queued_kind().await,
         Some(AutomationActionKind::OfflineCombined)
     );
+}
+
+#[tokio::test]
+async fn new_messages_after_cancelling_a_fenced_send_do_not_replay_the_accepted_batch() {
+    let f = fixture().await;
+    let failed = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(AmbiguousExecutor),
+    );
+    failed
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    f.chat
+        .append_user("already-submitted".into(), "Original message".into())
+        .await
+        .unwrap();
+    failed.scan_once(1001).await.unwrap();
+    assert!(failed.run_next(1002).await.is_err());
+    let submitted = f.store.load(&f.task).unwrap();
+    assert_eq!(submitted.action.status, AutomationActionStatus::Ambiguous);
+    assert!(submitted.action.messages_fenced);
+    let action_id = submitted.action.id.unwrap();
+    failed
+        .cancel_action(&f.task, &action_id, 1004)
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1005).await.unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    f.chat
+        .append_user("new-after-cancellation".into(), "Continue".into())
+        .await
+        .unwrap();
+    f.store
+        .resume_cancelled_action_for_new_message(&f.task, 1006)
+        .unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().chat_mirror,
+        submitted.chat_mirror
+    );
+    f.supervisor.scan_once(1007).await.unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 1);
+    f.supervisor.run_next(1008).await.unwrap();
+    let executions = f.executor.executions.lock().unwrap();
+    assert_eq!(executions.len(), 1);
+    let ActionPrompt::OfflineChat { messages, .. } = &executions[0].request.prompt else {
+        panic!("expected a new user-message batch");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "new-after-cancellation");
+}
+
+#[tokio::test]
+async fn resuming_a_goal_after_cancelling_a_fenced_send_preserves_accepted_messages() {
+    for active in [false, true] {
+        let f = fixture().await;
+        let failed = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            Arc::new(AmbiguousExecutor),
+        );
+        failed
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        let goal = f
+            .store
+            .set_goal(&f.task, "Keep the existing goal", 900)
+            .unwrap();
+        if active {
+            f.store.run_goal(&f.task, goal.revision, 901).unwrap();
+        }
+        f.chat
+            .append_user("already-submitted".into(), "Original message".into())
+            .await
+            .unwrap();
+        failed.scan_once(1001).await.unwrap();
+        assert!(failed.run_next(1002).await.is_err());
+        let submitted = f.store.load(&f.task).unwrap();
+        assert_eq!(submitted.action.status, AutomationActionStatus::Ambiguous);
+        assert!(submitted.action.messages_fenced);
+        let action_id = submitted.action.id.unwrap();
+        failed
+            .cancel_action(&f.task, &action_id, 1004)
+            .await
+            .unwrap();
+        let before = f.store.load(&f.task).unwrap();
+        let receipt = f
+            .store
+            .apply_owner_goal_command(
+                &f.task,
+                "resume-fenced-goal",
+                codexify::agent_automation::OwnerGoalCommand::Run,
+                1005,
+            )
+            .unwrap();
+        let resumed = receipt.goal.unwrap();
+        let previous = before.goal.unwrap();
+        assert_eq!(resumed.revision, previous.revision);
+        assert_eq!(resumed.elapsed_active_ms, previous.elapsed_active_ms);
+        assert_eq!(resumed.turn_count, previous.turn_count);
+        assert_eq!(
+            f.store.load(&f.task).unwrap().chat_mirror,
+            before.chat_mirror
+        );
+        f.supervisor.scan_once(1006).await.unwrap();
+        assert_eq!(f.supervisor.queued_count().await, 1);
+        assert_eq!(
+            f.supervisor.next_queued_kind().await,
+            Some(codexify::agent_automation::AutomationActionKind::OfflineGoal)
+        );
+    }
 }
 
 #[tokio::test]
