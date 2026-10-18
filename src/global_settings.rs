@@ -12,6 +12,21 @@ use crate::types::AppConfig;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 static EDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub(crate) fn extras(config: &AppConfig) -> Result<crate::markdown_chat::ExtrasConfig, String> {
+    let Some(path) = &config.loaded_config_path else {
+        return Ok(config.markdown_chat.extras.clone());
+    };
+    let document: Value = serde_json::from_str(&read_raw(path)?).map_err(|e| e.to_string())?;
+    document
+        .pointer("/agentChat/extras")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
 pub fn turn_renewal_settings(
     path: Option<&Path>,
     fallback: &crate::agent_automation::turn_renewal::TurnRenewalConfig,
@@ -190,6 +205,7 @@ pub fn save(
             chat.remove("rolloutEnabled");
             chat.remove("analyticsEnabled");
             chat.remove("turnRenewal");
+            chat.remove("extras");
         }
         if value
             .get("agentChat")

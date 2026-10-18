@@ -121,6 +121,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43229/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -200,6 +201,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43230/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -258,6 +260,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     return route.fulfill({json:refresh});
    }
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
    throw Error(`Unexpected request: ${path}`);
   });
   await page.goto('http://127.0.0.1:43231/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -305,6 +308,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
     revision++;return route.fulfill({json:{...snapshot(),restartRequired:true}});
    }
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
    throw Error('Unexpected request: '+path);
   });
   await page.goto('http://127.0.0.1:43240/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
@@ -344,6 +348,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    if(path==='/api/global')return fail?route.fulfill({status:503,body:'Unavailable'}):route.fulfill({json:{version:'1.7.0',plan,latest:{updateAvailable:false}}});
    if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
    throw Error('Unexpected request: '+path);
   });
   await page.goto('http://127.0.0.1:43241/#test-token');await page.getByText('v1.7.0',{exact:true}).waitFor();

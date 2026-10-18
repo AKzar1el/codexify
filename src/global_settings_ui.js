@@ -14,6 +14,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     code:'<path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-14-2 16"/>',
     arrow:'<path d="m9 5 7 7-7 7"/>',
     check:'<path d="m5 12 4 4L19 6"/>',
+    extras:'<path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.8 1-6.1-4.4-4.3 6.1-.9Z"/>',
     analytics:'<path d="M4 20V10m8 10V4m8 16v-7M2 20h20"/>',
     restart:'<path d="M3 10a9 9 0 1 1 1 8M3 3v7h7"/>',
   };
@@ -24,13 +25,13 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
 #account-plan{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--ink)}
 #global-footer-actions{display:flex;align-items:center;gap:6px;flex:none;margin-left:auto}
 #global-version{white-space:nowrap;font-variant-numeric:tabular-nums}
-#global-settings{display:grid;place-items:center;flex:none;width:32px;height:32px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
-#global-settings:hover{background:var(--bg);color:var(--ink)}
-#global-settings svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+:is(#global-settings,#global-statistics){display:grid;place-items:center;flex:none;width:32px;height:32px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
+:is(#global-settings,#global-statistics):hover{background:var(--bg);color:var(--ink)}
+:is(#global-settings,#global-statistics) svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 #global-update{display:inline-flex;align-items:center;justify-content:center;min-height:32px;margin-left:4px;border:0;background:var(--selected);color:var(--accent);padding:0 10px;border-radius:8px;font:inherit;font-size:13px;line-height:20px;cursor:pointer}
 #global-footer [hidden]{display:none!important}
 #global-footer button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-@media(max-width:760px),(hover:none) and (pointer:coarse){#global-footer{flex:none;gap:8px;min-height:49px;padding:2px 14px;font-size:13px}#global-footer-actions{gap:4px}#global-settings{width:44px;height:44px}#global-version{font-size:12px}#global-update{font-size:12px}}
+@media(max-width:760px),(hover:none) and (pointer:coarse){#global-footer{flex:none;gap:8px;min-height:49px;padding:2px 14px;font-size:13px}#global-footer-actions{gap:4px}:is(#global-settings,#global-statistics){width:44px;height:44px}#global-version{font-size:12px}#global-update{font-size:12px}}
 #settings-dialog{--settings-error:#b42328;--settings-shadow:0 24px 90px #0003;width:min(1040px,calc(100vw - 48px));height:min(790px,calc(100dvh - 64px));max-width:none;max-height:none;margin:auto;padding:0;border:1px solid var(--line);border-radius:20px;background:var(--panel);color:var(--ink);box-shadow:var(--settings-shadow);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}
 #settings-dialog::backdrop{background:#10191673;backdrop-filter:blur(5px)}
 #settings-dialog [hidden]{display:none!important}
@@ -121,12 +122,18 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     {id:'connections',name:'Connections',description:'Manage authentication, MCP servers, and OpenAI tunnels.'},
     {id:'tools',name:'Tools & files',description:'Set command limits and control file access, imports, and exports.'},
     {id:'advanced',name:'Advanced',description:'Logging, diagnostics, memory, and experimental features.'},
+    {id:'extras',name:'Extras',description:'Make room for a little celebration. Statistics and sharing always stay available.'},
     {id:'analytics',name:'Analytics',description:'Turns, tools, goals, and the momentum behind your conversations.'},
   ];
   const groups={general:'Preferences',agentChat:'Chat server',worktrees:'Worktrees',projectCatalog:'Project catalogue',projectDoc:'Project instructions',skills:'Skills',codexMcp:'Imported MCP servers',tree:'Directory tree',ignore:'Ignored files',command:'Command limits',exec:'Command sessions',output:'Output limits',filesystem:'Filesystem limits',diff:'Diff limits',artifactIngress:'File imports',artifactEgress:'File exports',toolLogging:'Tool logging',audit:'Audit log',memory:'Memory',experimental:'Experimental features'};
   const names={workDir:'Project access directory',multiProject:'Allow multiple projects',projectCloneDir:'Git clone directory',uiWidgets:'Embedded chat widgets',apiKey:'API key',conversationAuthToken:'Conversation setup reference',openaiTunnel:'Primary OpenAI tunnel',openaiTunnels:'Additional OpenAI tunnels',mcpServers:'MCP servers',allowedHosts:'Allowed host names',debug:'Debug mode'};
   const annotationHintOverrides=new Set(['experimental.forceDestructiveToolAnnotations','experimental.forceIdempotentToolAnnotations','experimental.forceOpenWorldToolAnnotations']);
   const metadata={
+    'agentChat.extras.achievements':['Celebrate newly earned badges. Your badge collection stays in Statistics. Applies immediately.','extras','Achievement celebrations'],
+    'agentChat.extras.animations':['Colorful bursts and motion, lasting a few seconds. Respects reduced motion. Applies immediately.','extras','Animations'],
+    'agentChat.extras.weeklyRecap':['Show your completed Monday–Sunday recap once a week. You can always open it in Statistics. Applies immediately.','extras','Weekly recap'],
+    'agentChat.extras.dailyStreaks':['A small, non-blocking celebration for each active day. Streak statistics stay available. Applies immediately.','extras','Daily streak celebrations'],
+    'agentChat.extras.personalRecords':['Celebrate each conversation or goal only the first time it breaks a record. Applies immediately.','extras','Personal record celebrations'],
     'experimental.forceReadOnlyToolAnnotations':['When enabled, set only readOnlyHint to true for every advertised tool. Other hints are unchanged.','advanced'],
     'experimental.forceDestructiveToolAnnotations':['Set destructiveHint on every advertised tool. The default preserves existing hints.','advanced','Destructive hint override'],
     'experimental.forceIdempotentToolAnnotations':['Set idempotentHint on every advertised tool. The default preserves existing hints.','advanced','Idempotent hint override'],
@@ -154,6 +161,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     let section=groups[root]||'Other settings',group=meta?.[1];
     if(!group){if(path.startsWith('agentChat.notifications'))group='notifications';else if(path.startsWith('agentChat.automation'))group='browser';else if(root==='agentChat')group='chats';else if(['worktrees','projectCatalog','projectDoc','skills','codexMcp'].includes(root))group='workspaces';else if(['tree','ignore','command','exec','output','filesystem','diff','artifactIngress','artifactEgress'].includes(root))group='tools';else if(['workDir','projectCloneDir','multiProject','uiWidgets','port'].includes(root))group='general';else group='advanced';}
     if(group==='general')section='Preferences';
+    if(group==='extras')section='Celebrations';
     if(group==='notifications')section=path.includes('.events.')?'Events':'Delivery';
     if(group==='browser')section='Browser companion';
     if(path.startsWith('agentChat.turnRenewal'))section='Turn renewal';
@@ -276,7 +284,8 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     const request=++cutoffRequest;
     try {const response=await api('/api/analytics/turn-cutoffs');if(!response.ok)return;const data=await response.json();if(request!==cutoffRequest)return;cutoffEstimates=data;const card=byId('cutoff-estimates');if(card)card.replaceWith(cutoffCard());}catch{/* Optional analytics must never affect settings or display errors. */}
   }
-  const usageDashboard=createUsageAnalytics({api,getChats,bindBackdrop,onOpenChat:id=>{dialog.close();onOpenChat(id);},isVisible:()=>dialog.open&&category==='analytics'&&!rawMode,cutoffCard});
+  const extras=startStatisticsExtras({api,getChats,onOpenChat,bindBackdrop});
+  const usageDashboard=createUsageAnalytics({api,getChats,bindBackdrop,getHighlights:section=>extras.highlights(section),onOpenChat:id=>{dialog.close();onOpenChat(id);},isVisible:()=>dialog.open&&category==='analytics'&&!rawMode,cutoffCard});
   function renderForm() {
     for(const button of byId('settings-nav').children)button.setAttribute('aria-current',String(!rawMode&&button.dataset.category===category));
     byId('settings-sidebar').hidden=rawMode;byId('settings-form').hidden=rawMode;byId('settings-raw-panel').hidden=!rawMode;byId('settings-dialog').querySelector('.settings-body').style.gridTemplateColumns=rawMode?'minmax(0,1fr)':'';
@@ -309,7 +318,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     message(snapshot.restartRequired?'Saved. Restart Codexify to apply changes.':'All changes saved.');
     if(global?.connectorRefresh?.source==='manual'||['queued','running'].includes(global?.connectorRefresh?.phase)){shownRefreshState=null;renderRefresh(global.connectorRefresh);}
   }
-  async function load(){snapshot=await(await api('/api/settings')).json();dirty={};saveError=null;renderEditor();void loadCutoffEstimates();}
+  async function load(){snapshot=await(await api('/api/settings')).json();extras.preferences({...snapshot.defaults?.agentChat?.extras,...snapshot.document?.agentChat?.extras});dirty={};saveError=null;renderEditor();void loadCutoffEstimates();}
   function changeDocument(changes) {
     const document=JSON.parse(JSON.stringify(snapshot.document));
     for(const [path,value] of Object.entries(changes)){const parts=path.split('.');let target=document;for(const part of parts.slice(0,-1)){if(!target[part]||typeof target[part]!=='object')target[part]={};target=target[part];}if(value===RESET)delete target[parts.at(-1)];else target[parts.at(-1)]=value;}
@@ -322,7 +331,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     const changes=dirty;dirty={};inFlightChanges=changes;saving=true;
     const body=Object.values(changes).includes(RESET)?{revision:snapshot.revision,raw:JSON.stringify(changeDocument(changes))}:{revision:snapshot.revision,changes};
     savePromise=(async()=>{
-      try{snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify(body)})).json();saveError=null;if(!rawEdited)byId('settings-raw').value=snapshot.raw;window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'steer'}));if(invalidFields.size)message(invalidFields.values().next().value,true);else message(snapshot.restartRequired?'Saved. Restart Codexify to apply changes.':'All changes saved.');return true;}
+      try{snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify(body)})).json();saveError=null;extras.preferences({...snapshot.defaults?.agentChat?.extras,...snapshot.document?.agentChat?.extras});if(!rawEdited)byId('settings-raw').value=snapshot.raw;window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'steer'}));if(invalidFields.size)message(invalidFields.values().next().value,true);else message(snapshot.restartRequired?'Saved. Restart Codexify to apply changes.':'All changes saved.');return true;}
       catch(error){dirty={...changes,...dirty};saveError=error.message||'Settings were not saved.';message(saveError,true);return false;}
       finally{saving=false;inFlightChanges={};}
     })();
@@ -378,7 +387,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   byId('settings-reload').addEventListener('click',async()=>{if(saving)await savePromise;clearTimeout(saveTimer);rawEdited=false;try{await load();}catch(error){message(error.message,true);}});
   byId('settings-raw-toggle').addEventListener('click',async()=>{if(!snapshot||!await saveChanges())return;rawMode=!rawMode;if(rawMode&&!rawEdited)byId('settings-raw').value=snapshot.raw;renderForm();byId('settings-main').scrollTop=0;});
   byId('settings-raw').addEventListener('input',()=>{rawEdited=true;message('Raw configuration changes are not saved yet.');});
-  byId('settings-save-raw').addEventListener('click',async()=>{const raw=byId('settings-raw').value;byId('settings-save-raw').disabled=true;try{if(!await saveChanges())return;snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify({revision:snapshot.revision,raw})})).json();rawEdited=false;window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'steer'}));renderEditor();}catch(error){message(error.message,true);}finally{byId('settings-save-raw').disabled=false;}});
+  byId('settings-save-raw').addEventListener('click',async()=>{const raw=byId('settings-raw').value;byId('settings-save-raw').disabled=true;try{if(!await saveChanges())return;snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify({revision:snapshot.revision,raw})})).json();rawEdited=false;extras.preferences({...snapshot.defaults?.agentChat?.extras,...snapshot.document?.agentChat?.extras});window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'steer'}));renderEditor();}catch(error){message(error.message,true);}finally{byId('settings-save-raw').disabled=false;}});
   byId('settings-restart').addEventListener('click',()=>void maintain('restart'));
   for(const id of ['global-update','settings-update'])byId(id).addEventListener('click',()=>void maintain('update'));
   byId('settings-refresh-connector').addEventListener('click',async()=>{

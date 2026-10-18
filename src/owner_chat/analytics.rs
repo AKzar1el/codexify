@@ -60,6 +60,50 @@ pub(super) async fn read(State(state): State<OwnerState>) -> Json<Summary> {
 pub(super) struct UsageQuery {
     days: Option<String>,
 }
+
+pub(super) async fn extras(
+    State(state): State<OwnerState>,
+) -> Result<Json<crate::usage_extras::Snapshot>, (StatusCode, String)> {
+    static EXTRAS_READING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    best_effort(
+        EXTRAS_READING.get_or_init(Default::default).clone(),
+        Duration::from_secs(2),
+        move || {
+            Some(crate::usage_extras::snapshot(
+                &state.config,
+                locate(&state.config, &state.project_bindings)
+                    .into_iter()
+                    .map(|c| (c.id, c.path))
+                    .collect(),
+                crate::markdown_chat::now_ms(),
+            ))
+        },
+    )
+    .await
+    .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Statistics busy".into()))?
+    .map(Json)
+    .map_err(internal_error)
+}
+
+#[derive(Deserialize)]
+pub(super) struct Claim {
+    id: String,
+}
+pub(super) async fn claim_extra(
+    State(state): State<OwnerState>,
+    Json(input): Json<Claim>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    static CLAIMING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    best_effort(
+        CLAIMING.get_or_init(Default::default).clone(),
+        Duration::from_secs(2),
+        move || Some(crate::usage_extras::claim(&state.config, &input.id)),
+    )
+    .await
+    .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "Statistics busy".into()))?
+    .map(|claimed| Json(json!({"claimed":claimed})))
+    .map_err(internal_error)
+}
 pub(super) async fn usage(
     State(state): State<OwnerState>,
     Query(query): Query<UsageQuery>,
@@ -211,6 +255,56 @@ mod tests {
             .unwrap();
         assert_eq!(usage.status(), StatusCode::OK);
         assert_eq!(usage.json::<Value>().await.unwrap()["totals"]["turns"], 0);
+        let extras_url = format!("http://127.0.0.1:{port}/api/analytics/extras");
+        assert_eq!(
+            client.get(&extras_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .post(format!("{extras_url}/claim"))
+                .json(&json!({"id":"week:2026-10-11"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let extras = client
+            .get(&extras_url)
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(extras.status(), StatusCode::OK);
+        let extras = extras.json::<Value>().await.unwrap();
+        assert_eq!(extras["badges"].as_array().unwrap().len(), 8);
+        assert_eq!(extras["week"]["ready"], false);
+        assert_eq!(extras["preferences"]["animations"], true);
+        let milestones = temp.path().join("state/statistics-extras.json");
+        std::fs::write(&milestones, b"broken milestones").unwrap();
+        assert_eq!(
+            client
+                .get(&extras_url)
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .get(format!("http://127.0.0.1:{port}/api/chats"))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(std::fs::read(&milestones).unwrap(), b"broken milestones");
+
         assert_eq!(std::fs::read(&bad).unwrap(), b"bad analytics");
         server.abort();
     }

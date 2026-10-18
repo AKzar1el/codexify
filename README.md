@@ -257,6 +257,28 @@ Download the SVG and add it to your repository, then embed it in a README with
 `![Codexify stats](./codexify-stats.svg)`. Image animation support depends on the
 viewer; use the PNG where animations or SVG files are unsupported.
 
+The **Statistics** button beside the global settings cog opens the same dashboard
+in its own window. Daily streaks, personal records and an eight-badge achievement
+collection stay available there, along with the usual charts and exports. Streaks
+use activity days in the server timezone; a streak ending yesterday remains current
+until today ends. Goal duration records count active time, including bounded live
+timer intervals, and exclude paused time. Historical goal records begin with the
+goals visible when Statistics first observes them.
+
+**Your week in review** appears once for the latest completed Monday–Sunday week
+with activity, when the interface is idle. You can reopen it from Statistics and
+share a static PNG or animated SVG using that week's exact dates and totals.
+Record, badge and streak celebrations use a short, click-through toast; fireworks
+last under four seconds and respect reduced motion. Durable local receipts in
+`statistics-extras.json` prevent repeats across reloads or simultaneous clients.
+A conversation or goal celebrates each record category only once, including after
+goal edits, pauses and resumes. Initial historical milestones are recorded quietly.
+
+In **Settings → Extras**, independently turn off achievement celebrations,
+animations, weekly recap popups, daily streak celebrations or personal record
+celebrations. These settings apply immediately and never hide Statistics, sharing,
+or collected milestones. Disabled celebrations do not accumulate a later backlog.
+
 **Model cutoff estimates** appear in **Settings → Chats & goals**. Passive local
 collection runs while Turn renewal is off, grouping inferred unfinished stops by
 the actual model and effort (including fallback). Durations run from the confirmed

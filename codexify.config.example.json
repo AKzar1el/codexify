@@ -235,6 +235,13 @@
           "enabled": true
         }
       ]
+    },
+    "extras": {
+      "achievements": true,
+      "animations": true,
+      "weeklyRecap": true,
+      "dailyStreaks": true,
+      "personalRecords": true
     }
   },
   "skills": {

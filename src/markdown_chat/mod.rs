@@ -171,6 +171,7 @@ pub struct MarkdownChatConfig {
     #[doc(hidden)]
     pub _legacy_analytics_enabled: Option<bool>,
     pub turn_renewal: crate::agent_automation::turn_renewal::TurnRenewalConfig,
+    pub extras: ExtrasConfig,
     pub notifications: Option<NotificationsConfig>,
     pub automation: AgentAutomationConfig,
 }
@@ -186,8 +187,31 @@ impl Default for MarkdownChatConfig {
             rollout_enabled: true,
             _legacy_analytics_enabled: None,
             turn_renewal: Default::default(),
+            extras: Default::default(),
             notifications: None,
             automation: AgentAutomationConfig::default(),
+        }
+    }
+}
+
+/// Optional presentation only. Statistics collection and sharing stay available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExtrasConfig {
+    pub achievements: bool,
+    pub animations: bool,
+    pub weekly_recap: bool,
+    pub daily_streaks: bool,
+    pub personal_records: bool,
+}
+impl Default for ExtrasConfig {
+    fn default() -> Self {
+        Self {
+            achievements: true,
+            animations: true,
+            weekly_recap: true,
+            daily_streaks: true,
+            personal_records: true,
         }
     }
 }

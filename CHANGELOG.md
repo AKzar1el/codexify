@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Standalone Statistics beside the global settings cog, with daily streaks,
+  personal records, achievement badges and shareable calendar-week recaps.
+  Celebrations are brief and do not intercept clicks. Persistent receipts prevent
+  repeated record animations after reloads or goal pause/resume. Extras settings
+  independently disable celebrations and recaps while preserving all statistics.
 - Turn renewal can be enabled independently for each model and reasoning effort.
   Disabled and unlisted selections are left alone, including after a model
   fallback. Model switches apply immediately and cancel pending renewals.

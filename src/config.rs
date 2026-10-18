@@ -2536,6 +2536,7 @@ mod tests {
                     "rolloutReminderInterval",
                     "rolloutEnabled",
                     "turnRenewal",
+                    "extras",
                     "notifications",
                     "port",
                 ],

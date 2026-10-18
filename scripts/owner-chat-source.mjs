@@ -12,6 +12,7 @@ export const ownerHtml = readFileSync(new URL("../src/owner_chat.html", import.m
   .replace("<!-- CHAT_TEMPLATE -->", `<template id="chat-template"><style>${style}\n#chat { max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; } #panel { display:flex; flex:1; min-height:0; flex-direction:column; } #panel[hidden] { display:none; } #messages { flex:1; max-height:none; min-height:0; }\n</style>${widgetBody}</template>`)
   .replace("/* CHAT_SCRIPT */", widgetScript)
   .replace("/* USAGE_ANALYTICS_SCRIPT */",readFileSync(new URL("../src/analytics_ui.js",import.meta.url),"utf8"))
+  .replace("/* STATISTICS_EXTRAS_SCRIPT */",readFileSync(new URL("../src/statistics_extras_ui.js",import.meta.url),"utf8"))
   .replace("/* GLOBAL_SETTINGS_SCRIPT */",readFileSync(new URL("../src/global_settings_ui.js",import.meta.url),"utf8"));
 
 // Match the owner's public install assets before conversation-specific API mocks.

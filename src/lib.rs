@@ -65,6 +65,7 @@ pub mod tools;
 pub mod types;
 mod upstream_control;
 pub(crate) mod usage_analytics;
+pub(crate) mod usage_extras;
 pub mod util;
 pub mod widget_debug;
 pub mod worktrees;

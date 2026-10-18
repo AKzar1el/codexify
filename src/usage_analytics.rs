@@ -162,7 +162,7 @@ pub(crate) struct Totals {
     pub active_ms: u64,
 }
 impl Totals {
-    fn add(&mut self, o: &Self) {
+    pub(crate) fn add(&mut self, o: &Self) {
         self.turns = self.turns.saturating_add(o.turns);
         self.tool_calls = self.tool_calls.saturating_add(o.tool_calls);
         self.goals = self.goals.saturating_add(o.goals);
@@ -491,7 +491,7 @@ fn next_day(at: u64) -> Option<u64> {
     )
     .ok()
 }
-fn read(path: &Path, max: u64) -> Result<Option<Vec<u8>>, ()> {
+pub(crate) fn read(path: &Path, max: u64) -> Result<Option<Vec<u8>>, ()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

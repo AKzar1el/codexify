@@ -1867,6 +1867,7 @@ static OWNER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .replace("/* CHAT_SCRIPT */", script)
         .replace("/* GLOBAL_SETTINGS_SCRIPT */", include_str!("global_settings_ui.js"))
         .replace("/* USAGE_ANALYTICS_SCRIPT */", include_str!("analytics_ui.js"))
+        .replace("/* STATISTICS_EXTRAS_SCRIPT */", include_str!("statistics_extras_ui.js"))
 });
 
 pub async fn start(
@@ -2033,6 +2034,8 @@ fn router(state: OwnerState) -> Router {
         .route("/api/settings", get(settings::read).post(settings::save))
         .route("/api/analytics/turn-cutoffs", get(analytics::read))
         .route("/api/analytics/usage", get(analytics::usage))
+        .route("/api/analytics/extras", get(analytics::extras))
+        .route("/api/analytics/extras/claim", post(analytics::claim_extra))
         .route("/api/settings/restart", post(settings::restart))
         .route("/api/settings/update", post(settings::update))
         .route(

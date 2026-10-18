@@ -1,4 +1,4 @@
-function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,bindBackdrop=()=>{}}) {
+function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getHighlights,rootId='usage-analytics',bindBackdrop=()=>{}}) {
  const svgNS='http://www.w3.org/2000/svg',palette=['#8b5cf6','#06b6d4','#f59e0b','#ec4899','#3b82f6','#14b8a6','#f97316','#a855f7','#84cc16','#eab308','#6366f1','#f43f5e'];
  const metricNames={turns:'Turns',activeMs:'Active time',toolCalls:'Tool calls'};
  const rangeCache=new Map();
@@ -19,83 +19,83 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,bind
   return {models,daily,conversations,totals:totals(value?.totals),lifetime:totals(value?.lifetime),since:Number.isFinite(value?.since)?value.since:null,today:/^\d{4}-\d{2}-\d{2}$/.test(value?.today)?value.today:new Date().toISOString().slice(0,10),timezone:typeof value?.timezone==='string'?value.timezone:'server time',activeDays:Number.isFinite(value?.activeDays)?value.activeDays:0,streak:Number.isFinite(value?.streak)?value.streak:0};
  }
  const style=el('style');style.textContent=`
-#settings-dialog .analytics{--chart-grid:color-mix(in srgb,var(--line) 75%,transparent);--violet:#8b5cf6;display:grid;gap:18px;min-width:0}
-#settings-dialog .analytics-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;border-radius:18px;background:linear-gradient(112deg,#673acb,#7852e4 62%,#9466ec);color:#fff;box-shadow:0 8px 26px #6e43d420}
-#settings-dialog .analytics-eyebrow{font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:1.6px;color:#e0d4ff;margin:0 0 8px}
-#settings-dialog .analytics-hero h4{font-size:30px;letter-spacing:-1px;font-weight:750;margin:0;line-height:1.18}
-#settings-dialog .analytics-hero p:last-child{font-size:11px;color:#e0d4ff;margin:8px 0 0}
-#settings-dialog .analytics-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-#settings-dialog .analytics-select{font:inherit;font-size:12px;color:#fff;background:#fff1;border:1px solid #fff5;border-radius:9px;padding:10px;max-width:100%;height:36px;color-scheme:dark}
-#settings-dialog .analytics-select option{background:#34234f;color:#fff}
-#settings-dialog .analytics-controls button{padding:10px 12px;height:36px;font-size:12px;font-weight:600;white-space:nowrap;background:#fff1;border-color:#fff5;color:#fff}
-#settings-dialog .analytics-controls button:hover{background:#fff2}
-#settings-dialog .analytics-controls .analytics-share-button{background:#dfff75;color:#32224f;border-color:#dfff75;box-shadow:0 3px 0 #41217b}
-#settings-dialog .analytics-controls .analytics-share-button:hover{background:#eaffab}
-#settings-dialog .analytics-controls :is(button,select):focus-visible{outline-color:#fff;outline-offset:3px}
-#settings-dialog .analytics-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-#settings-dialog .analytics-kpi{--metric:#7146d6;--tile:#eee7ff;position:relative;border:1px solid color-mix(in srgb,var(--metric) 15%,transparent);border-radius:15px;background:var(--tile);padding:18px;min-width:0;overflow:hidden;color:#252036}
-#settings-dialog .analytics-kpi[data-metric=activeMs]{--metric:#10705c;--tile:#def5eb}
-#settings-dialog .analytics-kpi[data-metric=toolCalls]{--metric:#925600;--tile:#fff0d5}
-#settings-dialog .analytics-kpi[data-metric=goals]{--metric:#a93268;--tile:#ffe6f0}
-#settings-dialog .analytics-kpi-label{font-size:11px;font-weight:600;color:var(--metric);margin:0;position:relative;z-index:1}
-#settings-dialog .analytics-kpi-value{display:block;font-size:38px;font-weight:750;letter-spacing:-1.6px;line-height:1.1;margin:12px 0 9px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;position:relative;z-index:1}
-#settings-dialog .analytics-kpi-foot{font-size:10px;color:color-mix(in srgb,var(--metric) 75%,#333)}
-#settings-dialog .analytics-kpi .analytics-spark{position:absolute;right:10px;bottom:13px;width:76px;height:27px;opacity:.22;color:var(--metric);overflow:visible;pointer-events:none}
-#settings-dialog .analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
-#settings-dialog .analytics-card{border:1px solid var(--line);border-radius:16px;padding:20px;min-width:0;background:var(--panel);overflow:hidden;box-shadow:0 3px 12px #18223b03}
-#settings-dialog .analytics-card h4{font-size:15px;font-weight:700;letter-spacing:-.25px;margin:0}
-#settings-dialog .analytics-card-copy{font-size:11px;color:var(--muted);margin:6px 0 18px;line-height:1.5}
-#settings-dialog .analytics-wide{grid-column:1/-1}
-#settings-dialog .analytics-chart svg{display:block;width:100%;height:auto;fill:none;stroke:none;overflow:visible}
-#settings-dialog .analytics-chart text{font-family:inherit;font-size:10px;fill:var(--muted)}
-#settings-dialog .analytics-chart .chart-grid{stroke:var(--chart-grid);stroke-dasharray:3 5}
-#settings-dialog .analytics-chart g[tabindex]{transition:filter .15s}
-#settings-dialog .analytics-chart g[tabindex]:is(:focus,:hover){outline:0;filter:brightness(1.12)}
-#settings-dialog .analytics-chart g[tabindex]:focus .chart-hit{stroke:var(--violet);stroke-width:1}
-#settings-dialog .analytics-chart-detail{font-size:10px;color:var(--muted);min-height:15px;margin:8px 0 0;font-variant-numeric:tabular-nums}
-#settings-dialog .analytics-legend{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:12px}
-#settings-dialog .analytics-legend button{border:0;background:transparent;padding:3px 0;font-size:10px;color:var(--muted);gap:6px;text-align:left}
-#settings-dialog .analytics-dot{display:inline-block;flex:none;width:8px;height:8px;border-radius:50%;background:var(--series)}
-#settings-dialog .analytics-legend button[aria-pressed=false]{opacity:.4;text-decoration:line-through}
-#settings-dialog .analytics-league-tabs{display:flex;gap:4px;flex-wrap:wrap;margin:12px 0}
-#settings-dialog .analytics-league-tabs button{border:0;padding:6px 9px;font-size:10px;color:var(--muted);background:var(--bg)}
-#settings-dialog .analytics-league-tabs button[aria-pressed=true]{color:#7546d0;background:#8b5cf61c;font-weight:650}
-#settings-dialog .analytics-rank{position:relative;display:flex;align-items:center;gap:10px;padding:14px 10px;margin-top:5px;border-radius:10px;overflow:hidden;background:var(--bg)}
-#settings-dialog .analytics-rank:after{content:'';position:absolute;left:0;bottom:0;height:3px;width:var(--rank);background:var(--rank-color);opacity:.65}
-#settings-dialog .analytics-rank-number{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:9px;background:var(--panel);color:var(--muted);font-size:12px;font-weight:700}
-#settings-dialog .analytics-rank:first-child .analytics-rank-number{background:#ffe9a6;color:#896016}
-#settings-dialog .analytics-rank-copy{min-width:0;flex:1}
-#settings-dialog button.analytics-chat-link{display:block;text-align:left;max-width:100%;padding:0;border:0;background:transparent;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#settings-dialog .analytics-rank-project{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:3px 0 0}
-#settings-dialog .analytics-rank-value{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
-#settings-dialog .analytics-mix-content{display:grid;grid-template-columns:132px minmax(0,1fr);gap:24px;align-items:center}
-#settings-dialog .analytics-mix-ring{width:132px;height:132px;border-radius:50%;background:var(--mix);display:grid;place-items:center;margin:10px auto;box-shadow:0 0 0 7px color-mix(in srgb,var(--line) 25%,transparent)}
-#settings-dialog .analytics-mix-center{display:flex;flex-direction:column;align-items:center;justify-content:center;width:102px;height:102px;border-radius:50%;background:var(--panel);gap:3px}
-#settings-dialog .analytics-mix-center strong{font-size:23px;font-weight:750;letter-spacing:-.6px}
-#settings-dialog .analytics-mix-center span{font-size:10px;color:var(--muted)}
-#settings-dialog .analytics-model-row{margin:16px 0 0}#settings-dialog .analytics-model-row:first-child{margin-top:0}
-#settings-dialog .analytics-model-copy{display:flex;justify-content:space-between;gap:12px;font-size:11px;align-items:center}
-#settings-dialog .analytics-model-name{display:flex;gap:6px;align-items:center;min-width:0;overflow-wrap:anywhere}
-#settings-dialog .analytics-model-copy strong{font-size:11px;white-space:nowrap;font-weight:600;font-variant-numeric:tabular-nums}
-#settings-dialog .analytics-model-track{height:7px;background:var(--bg);border-radius:9px;margin-top:8px;overflow:hidden}
-#settings-dialog .analytics-model-track span{display:block;height:100%;border-radius:9px;background:var(--series)}
-#settings-dialog .analytics-model-caption{font-size:10px;color:var(--muted);margin:5px 0 0}
-#settings-dialog .analytics-momentum{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}
-#settings-dialog .analytics-momentum>div{border-radius:12px;background:var(--bg);padding:14px}
-#settings-dialog .analytics-momentum-value{font-size:25px;font-weight:750;letter-spacing:-.8px;margin:0 0 4px;color:var(--violet)}
-#settings-dialog .analytics-momentum-label{font-size:10px;color:var(--muted)}
-#settings-dialog .analytics-milestones{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
-#settings-dialog .analytics-milestone{font-size:11px;padding:7px 11px;border:1px solid var(--line);border-radius:9px;color:var(--muted)}
-#settings-dialog .analytics-milestone[data-earned=true]{background:#8b5cf61a;color:var(--violet);border-color:#8b5cf633;font-weight:600}
-#settings-dialog .analytics-activity{display:grid;grid-template-columns:repeat(14,minmax(0,1fr));gap:5px;margin-top:20px}
-#settings-dialog .analytics-activity span{height:16px;border-radius:4px;background:color-mix(in srgb,var(--violet) var(--level),var(--bg))}
-#settings-dialog .analytics-empty{padding:22px;border:1px dashed #8b5cf655;border-radius:14px;text-align:center;color:var(--muted);font-size:12px;line-height:1.6;background:#8b5cf609}
-#settings-dialog .analytics-footnote{font-size:10px;color:var(--muted);margin:0;line-height:1.6}
-#settings-dialog .analytics-loading{opacity:.65}
-@media(prefers-color-scheme:dark){#settings-dialog .analytics-kpi{--tile:#332845;color:#f5efff}#settings-dialog .analytics-kpi[data-metric=activeMs]{--tile:#1e3933;--metric:#66d4b2}#settings-dialog .analytics-kpi[data-metric=turns]{--metric:#c4a6ff}#settings-dialog .analytics-kpi[data-metric=toolCalls]{--tile:#3e3321;--metric:#efc26a}#settings-dialog .analytics-kpi[data-metric=goals]{--tile:#3c2634;--metric:#f49aba}#settings-dialog .analytics-kpi-foot{color:color-mix(in srgb,var(--metric) 80%,#ddd)}#settings-dialog .analytics-league-tabs button[aria-pressed=true]{color:#c4a6ff}#settings-dialog .analytics{--violet:#b89aff}}
-@media(max-width:900px){#settings-dialog .analytics-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}#settings-dialog .analytics-hero{align-items:flex-start;flex-direction:column}#settings-dialog .analytics-controls{justify-content:flex-start}}
-@media(max-width:580px){#settings-dialog.analytics-view{width:calc(100vw - 20px)}#settings-dialog .analytics-hero{padding:20px;border-radius:15px;gap:18px}#settings-dialog .analytics-hero h4{font-size:28px}#settings-dialog .analytics-controls{gap:7px;width:100%}#settings-dialog .analytics-controls button{padding:9px 10px;font-size:11px}#settings-dialog .analytics-select{padding:9px 7px;font-size:11px;min-width:0;width:100%}#settings-dialog .analytics-controls{display:grid;grid-template-columns:minmax(0,1fr) auto 32px;gap:6px}#settings-dialog .analytics-controls button[aria-label="Refresh analytics"]{padding:0;height:36px}#settings-dialog .analytics-mix-content{grid-template-columns:1fr;gap:12px}#settings-dialog .analytics-kpis{gap:9px}#settings-dialog .analytics-kpi{padding:15px}#settings-dialog .analytics-kpi-value{font-size:32px;margin-top:10px}#settings-dialog .analytics-kpi .analytics-spark{width:58px;height:21px;opacity:.18}#settings-dialog .analytics-grid{grid-template-columns:1fr}#settings-dialog .analytics-card{padding:16px}#settings-dialog .analytics{gap:12px}#settings-dialog .analytics-momentum{gap:7px}#settings-dialog .analytics-momentum>div{padding:10px}#settings-dialog .analytics-momentum-value{font-size:22px}}
-@media(prefers-reduced-motion:reduce){#settings-dialog .analytics-chart g[tabindex]{transition:none}}
+:is(#settings-dialog,#statistics-dialog) .analytics{--chart-grid:color-mix(in srgb,var(--line) 75%,transparent);--violet:#8b5cf6;display:grid;gap:18px;min-width:0}
+:is(#settings-dialog,#statistics-dialog) .analytics-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;border-radius:18px;background:linear-gradient(112deg,#673acb,#7852e4 62%,#9466ec);color:#fff;box-shadow:0 8px 26px #6e43d420}
+:is(#settings-dialog,#statistics-dialog) .analytics-eyebrow{font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:1.6px;color:#e0d4ff;margin:0 0 8px}
+:is(#settings-dialog,#statistics-dialog) .analytics-hero h4{font-size:30px;letter-spacing:-1px;font-weight:750;margin:0;line-height:1.18}
+:is(#settings-dialog,#statistics-dialog) .analytics-hero p:last-child{font-size:11px;color:#e0d4ff;margin:8px 0 0}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+:is(#settings-dialog,#statistics-dialog) .analytics-select{font:inherit;font-size:12px;color:#fff;background:#fff1;border:1px solid #fff5;border-radius:9px;padding:10px;max-width:100%;height:36px;color-scheme:dark}
+:is(#settings-dialog,#statistics-dialog) .analytics-select option{background:#34234f;color:#fff}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls button{padding:10px 12px;height:36px;font-size:12px;font-weight:600;white-space:nowrap;background:#fff1;border-color:#fff5;color:#fff}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls button:hover{background:#fff2}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls .analytics-share-button{background:#dfff75;color:#32224f;border-color:#dfff75;box-shadow:0 3px 0 #41217b}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls .analytics-share-button:hover{background:#eaffab}
+:is(#settings-dialog,#statistics-dialog) .analytics-controls :is(button,select):focus-visible{outline-color:#fff;outline-offset:3px}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi{--metric:#7146d6;--tile:#eee7ff;position:relative;border:1px solid color-mix(in srgb,var(--metric) 15%,transparent);border-radius:15px;background:var(--tile);padding:18px;min-width:0;overflow:hidden;color:#252036}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=activeMs]{--metric:#10705c;--tile:#def5eb}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=toolCalls]{--metric:#925600;--tile:#fff0d5}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=goals]{--metric:#a93268;--tile:#ffe6f0}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi-label{font-size:11px;font-weight:600;color:var(--metric);margin:0;position:relative;z-index:1}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi-value{display:block;font-size:38px;font-weight:750;letter-spacing:-1.6px;line-height:1.1;margin:12px 0 9px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;position:relative;z-index:1}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi-foot{font-size:10px;color:color-mix(in srgb,var(--metric) 75%,#333)}
+:is(#settings-dialog,#statistics-dialog) .analytics-kpi .analytics-spark{position:absolute;right:10px;bottom:13px;width:76px;height:27px;opacity:.22;color:var(--metric);overflow:visible;pointer-events:none}
+:is(#settings-dialog,#statistics-dialog) .analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+:is(#settings-dialog,#statistics-dialog) .analytics-card{border:1px solid var(--line);border-radius:16px;padding:20px;min-width:0;background:var(--panel);overflow:hidden;box-shadow:0 3px 12px #18223b03}
+:is(#settings-dialog,#statistics-dialog) .analytics-card h4{font-size:15px;font-weight:700;letter-spacing:-.25px;margin:0}
+:is(#settings-dialog,#statistics-dialog) .analytics-card-copy{font-size:11px;color:var(--muted);margin:6px 0 18px;line-height:1.5}
+:is(#settings-dialog,#statistics-dialog) .analytics-wide{grid-column:1/-1}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart svg{display:block;width:100%;height:auto;fill:none;stroke:none;overflow:visible}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart text{font-family:inherit;font-size:10px;fill:var(--muted)}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart .chart-grid{stroke:var(--chart-grid);stroke-dasharray:3 5}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart g[tabindex]{transition:filter .15s}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart g[tabindex]:is(:focus,:hover){outline:0;filter:brightness(1.12)}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart g[tabindex]:focus .chart-hit{stroke:var(--violet);stroke-width:1}
+:is(#settings-dialog,#statistics-dialog) .analytics-chart-detail{font-size:10px;color:var(--muted);min-height:15px;margin:8px 0 0;font-variant-numeric:tabular-nums}
+:is(#settings-dialog,#statistics-dialog) .analytics-legend{display:flex;flex-wrap:wrap;gap:7px 12px;margin-top:12px}
+:is(#settings-dialog,#statistics-dialog) .analytics-legend button{border:0;background:transparent;padding:3px 0;font-size:10px;color:var(--muted);gap:6px;text-align:left}
+:is(#settings-dialog,#statistics-dialog) .analytics-dot{display:inline-block;flex:none;width:8px;height:8px;border-radius:50%;background:var(--series)}
+:is(#settings-dialog,#statistics-dialog) .analytics-legend button[aria-pressed=false]{opacity:.4;text-decoration:line-through}
+:is(#settings-dialog,#statistics-dialog) .analytics-league-tabs{display:flex;gap:4px;flex-wrap:wrap;margin:12px 0}
+:is(#settings-dialog,#statistics-dialog) .analytics-league-tabs button{border:0;padding:6px 9px;font-size:10px;color:var(--muted);background:var(--bg)}
+:is(#settings-dialog,#statistics-dialog) .analytics-league-tabs button[aria-pressed=true]{color:#7546d0;background:#8b5cf61c;font-weight:650}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank{position:relative;display:flex;align-items:center;gap:10px;padding:14px 10px;margin-top:5px;border-radius:10px;overflow:hidden;background:var(--bg)}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank:after{content:'';position:absolute;left:0;bottom:0;height:3px;width:var(--rank);background:var(--rank-color);opacity:.65}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank-number{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:9px;background:var(--panel);color:var(--muted);font-size:12px;font-weight:700}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank:first-child .analytics-rank-number{background:#ffe9a6;color:#896016}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank-copy{min-width:0;flex:1}
+:is(#settings-dialog,#statistics-dialog) button.analytics-chat-link{display:block;text-align:left;max-width:100%;padding:0;border:0;background:transparent;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank-project{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:3px 0 0}
+:is(#settings-dialog,#statistics-dialog) .analytics-rank-value{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-content{display:grid;grid-template-columns:132px minmax(0,1fr);gap:24px;align-items:center}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-ring{width:132px;height:132px;border-radius:50%;background:var(--mix);display:grid;place-items:center;margin:10px auto;box-shadow:0 0 0 7px color-mix(in srgb,var(--line) 25%,transparent)}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-center{display:flex;flex-direction:column;align-items:center;justify-content:center;width:102px;height:102px;border-radius:50%;background:var(--panel);gap:3px}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-center strong{font-size:23px;font-weight:750;letter-spacing:-.6px}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-center span{font-size:10px;color:var(--muted)}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-row{margin:16px 0 0}:is(#settings-dialog,#statistics-dialog) .analytics-model-row:first-child{margin-top:0}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-copy{display:flex;justify-content:space-between;gap:12px;font-size:11px;align-items:center}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-name{display:flex;gap:6px;align-items:center;min-width:0;overflow-wrap:anywhere}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-copy strong{font-size:11px;white-space:nowrap;font-weight:600;font-variant-numeric:tabular-nums}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-track{height:7px;background:var(--bg);border-radius:9px;margin-top:8px;overflow:hidden}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-track span{display:block;height:100%;border-radius:9px;background:var(--series)}
+:is(#settings-dialog,#statistics-dialog) .analytics-model-caption{font-size:10px;color:var(--muted);margin:5px 0 0}
+:is(#settings-dialog,#statistics-dialog) .analytics-momentum{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}
+:is(#settings-dialog,#statistics-dialog) .analytics-momentum>div{border-radius:12px;background:var(--bg);padding:14px}
+:is(#settings-dialog,#statistics-dialog) .analytics-momentum-value{font-size:25px;font-weight:750;letter-spacing:-.8px;margin:0 0 4px;color:var(--violet)}
+:is(#settings-dialog,#statistics-dialog) .analytics-momentum-label{font-size:10px;color:var(--muted)}
+:is(#settings-dialog,#statistics-dialog) .analytics-milestones{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+:is(#settings-dialog,#statistics-dialog) .analytics-milestone{font-size:11px;padding:7px 11px;border:1px solid var(--line);border-radius:9px;color:var(--muted)}
+:is(#settings-dialog,#statistics-dialog) .analytics-milestone[data-earned=true]{background:#8b5cf61a;color:var(--violet);border-color:#8b5cf633;font-weight:600}
+:is(#settings-dialog,#statistics-dialog) .analytics-activity{display:grid;grid-template-columns:repeat(14,minmax(0,1fr));gap:5px;margin-top:20px}
+:is(#settings-dialog,#statistics-dialog) .analytics-activity span{height:16px;border-radius:4px;background:color-mix(in srgb,var(--violet) var(--level),var(--bg))}
+:is(#settings-dialog,#statistics-dialog) .analytics-empty{padding:22px;border:1px dashed #8b5cf655;border-radius:14px;text-align:center;color:var(--muted);font-size:12px;line-height:1.6;background:#8b5cf609}
+:is(#settings-dialog,#statistics-dialog) .analytics-footnote{font-size:10px;color:var(--muted);margin:0;line-height:1.6}
+:is(#settings-dialog,#statistics-dialog) .analytics-loading{opacity:.65}
+@media(prefers-color-scheme:dark){:is(#settings-dialog,#statistics-dialog) .analytics-kpi{--tile:#332845;color:#f5efff}:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=activeMs]{--tile:#1e3933;--metric:#66d4b2}:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=turns]{--metric:#c4a6ff}:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=toolCalls]{--tile:#3e3321;--metric:#efc26a}:is(#settings-dialog,#statistics-dialog) .analytics-kpi[data-metric=goals]{--tile:#3c2634;--metric:#f49aba}:is(#settings-dialog,#statistics-dialog) .analytics-kpi-foot{color:color-mix(in srgb,var(--metric) 80%,#ddd)}:is(#settings-dialog,#statistics-dialog) .analytics-league-tabs button[aria-pressed=true]{color:#c4a6ff}:is(#settings-dialog,#statistics-dialog) .analytics{--violet:#b89aff}}
+@media(max-width:900px){:is(#settings-dialog,#statistics-dialog) .analytics-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}:is(#settings-dialog,#statistics-dialog) .analytics-hero{align-items:flex-start;flex-direction:column}:is(#settings-dialog,#statistics-dialog) .analytics-controls{justify-content:flex-start}}
+@media(max-width:580px){:is(#settings-dialog,#statistics-dialog).analytics-view{width:calc(100vw - 20px)}:is(#settings-dialog,#statistics-dialog) .analytics-hero{padding:20px;border-radius:15px;gap:18px}:is(#settings-dialog,#statistics-dialog) .analytics-hero h4{font-size:28px}:is(#settings-dialog,#statistics-dialog) .analytics-controls{gap:7px;width:100%}:is(#settings-dialog,#statistics-dialog) .analytics-controls button{padding:9px 10px;font-size:11px}:is(#settings-dialog,#statistics-dialog) .analytics-select{padding:9px 7px;font-size:11px;min-width:0;width:100%}:is(#settings-dialog,#statistics-dialog) .analytics-controls{display:grid;grid-template-columns:minmax(0,1fr) auto 32px;gap:6px}:is(#settings-dialog,#statistics-dialog) .analytics-controls button[aria-label="Refresh analytics"]{padding:0;height:36px}:is(#settings-dialog,#statistics-dialog) .analytics-mix-content{grid-template-columns:1fr;gap:12px}:is(#settings-dialog,#statistics-dialog) .analytics-kpis{gap:9px}:is(#settings-dialog,#statistics-dialog) .analytics-kpi{padding:15px}:is(#settings-dialog,#statistics-dialog) .analytics-kpi-value{font-size:32px;margin-top:10px}:is(#settings-dialog,#statistics-dialog) .analytics-kpi .analytics-spark{width:58px;height:21px;opacity:.18}:is(#settings-dialog,#statistics-dialog) .analytics-grid{grid-template-columns:1fr}:is(#settings-dialog,#statistics-dialog) .analytics-card{padding:16px}:is(#settings-dialog,#statistics-dialog) .analytics{gap:12px}:is(#settings-dialog,#statistics-dialog) .analytics-momentum{gap:7px}:is(#settings-dialog,#statistics-dialog) .analytics-momentum>div{padding:10px}:is(#settings-dialog,#statistics-dialog) .analytics-momentum-value{font-size:22px}}
+@media(prefers-reduced-motion:reduce){:is(#settings-dialog,#statistics-dialog) .analytics-chart g[tabindex]{transition:none}}
 `;
  document.head.append(style);
  function dayBins(){
@@ -142,23 +142,25 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,bind
     shareCard.open({period:range,today:data.today,start:bins[0]?.start||data.today,totals:{...data.totals},activity:values});
   });controls.append(select,share,refresh);hero.append(copy,controls);root.append(hero);
   const kpis=el('div','analytics-kpis');for(const [key,title]of [['turns','Confirmed turns'],['activeMs','Active time · estimated'],['toolCalls','Tool calls'],['goals','Goals completed']]){const card=el('div','analytics-kpi');card.dataset.metric=key;const value=el('strong','analytics-kpi-value',valueText(key,d.totals[key]));value.title=key==='activeMs'?`${Math.round(d.totals[key]/1000)} seconds`:`${d.totals[key]}`;card.append(el('p','analytics-kpi-label',title),value,el('span','analytics-kpi-foot',`${valueText(key,d.lifetime[key])} lifetime`));const values=dayBins().map(bin=>[...bin.models.values()].reduce((sum,t)=>sum+t[key],0));
-   const points=values.slice(-30),max=Math.max(1,...points),spark=svg('svg',{viewBox:'0 0 96 34','aria-hidden':'true',class:'analytics-spark'}),path=points.map((v,i)=>`${i?'L':'M'}${points.length===1?48:i/(points.length-1)*96} ${30-v/max*26}`).join(' ');spark.append(svg('path',{d:path,fill:'none',stroke:'currentColor','stroke-width':2.5,'stroke-linecap':'round','stroke-linejoin':'round'}));card.append(spark);kpis.append(card);}root.append(kpis);
+   const points=values.slice(-30),max=Math.max(1,...points),spark=svg('svg',{viewBox:'0 0 96 34','aria-hidden':'true',class:'analytics-spark'}),path=points.map((v,i)=>`${i?'L':'M'}${points.length===1?48:i/(points.length-1)*96} ${30-v/max*26}`).join(' ');spark.append(svg('path',{d:path,fill:'none',stroke:'currentColor','stroke-width':2.5,'stroke-linecap':'round','stroke-linejoin':'round'}));card.append(spark);kpis.append(card);}root.append(kpis);const highlights=getHighlights?.('summary');if(highlights)root.append(highlights);
   if(!d.totals.turns&&!d.totals.toolCalls&&!d.totals.goals)root.append(el('div','analytics-empty',loading?'Loading your activity…':'Your next turn starts the story. New turns, tools and completed goals will appear here. No history has been backfilled.'));
   const charts=el('div','analytics-grid');charts.append(chart('turns',range==='all'?'Turns over time':'Daily turns','Confirmed ChatGPT sends, stacked by model and effort.'),chart('activeMs','Time in motion','Estimated active time; waiting loops and long idle gaps excluded.'),chart('toolCalls',range==='all'?'Tool calls over time':'Daily tool calls','Agent work requests. Idle waits and interface polling are excluded.',true),league(),mix());root.append(charts);
-  const momentum=el('section','analytics-card analytics-wide');momentum.append(el('h4','','Momentum'));const numbers=el('div','analytics-momentum');const daily=d.daily.map(day=>[...day.models.values()].reduce((s,t)=>s+t.turns,0));for(const [value,label]of [[`${d.streak} ${d.streak===1?'day':'days'}`,'Current streak'],[count(d.activeDays),'Active days in this period'],[count(Math.max(0,...daily)),'Best day · turns']]){const item=el('div','');item.append(el('p','analytics-momentum-value',value),el('span','analytics-momentum-label',label));numbers.append(item);}numbers.style.marginTop='16px';momentum.append(numbers);const milestones=el('div','analytics-milestones');for(const [key,target,label]of [['goals',1,'First goal'],['turns',10,'10 turns'],['toolCalls',100,'100 tools'],['toolCalls',1000,'1,000 tools']]){const earned=d.lifetime[key]>=target,badge=el('span','analytics-milestone',`${earned?'✓ ':''}${label}`);badge.dataset.earned=String(earned);badge.title=`${count(Math.min(d.lifetime[key],target))} / ${count(target)} lifetime`;milestones.append(badge);}momentum.append(milestones);const activity=el('div','analytics-activity');activity.setAttribute('aria-label','Recent daily tool activity');const recent=dayBins().slice(-28),peak=Math.max(1,...recent.map(b=>[...b.models.values()].reduce((sum,t)=>sum+t.toolCalls,0)));for(const bin of recent){const value=[...bin.models.values()].reduce((sum,t)=>sum+t.toolCalls,0),cell=el('span');cell.title=`${bin.start}: ${count(value)} tool calls`;cell.style.setProperty('--level',`${value?20+value/peak*80:0}%`);activity.append(cell);}momentum.append(activity);root.append(momentum);
+  const momentum=el('section','analytics-card analytics-wide');momentum.append(el('h4','','Momentum'));const numbers=el('div','analytics-momentum');const daily=d.daily.map(day=>[...day.models.values()].reduce((s,t)=>s+t.turns,0));for(const [value,label]of [[`${d.streak} ${d.streak===1?'day':'days'}`,'Current streak'],[count(d.activeDays),'Active days in this period'],[count(Math.max(0,...daily)),'Best day · turns']]){const item=el('div','');item.append(el('p','analytics-momentum-value',value),el('span','analytics-momentum-label',label));if(!highlights||label!=='Current streak')numbers.append(item);}if(highlights)numbers.style.gridTemplateColumns='repeat(2,minmax(0,1fr))';numbers.style.marginTop='16px';momentum.append(numbers);const milestones=el('div','analytics-milestones');for(const [key,target,label]of [['goals',1,'First goal'],['turns',10,'10 turns'],['toolCalls',100,'100 tools'],['toolCalls',1000,'1,000 tools']]){const earned=d.lifetime[key]>=target,badge=el('span','analytics-milestone',`${earned?'✓ ':''}${label}`);badge.dataset.earned=String(earned);badge.title=`${count(Math.min(d.lifetime[key],target))} / ${count(target)} lifetime`;milestones.append(badge);}if(!highlights)momentum.append(milestones);const activity=el('div','analytics-activity');activity.setAttribute('aria-label','Recent daily tool activity');const recent=dayBins().slice(-28),peak=Math.max(1,...recent.map(b=>[...b.models.values()].reduce((sum,t)=>sum+t.toolCalls,0)));for(const bin of recent){const value=[...bin.models.values()].reduce((sum,t)=>sum+t.toolCalls,0),cell=el('span');cell.title=`${bin.start}: ${count(value)} tool calls`;cell.style.setProperty('--level',`${value?20+value/peak*80:0}%`);activity.append(cell);}momentum.append(activity);root.append(momentum);const badges=getHighlights?.('badges');if(badges)root.append(badges);
   root.append(el('p','analytics-footnote','Active time is a native-activity estimate, not internal reasoning time or billed usage. Parallel conversations add agent-hours. Days follow the server timezone. Local, best-effort collection never controls chat delivery or goals.'));
   if(cutoffCard)root.append(cutoffCard());
   if(focused)for(const node of root.querySelectorAll('[data-analytics-focus]'))if(node.dataset.analyticsFocus===focused){node.focus({preventScroll:true});break;}
  }
  async function load(){const epoch=++request;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${range}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);mountedRange=range;rangeCache.set(range,data);}catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
+ window.addEventListener('statistics-extras-change',()=>{if(isVisible())render();});
  const timer=setInterval(()=>{if(isVisible()&&!document.hidden&&!loading&&!shareCard?.isOpen())void load();},30000);
  window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});
- return {mount(parent){root=el('div','analytics');root.id='usage-analytics';parent.append(root);render();if(!data||mountedRange!==range)void load();}};
+ return {mount(parent){root=el('div','analytics');root.id=rootId;parent.append(root);render();if(!data||mountedRange!==range)void load();}};
 }
 
 
 // Browser-local exports. No server endpoint, remote assets, or public URL is used.
 function createAnalyticsShareCard({bindBackdrop}) {
+ if(createAnalyticsShareCard.instance)return createAnalyticsShareCard.instance;
  const make=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!=null)n.textContent=text;return n;};
  const style=make('style');style.textContent=`
 #analytics-share-dialog{width:min(650px,calc(100vw - 32px));max-width:none;max-height:calc(100dvh - 32px);box-sizing:border-box;overflow:auto;margin:auto;padding:24px;border:1px solid var(--line);border-radius:20px;background:var(--panel);color:var(--ink);box-shadow:0 24px 90px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -208,7 +210,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
  function show(){
   if(!snapshot)return;const asset=assets[format],animated=format==='svg',still=paused||reducedMotion.matches;
   for(const [key,b]of formatButtons)b.setAttribute('aria-pressed',String(key===format));
-  description.textContent=`${snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`} · ${animated?'Animated SVG':'PNG image'}`;
+  description.textContent=`${snapshot.periodLabel|| (snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`)} · ${animated?'Animated SVG':'PNG image'}`;
   hint.textContent=animated?(reducedMotion.matches?'Reduced motion: showing the final totals. The SVG respects the viewer’s motion preference.':'A 6-second loop: count up, celebrate, hold. Add the downloaded SVG to your GitHub README as an image.'):'A still image for chats, posts and anywhere you share images.';
   motion.hidden=!animated;motion.disabled=reducedMotion.matches||!assets.still?.url;motion.textContent=reducedMotion.matches?'Motion reduced':paused?'Play preview':'Pause preview';motion.setAttribute('aria-pressed',String(!still));
   // Some image engines do not propagate a page's emulated motion preference
@@ -216,7 +218,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
   const shown=animated&&still?(assets.png?.url?assets.png:assets.still):asset;image.hidden=!shown?.url;placeholder.hidden=!!shown?.url;placeholder.textContent=asset?.error?'The image could not be created.':'Creating your card…';
   if(shown?.url&&image.getAttribute('src')!==shown.url)image.src=shown.url;
   download.textContent=animated?'Download SVG':'Download PNG';download.setAttribute('aria-disabled',String(!asset?.url));
-  if(asset?.url){download.href=asset.url;download.download=`codexify-stats-${snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.${format}`;}else download.removeAttribute('href');
+  if(asset?.url){download.href=asset.url;download.download=`codexify-stats-${snapshot.periodLabel?'week-in-review':snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.${format}`;}else download.removeAttribute('href');
   copyButton.textContent=animated?'Copy PNG':'Copy image';copyButton.disabled=!assets.png?.blob||copying||!canCopy();
   message.textContent=asset?.error?'Close this preview and try again.':!asset?.url?'':canCopy()?'Ready to share.':'Copy isn’t available in this browser. Download the PNG instead.';
  }
@@ -234,7 +236,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
   catch{result=Promise.reject(new Error('clipboard unavailable'));}
   Promise.resolve(result).then(()=>{if(current===epoch)message.textContent='Image copied.';},()=>{if(current===epoch)message.textContent='Couldn’t copy the image. Use Download PNG, or try again.';}).finally(()=>{if(current===epoch){copying=false;copyButton.disabled=!canCopy();}});
  });
- return {
+ return createAnalyticsShareCard.instance={
   isOpen:()=>dialog.open,
   open(value){
    if(dialog.open)return;
@@ -258,8 +260,8 @@ function renderAnalyticsSharePNG(snapshot) {
  star(1129,461,38,'#dfff75');star(407,160,23,'#ff91c8');
  context.fillStyle='#ff91c8';context.beginPath();context.arc(39,495,13,0,Math.PI*2);context.fill();
  context.fillStyle='#dfff75';context.save();context.translate(1099,157);context.rotate(-.3);context.fillRect(-5,-17,10,34);context.fillRect(-17,-5,34,10);context.restore();
- context.textBaseline='alphabetic';context.fillStyle='#fff9ea';context.font='800 48px system-ui, -apple-system, sans-serif';context.fillText('Codexify stats',68,113);
- const period=snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`;context.font='750 23px system-ui, -apple-system, sans-serif';const pillWidth=context.measureText(period).width+42;
+ context.textBaseline='alphabetic';context.fillStyle='#fff9ea';context.font='800 48px system-ui, -apple-system, sans-serif';context.fillText(snapshot.title||'Codexify stats',68,113);
+ const period=snapshot.periodLabel||(snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`);context.font='750 23px system-ui, -apple-system, sans-serif';const pillWidth=context.measureText(period).width+42;
  context.save();context.translate(W-72-pillWidth/2,85);context.rotate(.045);rounded(-pillWidth/2+5,-27+5,pillWidth,54,14);context.fillStyle=ink;context.fill();rounded(-pillWidth/2,-27,pillWidth,54,14);context.fillStyle='#fff9ea';context.fill();context.strokeStyle=ink;context.lineWidth=3;context.stroke();context.fillStyle=ink;context.textAlign='center';context.fillText(period,0,8);context.restore();
  const format=n=>new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:n>=10000?1:0}).format(n||0);
  const cards=[{key:'turns',label:'Turns',x:66,y:200,angle:-.025,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:.02,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-.018,color:'#80eadb'}];
@@ -291,7 +293,7 @@ function renderAnalyticsShareSVG(snapshot,still=false) {
  const rect=(x,y,w,h,r,fill,extra='')=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${fill}" ${extra}/>`;
  const anim=(attr,values,times)=>`<animate attributeName="${attr}" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>`;
  const star=(x,y,r,color,rotate=false)=>{const points=Array.from({length:16},(_,i)=>{const a=i*Math.PI/8-Math.PI/2,s=i%2?r*.52:r;return `${(Math.cos(a)*s).toFixed(2)},${(Math.sin(a)*s).toFixed(2)}`;}).join(' ');return `<g transform="translate(${x} ${y})"><polygon points="${points}" fill="${color}"/>${rotate?`<g class="motion" visibility="hidden"><set attributeName="visibility" to="visible" begin="0s"/><circle r="${r+2}" fill="#7651ed"/><polygon points="${points}" fill="${color}"><animateTransform attributeName="transform" type="rotate" values="0;0;90;90" keyTimes="0;.24;.4;1" dur="6s" repeatCount="indefinite"/></polygon></g>`:''}</g>`;};
- const period=snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`,pillWidth=period.length*15+42;
+ const period=snapshot.periodLabel||(snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`),pillWidth=period.length*15+42;
  let defs='<clipPath id="edge"><rect width="1200" height="675" rx="30"/></clipPath>',cards='';
  for(const [i,card]of [{key:'turns',label:'Turns',x:66,y:200,angle:-1.43,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:1.15,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-1.03,color:'#80eadb'}].entries()){
   const value=snapshot.totals[card.key]||0;
@@ -324,7 +326,7 @@ function renderAnalyticsShareSVG(snapshot,still=false) {
  <defs>${defs}</defs><g clip-path="url(#edge)">${rect(0,0,1200,675,0,'#7651ed')}
  ${star(1129,461,38,'#dfff75',true)}${star(407,160,23,'#ff91c8',true)}<circle cx="39" cy="495" r="13" fill="#ff91c8"/>
  <g transform="translate(1099 157) rotate(-17)"><path d="M-17 0h34M0-17v34" stroke="#dfff75" stroke-width="10"/></g>
- ${text(68,113,'Codexify stats',48,800,'class="cream"')}
+ ${text(68,113,snapshot.title||'Codexify stats',48,800,'class="cream"')}
  <g transform="translate(${1128-pillWidth/2} 85) rotate(2.58)">${rect(-pillWidth/2+5,-22,pillWidth,54,14,'#241739')}${rect(-pillWidth/2,-27,pillWidth,54,14,'#fff9ea','stroke="#241739" stroke-width="3"')}${text(0,8,period,23,750,'text-anchor="middle"')}</g>
  ${cards}<g class="motion">${sparks}<g transform="translate(754 568)" opacity="0">${anim('opacity','0;0;1;1;0;0','0;.24;.28;.5;.6;1')}<g>
  <animateTransform attributeName="transform" type="scale" values="1 1;.9 1.08;1.04 .96;1 1" dur=".6s" repeatCount="indefinite"/>
