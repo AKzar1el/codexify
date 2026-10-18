@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-10-18
+
+### Fixed
+
+- Scope managed-worktree cleanup to source projects under the server's current
+  access root. Servers with different access roots can share a worktree directory
+  without removing each other's clean worktrees. Missing or unresolved source
+  paths are preserved.
+
 ## [2.2.0] - 2026-10-18
 
 ### Added
@@ -800,7 +809,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/devnoname120/codexify/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/devnoname120/codexify/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/devnoname120/codexify/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v2.0.0

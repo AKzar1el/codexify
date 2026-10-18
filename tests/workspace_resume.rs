@@ -72,6 +72,35 @@ fn records(root: &Path, extension: &str) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn cleanup_only_removes_worktrees_from_its_current_access_root() {
+    let (_root, mut config, _store, project) = fixture();
+    let (_other_root, mut other_config, _other_store, other_project) = fixture();
+    other_config.worktrees.root = config.worktrees.root.clone();
+    let inside = codexify::worktrees::create_managed_worktree(&config, &project)
+        .await
+        .unwrap();
+    let outside = codexify::worktrees::create_managed_worktree(&other_config, &other_project)
+        .await
+        .unwrap();
+    config.worktrees.auto_cleanup_enabled = true;
+    config.worktrees.keep_count = 0;
+    let warnings =
+        codexify::worktrees::cleanup_managed_worktrees(&config, &std::collections::HashSet::new())
+            .await;
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(!inside.worktree_git_root.exists());
+    assert!(outside.worktree_git_root.is_dir());
+    assert_eq!(
+        fs::read_to_string(outside.worktree_git_root.join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+    assert!(
+        git(&other_project, &["worktree", "list", "--porcelain"])
+            .contains(outside.worktree_git_root.to_str().unwrap())
+    );
+}
+
+#[tokio::test]
 async fn resume_keeps_dirty_checkout_and_index_under_every_worktree_policy() {
     for managed in [false, true] {
         let (_root, mut config, store, project) = fixture();

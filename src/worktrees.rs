@@ -323,6 +323,10 @@ pub async fn cleanup_managed_worktrees(
     if !config.worktrees.auto_cleanup_enabled {
         return Vec::new();
     }
+    let access_root = match fs::canonicalize(&config.work_dir) {
+        Ok(root) => root,
+        Err(error) => return vec![format!("Could not resolve cleanup access root: {error}")],
+    };
     let root = match prepare_worktrees_root(&config.worktrees.root) {
         Ok(root) => root,
         Err(error) => return vec![error],
@@ -350,6 +354,12 @@ pub async fn cleanup_managed_worktrees(
         let Ok(metadata) = load_metadata(&metadata_path) else {
             continue;
         };
+        let Ok(source_project_root) = fs::canonicalize(&metadata.source_project_root) else {
+            continue;
+        };
+        if !source_project_root.starts_with(&access_root) {
+            continue;
+        }
         let project_root = PathBuf::from(&metadata.project_root);
         if referenced_project_roots.contains(&project_root) {
             continue;
