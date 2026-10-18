@@ -24,18 +24,18 @@ fn user_append(path: &std::path::Path, text: &str) {
 #[test]
 fn markdown_chat_defaults_and_validation() {
     let config: MarkdownChatConfig = serde_json::from_str("{}").unwrap();
-    assert!(!config.enabled);
+    assert!(config.enabled);
     assert_eq!(config.port, Some(DEFAULT_OWNER_CHAT_PORT));
     assert_eq!(config.max_wait_ms, 55_000);
     assert!(config.notifications.is_none());
-    assert!(!config.automation.enabled);
+    assert!(config.automation.enabled);
     assert_eq!(
         config.automation.descriptor_path,
         "~/.codexify/browser/descriptor.json"
     );
     assert!(config.automation.connector_name.is_empty());
     assert_eq!(config.automation.max_queued_actions, 64);
-    assert!(!config.automation.auto_approve_tool_calls);
+    assert!(config.automation.auto_approve_tool_calls);
     assert!(config.validate().is_ok());
     for wait in [0, 999, 300_001, u64::MAX] {
         let config = MarkdownChatConfig {
@@ -80,14 +80,14 @@ fn agent_chat_automation_defaults_overrides_and_validation() {
     };
 
     let defaulted = load(serde_json::json!({"enabled": true})).unwrap();
-    assert!(!defaulted.markdown_chat.automation.enabled);
+    assert!(defaulted.markdown_chat.automation.enabled);
     assert_eq!(
         defaulted.markdown_chat.automation.descriptor_path,
         "~/.codexify/browser/descriptor.json"
     );
     assert!(defaulted.markdown_chat.automation.connector_name.is_empty());
     assert_eq!(defaulted.markdown_chat.automation.max_queued_actions, 64);
-    assert!(!defaulted.markdown_chat.automation.auto_approve_tool_calls);
+    assert!(defaulted.markdown_chat.automation.auto_approve_tool_calls);
 
     let overridden = load(serde_json::json!({
         "enabled": true,
@@ -112,8 +112,11 @@ fn agent_chat_automation_defaults_overrides_and_validation() {
     assert_eq!(overridden.markdown_chat.automation.max_queued_actions, 17);
     assert!(overridden.markdown_chat.automation.auto_approve_tool_calls);
 
+    let chat_disabled = load(serde_json::json!({"enabled":false})).unwrap();
+    assert!(!chat_disabled.markdown_chat.enabled);
+    assert!(chat_disabled.markdown_chat.automation.enabled);
+
     for invalid in [
-        serde_json::json!({"automation":{"enabled":true}}),
         serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":0}}),
         serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":1025}}),
         serde_json::json!({"enabled":true,"automation":{"connectorName":"bad\nname"}}),

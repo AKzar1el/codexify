@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import type {Locator} from "patchright";
+import {localizedEffortId,ambiguousEffortLabel,normalizeUiLabel,uiLabels,escapeUiPattern} from "./ui-localization";
 import { capabilityCatalogSchema, protocolBuild, type CapabilityCatalog, type EffortCapability, type ModelCapability } from "./protocol";
 
 export type BrowserModelId = "gpt-5.6-luna" | "gpt-5.5-sol" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-astra";
@@ -6,14 +8,33 @@ export type BrowserEffort = string;
 export type BrowserModelFamily = "5.5" | "5.6" | "6";
 
 export const MODEL_FAMILY_LABELS: Record<BrowserModelFamily, RegExp> = {
-  "5.5": /^GPT[-\s]?5\.5(?:\s+(?:Sol|Luna))?(?:\s*Leaving on\s+.+)?$/i,
-  "5.6": /^GPT[-\s]?5\.6(?:\s+(?:Sol|Luna))?(?:\s+Pro)?$/i,
-  "6": /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+(?:Sol|Luna|Astra))?(?:\s+Pro)?)$/i,
+  "5.5": /^GPT[-\s]?5\.5(?:\s+(?:Sol|Luna))?$/iu,
+  "5.6": /^GPT[-\s]?5\.6(?:\s+(?:Sol|Luna))?(?:\s+Pro)?$/iu,
+  "6": new RegExp(`^(?:${uiLabels('latestModel').map(escapeUiPattern).join('|')}|(?:GPT[-\\s]?)?6(?:\\s+(?:Sol|Luna|Astra))?(?:\\s+Pro)?)$`,'iu'),
 };
 
 export function browserModelFamilyFromLabel(label: string): BrowserModelFamily | undefined {
-  const normalized = label.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
+  const normalized = normalizeUiLabel(label);
   return (["6", "5.6", "5.5"] as const).find(family => MODEL_FAMILY_LABELS[family].test(normalized));
+}
+
+/** Read identity and selection in one DOM revision; descriptions are not model names. */
+export async function readModelOptionRows(menu:Locator):Promise<{family:BrowserModelFamily|undefined;label:string;checked:boolean}[]> {
+  const patterns=Object.entries(MODEL_FAMILY_LABELS).map(([family,pattern])=>({family,source:pattern.source}));
+  const values=await menu.getByRole("menuitemradio",{includeHidden:true}).evaluateAll((elements,patterns)=>elements.map(element=>{
+    const clone=element.cloneNode(true) as Element;
+    for(const description of clone.querySelectorAll('[data-menu-row-description],[data-model-retirement-notice],[data-testid="model-retirement-notice"],svg'))description.remove();
+    const primary=clone.querySelector('[data-menu-row-label],[data-model-label]')??clone;
+    let label=(primary.textContent??'').normalize('NFKC').replace(/\p{Cf}/gu,'').replace(/\s+/g,' ').trim();
+    const identity=element.getAttribute('data-model-id')??element.getAttribute('data-model-slug')??element.getAttribute('data-model-family')??element.getAttribute('data-family');
+    const stable=/^(?:gpt-)?(5\.5|5\.6|6)(?:-(?:sol|astra|luna))?$/u.exec(identity??'')?.[1];
+    const named=patterns.filter(pattern=>new RegExp(pattern.source,'iu').test(label)).map(pattern=>pattern.family);
+    const family=stable?(!named.length||named.includes(stable)?stable:undefined):named.length===1?named[0]:undefined;
+    if(stable&&family&&!named.length)label=`GPT-${family}`;
+    if(family)element.setAttribute('data-browser-model-family',family);else element.removeAttribute('data-browser-model-family');
+    return {family,label,checked:element.getAttribute('aria-checked')==='true'};
+  }),patterns);
+  return values.map(value=>({...value,family:value.family as BrowserModelFamily|undefined}));
 }
 
 export interface AccountCapabilities {
@@ -43,17 +64,12 @@ export interface ResolvedBrowserModel {
 
 /** Compatibility aliases preserve saved selections; they never create capabilities. */
 export function browserEffortIdFromLabel(label: string): string {
-  const normalized = label.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim().toLowerCase();
-  switch (normalized) {
-    case "instant": return "low";
-    case "medium": return "medium";
-    case "high": return "high";
-    case "extra high": return "xhigh";
-    case "pro": return "max";
-    default:
-      if (!normalized) throw new Error("ChatGPT effort label is empty");
-      return `effort-${createHash("sha256").update(normalized).digest("hex").slice(0, 24)}`;
-  }
+  const normalized = normalizeUiLabel(label).toLowerCase();
+  if(ambiguousEffortLabel(normalized))throw new Error("ChatGPT effort label has ambiguous locale translations");
+  const known=localizedEffortId(normalized);
+  if(known)return known;
+  if (!normalized) throw new Error("ChatGPT effort label is empty");
+  return `effort-${createHash("sha256").update(normalized).digest("hex").slice(0, 24)}`;
 }
 
 export function modelsFromDiscoveredEfforts(
@@ -69,8 +85,8 @@ export function modelsFromDiscoveredEfforts(
   // ChatGPT's GPT-6 Pro option uses Astra. This is the explicit naming exception.
   if (family === "6") {
     return [
-      { id:"gpt-6-astra", label:"GPT-6 Astra", family, efforts:efforts.filter(effort => /^Pro$/i.test(effort.label)) },
-      { id:"gpt-6-sol", label:label(efforts.filter(effort => !/^Pro$/i.test(effort.label))), family, efforts:efforts.filter(effort => !/^Pro$/i.test(effort.label)) },
+      { id:"gpt-6-astra", label:"GPT-6 Astra", family, efforts:efforts.filter(effort => effort.id === "max") },
+      { id:"gpt-6-sol", label:label(efforts.filter(effort => effort.id !== "max")), family, efforts:efforts.filter(effort => effort.id !== "max") },
     ].filter(model => model.efforts.length > 0) as DiscoveredBrowserModel[];
   }
   return [{ id:`gpt-${family}-sol`, label:label(efforts), family, efforts }];

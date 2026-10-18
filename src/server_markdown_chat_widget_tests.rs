@@ -1,8 +1,9 @@
 #[tokio::test]
 async fn markdown_chat_widget_send_poll_and_agent_delivery_are_separate() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.markdown_chat.max_wait_ms = 5000;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
@@ -12,6 +13,12 @@ async fn markdown_chat_widget_send_poll_and_agent_delivery_are_separate() {
     );
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("widget-owner").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
+    bind_fixture_workspace(
+        &handler,
+        Some(&ConversationIdentity::from_openai_session("different-conversation").unwrap()),
+    )
+    .await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -28,6 +35,13 @@ async fn markdown_chat_widget_send_poll_and_agent_delivery_are_separate() {
     });
     let client = ().serve(client_transport).await.unwrap();
     let request = |name: &str, args: Value, conversation: &str| {
+        let mut args = args;
+        if name.starts_with("chat_ui_") && name != "chat_ui_state" {
+            args.as_object_mut()
+                .unwrap()
+                .entry("expected_chat_file")
+                .or_insert(json!(chat.path()));
+        }
         let mut request = CallToolRequestParams::new(name.to_owned())
             .with_arguments(args.as_object().unwrap().clone());
         request.meta =
@@ -359,11 +373,12 @@ fn markdown_chat_only_setup_advertises_a_chat_template() {
     for widgets in [false, true] {
         for enabled in [false, true] {
             for auth in [false, true] {
-                let mut config = crate::config::default_config(root.path().into());
+                let mut config =
+                    crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
                 config.ui_widgets = widgets;
                 config.markdown_chat.enabled = enabled;
                 config.conversation_auth_token = auth.then(|| "a".repeat(64).into());
-                config.multi_project = true;
+
                 let tools = crate::registry::load_tools_for_config(&config);
                 let mut linked = Vec::new();
                 for tool in &tools {
@@ -397,8 +412,9 @@ fn markdown_chat_only_setup_advertises_a_chat_template() {
 #[tokio::test]
 async fn only_model_visible_calls_start_offline_notification_monitors() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.markdown_chat.notifications = Some(crate::markdown_chat::NotificationsConfig {
         urls: vec!["ntfys://ntfy.example/topic?image=no".into()],
         python_path: root.path().join("missing-python").display().to_string(),
@@ -413,6 +429,17 @@ async fn only_model_visible_calls_start_offline_notification_monitors() {
     );
     handler.config = Arc::new(config);
     let chat_store = handler.markdown_chat.clone();
+    bind_fixture_workspace(&handler, None).await;
+    bind_fixture_workspace(
+        &handler,
+        Some(&ConversationIdentity::from_openai_session("first").unwrap()),
+    )
+    .await;
+    bind_fixture_workspace(
+        &handler,
+        Some(&ConversationIdentity::from_openai_session("second").unwrap()),
+    )
+    .await;
     let (server_transport, client_transport) = tokio::io::duplex(32 * 1024);
     let task = tokio::spawn(async move {
         handler
@@ -462,9 +489,10 @@ async fn markdown_chat_private_selection_does_not_deliver_or_fake_activity() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    let mut config = crate::config::default_config(root.path().into());
-    config.multi_project = true;
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
+
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
         root.path(),
@@ -548,8 +576,9 @@ async fn markdown_chat_private_selection_does_not_deliver_or_fake_activity() {
 #[tokio::test]
 async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presence() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.markdown_chat.automation.enabled = true;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
@@ -559,6 +588,7 @@ async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presenc
     );
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("stop-widget-owner").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -587,6 +617,13 @@ async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presenc
     });
     let client = ().serve(client_transport).await.unwrap();
     let request = |name: &str, args: Value| {
+        let mut args = args;
+        if name.starts_with("chat_ui_") {
+            args.as_object_mut()
+                .unwrap()
+                .entry("expected_chat_file")
+                .or_insert(json!(chat.path()));
+        }
         let mut req = CallToolRequestParams::new(name.to_owned())
             .with_arguments(args.as_object().unwrap().clone());
         req.meta =
@@ -661,8 +698,9 @@ async fn widget_stop_is_opportunistic_and_polling_cannot_restore_stopped_presenc
 #[tokio::test]
 async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_release_one() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.markdown_chat.max_wait_ms = 1000;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
@@ -672,6 +710,7 @@ async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_rel
     );
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("queue-dispatch").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -692,6 +731,13 @@ async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_rel
     });
     let client = ().serve(client_transport).await.unwrap();
     let request = |name: &str, args: Value| {
+        let mut args = args;
+        if name.starts_with("chat_ui_") {
+            args.as_object_mut()
+                .unwrap()
+                .entry("expected_chat_file")
+                .or_insert(json!(chat.path()));
+        }
         let mut request = CallToolRequestParams::new(name.to_owned())
             .with_arguments(args.as_object().unwrap().clone());
         request.meta =
@@ -773,8 +819,10 @@ async fn private_queue_is_excluded_from_passive_delivery_and_completed_calls_rel
 #[tokio::test]
 async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_queue() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.rollout_reminder_interval = 20;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.markdown_chat.max_wait_ms = 1000;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let mut handler = handler_with_tools(
@@ -784,6 +832,7 @@ async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_
     );
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("rollout-dispatch").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -940,8 +989,9 @@ async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_
 #[tokio::test]
 async fn rollout_recovery_returns_complete_reports_with_a_small_ordinary_tool_budget() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
+    config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.output.max_tool_output_tokens = Some(20);
     let mut handler = handler_with_tools(
@@ -951,6 +1001,7 @@ async fn rollout_recovery_returns_complete_reports_with_a_small_ordinary_tool_bu
     );
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("rollout-budget").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)

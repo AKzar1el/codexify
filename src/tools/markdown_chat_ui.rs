@@ -67,7 +67,7 @@ fn check_destination(
     expected_chat_file: Option<&str>,
     requires_destination: bool,
 ) -> Result<(), Box<ToolResult>> {
-    let missing = config.multi_project && requires_destination && expected_chat_file.is_none();
+    let missing = requires_destination && expected_chat_file.is_none();
     let changed = expected_workspace
         .is_some_and(|path| std::path::Path::new(path) != config.work_dir)
         || expected_chat_file.is_some_and(|path| std::path::Path::new(path) != chat_file);

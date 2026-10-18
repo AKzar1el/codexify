@@ -135,9 +135,6 @@ pub fn build_initial_instructions(config: &AppConfig) -> String {
             CONVERSATION_AUTH_INSTRUCTIONS.to_string()
         };
     }
-    if !config.multi_project {
-        return build_instructions(config);
-    }
 
     let mut environment = describe_environment(config);
     environment.cwd = "<not selected>".to_string();
@@ -230,8 +227,7 @@ mod tests {
     fn turn_handoffs_override_conflicting_rules_in_initial_and_project_briefs() {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
-        for multi_project in [false, true] {
-            config.multi_project = multi_project;
+        for _legacy_mode in [false, true] {
             for markdown_chat in [false, true] {
                 config.markdown_chat.enabled = markdown_chat;
                 for brief in [
@@ -256,8 +252,7 @@ mod tests {
     fn command_rejection_guidance_is_shared_by_initial_and_project_briefs() {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
-        for multi_project in [false, true] {
-            config.multi_project = multi_project;
+        for _legacy_mode in [false, true] {
             for markdown_chat in [false, true] {
                 config.markdown_chat.enabled = markdown_chat;
                 config.markdown_chat.automation.enabled = markdown_chat;

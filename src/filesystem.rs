@@ -442,7 +442,11 @@ mod tests {
     async fn queued_filesystem_requests_expire_and_cancel_before_spawning() {
         let config = crate::config::default_config(PathBuf::from("/unused"));
         let worker = FilesystemWorker::new(&config.filesystem, Some("/does-not-exist".into()));
-        let _slots = worker.slots.acquire_many(4).await.unwrap();
+        let _slots = worker
+            .slots
+            .acquire_many(config.filesystem.max_concurrent_workers as u32)
+            .await
+            .unwrap();
         let result = worker
             .run(
                 Operation::Grep,
@@ -473,7 +477,14 @@ mod tests {
     async fn filesystem_pending_queue_and_deadlines_are_bounded() {
         let config = crate::config::default_config(PathBuf::from("/unused"));
         let worker = FilesystemWorker::new(&config.filesystem, Some("/does-not-exist".into()));
-        let _pending = worker.pending.acquire_many(20).await.unwrap();
+        let _pending = worker
+            .pending
+            .acquire_many(
+                (config.filesystem.max_concurrent_workers + config.filesystem.max_pending_requests)
+                    as u32,
+            )
+            .await
+            .unwrap();
         let result = worker
             .run(
                 Operation::Grep,

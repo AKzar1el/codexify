@@ -44,7 +44,7 @@ pub fn memory_max_bytes(config: &AppConfig) -> usize {
     config.memory.max_bytes.unwrap_or(DEFAULT_MEMORY_MAX_BYTES)
 }
 
-fn project_state_dir_name(work_dir: &std::path::Path) -> String {
+pub(crate) fn project_state_dir_name(work_dir: &std::path::Path) -> String {
     let normalized = crate::safe_path::lexical_normalize(work_dir);
     let abs = normalized.to_string_lossy().to_string();
     let mut hasher = Sha256::new();
@@ -80,11 +80,7 @@ fn project_state_dir_name(work_dir: &std::path::Path) -> String {
 pub fn memory_dir(config: &AppConfig) -> PathBuf {
     if let Some(dir) = &config.memory.dir {
         let base = PathBuf::from(dir);
-        return if config.multi_project {
-            base.join(project_state_dir_name(&config.work_dir))
-        } else {
-            base
-        };
+        return base.join(project_state_dir_name(&config.work_dir));
     }
 
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));

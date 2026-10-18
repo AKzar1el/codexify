@@ -27,7 +27,7 @@ use tempfile::TempDir;
 fn multi_project_config(access_root: &std::path::Path) -> codexify::types::AppConfig {
     let mut config = default_config(access_root.to_path_buf());
     config.set_filesystem_worker_executable(env!("CARGO_BIN_EXE_codexify").into());
-    config.multi_project = true;
+
     config.worktrees.mode = WorktreeMode::Never;
     config.skills.enabled = Some(false);
     config
@@ -1244,7 +1244,11 @@ fn multi_project_mode_can_be_enabled_by_config_or_cli() {
         enabled_config.to_str().unwrap(),
     ])
     .unwrap();
-    assert!(load_config(from_file).unwrap().multi_project);
+    assert!(
+        codexify::registry::load_tools_for_config(&load_config(from_file).unwrap())
+            .iter()
+            .any(|tool| tool.name() == "set_project_root")
+    );
 
     let disabled_config = root.path().join("disabled.json");
     fs::write(
@@ -1261,7 +1265,11 @@ fn multi_project_mode_can_be_enabled_by_config_or_cli() {
         "--multi-project",
     ])
     .unwrap();
-    assert!(load_config(from_cli).unwrap().multi_project);
+    assert!(
+        codexify::registry::load_tools_for_config(&load_config(from_cli).unwrap())
+            .iter()
+            .any(|tool| tool.name() == "set_project_root")
+    );
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) {

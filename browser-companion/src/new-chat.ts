@@ -1,4 +1,5 @@
 import type { Page } from "patchright";
+import {uiLabelPattern} from "./ui-localization";
 import { activeComposer } from "./composer";
 import { BrowserCompanionError } from "./errors";
 import { assertAuthenticatedChatGptPage } from "./session";
@@ -26,10 +27,11 @@ export async function openNewChat(surface: SingleBrowserSurface, projectUrl: str
     // The project landing page's fresh composer is its New chat entry point.
     await composer.click({timeout:5_000, signal});
   } else {
-    const entry = page.locator('a[data-testid="create-new-chat-button"], a[data-testid="new-chat-button"]');
+    const entry = page.locator('[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]');
     if (await entry.count() === 1) await entry.click({timeout:5_000, signal});
     else {
-      const named = page.getByRole('link',{name:/^New chat(?:\s|$)/i});
+      const name=uiLabelPattern("newChat");
+      const named = page.getByRole('link',{name}).or(page.getByRole('button',{name}));
       if (await named.count() === 1) await named.click({timeout:5_000, signal});
     }
     if (new URL(page.url()).origin !== "https://chatgpt.com" || new URL(page.url()).pathname !== '/') throw new BrowserCompanionError("ChatGPT did not open a new chat", "conversation_unavailable");

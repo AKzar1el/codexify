@@ -2920,6 +2920,13 @@ async fn real_executor_defers_only_an_unowned_busy_pairing_window_to_companion_v
         let execute_calls = Arc::new(AtomicUsize::new(0));
         let execute_counter = execute_calls.clone();
         let app = Router::new()
+            // The process is responsive even when the ChatGPT session is unavailable.
+            .route("/v1/liveness", get(|| async {
+                axum::Json(serde_json::json!({
+                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                    "build":COMPANION_BUILD, "available":true
+                }))
+            }))
             .route("/v1/health", get(move || async move {
                 axum::Json(serde_json::json!({
                     "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,

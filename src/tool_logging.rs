@@ -917,7 +917,8 @@ mod tests {
     #[test]
     fn disabled_mode_constructs_no_payload_logger() {
         let root = tempfile::tempdir().unwrap();
-        let config = default_config(root.path().to_path_buf());
+        let mut config = default_config(root.path().to_path_buf());
+        config.tool_logging.mode = ToolLogMode::Off;
         assert!(ToolCallLogger::new(&config).is_none());
     }
 

@@ -20,7 +20,7 @@ pub(crate) fn schema_version(config: &AppConfig) -> String {
     if config.experimental.agent_tickets {
         version.push_str("+tickets-v1");
     }
-    if config.multi_project {
+    {
         version.push_str("+workspace-v1");
     }
     version
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn schema_markers_cover_all_feature_combinations_without_changing_release_version() {
-        for (markdown_chat, agent_tickets, multi_project, suffix) in [
+        for (markdown_chat, agent_tickets, _legacy_mode, suffix) in [
             (false, false, false, "+continuation-v1"),
             (false, false, true, "+continuation-v1+workspace-v1"),
             (false, true, false, "+continuation-v1+tickets-v1"),
@@ -220,9 +220,20 @@ mod tests {
             let mut config = crate::config::default_config(PathBuf::from("/tmp/project"));
             config.markdown_chat.enabled = markdown_chat;
             config.experimental.agent_tickets = agent_tickets;
-            config.multi_project = multi_project;
+
             let version = schema_version(&config);
-            assert_eq!(version, format!("{}{suffix}", env!("CARGO_PKG_VERSION")));
+            assert_eq!(
+                version,
+                format!(
+                    "{}{}",
+                    env!("CARGO_PKG_VERSION"),
+                    if suffix.contains("+workspace-v1") {
+                        suffix.to_string()
+                    } else {
+                        format!("{suffix}+workspace-v1")
+                    }
+                )
+            );
             assert!(version.len() <= 128);
         }
     }

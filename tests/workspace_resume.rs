@@ -47,7 +47,7 @@ fn fixture() -> (TempDir, AppConfig, ProjectBindingStore, PathBuf) {
         ],
     );
     let mut config = default_config(root.path().join("projects"));
-    config.multi_project = true;
+
     config.worktrees.root = root.path().join("worktrees");
     config.worktrees.auto_cleanup_enabled = false;
     config.memory.dir = Some(root.path().join("memory").to_string_lossy().into_owned());

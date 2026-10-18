@@ -1,0 +1,222 @@
+{
+  "effortInstant": {
+    "keys": [
+      "chatgpt.plus_onboarding.carousel.page.intelligence.preview.option.instant"
+    ],
+    "english": [
+      "Instant"
+    ]
+  },
+  "effortMedium": {
+    "keys": [
+      "chatgpt.plus_onboarding.carousel.page.intelligence.preview.option.medium"
+    ],
+    "english": [
+      "Medium"
+    ]
+  },
+  "effortHigh": {
+    "keys": [
+      "chatgpt.plus_onboarding.carousel.page.intelligence.preview.option.high"
+    ],
+    "english": [
+      "High"
+    ]
+  },
+  "effortExtraHigh": {
+    "keys": [
+      "chatgpt.plus_onboarding.carousel.page.intelligence.preview.option.extra_high"
+    ],
+    "english": [
+      "Extra High"
+    ]
+  },
+  "effortPro": {
+    "keys": [
+      "chatgpt.composer.intelligence_picker.pro_effort.pill.label.standard"
+    ],
+    "english": [
+      "Pro"
+    ]
+  },
+  "latestModel": {
+    "keys": [
+      "voiceMode.inCallModelPicker.option.subtitle.latest"
+    ],
+    "english": [
+      "Latest",
+      "最新",
+      "최신"
+    ]
+  },
+  "counter": {
+    "keys": [
+      "chatgpt.model_picker.work_power.keyboard_control.value",
+      "chatgpt.model_picker.work_power.keyboard_control.value.upgrade_required"
+    ],
+    "english": [
+      "{value}, {position} of {total}."
+    ]
+  },
+  "newChat": {
+    "keys": [
+      "chatgpt.composer.unified_menu.shortcut.new_chat.label",
+      "FannyPack.NewChat"
+    ],
+    "english": [
+      "New chat"
+    ]
+  },
+  "stopControl": {
+    "keys": [
+      "PromptTextarea.stopGenerating",
+      "cot.stop"
+    ],
+    "english": [
+      "Stop",
+      "Stop generating"
+    ]
+  },
+  "thinkControl": {
+    "keys": [
+      "chatgpt.composer.free_go_chat_model_picker.toggle.label.think"
+    ],
+    "english": [
+      "Think"
+    ]
+  },
+  "rateTitle": {
+    "keys": [
+      "conversationHistoryRateLimitModal.title"
+    ],
+    "english": [
+      "Too many requests"
+    ]
+  },
+  "rateBody": {
+    "keys": [
+      "conversationHistoryRateLimitModal.bodyLineOne"
+    ],
+    "english": [
+      "You are making requests too quickly. Please try again later.",
+      "making requests too quickly"
+    ]
+  },
+  "expiredTitle": {
+    "keys": [
+      "App.forceLogInModalTitle"
+    ],
+    "english": [
+      "Your session has expired"
+    ]
+  },
+  "expiredBody": {
+    "keys": [
+      "App.forceLogInModalDescription"
+    ],
+    "english": [
+      "Please log in again to continue using the app."
+    ]
+  },
+  "subscriptionFailure": {
+    "keys": [
+      "useSubscriptionData.subscriptionLoadError"
+    ],
+    "english": [
+      "Failed to load subscription: {error}",
+      "Failed to load subscription"
+    ]
+  },
+  "planFree": {
+    "keys": [
+      "pricingPlanConstants.free.name"
+    ],
+    "english": [
+      "Free"
+    ]
+  },
+  "planGo": {
+    "keys": [
+      "pricingPlanConstants.go.name"
+    ],
+    "english": [
+      "Go"
+    ]
+  },
+  "planPro": {
+    "keys": [
+      "pricingPlanConstants.pro.name"
+    ],
+    "english": [
+      "Pro"
+    ]
+  },
+  "planPlus": {
+    "keys": [
+      "pricingPlanConstants.plus.name"
+    ],
+    "english": [
+      "Plus"
+    ]
+  },
+  "planBusiness": {
+    "keys": [
+      "pricingPlanConstants.business.name",
+      "pricingPlanConstants.team.name"
+    ],
+    "english": [
+      "Business"
+    ]
+  },
+  "planEnterprise": {
+    "keys": [
+      "pricingPlanConstants.enterprise.name"
+    ],
+    "english": [
+      "Enterprise"
+    ]
+  },
+  "planEdu": {
+    "keys": [
+      "pricingPlanConstants.edu.name"
+    ],
+    "english": [
+      "Edu"
+    ]
+  },
+  "planWord": {
+    "keys": [
+      "organizationBillingInfo.planTabName"
+    ],
+    "english": [
+      "plan"
+    ]
+  },
+  "answerNow": {
+    "keys": [
+      "chatgpt.thread.steer_turn_actions.answer_now.button.label"
+    ],
+    "english": [
+      "Answer now"
+    ]
+  },
+  "thinkingStatus": {
+    "keys": [
+      "chatgpt.tpp.subagents_sidebar.status.active.thinking.label"
+    ],
+    "english": [
+      "Thinking"
+    ]
+  },
+  "terminalFailure": {
+    "keys": [
+      "TextMessageDisplay.somethingWentWrongTryAgain",
+      "3BZzpX",
+      "9peWdy"
+    ],
+    "english": [
+      "Something went wrong",
+      "An error occurred"
+    ]
+  }
+}

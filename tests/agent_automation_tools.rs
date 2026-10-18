@@ -33,6 +33,7 @@ fn fixture(name: &str) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let mut config = default_config(root.path().to_path_buf());
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
+    config.task_state_root = Some(root.path().join("metadata"));
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
     let task = ConversationIdentity::from_openai_session(name).unwrap();

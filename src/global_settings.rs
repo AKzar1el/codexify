@@ -27,6 +27,144 @@ pub(crate) fn extras(config: &AppConfig) -> Result<crate::markdown_chat::ExtrasC
         .map_err(|e| e.to_string())
 }
 
+/// Only presentation hints are hot-reloaded. Other schema changes are refreshed
+/// after the existing Restart flow has applied their runtime configuration.
+pub(crate) fn advertising_config(config: &AppConfig) -> AppConfig {
+    let mut effective = config.clone();
+    let document = config
+        .loaded_config_path
+        .as_ref()
+        .and_then(|p| read_raw(p).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if let Some(document) = document {
+        let value = |key: &str| {
+            document
+                .get("experimental")
+                .and_then(|e| e.get(key))
+                .and_then(Value::as_bool)
+        };
+        effective.experimental.force_read_only_tool_annotations =
+            value("forceReadOnlyToolAnnotations").unwrap_or(false);
+        effective.experimental.force_destructive_tool_annotations =
+            Some(value("forceDestructiveToolAnnotations").unwrap_or(false));
+        effective.experimental.force_idempotent_tool_annotations =
+            value("forceIdempotentToolAnnotations");
+        effective.experimental.force_open_world_tool_annotations =
+            Some(value("forceOpenWorldToolAnnotations").unwrap_or(false));
+    }
+    effective
+}
+fn schema_projection(document: &Value, defaults: &Value) -> Value {
+    let pointers = [
+        "/debug",
+        "/uiWidgets",
+        "/experimental/agentTickets",
+        "/experimental/forceReadOnlyToolAnnotations",
+        "/experimental/forceDestructiveToolAnnotations",
+        "/experimental/forceIdempotentToolAnnotations",
+        "/experimental/forceOpenWorldToolAnnotations",
+        "/agentChat/enabled",
+        "/artifactIngress/enabled",
+        "/artifactIngress/maxConcurrentDownloads",
+        "/artifactEgress/enabled",
+        "/mcpServers",
+        "/codexMcp",
+    ];
+    Value::Object(
+        pointers
+            .into_iter()
+            .map(|pointer| {
+                (
+                    pointer.into(),
+                    document
+                        .pointer(pointer)
+                        .filter(|v| !v.is_null())
+                        .or_else(|| defaults.pointer(pointer))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+            })
+            .collect(),
+    )
+}
+pub(crate) fn schema_versions(config: &AppConfig) -> Result<(String, String), String> {
+    let value = snapshot(config)?;
+    let mut projection = schema_projection(&value["document"], &value["defaults"]);
+    let all = revision(
+        serde_json::to_string(&projection)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    );
+    for key in [
+        "/experimental/forceReadOnlyToolAnnotations",
+        "/experimental/forceDestructiveToolAnnotations",
+        "/experimental/forceIdempotentToolAnnotations",
+        "/experimental/forceOpenWorldToolAnnotations",
+    ] {
+        projection.as_object_mut().unwrap().remove(key);
+    }
+    let structural = revision(
+        serde_json::to_string(&projection)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    );
+    Ok((all, structural))
+}
+pub(crate) fn schema_revision(config: &AppConfig) -> Result<String, String> {
+    schema_versions(config).map(|v| v.0)
+}
+pub(crate) fn schema_intent_path(config: &AppConfig) -> Result<PathBuf, String> {
+    Ok(config
+        .loaded_config_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .ok_or("No global settings path")?
+        .join("schema-refresh.json"))
+}
+pub(crate) fn read_schema_intent(config: &AppConfig) -> Option<Value> {
+    let path = schema_intent_path(config).ok()?;
+    let raw = read_raw(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+static SCHEMA_INTENT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn write_schema_intent_unlocked(config: &AppConfig, value: &Value) -> Result<(), String> {
+    let path = schema_intent_path(config)?;
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().ok_or("No state directory")?)
+        .map_err(|e| e.to_string())?;
+    temp.write_all(&serde_json::to_vec(value).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) {
+        return Err("Unsafe schema refresh file".into());
+    }
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub(crate) fn write_schema_intent(config: &AppConfig, value: &Value) -> Result<(), String> {
+    let _lock = SCHEMA_INTENT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Schema refresh lock unavailable")?;
+    write_schema_intent_unlocked(config, value)
+}
+pub(crate) fn update_schema_intent(
+    config: &AppConfig,
+    expected: &str,
+    value: &Value,
+) -> Result<(), String> {
+    let _lock = SCHEMA_INTENT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Schema refresh lock unavailable")?;
+    if read_schema_intent(config)
+        .as_ref()
+        .and_then(|v| v["refreshId"].as_str())
+        == Some(expected)
+    {
+        write_schema_intent_unlocked(config, value)?;
+    }
+    Ok(())
+}
+
 pub fn turn_renewal_settings(
     path: Option<&Path>,
     fallback: &crate::agent_automation::turn_renewal::TurnRenewalConfig,
@@ -117,9 +255,7 @@ pub fn snapshot(config: &AppConfig) -> Result<Value, String> {
         "defaults":defaults,
         "fieldSchema":serde_json::from_str::<Value>(include_str!("../codexify.config.example.json")).expect("bundled field schema"),
         "defaultLabels":{"workDir":"Required","skills.dirs":"Automatic discovery",
-        "experimental.forceDestructiveToolAnnotations":"Keep tool hints",
-        "experimental.forceIdempotentToolAnnotations":"Keep tool hints",
-        "experimental.forceOpenWorldToolAnnotations":"Keep tool hints"},
+        "experimental.forceIdempotentToolAnnotations":"Keep tool hints"},
         "restartRequired":false}),
     )
 }
@@ -236,6 +372,23 @@ pub fn save(
                 }
             }
         }
+        if let Some(experimental) = value.get_mut("experimental").and_then(Value::as_object_mut) {
+            for key in [
+                "forceReadOnlyToolAnnotations",
+                "forceDestructiveToolAnnotations",
+                "forceIdempotentToolAnnotations",
+                "forceOpenWorldToolAnnotations",
+            ] {
+                experimental.remove(key);
+            }
+        }
+        if value
+            .get("experimental")
+            .and_then(Value::as_object)
+            .is_some_and(|v| v.is_empty())
+        {
+            value.as_object_mut().unwrap().remove("experimental");
+        }
         if value
             .get("agentChat")
             .and_then(Value::as_object)
@@ -246,6 +399,23 @@ pub fn save(
         value.as_object_mut().unwrap().remove("schemaVersion");
     }
     saved["restartRequired"] = json!(previous != next);
+    let before_document: Value = serde_json::from_str(&before).map_err(|e| e.to_string())?;
+    let old_projection = schema_projection(&before_document, &saved["defaults"]);
+    let new_projection = schema_projection(&saved["document"], &saved["defaults"]);
+    saved["schemaRefreshRequired"] = json!(old_projection != new_projection);
+    let mut structural_before = old_projection;
+    let mut structural_after = new_projection;
+    for value in [&mut structural_before, &mut structural_after] {
+        for key in [
+            "/experimental/forceReadOnlyToolAnnotations",
+            "/experimental/forceDestructiveToolAnnotations",
+            "/experimental/forceIdempotentToolAnnotations",
+            "/experimental/forceOpenWorldToolAnnotations",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+    }
+    saved["schemaRestartRequired"] = json!(structural_before != structural_after);
     Ok(saved)
 }
 
@@ -472,20 +642,24 @@ mod tests {
             shown["defaults"]["output"]["maxFileBytes"],
             crate::output_budget::DEFAULT_MAX_FILE_BYTES
         );
-        assert_eq!(shown["defaults"]["multiProject"], false);
-        assert_eq!(shown["fieldSchema"]["multiProject"], true);
+        assert!(shown["defaults"]["multiProject"].is_null());
+        assert!(shown["fieldSchema"]["multiProject"].is_null());
         assert_eq!(shown["defaults"]["mcpServers"], json!({}));
         for key in [
             "forceDestructiveToolAnnotations",
             "forceIdempotentToolAnnotations",
             "forceOpenWorldToolAnnotations",
         ] {
-            assert!(shown["defaults"]["experimental"][key].is_null());
-            assert!(shown["fieldSchema"]["experimental"][key].is_null());
-            assert_eq!(
-                shown["defaultLabels"][format!("experimental.{key}")],
-                "Keep tool hints"
-            );
+            if key == "forceIdempotentToolAnnotations" {
+                assert!(shown["defaults"]["experimental"][key].is_null());
+                assert_eq!(
+                    shown["defaultLabels"][format!("experimental.{key}")],
+                    "Keep tool hints"
+                );
+            } else {
+                assert_eq!(shown["defaults"]["experimental"][key], false);
+                assert_eq!(shown["fieldSchema"]["experimental"][key], false);
+            }
         }
         assert_eq!(shown["defaults"]["openaiTunnels"], json!([]));
         assert_eq!(
@@ -610,7 +784,7 @@ mod tests {
         .unwrap();
         let mut config = crate::config::default_config(root.path().to_owned());
         config.loaded_config_path = Some(path);
-        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Steer);
+        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Queue);
         let mut current = snapshot(&config).unwrap();
         for mode in [json!("queue"), json!("steer")] {
             current = save(
@@ -646,7 +820,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current["restartRequired"], false);
-        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Steer);
+        assert_eq!(default_message_mode(&config).unwrap(), MessageMode::Queue);
         let bytes = std::fs::read(config.loaded_config_path.as_ref().unwrap()).unwrap();
         assert!(
             save(
@@ -676,7 +850,7 @@ mod tests {
         .unwrap();
         let mut config = crate::config::default_config(root.path().into());
         config.loaded_config_path = Some(path.clone());
-        assert_eq!(rollout_reminder_interval(&config).unwrap(), 20);
+        assert_eq!(rollout_reminder_interval(&config).unwrap(), 25);
         let mut current = snapshot(&config).unwrap();
         for interval in [1, 50, 10000] {
             current = save(
@@ -721,7 +895,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reset["restartRequired"], false);
-        assert_eq!(rollout_reminder_interval(&config).unwrap(), 20);
+        assert_eq!(rollout_reminder_interval(&config).unwrap(), 25);
+    }
+    #[test]
+    fn new_defaults_and_schema_refresh_projection_are_consistent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false},"multiProject":false})
+                .to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path);
+        let shown = snapshot(&config).unwrap();
+        let defaults = &shown["defaults"];
+        for pointer in [
+            "/debug",
+            "/agentChat/enabled",
+            "/agentChat/automation/enabled",
+            "/agentChat/automation/autoApproveToolCalls",
+            "/agentChat/rolloutEnabled",
+            "/audit/enabled",
+            "/audit/includeCommandPreview",
+        ] {
+            assert_eq!(defaults.pointer(pointer), Some(&json!(true)), "{pointer}");
+        }
+        assert_eq!(defaults["filesystem"]["maxConcurrentWorkers"], 8);
+        assert_eq!(defaults["artifactIngress"]["maxConcurrentDownloads"], 8);
+        assert_eq!(defaults["agentChat"]["rolloutReminderInterval"], 25);
+        assert_eq!(defaults["agentChat"]["defaultMessageMode"], "queue");
+        assert_eq!(defaults["toolLogging"]["level"], "info");
+        assert_eq!(defaults["toolLogging"]["mode"], "all");
+        assert_eq!(defaults["worktrees"]["upstreamRefreshMode"], "best-effort");
+        assert_eq!(
+            defaults["experimental"]["forceDestructiveToolAnnotations"],
+            false
+        );
+        assert_eq!(
+            defaults["experimental"]["forceOpenWorldToolAnnotations"],
+            false
+        );
+        assert_eq!(
+            defaults["agentChat"]["automation"]["requestBlockingEnabled"],
+            false
+        );
+        assert_eq!(
+            defaults["agentChat"]["automation"]["requestBlockList"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(defaults.get("multiProject").is_none());
+        assert!(
+            crate::registry::load_tools_for_config(&config)
+                .iter()
+                .any(|tool| tool.name() == "set_project_root")
+        );
+        let saved = save(
+            &config,
+            shown["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([(
+                "agentChat.extras.animations".into(),
+                json!(false),
+            )])),
+        )
+        .unwrap();
+        assert_eq!(saved["schemaRefreshRequired"], false);
+        let saved = save(
+            &config,
+            saved["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([("uiWidgets".into(), json!(false))])),
+        )
+        .unwrap();
+        assert_eq!(saved["schemaRefreshRequired"], true);
+        assert_eq!(saved["schemaRestartRequired"], true);
+        assert_eq!(saved["restartRequired"], true);
+        write_schema_intent(&config, &json!({"refreshId":"new","phase":"queued"})).unwrap();
+        update_schema_intent(
+            &config,
+            "old",
+            &json!({"refreshId":"old","phase":"completed"}),
+        )
+        .unwrap();
+        assert_eq!(read_schema_intent(&config).unwrap()["refreshId"], "new");
     }
 }
 

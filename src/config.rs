@@ -100,7 +100,7 @@ pub struct Cli {
 
     /// Let each ChatGPT conversation bind once to a project below --work-dir.
     /// Other MCP clients fall back to transport-session binding.
-    #[arg(long = "multi-project")]
+    #[arg(long = "multi-project", hide = true)]
     pub multi_project: bool,
 
     /// Existing directory below --work-dir where Git repositories are cloned.
@@ -414,7 +414,7 @@ pub(crate) fn settings_defaults(
             "forceOpenWorldToolAnnotations":defaults.experimental.force_open_world_tool_annotations,
             "claudeSkills":defaults.experimental.claude_skills},
         "apiKey":null,"conversationAuthToken":null,"port":defaults.port,
-        "multiProject":defaults.multi_project,"projectCloneDir":defaults.project_clone_dir,
+        "projectCloneDir":defaults.project_clone_dir,
         "worktrees":{"mode":defaults.worktrees.mode.as_str(),"root":defaults.worktrees.root,
             "upstreamRefreshMode":defaults.worktrees.upstream_refresh_mode.as_str(),
             "autoCleanupEnabled":defaults.worktrees.auto_cleanup_enabled,
@@ -432,7 +432,7 @@ pub(crate) fn settings_defaults(
         "toolLogging":{"mode":logging.mode.as_str(),"level":logging.level.as_str(),
             "maxRequestBytes":logging.max_request_bytes,"maxResponseBytes":logging.max_response_bytes,
             "redactEnv":logging.redact_env},
-        "audit":{"logFile":audit.log_file,"includeCommandPreview":audit.include_command_preview,
+        "audit":{"enabled":audit.log_file.is_some(),"logFile":audit.log_file,"includeCommandPreview":audit.include_command_preview,
             "commandPreviewMaxBytes":audit.command_preview_max_bytes,"redactEnv":audit.redact_env},
         "artifactIngress":defaults.artifact_ingress,"artifactEgress":defaults.artifact_egress,
         "memory":{"enabled":crate::memory::memory_enabled(&defaults),"dir":crate::memory::memory_dir(&defaults),
@@ -486,6 +486,7 @@ struct PartialOpenAiTunnel {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PartialAudit {
+    enabled: Option<bool>,
     log_file: Option<String>,
     include_command_preview: Option<bool>,
     command_preview_max_bytes: Option<usize>,
@@ -715,7 +716,8 @@ struct FileConfig {
     api_key: Option<String>,
     conversation_auth_token: Option<String>,
     port: Option<u16>,
-    multi_project: Option<bool>,
+    #[serde(rename = "multiProject")]
+    _legacy_multi_project: Option<bool>,
     project_clone_dir: Option<String>,
     worktrees: Option<PartialWorktrees>,
     tree: Option<PartialTree>,
@@ -945,15 +947,18 @@ fn resolve_mcp_servers_from(
 /// `load_config` produces from an empty config file. Handy for tests and for
 /// embedding the server without a config file.
 pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
+    let audit = AuditConfig {
+        log_file: Some(default_audit_path(&work_dir)),
+        ..Default::default()
+    };
     AppConfig {
         loaded_config_path: None,
         task_state_root: None,
         project_clone_dir: work_dir.clone(),
         work_dir,
-        debug: false,
+        debug: true,
         ui_widgets: true,
         experimental: ExperimentalConfig::default(),
-        multi_project: false,
         project_catalog: ProjectCatalogConfig::default(),
         worktrees: default_worktree_config(),
         api_key: None,
@@ -977,7 +982,7 @@ pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
         skills: SkillsConfig::default(),
         ignore: IgnoreConfig::default(),
         tool_logging: ToolLoggingConfig::default(),
-        audit: AuditConfig::default(),
+        audit,
         allowed_hosts: Vec::new(),
         openai_tunnel: None,
         additional_openai_tunnels: Vec::new(),
@@ -1006,7 +1011,7 @@ fn default_worktree_config() -> WorktreeConfig {
     WorktreeConfig {
         mode: WorktreeMode::Auto,
         root: codex_home_path().join("worktrees"),
-        upstream_refresh_mode: WorktreeUpstreamRefreshMode::Never,
+        upstream_refresh_mode: WorktreeUpstreamRefreshMode::BestEffort,
         auto_cleanup_enabled: true,
         keep_count: 15,
         allow_setup_script: false,
@@ -1097,7 +1102,7 @@ fn resolve_worktree_config(
     config.upstream_refresh_mode = file
         .upstream_refresh_mode
         .or(native.upstream_refresh_mode)
-        .unwrap_or_default();
+        .unwrap_or(config.upstream_refresh_mode);
     config.auto_cleanup_enabled = file
         .auto_cleanup_enabled
         .or(native.auto_cleanup_enabled)
@@ -1639,7 +1644,19 @@ fn resolve_tool_logging(
     })
 }
 
-fn resolve_audit(file: Option<PartialAudit>, cli: &Cli) -> Result<AuditConfig, String> {
+fn default_audit_path(work_dir: &Path) -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codexify/projects")
+        .join(crate::memory::project_state_dir_name(work_dir))
+        .join("audit.jsonl")
+}
+
+fn resolve_audit(
+    file: Option<PartialAudit>,
+    cli: &Cli,
+    work_dir: &Path,
+) -> Result<AuditConfig, String> {
     const MAX_COMMAND_PREVIEW_BYTES: usize = 16 * 1024;
 
     let file = file.unwrap_or_default();
@@ -1647,9 +1664,11 @@ fn resolve_audit(file: Option<PartialAudit>, cli: &Cli) -> Result<AuditConfig, S
         .audit_log
         .as_deref()
         .or(file.log_file.as_deref())
-        .map(resolve_path);
+        .map(resolve_path)
+        .or_else(|| Some(default_audit_path(work_dir)))
+        .filter(|_| file.enabled.unwrap_or(true) || cli.audit_log.is_some());
     let include_command_preview =
-        cli.audit_command_preview || file.include_command_preview.unwrap_or(false);
+        cli.audit_command_preview || file.include_command_preview.unwrap_or(true);
     let command_preview_max_bytes = file
         .command_preview_max_bytes
         .unwrap_or_else(|| AuditConfig::default().command_preview_max_bytes);
@@ -1657,9 +1676,6 @@ fn resolve_audit(file: Option<PartialAudit>, cli: &Cli) -> Result<AuditConfig, S
         return Err(format!(
             "audit.commandPreviewMaxBytes must be between 1 and {MAX_COMMAND_PREVIEW_BYTES}"
         ));
-    }
-    if include_command_preview && log_file.is_none() {
-        return Err("audit command previews require audit.logFile or --audit <FILE>".to_string());
     }
 
     let mut redact_env = file.redact_env.unwrap_or_default();
@@ -1746,7 +1762,7 @@ fn load_config_with_announcements(
     let (openai_tunnel, additional_openai_tunnels) =
         resolve_openai_tunnels(file.openai_tunnel, file.openai_tunnels, cli)?;
     let tool_logging = resolve_tool_logging(file.tool_logging, cli)?;
-    let audit = resolve_audit(file.audit, cli)?;
+    let audit = resolve_audit(file.audit, cli, &work_dir)?;
     let worktrees = resolve_worktree_config(file.worktrees.take(), cli, announce);
     let api_key = cli.api_key.clone().or(file.api_key);
     if api_key.is_some() && openai_tunnel.is_some() {
@@ -1790,7 +1806,7 @@ fn load_config_with_announcements(
         loaded_config_path: select_config_path(cli)?.path,
         task_state_root: None,
         work_dir,
-        debug: file.debug.unwrap_or(false),
+        debug: file.debug.unwrap_or(true),
         ui_widgets: file.ui_widgets.unwrap_or(true),
         experimental: ExperimentalConfig {
             agent_tickets: experimental.agent_tickets.unwrap_or(false),
@@ -1799,11 +1815,14 @@ fn load_config_with_announcements(
                 .or(file.force_read_only_tool_annotations)
                 .unwrap_or(false),
             claude_skills: experimental.claude_skills.unwrap_or(false),
-            force_destructive_tool_annotations: experimental.force_destructive_tool_annotations,
+            force_destructive_tool_annotations: experimental
+                .force_destructive_tool_annotations
+                .or(Some(false)),
             force_idempotent_tool_annotations: experimental.force_idempotent_tool_annotations,
-            force_open_world_tool_annotations: experimental.force_open_world_tool_annotations,
+            force_open_world_tool_annotations: experimental
+                .force_open_world_tool_annotations
+                .or(Some(false)),
         },
-        multi_project: cli.multi_project || file.multi_project.unwrap_or(false),
         project_clone_dir,
         project_catalog,
         worktrees,
@@ -2180,7 +2199,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 config.experimental.force_destructive_tool_annotations,
-                value.as_bool()
+                value.as_bool().or(Some(false))
             );
             assert_eq!(
                 config.experimental.force_idempotent_tool_annotations,
@@ -2188,7 +2207,7 @@ mod tests {
             );
             assert_eq!(
                 config.experimental.force_open_world_tool_annotations,
-                value.as_bool()
+                value.as_bool().or(Some(false))
             );
         }
         for key in keys {
@@ -2406,7 +2425,6 @@ mod tests {
             "agentChat",
             "mcpServers",
             "memory",
-            "multiProject",
             "output",
             "port",
             "projectCatalog",
@@ -2495,6 +2513,7 @@ mod tests {
             (
                 "audit",
                 &[
+                    "enabled",
                     "commandPreviewMaxBytes",
                     "includeCommandPreview",
                     "logFile",
@@ -2557,6 +2576,7 @@ mod tests {
                 "enabled",
                 "maxQueuedActions",
                 "requestBlockList",
+                "requestBlockingEnabled",
             ],
         );
         assert_keys(
@@ -3002,8 +3022,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = load_config(cli(root.path(), &config_path)).unwrap_err();
-        assert!(error.contains("require audit.logFile"));
+        let config = load_config(cli(root.path(), &config_path)).unwrap();
+        assert!(config.audit.log_file.is_some());
+        assert!(config.audit.include_command_preview);
     }
 
     #[test]

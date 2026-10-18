@@ -135,14 +135,12 @@ impl CodexHandler {
         task: Option<&ConversationIdentity>,
         root: PathBuf,
     ) -> Result<AppConfig, String> {
-        let mut effective = if self.config.multi_project
-            && let Some(task) = task
-        {
+        let mut effective = if let Some(task) = task {
             self.project_bindings.effective_config(&self.config, task)?
         } else {
             self.config.as_ref().clone()
         };
-        if self.config.multi_project && task.is_some() && effective.work_dir != root {
+        if task.is_some() && effective.work_dir != root {
             return Err(
                 "The conversation workspace changed; call get_agent_brief before continuing."
                     .into(),
@@ -314,9 +312,6 @@ impl CodexHandler {
         &self,
         task_conversation: Option<&ConversationIdentity>,
     ) -> Option<PathBuf> {
-        if !self.config.multi_project {
-            return Some(self.config.work_dir.clone());
-        }
         match task_conversation {
             Some(identity) => self
                 .project_bindings
@@ -506,7 +501,7 @@ fn advertised_tool(tool: &dyn Tool, config: &AppConfig) -> rmcp::model::Tool {
             ));
         }
     }
-    if config.multi_project && !app_only_tool(tool) {
+    if !app_only_tool(tool) {
         fields.push((WORKSPACE_CHANGE_FIELD, WORKSPACE_CHANGE_DESCRIPTION));
     }
     let output = if fields.is_empty() {
@@ -589,10 +584,16 @@ impl ServerHandler for CodexHandler {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let source = self.config.clone();
+        let advertising = tokio::task::spawn_blocking(move || {
+            crate::global_settings::advertising_config(&source)
+        })
+        .await
+        .unwrap_or_else(|_| self.config.as_ref().clone());
         let tools = self
             .tools
             .iter()
-            .map(|tool| advertised_tool(tool.as_ref(), &self.config))
+            .map(|tool| advertised_tool(tool.as_ref(), &advertising))
             .collect();
         let mut result = ListToolsResult::with_all_items(tools);
         let caller = crate::connector_schema::caller_key(&context.meta).or_else(|| {
@@ -1125,11 +1126,10 @@ impl ServerHandler for CodexHandler {
                                         .to_string()
                                 });
                             }
-                            if self.config.multi_project
-                                && self
-                                    .project_bindings
-                                    .selected_project_root(&self.config, physical)?
-                                    .is_some()
+                            if self
+                                .project_bindings
+                                .selected_project_root(&self.config, physical)?
+                                .is_some()
                             {
                                 return Err(
                                 "This ChatGPT conversation already has a workspace. Continue the task in a new conversation before selecting anything."
@@ -1137,15 +1137,13 @@ impl ServerHandler for CodexHandler {
                             );
                             }
                             self.continuations.claim(physical, &token, |source_task, saved| {
-                            let current = if self.config.multi_project {
+                            let current = {
                                 self.project_bindings
                                     .selected_project_root(&self.config, source_task)?
                                     .ok_or_else(|| {
                                         "The continued task no longer has a selected workspace."
                                             .to_string()
                                     })?
-                            } else {
-                                self.config.work_dir.clone()
                             };
                             let current = std::fs::canonicalize(&current).map_err(|error| {
                                 format!(
@@ -1676,7 +1674,7 @@ impl ServerHandler for CodexHandler {
         {
             tracing::warn!(%error, "could not persist Markdown chat delivery receipt");
         }
-        if self.config.multi_project && model_call {
+        if model_call {
             let notice = if authorized_before {
                 let change = match task_conversation.as_ref() {
                     Some(identity) => self
@@ -1843,7 +1841,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
 
     // Sweep managed worktrees left by conversations that are no longer bound
     // before taking ownership of `config` behind an `Arc`.
-    if config.multi_project && config.worktrees.auto_cleanup_enabled {
+    if config.worktrees.auto_cleanup_enabled {
         match project_bindings.referenced_managed_project_roots(&config) {
             Ok(referenced) => {
                 for warning in
@@ -1856,6 +1854,8 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         }
     }
     let config = Arc::new(config);
+    let _browser_recovery =
+        crate::agent_automation::watch_browser_companion(&config.markdown_chat.automation);
     let agent_automation = config.markdown_chat.automation.enabled.then(|| {
         let executor = Arc::new(crate::agent_automation::BrowserAutomationExecutor::new(
             config.markdown_chat.automation.clone(),
@@ -1932,6 +1932,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         http_config.allowed_hosts = config.allowed_hosts.clone();
     }
 
+    crate::owner_chat::start_schema_refresh(config.clone());
     let owner_chat_store = Arc::new(crate::markdown_chat::MarkdownChatStore::default());
     let make_service = |factory_connector_schemas: Arc<
         crate::connector_schema::ConnectorSchemaStore,
@@ -2052,15 +2053,13 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
         },
         config.port,
     );
-    if config.multi_project {
+    {
         println!("Project access root: {}", config.work_dir.display());
         println!("Project mode: persistent ChatGPT conversation binding");
         println!(
             "Conversation bindings: {}",
             project_bindings.base_dir().display()
         );
-    } else {
-        println!("Work directory: {}", config.work_dir.display());
     }
     println!(
         "Tools loaded ({tool_count}): {} native + {bridged_count} upstream-facing MCP tools",
@@ -2911,12 +2910,34 @@ mod tests {
     include!("server_turn_renewal_tests.rs");
     include!("server_continuation_tests.rs");
 
+    async fn bind_fixture_workspace(
+        handler: &CodexHandler,
+        identity: Option<&ConversationIdentity>,
+    ) {
+        let mut config = handler.config.as_ref().clone();
+        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        let path = config.work_dir.to_string_lossy();
+        if let Some(identity) = identity {
+            handler
+                .project_bindings
+                .select_project_root(&config, identity, &path)
+                .await
+                .unwrap();
+        } else {
+            handler
+                .session
+                .select_project_root(&config, &path)
+                .await
+                .unwrap();
+        }
+    }
+
     fn handler_with_tools(
         root: &std::path::Path,
         tools: Vec<Box<dyn Tool>>,
         tool_log_level: crate::types::ToolLogLevel,
     ) -> CodexHandler {
-        let mut config = crate::config::default_config(root.to_path_buf());
+        let mut config = crate::config::default_config(std::fs::canonicalize(root).unwrap());
         config.memory.dir = Some(root.join("test-state").display().to_string());
         config.tool_logging.mode = crate::types::ToolLogMode::All;
         config.tool_logging.level = tool_log_level;
@@ -3362,7 +3383,7 @@ mod tests {
             crate::types::ToolLogLevel::Info,
         );
         let config = Arc::make_mut(&mut handler.config);
-        config.multi_project = true;
+
         config.work_dir = access;
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
@@ -3489,7 +3510,7 @@ mod tests {
                     ToolLogLevel::Info,
                 );
                 let config = Arc::make_mut(&mut handler.config);
-                config.multi_project = true;
+
                 config.worktrees.mode = mode;
                 config.worktrees.root = root.path().join("worktrees");
                 config.worktrees.auto_cleanup_enabled = false;
@@ -3563,7 +3584,7 @@ mod tests {
                 crate::types::ToolLogLevel::Info,
             );
             let config = Arc::make_mut(&mut handler.config);
-            config.multi_project = true;
+
             config.work_dir = access;
             config.worktrees.mode = crate::types::WorktreeMode::Always;
             config.worktrees.root = root.path().join("worktrees");
@@ -3908,7 +3929,7 @@ mod tests {
         assert_eq!(annotations.read_only_hint, Some(false));
         assert_eq!(annotations.destructive_hint, Some(false));
         assert_eq!(annotations.idempotent_hint, Some(true));
-        assert_eq!(annotations.open_world_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
     }
 
     #[test]

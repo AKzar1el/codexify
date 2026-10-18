@@ -8,6 +8,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Automatically recover an installed browser companion when it closes, stops
+  responding or retires a frozen browser session. Recovery uses a browser-only
+  responsiveness probe and preserves the private profile and pairings.
+- Start browser and Stop browser controls in conversation settings. An explicit
+  stop persists until Start is pressed, including across server restarts. Stop
+  can cancel startup; concurrent callers share the same lifecycle lock.
+
+- Expand achievements from 8 to 32 across completed goals, lifetime turns, tool
+  calls, daily streaks, active goal hours and turns in one conversation. New
+  long-term tiers reach 1,000 goals, 100,000 turns, 10 million tools and a
+  year-long streak. Existing unlocks remain earned; newly added historical
+  milestones unlock quietly without a backlog of celebrations.
+- PWA installation beside Statistics, with native prompts where supported and
+  iPhone installation instructions. Installed apps hide the install control.
+- Automatic connector tool refresh after schema edits, debounced for 10 seconds.
+  Annotation edits refresh live; structural edits refresh after their restart.
+- Independent request-blocking switch, disabled by default, with five ChatGPT
+  telemetry, history and sidebar patterns ready to enable.
 - Standalone Statistics beside the global settings cog, with daily streaks,
   personal records, achievement badges and shareable calendar-week recaps.
   Celebrations are brief and do not intercept clicks. Persistent receipts prevent
@@ -16,6 +34,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Turn renewal can be enabled independently for each model and reasoning effort.
   Disabled and unlisted selections are left alone, including after a model
   fallback. Model switches apply immediately and cancel pending renewals.
+
+### Changed
+
+- Strip Markdown from generated and custom chat titles while preserving their
+  readable text. Sidebar labels, conversation headers and rename fields use the
+  same plain title; message formatting remains intact.
+
+- Compact mobile settings keep the same readable control text size during
+  editing, fix date-range text clipping, and respect iPhone screen safe areas.
+- Rename the chat sidebar to Codexify and always use workspace selection.
+- Enable agent chat, browser automation, auto approval, debug and audit previews
+  by default. Use 8 filesystem workers/downloads, Info/all tool logs, queue
+  delivery, a 25-call progress interval and best-effort upstream refresh.
+  Destructive and open-world annotation overrides default to false. Explicit
+  saved settings remain in effect.
 
 ## [2.1.0] - 2026-10-18
 
@@ -60,6 +93,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   message timestamps and delivery tracking internally.
 
 ### Fixed
+
+- Browser automation recognizes localized control labels, model efforts, slider
+  announcements, plans and error dialogs using verified UI identities and a
+  bundled catalog from ChatGPT’s published locales. Greek pairing and submission
+  preserve the selected model and effort. Ambiguous translations are rejected.
+
+- Handle ChatGPT’s optional Stop-response confirmation before continuing an
+  offline chat or goal. Match the dialog structure without localized labels
+  and keep cancellation and stop deadlines bounded.
 
 - Active goals are rediscovered at service startup and every 30 seconds, even
   without queued messages or a pending handoff. Restoring a goal no longer

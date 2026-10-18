@@ -121,57 +121,21 @@ pub trait AutomationExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct BrowserAutomationExecutor {
     config: AgentAutomationConfig,
-    startup_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserAutomationExecutor {
     pub fn new(config: AgentAutomationConfig) -> Self {
-        Self {
-            config,
-            startup_lock: Arc::new(Mutex::new(())),
-        }
+        Self { config }
     }
 
     async fn ready_client(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<BrowserCompanionClient, String> {
-        companion_client_or_start(&self.config, &self.startup_lock, cancellation, || async {
-            super::BrowserCompanionManager::from_config(&self.config)?
-                .start()
-                .await?;
-            Ok(())
-        })
-        .await
+        super::BrowserCompanionControl::new(&self.config)?
+            .ensure_running(cancellation)
+            .await
     }
-}
-
-async fn companion_client_or_start<F, Fut>(
-    config: &AgentAutomationConfig,
-    startup_lock: &Mutex<()>,
-    cancellation: &CancellationToken,
-    start: F,
-) -> Result<BrowserCompanionClient, String>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
-    if cancellation.is_cancelled() {
-        return Err("Browser action was cancelled before startup".into());
-    }
-    if let Ok(client) = BrowserCompanionClient::from_config(config) {
-        return Ok(client);
-    }
-    let _guard = startup_lock.lock().await;
-    if cancellation.is_cancelled() {
-        return Err("Browser action was cancelled before startup".into());
-    }
-    // A concurrent action may have already launched the installed companion.
-    if let Ok(client) = BrowserCompanionClient::from_config(config) {
-        return Ok(client);
-    }
-    start().await?;
-    BrowserCompanionClient::from_config(config)
 }
 
 #[async_trait]
@@ -442,10 +406,12 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             }
             return Err(execution_error(message, true));
         }
+        // The companion accepted this action. A restart before the final receipt
+        // cannot prove that Send was never attempted.
         let terminal = client
             .action(&execution.request.action_id, &cancellation)
             .await
-            .map_err(|message| execution_error(message, initial.send_accepted))?;
+            .map_err(|message| execution_error(message, true))?;
         if !action_is_terminal(terminal.state) {
             return Err(execution_error(
                 "Browser companion action did not reach a terminal state".into(),
@@ -554,13 +520,20 @@ impl AgentAutomationSupervisor {
                 if let Err(error) = supervisor.scan_once(crate::markdown_chat::now_ms()).await {
                     tracing::warn!(%error, "agent automation scan failed");
                 }
-                loop {
-                    match supervisor.run_next(crate::markdown_chat::now_ms()).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) if supervisor.queued_count().await > 0 => continue,
-                        Ok(None) => break,
-                        Err(error) => {
-                            tracing::warn!(%error, "agent automation action failed");
+                let browser_paused = super::BrowserCompanionControl::new(&supervisor.config)
+                    .is_ok_and(|control| {
+                        let state = control.public_status();
+                        state["manuallyStopped"] == true || state["waitingForServerRestart"] == true
+                    });
+                if !browser_paused {
+                    loop {
+                        match supervisor.run_next(crate::markdown_chat::now_ms()).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) if supervisor.queued_count().await > 0 => continue,
+                            Ok(None) => break,
+                            Err(error) => {
+                                tracing::warn!(%error, "agent automation action failed");
+                            }
                         }
                     }
                 }
@@ -2799,18 +2772,19 @@ fn unread_batch_id<'a>(
 
 #[cfg(all(test, unix))]
 mod browser_startup_tests {
+    use super::super::recovery::companion_client_or_start;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn publish_descriptor(path: &std::path::Path) {
+    fn publish_descriptor(path: &std::path::Path, endpoint: &str) {
         std::fs::set_permissions(
             path.parent().unwrap(),
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
         let data = serde_json::json!({"version":1,"kind":"codexify-browser-companion",
-            "pid":std::process::id(),"endpoint":"http://127.0.0.1:9/",
+            "pid":std::process::id(),"endpoint":endpoint,
             "token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "build":format!("startup-test{}",super::super::PROTOCOL_BUILD_SUFFIX),
             "createdAt":chrono::Utc::now().to_rfc3339()});
@@ -2818,10 +2792,28 @@ mod browser_startup_tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    async fn health_server(
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let app=axum::Router::new().route("/v1/health",axum::routing::get(move||{
+            let ready=ready.clone();async move{axum::Json(serde_json::json!({"protocolVersion":1,"kind":"codexify-browser-companion","build":format!("startup-test{}",super::super::PROTOCOL_BUILD_SUFFIX),"status":if ready.load(Ordering::SeqCst){"idle"}else{"unavailable"},"authenticated":ready.load(Ordering::SeqCst),"accountFingerprint":if ready.load(Ordering::SeqCst){Some("startup-account")}else{None},"activeActionId":null}))}
+        }));
+        (
+            endpoint,
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }),
+        )
+    }
+
     #[tokio::test]
     async fn simultaneous_actions_start_a_missing_companion_once_and_reuse_it() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("descriptor.json");
+        let (endpoint, server) =
+            health_server(Arc::new(std::sync::atomic::AtomicBool::new(true))).await;
         let config = AgentAutomationConfig {
             enabled: true,
             descriptor_path: path.display().to_string(),
@@ -2833,7 +2825,7 @@ mod browser_startup_tests {
         let start = || async {
             starts.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
-            publish_descriptor(&path);
+            publish_descriptor(&path, &endpoint);
             Ok(())
         };
         let (first, second) = tokio::join!(
@@ -2850,6 +2842,36 @@ mod browser_startup_tests {
             .await
             .is_ok()
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_valid_descriptor_with_unavailable_health_must_be_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("descriptor.json");
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (endpoint, server) = health_server(ready.clone()).await;
+        publish_descriptor(&path, &endpoint);
+        let config = AgentAutomationConfig {
+            enabled: true,
+            descriptor_path: path.display().to_string(),
+            ..Default::default()
+        };
+        let starts = AtomicUsize::new(0);
+        companion_client_or_start(
+            &config,
+            &Mutex::new(()),
+            &CancellationToken::new(),
+            || async {
+                starts.fetch_add(1, Ordering::SeqCst);
+                ready.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]

@@ -22,9 +22,6 @@ fn active_workspace(
     session: &SessionState,
     context: &ToolRequestContext,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    if !config.multi_project {
-        return Ok(Some(config.work_dir.clone()));
-    }
     match context.task_conversation.as_ref() {
         Some(identity) => context
             .project_bindings

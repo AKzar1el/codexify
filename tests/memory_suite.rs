@@ -62,8 +62,16 @@ fn memory_dir_explicit_dir_wins() {
     let root = TempDir::new().unwrap();
     let config = make_config(&root);
     let state = root.path().join("state");
-    assert_eq!(memory_dir(&config), state);
-    assert_eq!(memory_path(&config), state.join("memory.json"));
+    let actual = memory_dir(&config);
+    assert_eq!(actual.parent(), Some(state.as_path()));
+    assert!(
+        actual
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("work-")
+    );
+    assert_eq!(memory_path(&config), actual.join("memory.json"));
 }
 
 // ─── memory_enabled and memory_max_bytes ───────────────────────────────

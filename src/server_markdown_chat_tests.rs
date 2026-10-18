@@ -54,7 +54,7 @@ impl Tool for MarkdownPassthroughFixture {
 async fn markdown_chat_bridged_results_and_widget_metadata_keep_their_contents() {
     use std::io::Write;
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     let fixtures = vec![
@@ -88,6 +88,7 @@ async fn markdown_chat_bridged_results_and_widget_metadata_keep_their_contents()
     let mut handler = handler_with_tools(root.path(), tools, crate::types::ToolLogLevel::Info);
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("passthrough").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -149,9 +150,9 @@ async fn markdown_chat_bridged_results_and_widget_metadata_keep_their_contents()
 #[test]
 fn markdown_chat_all_advertised_outputs_have_an_optional_user_message() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
-    config.multi_project = true;
+
     config.conversation_auth_token = Some("a".repeat(64).into());
     for tool in crate::registry::load_tools_for_config(&config) {
         let advertised = advertised_tool(tool.as_ref(), &config);
@@ -191,7 +192,7 @@ async fn markdown_chat_dispatch_delivers_full_messages_after_budgeting_and_error
     use std::io::Write;
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("example.txt"), "source\n").unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.output.max_tool_output_tokens = Some(100);
@@ -200,6 +201,7 @@ async fn markdown_chat_dispatch_delivers_full_messages_after_budgeting_and_error
     let mut handler = handler_with_tools(root.path(), tools, crate::types::ToolLogLevel::Info);
     handler.config = Arc::new(config.clone());
     let identity = ConversationIdentity::from_openai_session("chat-dispatch").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)
@@ -304,7 +306,7 @@ async fn markdown_chat_dispatch_delivers_full_messages_after_budgeting_and_error
 #[tokio::test]
 async fn markdown_chat_never_initializes_or_exposes_a_channel_before_setup() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().into());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.markdown_chat.enabled = true;
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.conversation_auth_token = Some("a".repeat(64).into());

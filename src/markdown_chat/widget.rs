@@ -381,6 +381,11 @@ impl ChatFile {
         self.run(|chat| {
             chat.with_cursor(|cursor, file| {
                 check_cursor(file, cursor)?;
+                let custom_title = cursor
+                    .custom_title
+                    .as_deref()
+                    .map(|title| super::super::title::plain_text(title, 200))
+                    .filter(|title| !title.is_empty());
                 let metadata = file.metadata().map_err(io_error)?;
                 let modified = metadata.modified().map_err(io_error)?;
                 let mut cache = chat
@@ -392,11 +397,8 @@ impl ChatFile {
                     && cached.modified == modified
                 {
                     return Ok(OwnerChatSummary {
-                        title: cursor
-                            .custom_title
-                            .clone()
-                            .unwrap_or_else(|| cached.title.clone()),
-                        custom_title: cursor.custom_title.clone(),
+                        title: custom_title.clone().unwrap_or_else(|| cached.title.clone()),
+                        custom_title,
                         pinned_at_ms: cursor.pinned_at_ms,
                         archived_at_ms: cursor.archived_at_ms,
                         last_entry_end: cached.last_entry_end,
@@ -430,7 +432,8 @@ impl ChatFile {
                                 super::super::attachments::AttachmentStore::for_chat(&chat.path)
                             && let Ok(Some(plan)) = store.message(&span.id)
                         {
-                            let title = if plan.text.trim().is_empty() {
+                            let is_markdown = !plan.text.trim().is_empty();
+                            let title = if !is_markdown {
                                 plan.attachments
                                     .iter()
                                     .map(|a| a.original_name.as_str())
@@ -439,20 +442,42 @@ impl ChatFile {
                             } else {
                                 plan.text
                             };
-                            return Some(title.into_bytes());
+                            return Some((title.into_bytes(), is_markdown));
                         }
-                        read_range(
+                        let prefix = read_range(
                             file,
                             span.body_start,
                             span.body_end.min(span.body_start + 512),
                             512,
                         )
-                        .ok()
+                        .ok()?;
+                        // Formatting may close beyond the cheap preview. Read the
+                        // bounded body only when inline Markdown needs that context.
+                        if span.body_end > span.body_start + 512
+                            && prefix.iter().any(|byte| b"*_`[~".contains(byte))
+                        {
+                            read_range(file, span.body_start, span.body_end, MAX_UNREAD_BYTES)
+                                .ok()
+                                .or(Some(prefix))
+                        } else {
+                            Some(prefix)
+                        }
+                        .map(|bytes| (bytes, true))
                     })
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .map(|(bytes, is_markdown)| {
+                        let text = String::from_utf8_lossy(&bytes);
+                        if is_markdown {
+                            super::super::title::plain_text(&text, 72)
+                        } else {
+                            text.split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(72)
+                                .collect()
+                        }
+                    })
                     .filter(|text| !text.is_empty())
-                    .map(|text| text.chars().take(72).collect())
                     .unwrap_or_else(|| "Untitled conversation".into());
                 let last = records.last();
                 let last_user = records.iter().rev().find(|span| span.role == "user");
@@ -461,8 +486,8 @@ impl ChatFile {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 let summary = OwnerChatSummary {
-                    title: cursor.custom_title.clone().unwrap_or_else(|| title.clone()),
-                    custom_title: cursor.custom_title.clone(),
+                    title: custom_title.clone().unwrap_or_else(|| title.clone()),
+                    custom_title,
                     pinned_at_ms: cursor.pinned_at_ms,
                     archived_at_ms: cursor.archived_at_ms,
                     last_entry_end: last.map_or(0, |span| span.end),
@@ -1338,6 +1363,121 @@ pub(super) fn append_user_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owner_titles_strip_markdown_before_shortening_and_keep_messages_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        let wording = "It should not require a major redesign. ".repeat(20);
+        let markdown = format!(
+            "**{}** Use `session.sh` and [the guide](https://example.com).",
+            wording.trim_end()
+        );
+        let expected: String = wording.chars().take(72).collect();
+        let expected = expected.trim_end().to_owned();
+        chat.append(markdown.clone()).await.unwrap();
+        assert_eq!(chat.owner_summary().await.unwrap().title, expected);
+        chat.append_user("pending-input".into(), markdown.clone())
+            .await
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let unread = chat.unread_snapshot().await.unwrap();
+        assert!(!unread.messages.is_empty());
+        for current in [
+            chat.clone(),
+            chat.clone(),
+            Arc::new(ChatFile::new(path.clone(), true)),
+        ] {
+            assert_eq!(current.owner_summary().await.unwrap().title, expected);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        assert_eq!(
+            chat.widget_page(None, None)
+                .await
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .markdown,
+            markdown
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_titles_keep_attachment_filenames_literal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.ensure().await.unwrap();
+        let store = super::super::super::attachments::AttachmentStore::for_chat(&path).unwrap();
+        let file = store
+            .upload(
+                "filename-title",
+                "__init__.py",
+                "text/plain",
+                Some(1),
+                false,
+                b"x".to_vec(),
+            )
+            .unwrap();
+        chat.append_user_with_attachments("attachment-message".into(), "".into(), vec![file.id])
+            .await
+            .unwrap();
+        assert_eq!(chat.owner_summary().await.unwrap().title, "__init__.py");
+    }
+
+    #[tokio::test]
+    async fn owner_titles_normalize_new_names_and_legacy_names_on_both_cache_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append("Automatic title".into()).await.unwrap();
+        assert_eq!(chat.owner_summary().await.unwrap().title, "Automatic title");
+        // An existing saved name can contain Markdown without a new rename.
+        chat.run(|chat| {
+            chat.with_cursor(|cursor, _| {
+                cursor.custom_title = Some("**Existing** `chat`".into());
+                chat.save_cursor(cursor)
+            })
+        })
+        .await
+        .unwrap();
+        for current in [chat.clone(), Arc::new(ChatFile::new(path, true))] {
+            let summary = current.owner_summary().await.unwrap();
+            assert_eq!(summary.title, "Existing chat");
+            assert_eq!(summary.custom_title.as_deref(), Some("Existing chat"));
+        }
+        let saved = chat
+            .run(|chat| chat.with_cursor(|cursor, _| Ok(cursor.custom_title.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.as_deref(),
+            Some("**Existing** `chat`"),
+            "display normalization must not rewrite existing metadata"
+        );
+        chat.set_owner_title("## My **plain** `chat`".into())
+            .await
+            .unwrap();
+        let summary = chat.owner_summary().await.unwrap();
+        assert_eq!(summary.title, "My plain chat");
+        assert_eq!(summary.custom_title.as_deref(), Some("My plain chat"));
+        for (raw, shown) in [
+            ("`__init__.py`", "__init__.py"),
+            (r"\*literal\*", "*literal*"),
+        ] {
+            chat.set_owner_title(raw.into()).await.unwrap();
+            assert_eq!(chat.owner_summary().await.unwrap().title, shown);
+            chat.set_owner_title(shown.into()).await.unwrap();
+            assert_eq!(chat.owner_summary().await.unwrap().title, shown);
+        }
+        chat.set_owner_title("---".into()).await.unwrap();
+        let summary = chat.owner_summary().await.unwrap();
+        assert_eq!(summary.title, "Automatic title");
+        assert!(summary.custom_title.is_none());
+    }
 
     #[tokio::test]
     async fn goal_completion_is_durable_exactly_once_and_does_not_consume_user_messages() {

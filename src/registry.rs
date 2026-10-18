@@ -1,7 +1,7 @@
 //! The tool registry. Ports `src/registry.ts`.
 //!
-//! `load_tools` returns the single-project registry; `load_tools_for_mode` adds
-//! the session selector only when multi-project mode is enabled. Both enforce
+//! Workspace selectors are always included. The legacy mode helper ignores its
+//! compatibility argument. All registries enforce
 //! unique names, panicking on a duplicate (a programming error, as in the TS
 //! which throws at startup). The common order mirrors the TypeScript registry.
 
@@ -12,28 +12,19 @@ use crate::types::{AppConfig, DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS};
 pub fn load_tools() -> Vec<Box<dyn Tool>> {
     load_tools_with_options(
         false,
-        false,
         true,
         true,
-        false,
+        true,
         DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS,
     )
 }
 
-pub fn load_tools_for_mode(multi_project: bool) -> Vec<Box<dyn Tool>> {
-    load_tools_with_options(
-        multi_project,
-        false,
-        true,
-        true,
-        false,
-        DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS,
-    )
+pub fn load_tools_for_mode(_legacy_mode: bool) -> Vec<Box<dyn Tool>> {
+    load_tools()
 }
 
 pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
     let mut tools = load_tools_with_options(
-        config.multi_project,
         config.conversation_auth_token.is_some(),
         config.artifact_ingress.enabled,
         config.artifact_egress.enabled,
@@ -51,12 +42,12 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
     }
     if config.ui_widgets && (config.markdown_chat.enabled || config.experimental.agent_tickets) {
         tools.push(Box::new(tools::setup_ui_action::SetupUiAction::Update));
-        if config.multi_project {
+        {
             tools.push(Box::new(tools::setup_ui_action::SetupUiAction::Projects));
             tools.push(Box::new(tools::setup_ui_action::SetupUiAction::Select));
         }
     }
-    if config.multi_project && config.ui_widgets {
+    if config.ui_widgets {
         tools.push(Box::new(tools::workspace_ui::WorkspaceUi::Switch));
         tools.push(Box::new(tools::workspace_ui::WorkspaceUi::Worktrees));
         tools.push(Box::new(tools::workspace_ui::WorkspaceUi::Reuse));
@@ -65,7 +56,6 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
 }
 
 fn load_tools_with_options(
-    multi_project: bool,
     conversation_auth: bool,
     artifact_ingress_enabled: bool,
     artifact_egress_enabled: bool,
@@ -94,10 +84,8 @@ fn load_tools_with_options(
     } else if markdown_chat_enabled {
         all.push(Box::new(tools::setup::UnrestrictedSetup));
     }
-    if multi_project {
-        all.push(Box::new(tools::list_projects::ListProjects));
-        all.push(Box::new(tools::set_project_root::SetProjectRoot));
-    }
+    all.push(Box::new(tools::list_projects::ListProjects));
+    all.push(Box::new(tools::set_project_root::SetProjectRoot));
     all.push(Box::new(tools::read_file::ReadFile));
     all.push(Box::new(tools::write_file::WriteFile));
     if artifact_ingress_enabled {

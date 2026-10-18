@@ -1,4 +1,5 @@
 import type {Page} from "patchright";
+import {uiLabels,escapeUiPattern,normalizeUiLabel} from "./ui-localization";
 import {readChatGptAccount} from "./account";
 import {selectConnector,SELECTED_CONNECTOR_SELECTOR} from "./connector-selection";
 import {BrowserCompanionError,selectorDrift} from "./errors";
@@ -8,15 +9,23 @@ function traceRefresh(phase:string):void {
   if(process.env.CODEXIFY_BROWSER_MAINTENANCE_TRACE==="1")console.info(`[connector-refresh] ${Date.now()} ${phase}`);
 }
 
+const planGroups=['planFree','planGo','planPro','planPlus','planBusiness','planEnterprise','planEdu'] as const;
+const planNames=planGroups.flatMap(group=>uiLabels(group)).sort((a,b)=>b.length-a.length).map(escapeUiPattern).join('|');
+const planWord=uiLabels('planWord').map(escapeUiPattern).join('|');
+const planHeadingPattern=`^(?:ChatGPT\\s+)?(?:${planNames})(?=$|[\\s:]|(?:${planWord}))`;
+const planLabelPattern=`^(?:ChatGPT\\s+)?(?:${planNames})(?:\\s+(?:5x|20x|25x|50|200|250))?(?:\\s*(?:${planWord}))?$`;
+function planIs(label:string,group:typeof planGroups[number],suffix=false):boolean {
+  return uiLabels(group).some(value=>new RegExp('^'+escapeUiPattern(value)+(suffix?`(?=$|[\\s:]|(?:${planWord}))`:`(?:\\s*(?:${planWord}))?$`),'iu').test(label));
+}
 export function classifyPlan(sourceLabel:string): Omit<AccountPlan,"accountFingerprint"> {
-  const label=sourceLabel.normalize("NFKC").replace(/\s+/g," ").trim().slice(0,128);
+  const label=normalizeUiLabel(sourceLabel).slice(0,128);
   const normalized=label.replace(/^ChatGPT\s+/i,"").replace(/_/g," ").trim();
-  if (/^Free(?:\s+plan)?$/i.test(normalized)) return {label:"Free",sourceLabel:label,kind:"free"};
-  if (/^Go(?:\s+plan)?$/i.test(normalized)) return {label:"Go",sourceLabel:label,kind:"go"};
-  if (/^Pro\b/i.test(normalized)) {
+  if (planIs(normalized,'planFree')) return {label:"Free",sourceLabel:label,kind:"free"};
+  if (planIs(normalized,'planGo')) return {label:"Go",sourceLabel:label,kind:"go"};
+  if (planIs(normalized,'planPro',true)) {
     const tier=/\b(5x|20x|25x|50|200|250)\b/i.exec(normalized)?.[1]?.toLowerCase();
     const aliases:Record<string,string>={"50":"5x","200":"20x","250":"25x","5x":"5x","20x":"20x","25x":"25x"};
-    return {label:tier?`Pro ${aliases[tier]}`:/^pro$/i.test(normalized)?"Pro":label,sourceLabel:label,kind:"pro"};
+    return {label:tier?`Pro ${aliases[tier]}`:planIs(normalized,'planPro')?"Pro":label,sourceLabel:label,kind:"pro"};
   }
   return {label,sourceLabel:label,kind:"unknown"};
 }
@@ -105,7 +114,7 @@ export async function readBillingPlan(page:Page,signal?:AbortSignal):Promise<Acc
     const deadline=Date.now()+2_500;
     do {
     signal?.throwIfAborted();
-    sourceLabel=await page.evaluate(()=>{
+    sourceLabel=await page.evaluate(({headingPattern,labelPattern})=>{
       const visible=(node:Element)=>node.getClientRects().length>0;
       const uniquePlan=(labels:string[])=>new Set(labels.map(label=>label.replace(/^ChatGPT\s+/i,"").toLowerCase())).size===1
         ? labels.find(label=>/^ChatGPT\s+/i.test(label))??labels[0] : null;
@@ -113,12 +122,12 @@ export async function readBillingPlan(page:Page,signal?:AbortSignal):Promise<Acc
         .map(node=>node.textContent?.trim()).filter((text):text is string=>Boolean(text&&text.length<=128));
       if(uniquePlan(direct))return uniquePlan(direct);
       const headings=[...document.querySelectorAll('h1,h2,h3,[role="heading"]')].filter(visible)
-        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&(/^(?:ChatGPT\s+)?(?:Free|Go|Pro|Plus|Business|Enterprise|Edu)\b/i.test(text)||/^ChatGPT\s+\S/i.test(text))&&text.length<=128));
+        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&(new RegExp(headingPattern,"iu").test(text)||/^ChatGPT\s+\S/i.test(text))&&text.length<=128));
       if(uniquePlan(headings))return uniquePlan(headings);
       const labels=[...document.querySelectorAll('p,span,strong,div')].filter(visible)
-        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&/^(?:ChatGPT\s+)?(?:Free|Go|Pro(?:\s+(?:5x|20x|25x|50|200|250))?|Plus|Business|Enterprise|Edu)(?:\s+plan)?$/i.test(text)));
+        .map(node=>node.textContent?.replace(/\s+/g," ").trim()).filter((text):text is string=>Boolean(text&&new RegExp(labelPattern,"iu").test(text)));
       return uniquePlan(labels);
-    });
+    },{headingPattern:planHeadingPattern,labelPattern:planLabelPattern});
     if(sourceLabel)break;
     await new Promise(resolve=>setTimeout(resolve,100));
     }while(Date.now()<deadline);

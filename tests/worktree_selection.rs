@@ -53,7 +53,7 @@ fn repository(root: &TempDir) -> (PathBuf, PathBuf) {
 
 fn config(root: &TempDir, access_root: PathBuf, mode: WorktreeMode) -> AppConfig {
     let mut config = default_config(access_root);
-    config.multi_project = true;
+
     config.skills.enabled = Some(false);
     config.worktrees.mode = mode;
     config.worktrees.root = root.path().join("managed-worktrees");

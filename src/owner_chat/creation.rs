@@ -11,11 +11,6 @@ pub(super) async fn projects(
     State(state): State<OwnerState>,
     Query(query): Query<ProjectQuery>,
 ) -> ApiResult {
-    if !state.config.multi_project {
-        return Ok(Json(
-            json!({"catalog":{"projects":[],"total":0,"warnings":[]},"createWorktree":false}),
-        ));
-    }
     let config = state.config.clone();
     let catalog = tokio::task::spawn_blocking(move || {
         crate::project_catalog::discover_project_catalog(&config)
@@ -104,7 +99,7 @@ pub(super) async fn prepare_chat(
     write_catalog_cache(&state, &entry).map_err(internal_error)?;
     *state.catalog_cache.lock().await = Some(entry);
     Ok(Json(
-        json!({"models":catalog.models,"catalogRevision":catalog.catalog_revision,"chatgptProjectUrl":state.config.markdown_chat.automation.chatgpt_project_url,"multiProject":state.config.multi_project,"workspaceName":state.config.work_dir.file_name().map(|name|name.to_string_lossy()),"createWorktree":state.config.worktrees.mode != crate::types::WorktreeMode::Never}),
+        json!({"models":catalog.models,"catalogRevision":catalog.catalog_revision,"chatgptProjectUrl":state.config.markdown_chat.automation.chatgpt_project_url,"workspaceName":state.config.work_dir.file_name().map(|name|name.to_string_lossy()),"createWorktree":state.config.worktrees.mode != crate::types::WorktreeMode::Never}),
     ))
 }
 
@@ -218,10 +213,9 @@ pub(super) async fn create_chat(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&body).map_err(internal_error)?)
     );
-    if state.config.multi_project
-        && let Some(previous_root) = bindings
-            .selected_project_root(&state.config, &task)
-            .map_err(internal_error)?
+    if let Some(previous_root) = bindings
+        .selected_project_root(&state.config, &task)
+        .map_err(internal_error)?
     {
         let mut previous_config = state.config.as_ref().clone();
         previous_config.work_dir = previous_root;
@@ -231,19 +225,7 @@ pub(super) async fn create_chat(
             .map_err(internal_error)?;
     }
     let config = selection_config(&state.config, body.create_worktree);
-    let root = if !state.config.multi_project {
-        if body.path.is_some()
-            || body.without_project.is_some()
-            || body.resume_path.is_some()
-            || body.worktree_path.is_some()
-            || body.create_worktree.is_some()
-        {
-            return Err(internal_error(
-                "This server uses its configured workspace; project selection is disabled",
-            ));
-        }
-        std::fs::canonicalize(&state.config.work_dir).map_err(internal_error)?
-    } else if let Some(worktree) = &body.worktree_path {
+    let root = if let Some(worktree) = &body.worktree_path {
         if body.without_project.is_some()
             || body.resume_path.is_some()
             || body.create_worktree.is_some()
@@ -502,7 +484,7 @@ mod tests {
         let project = root.join("projects");
         std::fs::create_dir_all(project.join("repo")).unwrap();
         let mut config = crate::config::default_config(project);
-        config.multi_project = true;
+
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();

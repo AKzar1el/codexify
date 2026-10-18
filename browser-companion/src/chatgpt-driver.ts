@@ -86,25 +86,76 @@ async function stopLingeringResponse(
       throw new BrowserCompanionError("ChatGPT account changed while stopping the previous response", "authentication_required");
     }
   };
+  const dialogs = page.locator('[role="dialog"], [role="alertdialog"]').filter({ visible:true });
+  let stopRequested = false;
+  let confirmationSubmitted = false;
+  const waitForStopped = async (stop:Locator) => {
+    let settleDeadline = Date.now() + timeout(1_000);
+    while (!boundedSignal.aborted) {
+      const count = await dialogs.count();
+      if (count) {
+        const dialog = dialogs.first();
+        // This generic dialog shell also serves other actions. Only handle a
+        // confirmation that appeared after our own verified Stop click.
+        if (!stopRequested || count !== 1 || !await dialog.evaluate(element => {
+          if (!element.matches('.codex-dialog[role="dialog"][aria-modal="true"][data-state="open"]')) return false;
+          const forms = element.querySelectorAll('form');
+          if (forms.length !== 1) return false;
+          const form = forms[0]!;
+          const heading = element.ownerDocument.getElementById(element.getAttribute('aria-labelledby') ?? '');
+          const description = element.ownerDocument.getElementById(element.getAttribute('aria-describedby') ?? '');
+          const submits = form.querySelectorAll('button[type="submit"]');
+          if (!heading?.matches('h2') || !form.contains(heading) || !description || !form.contains(description)
+            || !form.querySelector('.heading-dialog') || !form.querySelector('.text-codex-description')
+            || submits.length !== 1 || !submits[0]!.matches('.bg-primary-solid.text-primary-solid')) return false;
+          const actions = submits[0]!.parentElement!;
+          return actions.querySelectorAll('button').length === 2 && actions.querySelectorAll('button[type="button"]').length === 1;
+        })) {
+          throw new BrowserCompanionError("ChatGPT has an unexpected dialog while stopping the response", "external_interference");
+        }
+        if (!confirmationSubmitted) {
+          await assertTarget();
+          boundedSignal.throwIfAborted();
+          // Do not use localized labels or generated Radix IDs to choose Stop.
+          await dialog.locator('form button[type="submit"].bg-primary-solid').click({timeout:timeout(750),signal:boundedSignal});
+          confirmationSubmitted = true;
+        }
+        await dialog.waitFor({state:"hidden",timeout:timeout(1_000),signal:boundedSignal});
+        settleDeadline = Date.now() + timeout(1_000);
+      }
+      if (!await stop.isVisible()) return;
+      if (Date.now() >= settleDeadline) throw new Error("ChatGPT Stop has not completed");
+      await new Promise(resolve => setTimeout(resolve,50));
+    }
+    boundedSignal.throwIfAborted();
+  };
   let lastError:unknown;
   for (let attempt = 0; attempt < 3 && !boundedSignal.aborted; attempt++) {
     await assertTarget();
     if (boundedSignal.aborted) break;
     const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true });
     const count = await stop.count();
-    if (count === 0) return;
-    if (count !== 1) {
+    const dialogCount = await dialogs.count();
+    if (dialogCount && !stopRequested) {
+      throw new BrowserCompanionError("ChatGPT has an open dialog before stopping the response", "external_interference");
+    }
+    if (count === 0 && dialogCount === 0) return;
+    if (count !== 1 && dialogCount === 0) {
       throw new BrowserCompanionError("ChatGPT does not have one visible Stop control", "selector_drift");
     }
     try {
-      if (await stop.isEnabled()) await stop.click({ timeout:timeout(750), signal:boundedSignal });
-      await stop.waitFor({ state:"hidden", timeout:timeout(1_000), signal:boundedSignal });
+      if (dialogCount === 0 && await stop.isEnabled()) {
+        await stop.click({ timeout:timeout(750), signal:boundedSignal });
+        stopRequested = true;
+      }
+      await waitForStopped(stop);
       return;
     } catch (error) {
-      if (signal.aborted) throw error;
+      if (signal.aborted || error instanceof BrowserCompanionError) throw error;
       lastError = error;
     }
     if (attempt === 1 && !boundedSignal.aborted) {
+      if (await dialogs.count()) break;
       // Rehydrate a stuck Stop control only before inserting our prompt.
       await assertTarget();
       let composer:Locator;
@@ -179,6 +230,17 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   private readonly connectorApps:ConnectorAppCache;
   constructor(private readonly surface: SingleBrowserSurface, private readonly build: string,connectorCachePath?:string) {
     this.connectorApps=new ConnectorAppCache(connectorCachePath);
+  }
+
+  async liveness():Promise<boolean> {
+    let timeout:ReturnType<typeof setTimeout>|undefined;
+    try {
+      return await Promise.race([
+        this.surface.page().then(page=>page.evaluate(()=>true)),
+        new Promise<false>(resolve=>{timeout=setTimeout(()=>resolve(false),1500);}),
+      ]);
+    }catch{return false;}
+    finally{if(timeout)clearTimeout(timeout);}
   }
 
   async health(): Promise<{

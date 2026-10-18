@@ -5,7 +5,7 @@ async fn renewal_control_reaches_real_mcp_results_without_queue_or_progress_depe
         AgentAutomationStore, AutomationActionKind, AutomationActionStatus,
     };
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().to_owned());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.memory.dir = Some(root.path().join("state").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
@@ -22,6 +22,7 @@ async fn renewal_control_reaches_real_mcp_results_without_queue_or_progress_depe
         Arc::new(ServerAutomationNoopExecutor),
     ));
     let identity = ConversationIdentity::from_openai_session("mcp-renewal").unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let store = AgentAutomationStore::for_config(&config).unwrap();
     let now = crate::markdown_chat::now_ms();
     let pair = store

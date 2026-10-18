@@ -278,10 +278,16 @@ mod tests {
             .unwrap();
         assert_eq!(extras.status(), StatusCode::OK);
         let extras = extras.json::<Value>().await.unwrap();
-        assert_eq!(extras["badges"].as_array().unwrap().len(), 8);
+        assert_eq!(extras["badges"].as_array().unwrap().len(), 32);
         assert_eq!(extras["week"]["ready"], false);
         assert_eq!(extras["preferences"]["animations"], true);
-        let milestones = temp.path().join("state/statistics-extras.json");
+        let milestones =
+            crate::memory::memory_dir(&crate::config::default_config(temp.path().into()));
+        let milestones = temp
+            .path()
+            .join("state")
+            .join(milestones.file_name().unwrap())
+            .join("statistics-extras.json");
         std::fs::write(&milestones, b"broken milestones").unwrap();
         assert_eq!(
             client

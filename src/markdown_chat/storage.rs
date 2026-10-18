@@ -185,10 +185,21 @@ impl ChatFile {
         if title.chars().count() > 200 {
             return Err("Chat name must not exceed 200 characters".into());
         }
+        let has_text = !super::title::plain_text(&title, 200).is_empty();
         self.run(move |chat| {
             chat.with_cursor(|cursor, _| {
+                // Saving an unchanged displayed name must preserve literal Markdown
+                // characters originally supplied through code spans or escapes.
+                if has_text
+                    && cursor
+                        .custom_title
+                        .as_deref()
+                        .is_some_and(|current| super::title::plain_text(current, 200) == title)
+                {
+                    return Ok(());
+                }
                 let mut next = cursor.clone();
-                next.custom_title = (!title.is_empty()).then_some(title);
+                next.custom_title = has_text.then_some(title);
                 chat.save_cursor(&next)?;
                 *cursor = next;
                 Ok(())

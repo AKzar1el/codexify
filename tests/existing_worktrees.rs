@@ -51,7 +51,7 @@ async fn lists_and_reuses_registered_worktrees_without_changing_their_files() {
     );
     std::fs::write(previous.join("unfinished.txt"), "keep edits").unwrap();
     let mut config = default_config(projects);
-    config.multi_project = true;
+
     config.worktrees.mode = WorktreeMode::Always;
     config.worktrees.root = temp.path().join("managed");
     config.memory.dir = Some(temp.path().join("metadata").display().to_string());
@@ -128,7 +128,7 @@ async fn previous_managed_worktree_remains_reusable_after_a_switch_and_restart()
         ],
     );
     let mut config = default_config(temp.path().join("projects"));
-    config.multi_project = true;
+
     config.worktrees.mode = WorktreeMode::Always;
     config.worktrees.root = temp.path().join("managed");
     config.memory.dir = Some(temp.path().join("metadata").display().to_string());

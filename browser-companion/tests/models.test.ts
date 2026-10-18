@@ -55,7 +55,7 @@ test("verified plans name otherwise unnamed models without changing IDs or effor
   expect(buildCapabilityCatalog(observedNames, "observed", undefined, "pro").models[0]!.label).toBe("GPT-5.6 Luna");
 });
 
-test("supported model rows include GPT-5.5's retirement notice", () => {
-  expect(["GPT-6", "GPT-5.6", "GPT-5.5Leaving on October 14"].map(browserModelFamilyFromLabel)).toEqual(["6", "5.6", "5.5"]);
+test("plain model labels exclude descriptions and unknown variants", () => {
+  expect(["GPT-6", "GPT-5.6", "GPT-5.5"].map(browserModelFamilyFromLabel)).toEqual(["6", "5.6", "5.5"]);
   expect(browserModelFamilyFromLabel("GPT-5.5 Preview")).toBeUndefined();
 });

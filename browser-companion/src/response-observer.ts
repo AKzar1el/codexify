@@ -5,6 +5,7 @@ import type { Locator } from "patchright";
 import { CHATGPT_COMPLETION_ACTION_SELECTOR } from "./session";
 import type { ChatGptMarkdownSegment } from "./response-stream";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "./ui-labels";
+import {matchesUiLabel,uiLabels,escapeUiPattern} from "./ui-localization";
 import { BrowserCompanionError } from "./errors";
 
 const CHATGPT_DOM_REVISION_ATTRIBUTES = [
@@ -99,12 +100,12 @@ export class ChatGptVisibleTraceTracker {
 export function isChatGptTraceControl(block: ChatGptVisibleTraceBlock): boolean {
   if (block.kind !== "status") return false;
   const text = block.text.replace(/\s+/g, " ").trim();
-  return block.uiControl === true || text === "Answer now" || text === "Thinking";
+  return block.uiControl === true || matchesUiLabel(text,"answerNow") || matchesUiLabel(text,"thinkingStatus");
 }
 
 export function stripChatGptTraceControlSuffix(block: ChatGptVisibleTraceBlock): ChatGptVisibleTraceBlock {
   if (block.kind !== "status") return block;
-  const text = block.text.replace(/(?:^|\s)Answer now\s*$/, "").trimEnd();
+  const text = block.text.replace(new RegExp(`(?:^|\\s)(?:${uiLabels("answerNow").map(escapeUiPattern).join("|")})\\s*$`,"u"), "").trimEnd();
   return text === block.text ? block : { ...block, text };
 }
 

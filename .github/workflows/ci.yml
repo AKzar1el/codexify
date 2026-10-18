@@ -149,7 +149,7 @@ jobs:
         run: node --test scripts/test-markdown-chat-widget.mjs
 
       - name: Test Home Screen app metadata and private launch
-        run: node --test scripts/test-owner-chat-pwa.mjs
+        run: node --test scripts/test-owner-chat-pwa.mjs scripts/test-mobile-install.mjs
 
       - name: Test private message queue and composer modes
         run: node --test scripts/test-message-queue.mjs scripts/test-connector-name.mjs

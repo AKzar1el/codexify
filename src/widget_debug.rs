@@ -54,7 +54,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(root.path().to_path_buf());
         let mut result = ToolResult::text("ok");
-
+        config.debug = false;
         attach_configured_tool_timing(&config, &mut result, "setup", 7);
         assert!(result.meta.is_none());
 

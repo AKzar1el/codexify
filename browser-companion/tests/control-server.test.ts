@@ -98,6 +98,9 @@ test("private loopback server enforces bearer auth and streams bounded NDJSON", 
     }
 
     expect((await fetch(`${server.endpoint}/v1/health`)).status).toBe(401);
+    expect((await fetch(`${server.endpoint}/v1/liveness`)).status).toBe(401);
+    const liveness=await fetch(`${server.endpoint}/v1/liveness`,{headers:{Authorization:`Bearer ${server.token}`}});
+    expect(await liveness.json()).toEqual({protocolVersion:1,build:TEST_BUILD,available:true});
     const headers = { Authorization:`Bearer ${server.token}` };
     const health = await (await fetch(`${server.endpoint}/v1/health`, { headers })).json();
     expect(health).toMatchObject({ protocolVersion:1, kind:"codexify-browser-companion", authenticated:true });

@@ -114,7 +114,7 @@ impl Tool for WorkspaceUi {
         session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        if !config.ui_widgets || !config.multi_project {
+        if !config.ui_widgets || false {
             return ToolResult::error("Workspace selection UI is disabled");
         }
         if context.cancellation.is_cancelled() {

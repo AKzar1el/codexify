@@ -90,14 +90,12 @@ impl Tool for ListProjects {
     }
 
     fn describe(&self, config: &AppConfig) -> String {
-        if config.multi_project {
+        {
             format!(
                 "{} The configured access root is `{}`. Only existing directories authorized beneath that root are returned.",
                 self.description(),
                 config.work_dir.display()
             )
-        } else {
-            "Project catalogue discovery is disabled on this server. Start codexify with --multi-project or set multiProject to true to enable it.".into()
         }
     }
 
@@ -171,11 +169,7 @@ impl Tool for ListProjects {
             Ok(args) => args,
             Err(error) => return *error,
         };
-        if !config.multi_project {
-            return ToolResult::error(
-                "Project catalogue discovery is disabled. Start codexify with `--multi-project` or set `multiProject` to true.",
-            );
-        }
+
         let limit = match limit {
             None => DEFAULT_PROJECT_LIMIT,
             Some(limit) if (1..=MAX_PROJECT_LIMIT as u64).contains(&limit) => limit as usize,
@@ -205,8 +199,8 @@ mod tests {
 
     #[tokio::test]
     async fn validates_limit_before_discovery() {
-        let mut config = default_config(std::path::PathBuf::from("/missing"));
-        config.multi_project = true;
+        let config = default_config(std::path::PathBuf::from("/missing"));
+
         let result = ListProjects
             .call(
                 json!({ "limit": MAX_PROJECT_LIMIT + 1 }),
@@ -219,14 +213,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_single_project_mode() {
+    async fn project_selection_is_always_available() {
         let root = tempfile::tempdir().unwrap();
         let config = default_config(root.path().to_path_buf());
         let result = ListProjects
             .call(json!({}), &config, &SessionState::new())
             .await;
-        assert!(result.is_error);
-        assert!(result.joined_text().contains("--multi-project"));
+        assert!(!result.is_error);
     }
 
     #[tokio::test]
@@ -234,7 +227,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("alpha")).unwrap();
         let mut config = default_config(root.path().to_path_buf());
-        config.multi_project = true;
+
         config.project_catalog.codex_config.enabled = false;
         config
             .project_catalog

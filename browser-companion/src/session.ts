@@ -2,8 +2,9 @@
 // src/chatgpt-session.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 // Keep selector and verification changes structurally reviewable against upstream.
 import type { Locator, Page } from "patchright";
+import {parseEffortAnnouncement,uiLabels} from "./ui-localization";
 import { composerText } from "./composer";
-import { browserEffortIdFromLabel, browserModelFamilyFromLabel, modelsFromDiscoveredEfforts, type AccountCapabilities, type BrowserModelFamily, type DiscoveredBrowserEffort } from "./models";
+import { browserEffortIdFromLabel, readModelOptionRows, modelsFromDiscoveredEfforts, type AccountCapabilities, type BrowserModelFamily, type DiscoveredBrowserEffort } from "./models";
 import { selectChatGptModelFamily } from "./model-selection";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
@@ -81,7 +82,7 @@ export async function readChatGptModelAnnouncements(slider: Locator): Promise<st
 }
 /** Resolve only inside the verified composer's form; multiple submitters are an error. */
 export const CHATGPT_SEND_BUTTON_SELECTOR = '[data-testid="send-button"]:not(:has(svg use[href*="#voice-"])), button[type="submit"]:not(:has(svg use[href*="#voice-"]))';
-export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form[data-chatgpt-composer] button[type="button"][aria-label="Stop"]';
+export const CHATGPT_STOP_BUTTON_SELECTOR = '[data-testid="stop-button"], form[data-chatgpt-composer] button[type="button"]:is('+uiLabels('stopControl').map(label=>'[aria-label='+JSON.stringify(label)+']').join(',')+')';
 // The new footer is shared with user messages. Response extraction additionally requires
 // this control to FOLLOW the last assistant answer, excluding the user's earlier footer.
 export const CHATGPT_COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"], [data-turn-key] .turn-action-controls button';
@@ -263,12 +264,9 @@ export async function readChatGptEffortSnapshot(
 }
 
 export function chatGptEffortLabelFromAnnouncement(text: string, state: ChatGptEffortSliderState): string | undefined {
-  const normalized = text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
-  const announcement = /^(.+?)[,、]\s*(\d+)\s+of\s+(\d+)\.?$/i.exec(normalized);
-  if (!announcement || Number(announcement[2]) !== state.value - state.min + 1
-    || Number(announcement[3]) !== state.max - state.min + 1) return undefined;
-  const label = parseChatGptModelAnnouncement(announcement[1]!)?.mode ?? announcement[1]!;
-  return label.trim() || undefined;
+  const announcement=parseEffortAnnouncement(text);
+  if(!announcement||announcement.position!==state.value-state.min+1||announcement.total!==state.max-state.min+1)return undefined;
+  return parseChatGptModelAnnouncement(announcement.label)?.mode??announcement.label;
 }
 
 export async function readCurrentEffortLabel(menu: ChatGptEffortActivation): Promise<string> {
@@ -279,7 +277,7 @@ export async function readCurrentEffortLabel(menu: ChatGptEffortActivation): Pro
     if (valueText?.trim()) {
       const counted = chatGptEffortLabelFromAnnouncement(valueText, state);
       if (counted) return counted;
-      if (!/[,、]\s*\d+\s+of\s+\d+/i.test(valueText)) {
+      if (!parseEffortAnnouncement(valueText)) {
         return parseChatGptModelAnnouncement(valueText)?.mode ?? valueText.trim();
       }
     }
@@ -419,19 +417,18 @@ export async function detectChatGptAccountCapabilities(
   let originalFamily: BrowserModelFamily | undefined;
   let originalValue: number | undefined;
   try {
-    const rows = menu.menu.getByRole("menuitemradio", { includeHidden:true });
-    const modelFamilies = [...new Set((await rows.allTextContents())
-      .map(browserModelFamilyFromLabel).filter((family): family is BrowserModelFamily => family !== undefined))];
+    const rows = await readModelOptionRows(menu.menu);
+    const modelFamilies = [...new Set(rows.flatMap(row=>row.family?[row.family]:[]))];
     if (modelFamilies.length === 0) throw new Error("ChatGPT model picker did not expose a supported model family");
-    const originalLabels = await rows.evaluateAll(elements => elements.filter(element => element.getAttribute("aria-checked") === "true").map(element => element.textContent ?? ""));
-    originalFamily = originalLabels.length === 1 ? browserModelFamilyFromLabel(originalLabels[0]!) : undefined;
+    const checked=rows.filter(row=>row.checked);
+    originalFamily=checked.length===1?checked[0]!.family:undefined;
     if (!originalFamily) throw new Error("ChatGPT did not identify its selected model family");
     originalValue = (await readChatGptEffortSnapshot(menu.sliderContainer)).value;
     const models: AccountCapabilities["models"][number][] = [];
     for (const family of modelFamilies) {
       options.signal?.throwIfAborted();
       menu = await selectChatGptModelFamily(menu, family, () => activateChatGptEffortMenu(page, effortButton,{signal:options.signal}),options.signal);
-      const familyLabel=(await menu.menu.getByRole("menuitemradio",{includeHidden:true}).allTextContents()).find(label=>browserModelFamilyFromLabel(label)===family);
+      const familyLabel=(await readModelOptionRows(menu.menu)).find(row=>row.family===family)?.label;
       models.push(...modelsFromDiscoveredEfforts(family, await discoverChatGptEfforts(menu,options.signal),familyLabel));
     }
     return { models };

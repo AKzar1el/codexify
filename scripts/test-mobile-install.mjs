@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {mkdirSync} from 'node:fs';
+import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
+const {chromium,webkit}=createRequire(import.meta.url)('playwright');
+const origin='http://127.0.0.1:43359';
+async function fixture(engine,{installed=false,ios=false}={}){
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true,...(ios?{userAgent:'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Version/26.0 Mobile/15E148 Safari/604.1'}:{})});page.setDefaultTimeout(6000);
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));await page.addInitScript(installed=>{Object.defineProperty(navigator,'standalone',{get:()=>installed});},installed);
+ const defaults={workDir:'/projects',debug:true,filesystem:{maxConcurrentWorkers:8},artifactIngress:{maxConcurrentDownloads:8},agentChat:{enabled:true,rolloutEnabled:true,rolloutReminderInterval:25,defaultMessageMode:'queue',automation:{enabled:true,autoApproveToolCalls:true,requestBlockingEnabled:false,requestBlockList:['one','two','three','four','five']}},audit:{enabled:true,includeCommandPreview:true},experimental:{forceDestructiveToolAnnotations:false,forceOpenWorldToolAnnotations:false},allowedHosts:[],apiKey:null,conversationAuthToken:null,mcpServers:{},uiWidgets:true};
+ await routeOwner(page,origin+'/**',route=>{const path=new URL(route.request().url()).pathname;if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});if(path==='/api/global')return route.fulfill({json:{version:'2.1.0',plan:{label:'Pro 20x'},settingsAvailable:true}});if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});if(path==='/api/settings')return route.fulfill({json:{document:{},defaults,fieldSchema:defaults,raw:'{}',revision:'one',path:'/fixture/config.json',restartRequired:false}});if(path==='/api/analytics/usage')return route.fulfill({json:{models:[],daily:[],conversations:[],totals:{},lifetime:{},today:'2026-10-19',timezone:'UTC'}});return route.fulfill({status:404});});
+ await page.goto(origin+'/#fixture-token');await page.getByText('Pro 20x',{exact:true}).waitFor();return {browser,page,errors};
+}
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]]){
+ test(`${name}: install control uses the native prompt and hides in an installed PWA`,async()=>{
+  const {browser,page,errors}=await fixture(engine);try{
+   assert.equal(await page.locator('#sidebar-title').textContent(),'Codexify');const install=page.getByRole('button',{name:'Install Codexify',exact:true});assert(await install.isVisible());
+   const order=await page.locator('#global-footer-actions button').evaluateAll(nodes=>nodes.slice(0,3).map(n=>n.id));assert.deepEqual(order,['global-install','global-statistics','global-settings']);
+   await page.evaluate(()=>{window.installPrompts=0;const event=new Event('beforeinstallprompt',{cancelable:true});event.prompt=async()=>{window.installPrompts++};event.userChoice=Promise.resolve({outcome:'accepted'});window.dispatchEvent(event);});await install.click();await page.waitForFunction(()=>document.getElementById('global-install').hidden);assert.equal(await page.evaluate(()=>window.installPrompts),1);assert.equal(await page.locator('#pwa-install-dialog').count(),0);assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+  const installed=await fixture(engine,{installed:true});try{assert(await installed.page.locator('#global-install').isHidden());assert(await installed.page.getByRole('button',{name:'Statistics',exact:true}).isVisible());}finally{await installed.browser.close();}
+ });
+ test(`${name}: iPhone install instructions, compact settings and safe-area dialog corners`,async()=>{
+  const {browser,page,errors}=await fixture(engine,{ios:true});const out=process.env.MOBILE_SETTINGS_SCREENSHOTS||'/tmp/mobile-settings-screenshots';mkdirSync(out,{recursive:true});try{
+   await page.getByRole('button',{name:'Install Codexify',exact:true}).click();const guide=page.getByRole('dialog',{name:'Install Codexify',exact:true});assert.match(await guide.textContent(),/Share menu.*Add to Home Screen/);await guide.getByRole('button',{name:'Got it',exact:true}).click();
+   await page.evaluate(()=>{const s=document.documentElement.style;s.setProperty('--owner-safe-top','59px');s.setProperty('--owner-safe-bottom','34px');});
+   const footer=await page.locator('#global-footer').boundingBox();assert(footer.y+footer.height<=811,'footer stays above the home indicator and physical corners');
+   await page.getByRole('button',{name:'Codexify settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Codexify settings',exact:true});const box=await settings.boundingBox();assert(box.y>=70);assert(box.y+box.height<=799);assert.equal(await settings.getByRole('button',{name:'View raw config',exact:true}).isVisible(),true);
+   assert(await settings.locator('#settings-main').evaluate(n=>n.clientHeight)>420,'compact chrome leaves useful content space even inside iPhone safe areas');await page.screenshot({path:out+'/'+name+'-settings.png',animations:'disabled'});
+   await settings.getByRole('button',{name:'Connections',exact:true}).click();await page.screenshot({path:out+'/'+name+'-connections.png',animations:'disabled'});const row=settings.locator('[data-setting-row="allowedHosts"]');assert(await row.locator('textarea').evaluate(n=>n.getBoundingClientRect().height)<70,'empty list editors use little vertical space');assert.equal(await settings.evaluate(n=>n.scrollWidth>n.clientWidth),false);const apiKey=settings.getByLabel('apiKey',{exact:true});assert.equal(await apiKey.evaluate(n=>getComputedStyle(n).fontSize),'13px');await apiKey.focus();assert.equal(await apiKey.evaluate(n=>getComputedStyle(n).fontSize),'13px');const editor=row.locator('textarea');await editor.focus();assert.equal(await editor.evaluate(n=>getComputedStyle(n).fontSize),'13px');await editor.blur();await apiKey.blur();assert.equal(await apiKey.evaluate(n=>getComputedStyle(n).fontSize),'13px');
+   await settings.getByRole('button',{name:'Close settings',exact:true}).click();await page.getByRole('button',{name:'Statistics',exact:true}).click();const stats=page.getByRole('dialog',{name:'Statistics',exact:true});await stats.getByLabel('Analytics date range').waitFor();const select=await stats.getByLabel('Analytics date range').evaluate(n=>{const s=getComputedStyle(n);return {inner:n.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom),line:parseFloat(s.lineHeight),text:n.selectedOptions[0].textContent};});assert.equal(select.text,'7 days');assert(select.inner>=select.line,'descenders in days fit inside the select');const statsBox=await stats.boundingBox();assert(statsBox.y>=70&&statsBox.y+statsBox.height<=799);await page.screenshot({path:out+'/'+name+'-stats.png',animations:'disabled'});assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+ });
+}

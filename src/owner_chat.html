@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
 <link rel="apple-touch-icon" sizes="180x180" href="/icons/app-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/icons/app-192.png">
@@ -116,6 +116,15 @@ input,select,textarea { font:inherit; }
 #new-chat-dialog .muted { color:var(--muted); font-size:12px; }
 #new-chat-submit { background:var(--accent) !important; color:var(--panel) !important; }
 #new-chat-dialog button:disabled { opacity:.5; cursor:default; }
+/* Insets apply to layout content and to top-layer dialogs independently. */
+:root{--owner-safe-top:env(safe-area-inset-top,0px);--owner-safe-right:env(safe-area-inset-right,0px);--owner-safe-bottom:env(safe-area-inset-bottom,0px);--owner-safe-left:env(safe-area-inset-left,0px)}
+@media(max-width:760px),(hover:none) and (pointer:coarse){
+ #layout{padding:var(--owner-safe-top) var(--owner-safe-right) var(--owner-safe-bottom) var(--owner-safe-left)}
+}
+dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-block-start:calc(var(--owner-viewport-top,0px) + var(--owner-safe-top) + 12px);inset-block-end:calc(100dvh - var(--owner-viewport-height,100dvh) - var(--owner-viewport-top,0px) + var(--owner-safe-bottom) + 12px);inset-inline-start:calc(var(--owner-safe-left) + 12px);inset-inline-end:calc(var(--owner-safe-right) + 12px);max-height:calc(var(--owner-viewport-height,100dvh) - var(--owner-safe-top) - var(--owner-safe-bottom) - 24px)!important;max-width:calc(100vw - var(--owner-safe-left) - var(--owner-safe-right) - 24px)!important}
+#pwa-install-dialog{width:360px;padding:22px;border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--ink);box-shadow:0 24px 90px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#pwa-install-dialog::backdrop{background:#10191673;backdrop-filter:blur(5px)}#pwa-install-dialog h2{margin:0;font-size:20px}#pwa-install-dialog p{color:var(--muted);margin:12px 0 20px}#pwa-install-dialog button{display:block;margin-left:auto;border:1px solid var(--line);border-radius:8px;padding:9px 14px;background:var(--panel);color:var(--ink)}
+
 #connector-name-dialog{width:min(420px,calc(100vw - 32px));padding:24px;border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--ink);box-shadow:0 24px 90px #0003}
 #connector-name-dialog::backdrop{background:#10191673;backdrop-filter:blur(5px)}
 #connector-name-dialog h2{margin:0;font-size:20px}#connector-name-dialog p{line-height:1.5;color:var(--muted)}
@@ -130,10 +139,10 @@ input,select,textarea { font:inherit; }
 <body>
 <div id="layout" data-view="list">
   <aside aria-label="Conversations">
-    <header><div class="sidebar-heading"><div class="sidebar-heading-title"><button type="button" class="sidebar-icon" id="archive-back" aria-label="Back to agent chats" title="Back to agent chats" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7M5 12h14"/></svg></button><h1 id="sidebar-title">Agent chats</h1></div><div class="sidebar-heading-actions" id="sidebar-actions"><button type="button" class="sidebar-icon" id="archived-chats" aria-label="Archived chats" title="Archived chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h18v4H3zM5 7v14h14V7M10 11h4"/></svg></button><button type="button" class="sidebar-icon" id="new-chat" aria-label="New chat" title="New chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></div><input id="chat-search" type="search" aria-label="Search chats" placeholder="Search chats…" maxlength="1024"><div id="list-view" aria-label="Chat list view"><button type="button" id="view-projects" aria-pressed="true">Projects</button><button type="button" id="view-recent" aria-pressed="false">Recent</button></div></header>
+    <header><div class="sidebar-heading"><div class="sidebar-heading-title"><button type="button" class="sidebar-icon" id="archive-back" aria-label="Back to agent chats" title="Back to agent chats" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7M5 12h14"/></svg></button><h1 id="sidebar-title">Codexify</h1></div><div class="sidebar-heading-actions" id="sidebar-actions"><button type="button" class="sidebar-icon" id="archived-chats" aria-label="Archived chats" title="Archived chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h18v4H3zM5 7v14h14V7M10 11h4"/></svg></button><button type="button" class="sidebar-icon" id="new-chat" aria-label="New chat" title="New chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></div><input id="chat-search" type="search" aria-label="Search chats" placeholder="Search chats…" maxlength="1024"><div id="list-view" aria-label="Chat list view"><button type="button" id="view-projects" aria-pressed="true">Projects</button><button type="button" id="view-recent" aria-pressed="false">Recent</button></div></header>
     <div id="error" hidden></div>
     <nav id="conversations" aria-label="Agent chat conversations"></nav>
-    <div id="global-footer"><span id="account-plan" hidden></span><div id="global-footer-actions"><button type="button" id="global-statistics" aria-label="Statistics" title="Statistics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10m8 10V4m8 16v-7M2 20h20"/></svg></button><button type="button" id="global-settings" aria-label="Codexify settings" title="Codexify settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2h4l.7 3 2.5 1.4 2.9-.9 2 3.4-2.2 2.1v2l2.2 2.1-2 3.4-2.9-.9-2.5 1.4-.7 3h-4l-.7-3-2.5-1.4-2.9.9-2-3.4L4.1 13v-2L1.9 8.9l2-3.4 2.9.9L9.3 5Z"/><circle cx="12" cy="12" r="3"/></svg></button><span id="global-version"></span><button type="button" id="global-update" hidden>Update</button></div></div>
+    <div id="global-footer"><span id="account-plan" hidden></span><div id="global-footer-actions"><button type="button" id="global-install" aria-label="Install Codexify" title="Install Codexify" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg></button><button type="button" id="global-statistics" aria-label="Statistics" title="Statistics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10m8 10V4m8 16v-7M2 20h20"/></svg></button><button type="button" id="global-settings" aria-label="Codexify settings" title="Codexify settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2h4l.7 3 2.5 1.4 2.9-.9 2 3.4-2.2 2.1v2l2.2 2.1-2 3.4-2.9-.9-2.5 1.4-.7 3h-4l-.7-3-2.5-1.4-2.9.9-2-3.4L4.1 13v-2L1.9 8.9l2-3.4 2.9.9L9.3 5Z"/><circle cx="12" cy="12" r="3"/></svg></button><span id="global-version"></span><button type="button" id="global-update" hidden>Update</button></div></div>
   </aside>
   <main><div id="chat-host"><div id="placeholder">Select a conversation to view its chat.</div></div></main>
 </div>
@@ -258,12 +267,14 @@ input,select,textarea { font:inherit; }
 #rename-chat svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.7; }
 [hidden] { display:none !important; }
 @media(max-width:480px) { .footer { padding:10px 8px; } #composer { padding:10px; } #goal-bar { margin-left:8px; margin-right:8px; gap:5px; } #goal-caption { max-width:90px; overflow:hidden; text-overflow:ellipsis; } #goal-editor,#pairing-editor { left:8px; right:8px; } #composer-tools { gap:2px; font-size:12px; } }
+dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-block-start:calc(var(--owner-viewport-top,0px) + var(--owner-safe-top) + 12px);inset-block-end:calc(100dvh - var(--owner-viewport-height,100dvh) - var(--owner-viewport-top,0px) + var(--owner-safe-bottom) + 12px);inset-inline-start:calc(var(--owner-safe-left) + 12px);inset-inline-end:calc(var(--owner-safe-right) + 12px);max-height:calc(var(--owner-viewport-height,100dvh) - var(--owner-safe-top) - var(--owner-safe-bottom) - 24px)!important;max-width:calc(100vw - var(--owner-safe-left) - var(--owner-safe-right) - 24px)!important}
 </style></template>
 <!-- CHAT_TEMPLATE -->
 <script>
 /* CHAT_SCRIPT */
 /* USAGE_ANALYTICS_SCRIPT */
 /* STATISTICS_EXTRAS_SCRIPT */
+/* OWNER_PWA_SCRIPT */
 /* GLOBAL_SETTINGS_SCRIPT */
 (() => {
   "use strict";
@@ -284,7 +295,7 @@ input,select,textarea { font:inherit; }
   const viewport = document.querySelector('meta[name="viewport"]');
   function syncViewport() {
     const fixed = mobileLayout.matches;
-    const content = "width=device-width, initial-scale=1" + (fixed ? ", minimum-scale=1, maximum-scale=1, user-scalable=no" : "");
+    const content = "width=device-width, initial-scale=1, viewport-fit=cover" + (fixed ? ", minimum-scale=1, maximum-scale=1, user-scalable=no" : "");
     if (viewport.content !== content) viewport.content = content;
     const style = document.documentElement.style;
     if (fixed) {
@@ -514,7 +525,7 @@ input,select,textarea { font:inherit; }
           </section>
           <section class="connection-settings-card" aria-labelledby="connection-browser-heading">
             <div class="connection-card-heading"><h3 id="connection-browser-heading">Browser connection</h3><p id="companion-status" class="connection-state" role="status"></p></div>
-            <div class="connection-card-content"><p class="connection-card-copy">Manage the ChatGPT browser session used to send messages.</p><div class="automation-actions"><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div></div>
+            <div class="connection-card-content"><p class="connection-card-copy">Manage the ChatGPT browser session used to send messages.</p><div class="automation-actions"><button type="button" id="automation-browser-start">Start browser</button><button type="button" id="automation-browser-stop">Stop browser</button><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div></div>
           </section>
           <section class="connection-settings-card" aria-labelledby="connection-pairing-heading">
             <div class="connection-card-heading"><h3 id="connection-pairing-heading">Paired conversation</h3><p id="pairing-status" class="connection-state"></p></div>
@@ -562,6 +573,7 @@ input,select,textarea { font:inherit; }
     const byId = name => scope.querySelector(`#${name}`);
     const nodes = {
       presence:byId("automation-presence"), queue:byId("automation-queue"), action:byId("automation-action"),
+      browserStart:byId("automation-browser-start"),browserStop:byId("automation-browser-stop"),
       companion:byId("companion-status"), login:byId("automation-login"), capabilities:byId("automation-capabilities"), reveal:byId("automation-reveal"),
       url:byId("automation-url"), pair:byId("automation-pair"), unlink:byId("automation-unlink"), pairing:byId("pairing-status"),
       model:byId("automation-model"), effort:byId("automation-effort"),
@@ -569,6 +581,7 @@ input,select,textarea { font:inherit; }
       liveStatus:byId("automation-live-status"), liveCommentary:byId("automation-live-commentary"), liveAnswer:byId("automation-live-answer"), cancelAction:byId("automation-cancel-action"), retryAction:byId("automation-retry-action"), error:byId("automation-error")
     };
     let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, catalogAttempted = false, loadingModels = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
+    let browserOperation = null, browserRevision = 0, browserError = "", browserErrorOperation = null;
     let pairingSubmitting = false, pairingRevision = 0, pairingSubmissionError = "", lastSubmittedPairingUrl = "";
     let dismissedError = null, shownErrorSignature = null;
     const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
@@ -637,7 +650,8 @@ input,select,textarea { font:inherit; }
       // Goal controls can arrive after the history has already scrolled to its end.
       const atBottom = history.scrollHeight - history.scrollTop - history.clientHeight < 50;
       current = state;
-      const setStateError = message => setError(message, errorSignature(message));
+      if(browserErrorOperation==='start'&&!browserOperation&&(state.companion?.authenticated||state.companion?.responsive||state.companion?.status==='authentication_required'))browserError='';
+      const setStateError = message => setError(browserError||message,browserError?`browser:${browserRevision}:${browserError}`:errorSignature(message));
       panel.hidden = tools.hidden = !state?.enabled;
       settingsToggle.hidden = !state?.enabled;
       if (!state?.enabled) { showSettings(false); return; }
@@ -648,10 +662,16 @@ input,select,textarea { font:inherit; }
       nodes.queue.textContent = nodes.queue.hidden ? "" : `· Queue ${state.queue.position} of ${state.queue.total}`;
       nodes.action.textContent = automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
       const companion = state.companion || {};
-      nodes.companion.textContent = companion.authenticated ? `Connected · ${sentenceCase(companion.status || "idle")}` : companion.status === "unavailable" ? (companion.detail || "Browser companion is unavailable") : "ChatGPT sign-in required";
-      nodes.companion.dataset.state = companion.authenticated ? "connected" : companion.status === "unavailable" ? "unavailable" : "disconnected";
-      nodes.login.disabled = companion.authenticated === true;
-      nodes.capabilities.disabled = companion.authenticated !== true || companion.status !== "idle" || loadingModels || Boolean(companion.activeActionId);
+      const stopping=browserOperation==='stop'||companion.stopping;
+      const starting=browserOperation==='start'||companion.recovering;
+      nodes.companion.textContent=stopping?'Stopping browser…':starting?'Starting browser…':companion.manuallyStopped?'Browser stopped by you':companion.waitingForServerRestart?'Waiting for Codexify to restart':companion.responsive&&companion.status==='unavailable'?'Browser is running; check the ChatGPT page':companion.authenticated?`Connected · ${sentenceCase(companion.status||'idle')}`:companion.status==='unavailable'?(companion.detail||'Browser companion is unavailable'):'ChatGPT sign-in required';
+      nodes.companion.dataset.state=companion.manuallyStopped||stopping||starting||companion.waitingForServerRestart?'disconnected':companion.authenticated?'connected':companion.status==='unavailable'?'unavailable':'disconnected';
+      nodes.browserStart.disabled=Boolean(browserOperation)||(!companion.manuallyStopped&&companion.status!=='unavailable'&&!companion.recovering);
+      nodes.browserStop.disabled=browserOperation==='stop'||(companion.manuallyStopped===true&&browserOperation!=='start');
+      nodes.browserStart.textContent=browserOperation==='start'?'Starting…':'Start browser';
+      nodes.browserStop.textContent=browserOperation==='stop'?'Stopping…':'Stop browser';
+      nodes.login.disabled = companion.authenticated===true||Boolean(browserOperation)||companion.manuallyStopped===true;
+      nodes.capabilities.disabled=companion.authenticated!==true||companion.status!=='idle'||loadingModels||Boolean(companion.activeActionId)||Boolean(browserOperation)||companion.manuallyStopped===true;
       const pairing = state.pairing || { status:"unpaired" };
       const verified = pairing.status === "verified";
       const currentPairingPhase = pairingPhase(state, Date.now() + clockOffset);
@@ -767,7 +787,7 @@ input,select,textarea { font:inherit; }
           if (context !== catalogContext || !state.companion?.authenticated) { models = []; catalogLoaded = false; catalogAttempted = false; catalogContext = context; }
           if (state.catalog) { models = state.catalog.models || []; catalogLoaded = true; catalogAttempted = true; }
           render(state);
-          if (state.enabled && state.pairing?.status === "verified" && !catalogAttempted) await loadModels();
+          if (state.enabled && state.pairing?.status === "verified" && !catalogAttempted && state.companion?.authenticated && state.companion.status==='idle' && !state.companion.manuallyStopped && !state.companion.recovering && !state.companion.stopping) await loadModels();
         }
       } catch (error) { if (!closed) setError(error.message || "Chat automation state unavailable"); }
       finally { requestInFlight = false; }
@@ -893,6 +913,18 @@ input,select,textarea { font:inherit; }
     nodes.effort.addEventListener("change", () => { selectionDraft = { model:nodes.model.value, effort:nodes.effort.value }; void saveSelection(); });
     nodes.url.addEventListener("input", () => { nodes.pair.disabled = !nodes.url.value.trim() || !current?.companion?.authenticated; });
     nodes.goal.addEventListener("input", () => { nodes.setGoal.disabled = !nodes.goal.value.trim(); });
+    async function controlBrowser(operation) {
+      if(browserOperation===operation||browserOperation==='stop')return;
+      const revision=++browserRevision;
+      browserOperation=operation;browserError='';browserErrorOperation=operation;render(current);setError('');
+      try {
+        const result=await(await api(`/api/browser/${operation}`,{method:'POST',body:JSON.stringify({requestId:requestId(`browser-${operation}`)})})).json();
+        if(!closed&&current&&revision===browserRevision){current.companion={...result.companion,...result.lifecycle};models=[];catalogLoaded=false;catalogAttempted=false;catalogContext=null;}
+      }catch(error){if(!closed&&revision===browserRevision){browserError=error.message||'Browser control failed';setError(browserError);}}
+      finally{if(revision===browserRevision){browserOperation=null;if(!closed){render(current);await refreshState({quiet:true});}}}
+    }
+    nodes.browserStart.addEventListener('click',()=>void controlBrowser('start'));
+    nodes.browserStop.addEventListener('click',()=>void controlBrowser('stop'));
     nodes.login.addEventListener("click", () => run(async () => { await post("login"); }));
     nodes.capabilities.addEventListener("click", () => run(() => loadModels(true)));
     nodes.pair.addEventListener("click", () => { if (current?.pairing?.creatingChat && !current.pairing.canonicalUrl) void run(async () => { await post("create/retry", {requestId:requestId("create-retry")}); }); else void submitPairing(nodes.url.value.trim()); });
@@ -905,6 +937,7 @@ input,select,textarea { font:inherit; }
     nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     byId("automation-retry-inline").addEventListener("click", () => nodes.retryAction.click());
     byId("automation-dismiss-inline").addEventListener("click", () => {
+      if(browserError){browserError='';byId("connection-settings-error").hidden=true;}
       dismissedError = shownErrorSignature;
       nodes.error.hidden = true;
       byId("automation-retry-inline").hidden = true;
@@ -1027,7 +1060,7 @@ input,select,textarea { font:inherit; }
     const focusedChat = focused?.closest(".conversation-row")?.dataset.chatId;
     const focusedAction = focused?.dataset.action;
     list.replaceChildren();
-    document.getElementById("sidebar-title").textContent = archiveView ? "Archived chats" : "Agent chats";
+    document.getElementById("sidebar-title").textContent = archiveView ? "Archived chats" : "Codexify";
     document.getElementById("archive-back").hidden = !archiveView;
     document.getElementById("sidebar-actions").hidden = archiveView;
     document.getElementById("list-view").hidden = archiveView;
@@ -1344,8 +1377,7 @@ input,select,textarea { font:inherit; }
       if(epoch!==newEpoch || !newDialog.open)return;
       newCatalog = catalog; newNode("model").replaceChildren();
       if (!newWorktreeEdited && typeof catalog.createWorktree === "boolean") newNode("worktree").checked = catalog.createWorktree;
-      newNode("workspace-picker").hidden = catalog.multiProject === false;
-      if (catalog.multiProject === false) chooseNew({}, `Workspace: ${catalog.workspaceName || "Configured workspace"}`);
+      newNode("workspace-picker").hidden = false;
       for(const model of catalog.models) {const option=new Option(displayModelLabel(model),model.id);option.disabled=!model.efforts.some(effort=>effort.available);newNode("model").append(option);}
       newNode("model").value = catalog.models.find(model=>model.efforts.some(effort=>effort.available))?.id || "";
       newNode("model").disabled = !newNode("model").value;newEfforts();
@@ -1383,6 +1415,7 @@ input,select,textarea { font:inherit; }
     finally{newBusy=false;newReady();}
   });
   bindBackdrop(newDialog, () => { if (!newBusy) newDialog.close(); });
+  startOwnerPwa({bindBackdrop});
   startGlobalSettings({api,bindBackdrop,getChats:()=>chats,onOpenChat:id=>select(id),onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
   search.addEventListener("input", () => {
     clearTimeout(searchTimer); ++listRequest; pendingList = null; renderList();

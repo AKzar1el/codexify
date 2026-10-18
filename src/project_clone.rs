@@ -1872,7 +1872,7 @@ mod tests {
         let repository =
             parse_git_repository("https://gitlab.example/acme/platform/widget.git").unwrap();
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_clone_dir = clone_dir.clone();
         config.project_catalog.codex_config.enabled = false;
 
@@ -1932,7 +1932,7 @@ mod tests {
         let repository =
             parse_github_repository("https://github.com/acme/widget/tree/split_db").unwrap();
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_clone_dir = clone_dir.clone();
         config.project_catalog.codex_config.enabled = false;
 
@@ -1979,7 +1979,7 @@ mod tests {
         let repository =
             parse_github_repository("https://github.com/acme/widget/pull/886").unwrap();
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_clone_dir = clone_dir.clone();
         config.project_catalog.codex_config.enabled = false;
 
@@ -2024,7 +2024,7 @@ mod tests {
         ))
         .unwrap();
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_clone_dir = clone_dir.clone();
         config.project_catalog.codex_config.enabled = false;
 
@@ -2144,7 +2144,7 @@ mod tests {
         }
 
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_catalog.codex_config.enabled = false;
         let repository = parse_github_repository("https://github.com/acme/widget").unwrap();
 
@@ -2169,7 +2169,7 @@ mod tests {
         fs::write(target.join("keep.txt"), "do not replace").unwrap();
 
         let mut config = default_config(access_root.clone());
-        config.multi_project = true;
+
         config.project_catalog.codex_config.enabled = false;
         let repository = parse_github_repository("https://github.com/acme/widget").unwrap();
 

@@ -47,9 +47,6 @@ impl ProjectBindingStore {
         path: &Path,
         state_root: &Path,
     ) -> Result<PathBuf, String> {
-        if !config.multi_project {
-            return Err("Workspace editing requires multi-project mode.".into());
-        }
         if !path.is_absolute() {
             return Err("Enter an absolute project directory.".into());
         }
@@ -155,9 +152,6 @@ impl ProjectBindingStore {
         config: &AppConfig,
         identity: &ConversationIdentity,
     ) -> Result<(Option<PathBuf>, Option<WorkspaceChange>), String> {
-        if !config.multi_project {
-            return Ok((Some(config.work_dir.clone()), None));
-        }
         let root = canonical_access_root(config)?;
         let _lock = acquire_lock(&self.binding_path(&root, identity)).await?;
         Ok((
@@ -253,9 +247,6 @@ impl ProjectBindingStore {
         config: &AppConfig,
         identity: &ConversationIdentity,
     ) -> Result<Option<WorkspaceChange>, String> {
-        if !config.multi_project {
-            return Ok(None);
-        }
         self.pending_change_at(&canonical_access_root(config)?, identity)
     }
 
@@ -327,9 +318,6 @@ impl ProjectBindingStore {
         identity: &ConversationIdentity,
         expected_path: &Path,
     ) -> Result<(), String> {
-        if !config.multi_project {
-            return Err("Workspace switching requires multi-project mode".into());
-        }
         let root = canonical_access_root(config)?;
         let _lock = acquire_lock(&self.binding_path(&root, identity)).await?;
         if let Some(change) = self.pending_change_at(&root, identity)?
@@ -428,7 +416,7 @@ mod owner_workspace_tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let mut config = crate::config::default_config(access.clone());
-        config.multi_project = true;
+
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         config.memory.dir = Some(temp.path().join("state").to_string_lossy().into_owned());
         config.markdown_chat.enabled = true;

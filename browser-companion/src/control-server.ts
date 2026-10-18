@@ -166,6 +166,9 @@ async function route(
   const operation = new AbortController();
   request.once("aborted",()=>operation.abort());
   response.once("close",()=>{ if(!response.writableEnded)operation.abort(); });
+  if(request.method === "GET" && url.pathname === "/v1/liveness") {
+    json(response,200,await coordinator.liveness());return;
+  }
   if (request.method === "GET" && url.pathname === "/v1/health") {
     json(response, 200, await coordinator.health());
     return;

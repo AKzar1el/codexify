@@ -1113,9 +1113,6 @@ impl SessionState {
     }
 
     pub fn effective_config(&self, config: &AppConfig) -> Result<AppConfig, String> {
-        if !config.multi_project {
-            return Ok(config.clone());
-        }
         match self.binding_state(config)? {
             ProjectBindingState::Project(selection) => {
                 let mut effective = config.clone();
@@ -1135,12 +1132,6 @@ impl SessionState {
     }
 
     pub fn binding_state(&self, config: &AppConfig) -> Result<ProjectBindingState, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
         let access_root = std::fs::canonicalize(&config.work_dir).map_err(|error| {
             format!(
                 "The configured project access root no longer exists or cannot be resolved: {}: {error}",
@@ -1175,13 +1166,6 @@ impl SessionState {
         config: &AppConfig,
         input: &str,
     ) -> Result<ProjectRootSelection, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
-
         let _selection_guard = self.project_selection_lock.lock().await;
         let reference = ProjectReference::parse(input)?;
 
@@ -1309,12 +1293,6 @@ impl SessionState {
         &self,
         config: &AppConfig,
     ) -> Result<WithoutProjectSelection, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
         let _selection_guard = self.project_selection_lock.lock().await;
         let access_root = std::fs::canonicalize(&config.work_dir).map_err(|error| {
             format!(
@@ -1386,9 +1364,6 @@ impl SessionState {
         ),
         String,
     > {
-        if !config.multi_project {
-            return Ok((Some(config.work_dir.clone()), None));
-        }
         let _lock = self.project_selection_lock.lock().await;
         let root = match self.binding_state(config)? {
             ProjectBindingState::Project(selection) => Some(selection.project_root),
@@ -1443,12 +1418,9 @@ impl SessionState {
 
     pub async fn switch_to_picker(
         &self,
-        config: &AppConfig,
+        _config: &AppConfig,
         expected: &Path,
     ) -> Result<(), String> {
-        if !config.multi_project {
-            return Err("Workspace switching requires multi-project mode".into());
-        }
         let _lock = self.project_selection_lock.lock().await;
         if self.selected_project_root().is_none()
             && self
@@ -1749,8 +1721,8 @@ mod tests {
         let source = access.path().join("project");
         std::fs::create_dir(&source).unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut config = crate::config::default_config(access.path().to_path_buf());
-        config.multi_project = true;
+        let config = crate::config::default_config(access.path().to_path_buf());
+
         let state = SessionState::new();
         *state.project_binding.lock().unwrap() = Some(TransportProjectBindingState::Project(
             TransportProjectBinding {
@@ -1774,8 +1746,8 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         let worktrees = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut config = crate::config::default_config(access.path().to_path_buf());
-        config.multi_project = true;
+        let config = crate::config::default_config(access.path().to_path_buf());
+
         let state = SessionState::new();
         *state.project_binding.lock().unwrap() = Some(TransportProjectBindingState::Project(
             TransportProjectBinding {
@@ -1804,8 +1776,8 @@ mod tests {
         let worktree_git_root = worktrees.path().join("managed");
         std::fs::create_dir(&worktree_git_root).unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let mut config = crate::config::default_config(access.path().to_path_buf());
-        config.multi_project = true;
+        let config = crate::config::default_config(access.path().to_path_buf());
+
         let state = SessionState::new();
         *state.project_binding.lock().unwrap() = Some(TransportProjectBindingState::Project(
             TransportProjectBinding {

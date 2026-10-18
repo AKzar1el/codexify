@@ -13,6 +13,7 @@ export const ownerHtml = readFileSync(new URL("../src/owner_chat.html", import.m
   .replace("/* CHAT_SCRIPT */", widgetScript)
   .replace("/* USAGE_ANALYTICS_SCRIPT */",readFileSync(new URL("../src/analytics_ui.js",import.meta.url),"utf8"))
   .replace("/* STATISTICS_EXTRAS_SCRIPT */",readFileSync(new URL("../src/statistics_extras_ui.js",import.meta.url),"utf8"))
+  .replace("/* OWNER_PWA_SCRIPT */",readFileSync(new URL("../src/owner_pwa_ui.js",import.meta.url),"utf8"))
   .replace("/* GLOBAL_SETTINGS_SCRIPT */",readFileSync(new URL("../src/global_settings_ui.js",import.meta.url),"utf8"));
 
 // Match the owner's public install assets before conversation-specific API mocks.

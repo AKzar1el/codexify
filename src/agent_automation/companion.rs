@@ -411,6 +411,36 @@ impl BrowserCompanionClient {
         self.pid
     }
 
+    /// Optional browser-only probe. It performs no ChatGPT account/session request.
+    pub async fn liveness(&self, cancellation: &CancellationToken) -> Result<Option<bool>, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Liveness {
+            protocol_version: u32,
+            build: String,
+            available: bool,
+        }
+        let response = self
+            .send_json(
+                Method::GET,
+                "/v1/liveness",
+                Option::<&Value>::None,
+                cancellation,
+            )
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(status_error(response.status()));
+        }
+        let value: Liveness = self.decode_json_response(response, cancellation).await?;
+        if value.protocol_version != PROTOCOL_VERSION || value.build != self.build.as_ref() {
+            return Err("Browser liveness response has an incompatible protocol".into());
+        }
+        Ok(Some(value.available))
+    }
+
     pub async fn health(
         &self,
         cancellation: &CancellationToken,

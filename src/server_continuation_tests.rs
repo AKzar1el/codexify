@@ -344,6 +344,11 @@ async fn prepare_and_continue_tools_transfer_the_same_task_without_copying_state
     );
     handler.continuations = continuations.clone();
 
+    bind_fixture_workspace(
+        &handler,
+        Some(&ConversationIdentity::from_openai_session("source-chat").unwrap()),
+    )
+    .await;
     let (server_transport, client_transport) = tokio::io::duplex(128 * 1024);
     let task = tokio::spawn(async move {
         handler
@@ -469,7 +474,7 @@ async fn handoff_keeps_workspace_chat_memory_diff_and_exec_state_attached() {
     let project = access_root.join("demo");
     std::fs::create_dir_all(&project).unwrap();
     let mut config = crate::config::default_config(access_root);
-    config.multi_project = true;
+
     config.worktrees.mode = WorktreeMode::Never;
     config.markdown_chat.enabled = true;
     config.memory.dir = Some(root.path().join("metadata").to_string_lossy().into_owned());

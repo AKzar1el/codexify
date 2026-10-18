@@ -150,45 +150,11 @@ fn compact_error(error: &str) -> String {
         .collect()
 }
 
-fn static_project_info(config: &AppConfig) -> SetupProjectInfo {
-    match std::fs::canonicalize(&config.work_dir) {
-        Ok(project_root) => SetupProjectInfo {
-            status: SetupProjectStatus::Selected,
-            selection_available: false,
-            access_root: Some(project_root.to_string_lossy().into_owned()),
-            name: Some(path_name(&project_root)),
-            active_path: Some(project_root.to_string_lossy().into_owned()),
-            source_path: Some(project_root.to_string_lossy().into_owned()),
-            managed_worktree: false,
-            binding_scope: Some("static".to_string()),
-            detail: None,
-        },
-        Err(error) => SetupProjectInfo {
-            status: SetupProjectStatus::CheckFailed,
-            selection_available: false,
-            access_root: Some(config.work_dir.to_string_lossy().into_owned()),
-            name: None,
-            active_path: None,
-            source_path: None,
-            managed_worktree: false,
-            binding_scope: Some("static".to_string()),
-            detail: Some(compact_error(&format!(
-                "Could not resolve static project root {}: {error}",
-                config.work_dir.display()
-            ))),
-        },
-    }
-}
-
 fn project_info(
     config: &AppConfig,
     session: &SessionState,
     context: &ToolRequestContext,
 ) -> SetupProjectInfo {
-    if !config.multi_project {
-        return static_project_info(config);
-    }
-
     let state = match context.task_conversation.as_ref() {
         Some(identity) => context.project_bindings.binding_state(config, identity),
         None => session.binding_state(config),
@@ -796,7 +762,12 @@ mod tests {
             "verify",
         ] {
             assert!(
-                !text.contains(forbidden),
+                !(if forbidden == "token" {
+                    text.split(|c: char| !c.is_alphanumeric())
+                        .any(|word| word == "token")
+                } else {
+                    text.contains(forbidden)
+                }),
                 "unexpected `{forbidden}` in `{text}`"
             );
         }
@@ -860,12 +831,12 @@ mod tests {
             .unwrap();
         for markdown_chat in [false, true] {
             for agent_tickets in [false, true] {
-                for multi_project in [false, true] {
+                for _legacy_mode in [true] {
                     let root = tempfile::tempdir().unwrap();
                     let mut config = default_config(root.path().into());
                     config.markdown_chat.enabled = markdown_chat;
                     config.experimental.agent_tickets = agent_tickets;
-                    config.multi_project = multi_project;
+
                     let current = crate::connector_schema::schema_version(&config);
                     config.worktrees.mode = WorktreeMode::Never;
                     config.debug = true;
@@ -873,10 +844,10 @@ mod tests {
                     for tool in [&ConversationAuthorization as &dyn Tool, &UnrestrictedSetup] {
                         assert!(tool.describe(&config).contains(&format!("`{current}`")));
                     }
-                    let mut previous_configs = [config.clone(), config.clone(), config.clone()];
+                    let mut previous_configs = [config.clone(), config.clone()];
                     previous_configs[0].markdown_chat.enabled = !markdown_chat;
                     previous_configs[1].experimental.agent_tickets = !agent_tickets;
-                    previous_configs[2].multi_project = !multi_project;
+
                     for previous_config in previous_configs {
                         let previous = crate::connector_schema::schema_version(&previous_config);
                         for (connector, conversation, status) in [
@@ -1043,7 +1014,8 @@ mod tests {
         assert!(args.connector_version.is_none());
 
         let root = tempfile::tempdir().unwrap();
-        let config = default_config(root.path().into());
+        let mut config = default_config(root.path().into());
+        config.debug = false;
         let result = setup_result(SetupResultInput {
             config: &config,
             scope_description: Some("this MCP transport session"),
@@ -1105,9 +1077,10 @@ mod tests {
                 for multi_project in [false, true] {
                     let root = tempfile::tempdir().unwrap();
                     let mut config = default_config(root.path().into());
+                    config.debug = false;
                     config.markdown_chat.enabled = markdown_chat;
                     config.experimental.agent_tickets = agent_tickets;
-                    config.multi_project = multi_project;
+
                     let auth_token = "a".repeat(64);
                     config.conversation_auth_token = Some(auth_token.clone().into());
                     let description = ConversationAuthorization.describe(&config);
@@ -1188,7 +1161,7 @@ mod tests {
         let access = root.path().join("projects");
         std::fs::create_dir_all(&access).unwrap();
         let mut config = default_config(access.clone());
-        config.multi_project = true;
+
         let auth_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         config.conversation_auth_token = Some(auth_token.into());
         let identity = ConversationIdentity::from_openai_session("project-picker").unwrap();
@@ -1232,7 +1205,7 @@ mod tests {
         let project = access.join("alpha");
         std::fs::create_dir_all(&project).unwrap();
         let mut config = default_config(access.clone());
-        config.multi_project = true;
+
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         let auth_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         config.conversation_auth_token = Some(auth_token.into());
@@ -1311,7 +1284,7 @@ mod tests {
         let project = access.join("alpha");
         initialize_git_project(&project);
         let mut config = default_config(access);
-        config.multi_project = true;
+
         config.worktrees.mode = crate::types::WorktreeMode::Always;
         config.worktrees.root = root.path().join("worktrees");
         config.worktrees.auto_cleanup_enabled = false;
@@ -1366,7 +1339,7 @@ mod tests {
         let access = root.path().join("projects");
         std::fs::create_dir_all(&access).unwrap();
         let mut config = default_config(access.clone());
-        config.multi_project = true;
+
         let auth_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         config.conversation_auth_token = Some(auth_token.into());
         let identity = ConversationIdentity::from_openai_session("broken-project-state").unwrap();

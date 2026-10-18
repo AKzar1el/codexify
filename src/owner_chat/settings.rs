@@ -62,6 +62,10 @@ pub(super) fn start(state: OwnerState) {
             });
             if state.config.markdown_chat.automation.enabled
                 && companion_client(&state).is_err()
+                && !crate::agent_automation::BrowserCompanionControl::new(
+                    &state.config.markdown_chat.automation,
+                )
+                .is_ok_and(|c| c.public_status()["manuallyStopped"] == true)
                 && let Some(mut intent) = pending
                 && intent["updateId"]
                     .as_str()
@@ -74,10 +78,15 @@ pub(super) fn start(state: OwnerState) {
                     let manager = crate::agent_automation::BrowserCompanionManager::from_config(
                         &state.config.markdown_chat.automation,
                     )?;
-                    if !manager.status().await.installed {
+                    let status = manager.status().await;
+                    if !status.installed || status.version != env!("CARGO_PKG_VERSION") {
                         manager.install().await?;
                     }
-                    manager.start().await?;
+                    crate::agent_automation::BrowserCompanionControl::new(
+                        &state.config.markdown_chat.automation,
+                    )?
+                    .ensure_running(&CancellationToken::new())
+                    .await?;
                     Ok::<_, String>(())
                 }
                 .await;
@@ -164,11 +173,24 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
         }
         Err(_) => json!({"version":null,"updateAvailable":false,"unavailable":true}),
     };
-    let refresh = global
-        .manual_refresh
-        .clone()
-        .or_else(|| global.refresh.clone())
-        .or_else(crate::global_settings::read_refresh_intent);
+    let schema = crate::global_settings::read_schema_intent(&state.config);
+    let refresh = schema
+        .as_ref()
+        .filter(|value| {
+            matches!(
+                value["phase"].as_str(),
+                Some("queued" | "running" | "waiting_for_restart" | "failed")
+            )
+        })
+        .cloned()
+        .or_else(|| {
+            global
+                .manual_refresh
+                .clone()
+                .or_else(|| global.refresh.clone())
+                .or_else(crate::global_settings::read_refresh_intent)
+        })
+        .or(schema);
     Ok(Json(
         json!({"version":env!("CARGO_PKG_VERSION"),"instanceId":std::process::id().to_string(),"latest":latest,"plan":global.plan,"connectorRefresh":refresh,
         "settingsAvailable":state.config.loaded_config_path.is_some(),"restartAvailable":std::env::var_os(crate::process_env::SERVICE_SUPERVISED_ENV).as_deref()==Some(std::ffi::OsStr::new("1"))&&crate::service::is_installed().unwrap_or(false)}),
@@ -247,7 +269,7 @@ pub(super) struct SaveBody {
 }
 pub(super) async fn save(State(state): State<OwnerState>, Json(body): Json<SaveBody>) -> ApiResult {
     let config = state.config.clone();
-    let value = tokio::task::spawn_blocking(move || {
+    let mut value = tokio::task::spawn_blocking(move || {
         crate::global_settings::save(&config, &body.revision, body.raw, body.changes)
     })
     .await
@@ -262,10 +284,59 @@ pub(super) async fn save(State(state): State<OwnerState>, Json(body): Json<SaveB
             error,
         )
     })?;
+    if value["schemaRefreshRequired"] == true
+        && let Err(error) = super::schema_refresh::queue(state.config.clone(), &value).await
+    {
+        value["schemaRefreshError"] = json!(error);
+    }
     Ok(Json(value))
 }
 
-pub(super) async fn restart(State(_state): State<OwnerState>) -> ApiResult {
+pub(super) async fn restart(State(state): State<OwnerState>) -> ApiResult {
+    // Request rules are launch-time Chrome policy. The existing Restart action
+    // applies changed rules only when no companion UI action is in progress.
+    if let Some(path) = state.config.loaded_config_path.clone() {
+        let next = tokio::task::spawn_blocking(move || {
+            use clap::Parser;
+            let cli = crate::config::Cli::try_parse_from([
+                std::ffi::OsString::from("codexify"),
+                std::ffi::OsString::from("--config"),
+                path.into_os_string(),
+            ])
+            .map_err(|e| e.to_string())?;
+            crate::config::load_config_quiet_read_only(cli)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+        let old = &state.config.markdown_chat.automation;
+        let new = &next.markdown_chat.automation;
+        if old.enabled
+            && (!new.enabled
+                || old.effective_request_block_list() != new.effective_request_block_list())
+        {
+            let manager = crate::agent_automation::BrowserCompanionManager::from_config(old)
+                .map_err(internal_error)?;
+            if manager.status().await.running {
+                let client = companion_client(&state)?;
+                let health = client
+                    .health(&CancellationToken::new())
+                    .await
+                    .map_err(internal_error)?;
+                if health.active_action_id.is_some() {
+                    return Err((
+                        StatusCode::LOCKED,
+                        "A browser action is active. Wait for it to finish, then restart.".into(),
+                    ));
+                }
+                crate::agent_automation::BrowserCompanionControl::new(old)
+                    .map_err(internal_error)?
+                    .stop_for_restart()
+                    .await
+                    .map_err(internal_error)?;
+            }
+        }
+    }
     tokio::task::spawn_blocking(crate::global_settings::schedule_restart)
         .await
         .map_err(internal_error)?
@@ -323,7 +394,7 @@ async fn set_manual_refresh_phase(
 async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration) {
     loop {
         let result = async {
-            let client = companion_client(&state).map_err(|(_, error)| error)?;
+            let client = super::schema_refresh::refresh_client(&state.config).await?;
             let health = client.health(&CancellationToken::new()).await?;
             if health.active_action_id.is_some()
                 || health.status == crate::agent_automation::CompanionSessionStatus::Busy
@@ -430,6 +501,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    Json(json!({"status":"ok","tunnelsReady":0,"tunnelsConfigured":0}))
+                }),
+            )
             .route("/v1/health", get(refresh_health))
             .route("/v1/connectors/refresh", post(fixture_refresh))
             .with_state(fixture.clone());
@@ -454,6 +531,7 @@ mod tests {
             std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let mut config = crate::config::default_config(root.to_owned());
+        config.port = reqwest::Url::parse(&endpoint).unwrap().port().unwrap();
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.descriptor_path = descriptor.display().to_string();
         config.markdown_chat.automation.connector_name = "Fixture connector".into();
@@ -772,6 +850,30 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+        for operation in ["start", "stop"] {
+            let url = format!("{base}/api/browser/{operation}");
+            assert_eq!(
+                client
+                    .post(&url)
+                    .json(&json!({"requestId":"unauthorized-control"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                client
+                    .post(&url)
+                    .bearer_auth("test-token")
+                    .json(&json!({"requestId":""}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
         let snapshot: Value = client
             .get(format!("{base}/api/settings"))
             .bearer_auth("test-token")
@@ -811,5 +913,124 @@ mod tests {
             .unwrap();
         assert_eq!(stale.status(), StatusCode::CONFLICT);
         server.abort();
+    }
+    #[tokio::test]
+    async fn schema_edits_debounce_and_external_edits_refresh_without_an_open_settings_page() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, fixture, _base, owner, companion) = refresh_fixture(root.path()).await;
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        Arc::make_mut(&mut state.config).loaded_config_path = Some(path.clone());
+        crate::owner_chat::start_schema_refresh(state.config.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::global_settings::read_schema_intent(&state.config).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The first edit is through the owner API's save path; the second is an
+        // external file edit, like config set or a text editor. Only the last
+        // schema should be refreshed, after ten quiet seconds.
+        let first = crate::global_settings::snapshot(&state.config).unwrap();
+        let saved = crate::global_settings::save(
+            &state.config,
+            first["revision"].as_str().unwrap(),
+            None,
+            Some(serde_json::Map::from_iter([(
+                "experimental.forceReadOnlyToolAnnotations".into(),
+                json!(true),
+            )])),
+        )
+        .unwrap();
+        assert_eq!(saved["schemaRefreshRequired"], true);
+        assert_eq!(saved["schemaRestartRequired"], false);
+        assert_eq!(saved["restartRequired"], false);
+        super::super::schema_refresh::queue(state.config.clone(), &saved)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(&path,json!({"workDir":root.path(),"codexMcp":{"enabled":false},"experimental":{"forceReadOnlyToolAnnotations":true,"forceIdempotentToolAnnotations":true}}).to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let pending = crate::global_settings::read_schema_intent(&state.config).unwrap();
+        assert_eq!(pending["phase"], "queued");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            crate::global_settings::advertising_config(&state.config)
+                .experimental
+                .force_read_only_tool_annotations
+        );
+        tokio::time::timeout(Duration::from_secs(14), async {
+            loop {
+                if crate::global_settings::read_schema_intent(&state.config)
+                    .is_some_and(|v| v["phase"] == "completed")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.successes.load(Ordering::SeqCst), 1);
+        owner.abort();
+        companion.abort();
+    }
+    #[tokio::test]
+    async fn structural_refresh_waits_for_restart_and_survives_agent_chat_being_disabled() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let (mut state, fixture, _base, owner, companion) = refresh_fixture(root.path()).await;
+        let path = root.path().join("config.json");
+        std::fs::write(&path,json!({"workDir":root.path(),"agentChat":{"enabled":false},"codexMcp":{"enabled":false}}).to_string()).unwrap();
+        let config = Arc::make_mut(&mut state.config);
+        config.loaded_config_path = Some(path);
+        config.markdown_chat.enabled = false;
+        let mut saved = crate::global_settings::snapshot(&state.config).unwrap();
+        saved["schemaRestartRequired"] = json!(true);
+        super::super::schema_refresh::queue(state.config.clone(), &saved)
+            .await
+            .unwrap();
+        let mut intent = crate::global_settings::read_schema_intent(&state.config).unwrap();
+        intent["dueAtMs"] = json!(0);
+        crate::global_settings::write_schema_intent(&state.config, &intent).unwrap();
+        // A following annotation-only edit must retain the pending restart.
+        saved["schemaRestartRequired"] = json!(false);
+        super::super::schema_refresh::queue(state.config.clone(), &saved)
+            .await
+            .unwrap();
+        intent = crate::global_settings::read_schema_intent(&state.config).unwrap();
+        assert_eq!(intent["phase"], "waiting_for_restart");
+        assert_eq!(intent["requiresRestart"], true);
+        intent["dueAtMs"] = json!(0);
+        crate::global_settings::write_schema_intent(&state.config, &intent).unwrap();
+        crate::owner_chat::start_schema_refresh(state.config.clone());
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        // Simulate the new worker after Restart: its PID differs from the writer.
+        intent = crate::global_settings::read_schema_intent(&state.config).unwrap();
+        intent["originPid"] = json!(0);
+        crate::global_settings::write_schema_intent(&state.config, &intent).unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if crate::global_settings::read_schema_intent(&state.config)
+                    .is_some_and(|v| v["phase"] == "completed")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.successes.load(Ordering::SeqCst), 1);
+        owner.abort();
+        companion.abort();
     }
 }

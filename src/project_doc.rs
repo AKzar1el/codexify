@@ -31,13 +31,6 @@ pub fn candidate_filenames(settings: &ProjectDocConfig) -> Vec<String> {
     names
 }
 
-fn root_markers(settings: &ProjectDocConfig) -> Vec<String> {
-    settings
-        .root_markers
-        .clone()
-        .unwrap_or_else(|| DEFAULT_ROOT_MARKERS.iter().map(|s| s.to_string()).collect())
-}
-
 /// Nearest ancestor of `start_dir` (inclusive) holding one of `markers`, or
 /// `None` when none does.
 pub fn find_project_root(start_dir: &Path, markers: &[String]) -> Option<PathBuf> {
@@ -59,29 +52,8 @@ pub fn find_project_root(start_dir: &Path, markers: &[String]) -> Option<PathBuf
 /// Directories from the project root down to the work directory, outermost
 /// first. Shared by AGENTS.md discovery and (in `skills.rs`) repo skill roots.
 pub fn project_dirs(config: &AppConfig) -> Vec<PathBuf> {
-    if config.multi_project {
-        return vec![config.work_dir.clone()];
-    }
-
-    let settings = &config.project_doc;
-    let root = find_project_root(&config.work_dir, &root_markers(settings));
-
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut cursor = config.work_dir.clone();
-    loop {
-        dirs.push(cursor.clone());
-        match &root {
-            Some(r) if &cursor == r => break,
-            None => break,
-            _ => {}
-        }
-        match cursor.parent() {
-            Some(parent) if parent != cursor => cursor = parent.to_path_buf(),
-            _ => break,
-        }
-    }
-    dirs.reverse();
-    dirs
+    // The selected workspace is the instruction boundary; never scan parents.
+    vec![config.work_dir.clone()]
 }
 
 /// Project docs from the project root down to the work directory, at most one

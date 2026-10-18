@@ -17,6 +17,9 @@ use zip::ZipArchive;
 use crate::markdown_chat::AgentAutomationConfig;
 use crate::util::home_dir;
 
+use super::process::{
+    executable as process_executable, managed_descendants, orphaned_browser, same_process,
+};
 use super::{
     BrowserCompanionClient, CompanionSessionStatus, PROTOCOL_BUILD_SUFFIX, PROTOCOL_SCHEMA_HASH,
     PROTOCOL_VERSION,
@@ -146,10 +149,10 @@ impl BrowserCompanionManager {
     pub fn from_config(config: &AgentAutomationConfig) -> Result<Self, String> {
         let root = match std::env::var_os("CODEXIFY_BROWSER_HOME") {
             Some(path) => PathBuf::from(path),
-            None => home_dir()
-                .ok_or_else(|| "Browser companion lifecycle requires a home directory".to_string())?
-                .join(".codexify")
-                .join("browser"),
+            None => expand_descriptor_path(&config.descriptor_path)?
+                .parent()
+                .ok_or("Browser descriptor has no parent directory")?
+                .to_path_buf(),
         };
         let release_root = std::env::var("CODEXIFY_BROWSER_RELEASE_ROOT")
             .unwrap_or_else(|_| DEFAULT_RELEASE_ROOT.to_string());
@@ -254,6 +257,13 @@ impl BrowserCompanionManager {
     }
 
     pub async fn start(&self) -> Result<BrowserCompanionStatus, String> {
+        self.start_checked(|| Ok(())).await
+    }
+    pub(super) async fn start_checked(
+        &self,
+        allowed: impl Fn() -> Result<(), String>,
+    ) -> Result<BrowserCompanionStatus, String> {
+        allowed()?;
         if !self.config.enabled {
             return Err("Browser automation is disabled".into());
         }
@@ -288,13 +298,17 @@ impl BrowserCompanionManager {
             .map_err(|_| "Could not duplicate the browser companion log handle".to_string())?;
         let mut command = StdCommand::new(&runtime.entrypoint);
         command
-            .current_dir(&self.layout.runtime_dir)
+            .current_dir(
+                self.layout
+                    .runtime_root
+                    .join(&runtime.manifest.codexify_version),
+            )
             .env("CODEXIFY_BROWSER_HOME", &self.layout.root)
             .env("CODEXIFY_BROWSER_DESCRIPTOR", &self.layout.descriptor_path)
-            .env("CODEXIFY_BROWSER_BUILD", &self.expected_build)
+            .env("CODEXIFY_BROWSER_BUILD", &runtime.manifest.build)
             .env(
                 "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST",
-                serde_json::to_string(&self.config.request_block_list)
+                serde_json::to_string(self.config.effective_request_block_list())
                     .map_err(|_| "Could not encode browser request block list")?,
             )
             .stdin(Stdio::null())
@@ -306,6 +320,17 @@ impl BrowserCompanionManager {
             .map_err(|_| "Could not start the installed browser companion".to_string())?;
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
+            if let Err(error) = allowed() {
+                if let Ok(executable) =
+                    process_executable(child.id()).and_then(|p| p.canonicalize())
+                {
+                    let _ =
+                        stop_process_tree(child.id(), executable, &self.layout.runtime_root).await;
+                } else {
+                    cleanup_started_child(child.id(), &self.layout.runtime_root).await;
+                }
+                return Err(error);
+            }
             if let Some(exit) = child
                 .try_wait()
                 .map_err(|_| "Could not inspect the browser companion process".to_string())?
@@ -324,18 +349,28 @@ impl BrowserCompanionManager {
             ) {
                 return Ok(status);
             }
-            if matches!(
-                status.state,
-                BrowserLifecycleState::Incompatible | BrowserLifecycleState::Unavailable
-            ) && self.layout.descriptor_path.exists()
+            if status.state == BrowserLifecycleState::Unavailable
+                && let Ok(client) = BrowserCompanionClient::from_descriptor_path_with_timeout(
+                    &self.layout.descriptor_path,
+                    Duration::from_secs(2),
+                )
+                && client
+                    .liveness(&tokio_util::sync::CancellationToken::new())
+                    .await
+                    == Ok(Some(true))
             {
-                let _ = terminate_process(child.id(), true);
+                return Ok(status);
+            }
+            if status.state == BrowserLifecycleState::Incompatible
+                && self.layout.descriptor_path.exists()
+            {
+                cleanup_started_child(child.id(), &self.layout.runtime_root).await;
                 return Err(status.detail.unwrap_or_else(|| {
                     "Browser companion failed its startup verification".into()
                 }));
             }
             if Instant::now() >= deadline {
-                let _ = terminate_process(child.id(), true);
+                cleanup_started_child(child.id(), &self.layout.runtime_root).await;
                 return Err(
                     "Browser companion did not become ready before the startup deadline".into(),
                 );
@@ -347,42 +382,61 @@ impl BrowserCompanionManager {
     pub async fn stop(&self) -> Result<BrowserCompanionStatus, String> {
         let client = match BrowserCompanionClient::from_descriptor_path_with_timeout(
             &self.layout.descriptor_path,
-            STOP_TIMEOUT,
+            Duration::from_secs(2),
         ) {
             Ok(client) => client,
             Err(message) if descriptor_means_stopped(&message) => {
+                if let Some((pid, executable)) = orphaned_browser(
+                    &self.layout.root.join("chrome-profile"),
+                    &self.layout.runtime_root,
+                )? {
+                    self.verify_runtime_path(&executable)?;
+                    stop_process_tree(pid, executable, &self.layout.runtime_root).await?;
+                }
                 self.remove_stale_descriptor()?;
                 return Ok(self.status().await);
             }
             Err(message) => return Err(message),
         };
-        if client.build() != self.expected_build {
-            return Err("Browser companion build does not match the installed runtime".into());
-        }
-        client
+        let health = client
             .health(&tokio_util::sync::CancellationToken::new())
-            .await?;
+            .await;
         let pid = client.pid();
-        terminate_process(pid, false)?;
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        while self.layout.descriptor_path.exists()
-            && process_is_alive(pid)
-            && Instant::now() < deadline
+        let executable = match process_executable(pid) {
+            Ok(path) => path
+                .canonicalize()
+                .map_err(|_| "Could not verify the browser companion executable")?,
+            Err(error) if health.is_err() && matches!(error.raw_os_error(), Some(2 | 3)) => {
+                // A dead/zombie launcher may leave a valid-looking PID descriptor.
+                if let Some((pid, executable)) = orphaned_browser(
+                    &self.layout.root.join("chrome-profile"),
+                    &self.layout.runtime_root,
+                )? {
+                    self.verify_runtime_path(&executable)?;
+                    stop_process_tree(pid, executable, &self.layout.runtime_root).await?;
+                }
+                self.remove_stale_descriptor()?;
+                return Ok(self.status().await);
+            }
+            Err(_) => return Err("Could not verify the browser companion executable".into()),
+        };
+        if let Err(error) = health {
+            // A frozen HTTP server cannot authenticate a stop. Its OS executable
+            // must instead match the manifest of this private managed runtime.
+            if !self
+                .managed_executable(client.build())
+                .is_ok_and(|expected| expected == executable)
+            {
+                return Err(format!(
+                    "{error}; could not verify a managed browser companion process"
+                ));
+            }
+        }
+        stop_process_tree(pid, executable, &self.layout.runtime_root).await?;
+        if BrowserCompanionClient::from_descriptor_path(&self.layout.descriptor_path)
+            .is_ok_and(|current| current.pid() != pid)
         {
-            tokio::time::sleep(LIFECYCLE_POLL_INTERVAL).await;
-        }
-        if self.layout.descriptor_path.exists() && process_is_alive(pid) {
-            terminate_process(pid, true)?;
-        }
-        let force_deadline = Instant::now() + Duration::from_secs(2);
-        while self.layout.descriptor_path.exists()
-            && process_is_alive(pid)
-            && Instant::now() < force_deadline
-        {
-            tokio::time::sleep(LIFECYCLE_POLL_INTERVAL).await;
-        }
-        if self.layout.descriptor_path.exists() && process_is_alive(pid) {
-            return Err("Browser companion process did not stop".into());
+            return Err("Browser companion changed while stopping".into());
         }
         self.remove_stale_descriptor()?;
         Ok(self.status().await)
@@ -391,9 +445,6 @@ impl BrowserCompanionManager {
     pub async fn login(&self) -> Result<BrowserCompanionStatus, String> {
         self.start().await?;
         let client = BrowserCompanionClient::from_descriptor_path(&self.layout.descriptor_path)?;
-        if client.build() != self.expected_build {
-            return Err("Browser companion build does not match the installed runtime".into());
-        }
         let health = client
             .login(&tokio_util::sync::CancellationToken::new())
             .await?;
@@ -406,9 +457,6 @@ impl BrowserCompanionManager {
     pub async fn reveal(&self) -> Result<BrowserCompanionStatus, String> {
         self.start().await?;
         let client = BrowserCompanionClient::from_descriptor_path(&self.layout.descriptor_path)?;
-        if client.build() != self.expected_build {
-            return Err("Browser companion build does not match the installed runtime".into());
-        }
         client
             .reveal(
                 &super::RevealWindowRequest { url: None },
@@ -456,43 +504,45 @@ impl BrowserCompanionManager {
             }
         };
 
-        let client =
-            match BrowserCompanionClient::from_descriptor_path(&self.layout.descriptor_path) {
-                Ok(client) => client,
-                Err(message) if descriptor_means_stopped(&message) => {
-                    return self.status_value(
-                        BrowserLifecycleState::Stopped,
-                        true,
-                        false,
-                        false,
-                        Some(runtime.manifest.build),
-                        Some(runtime.entrypoint),
-                        Some("The installed browser companion is not running".into()),
-                    );
-                }
-                Err(message) if descriptor_means_incompatible(&message) => {
-                    return self.status_value(
-                        BrowserLifecycleState::Incompatible,
-                        true,
-                        false,
-                        false,
-                        Some(runtime.manifest.build),
-                        Some(runtime.entrypoint),
-                        Some(message),
-                    );
-                }
-                Err(message) => {
-                    return self.status_value(
-                        BrowserLifecycleState::Unavailable,
-                        true,
-                        false,
-                        false,
-                        Some(runtime.manifest.build),
-                        Some(runtime.entrypoint),
-                        Some(message),
-                    );
-                }
-            };
+        let client = match BrowserCompanionClient::from_descriptor_path_with_timeout(
+            &self.layout.descriptor_path,
+            Duration::from_secs(2),
+        ) {
+            Ok(client) => client,
+            Err(message) if descriptor_means_stopped(&message) => {
+                return self.status_value(
+                    BrowserLifecycleState::Stopped,
+                    true,
+                    false,
+                    false,
+                    Some(runtime.manifest.build),
+                    Some(runtime.entrypoint),
+                    Some("The installed browser companion is not running".into()),
+                );
+            }
+            Err(message) if descriptor_means_incompatible(&message) => {
+                return self.status_value(
+                    BrowserLifecycleState::Incompatible,
+                    true,
+                    false,
+                    false,
+                    Some(runtime.manifest.build),
+                    Some(runtime.entrypoint),
+                    Some(message),
+                );
+            }
+            Err(message) => {
+                return self.status_value(
+                    BrowserLifecycleState::Unavailable,
+                    true,
+                    false,
+                    false,
+                    Some(runtime.manifest.build),
+                    Some(runtime.entrypoint),
+                    Some(message),
+                );
+            }
+        };
         let health = match client
             .health(&tokio_util::sync::CancellationToken::new())
             .await
@@ -668,6 +718,81 @@ impl BrowserCompanionManager {
     }
 
     fn installed_runtime(&self) -> Result<Option<InstalledBrowserRuntime>, String> {
+        if let Some(runtime) = self.current_runtime()? {
+            return Ok(Some(runtime));
+        }
+        let mut versions = fs::read_dir(&self.layout.runtime_root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| Version::parse(name).ok())
+            })
+            .collect::<Vec<_>>();
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            let build = format!("{version}{PROTOCOL_BUILD_SUFFIX}");
+            let root = self.layout.runtime_root.join(version.to_string());
+            if let Ok(entrypoint) = self.managed_executable(&build) {
+                let manifest =
+                    read_manifest(&root.join(MANIFEST_FILE)).map_err(|e| e.to_string())?;
+                return Ok(Some(InstalledBrowserRuntime {
+                    manifest,
+                    entrypoint,
+                }));
+            }
+        }
+        Ok(None)
+    }
+    fn verify_runtime_path(&self, path: &Path) -> Result<(), String> {
+        let root = self
+            .layout
+            .runtime_root
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let version = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.components().next())
+            .and_then(|p| p.as_os_str().to_str())
+            .ok_or("Process is outside its managed runtime")?;
+        self.managed_executable(&format!("{version}{PROTOCOL_BUILD_SUFFIX}"))
+            .map(|_| ())
+    }
+    fn managed_executable(&self, build: &str) -> Result<PathBuf, String> {
+        let version = build
+            .strip_suffix(PROTOCOL_BUILD_SUFFIX)
+            .and_then(|version| Version::parse(version).ok())
+            .ok_or("Browser companion build is incompatible")?;
+        let root = self.layout.runtime_root.join(version.to_string());
+        if !fs::symlink_metadata(&root).is_ok_and(|m| m.file_type().is_dir()) {
+            return Err("Browser runtime is not a real directory".into());
+        }
+        let manifest = read_manifest(&root.join(MANIFEST_FILE)).map_err(|e| e.to_string())?;
+        let entrypoint = validate_manifest(
+            &manifest,
+            &root,
+            &version.to_string(),
+            &self.asset.platform,
+            build,
+        )
+        .map_err(|e| e.to_string())?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+        let runtime_root = self
+            .layout
+            .runtime_root
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !entrypoint.starts_with(runtime_root) {
+            return Err("Browser executable is outside its managed runtime".into());
+        }
+        Ok(entrypoint)
+    }
+    fn current_runtime(&self) -> Result<Option<InstalledBrowserRuntime>, String> {
         let metadata = match fs::symlink_metadata(&self.layout.runtime_dir) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -748,8 +873,12 @@ impl BrowserCompanionManager {
             running,
             authenticated,
             active_action_id: None,
-            version: self.asset.version.clone(),
-            build,
+            version: build
+                .as_deref()
+                .and_then(|b| b.strip_suffix(PROTOCOL_BUILD_SUFFIX))
+                .unwrap_or(&self.asset.version)
+                .to_owned(),
+            build: build.clone(),
             platform: self.asset.platform.clone(),
             runtime_dir: entrypoint.map(|_| self.layout.runtime_dir.clone()),
             descriptor_path: self.layout.descriptor_path.clone(),
@@ -1215,7 +1344,7 @@ fn create_private_directory(path: &Path) -> anyhow::Result<()> {
     set_private_directory_permissions(path)
 }
 
-fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+pub(super) fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)
             .with_context(|| format!("create private directory {}", path.display()))?;
@@ -1240,7 +1369,7 @@ fn set_private_directory_permissions(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn atomic_private_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(super) fn atomic_private_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .context("Browser companion private file has no parent directory")?;
@@ -1473,31 +1602,44 @@ fn terminate_process(_pid: u32, _force: bool) -> Result<(), String> {
     Err("Browser companion process control is unsupported on this platform".into())
 }
 
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid > i32::MAX as u32 {
-        return false;
+async fn stop_process_tree(
+    pid: u32,
+    executable: PathBuf,
+    runtime_root: &Path,
+) -> Result<(), String> {
+    let mut owned = managed_descendants(pid, runtime_root)?;
+    owned.push((pid, executable));
+    terminate_process(pid, false)?;
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while owned
+        .iter()
+        .any(|(pid, executable)| same_process(*pid, executable))
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(LIFECYCLE_POLL_INTERVAL).await;
     }
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
+    // Chrome can outlive a frozen launcher. Stop only previously verified
+    // descendants in this managed runtime, never a system Chrome instance.
+    for (pid, executable) in &owned {
+        if same_process(*pid, executable) {
+            terminate_process(*pid, true)?;
+        }
     }
-    unsafe { CloseHandle(handle) };
-    true
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while owned
+        .iter()
+        .any(|(pid, executable)| same_process(*pid, executable))
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(LIFECYCLE_POLL_INTERVAL).await;
+    }
+    if owned
+        .iter()
+        .any(|(pid, executable)| same_process(*pid, executable))
+    {
+        return Err("Browser companion process did not stop".into());
+    }
+    Ok(())
 }
 
 fn random_id() -> anyhow::Result<String> {
@@ -1520,4 +1662,12 @@ fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+async fn cleanup_started_child(pid: u32, root: &Path) {
+    if let Ok(executable) = process_executable(pid).and_then(|p| p.canonicalize()) {
+        let _ = stop_process_tree(pid, executable, root).await;
+    } else {
+        let _ = terminate_process(pid, true);
+    }
 }

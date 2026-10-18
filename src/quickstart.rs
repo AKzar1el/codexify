@@ -229,14 +229,6 @@ where
     let config_value = wizard.decorate(ACCENT, config_path.display());
     writeln!(wizard.output, "{config_label} {config_value}\n")?;
 
-    let multi_project_default = file_config
-        .get("multiProject")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let multi_project = wizard.confirm(
-        "Use multi-project mode (recommended: select a project independently in each chat)?",
-        multi_project_default,
-    )?;
     let default_work_dir = args
         .work_dir
         .as_deref()
@@ -247,7 +239,6 @@ where
         &default_work_dir,
         &environment.current_dir,
         &environment.home_dir,
-        multi_project,
     )?;
 
     let default_connector_name = connector_name_default(&file_config);
@@ -290,7 +281,6 @@ where
         &tunnel_id,
         &key_path,
         &work_dir,
-        multi_project,
         conversation_auth_token.as_deref(),
     )?;
     let chat = file_config
@@ -324,15 +314,7 @@ where
     }
     write_summary_value(&mut wizard, "Config", config_path.display())?;
     write_summary_value(&mut wizard, "Runtime key", key_path.display())?;
-    write_summary_value(
-        &mut wizard,
-        if multi_project {
-            "Projects access root"
-        } else {
-            "Project directory"
-        },
-        work_dir.display(),
-    )?;
+    write_summary_value(&mut wizard, "Projects access root", work_dir.display())?;
     if conversation_auth_token.is_some() {
         let authorization = wizard.decorate(
             WARNING,
@@ -350,7 +332,7 @@ where
     let command = wizard.decorate(ACCENT, command);
     writeln!(wizard.output, "\n{launch_label}\n  {command}")?;
 
-    print_connector_step(&mut wizard, &connector_name, &tunnel_id, multi_project)?;
+    print_connector_step(&mut wizard, &connector_name, &tunnel_id)?;
     if let Some(token) = conversation_auth_token.as_deref() {
         print_conversation_auth_step(&mut wizard, token)?;
     }
@@ -512,7 +494,6 @@ fn prompt_existing_directory<R, W, F>(
     default: &Path,
     current_dir: &Path,
     home_dir: &Path,
-    multi_project: bool,
 ) -> anyhow::Result<PathBuf>
 where
     R: BufRead,
@@ -520,11 +501,7 @@ where
     F: FnMut(&str, &mut W) -> io::Result<String>,
 {
     let default = default.to_string_lossy();
-    let label = if multi_project {
-        "Projects access root"
-    } else {
-        "Project directory"
-    };
+    let label = "Projects access root";
     loop {
         let raw = wizard.prompt(label, Some(&default))?;
         let candidate = resolve_user_path(&raw, current_dir, home_dir);
@@ -715,18 +692,13 @@ fn print_connector_step<R, W, F>(
     wizard: &mut Wizard<'_, R, W, F>,
     connector_name: &str,
     tunnel_id: &str,
-    multi_project: bool,
 ) -> anyhow::Result<()>
 where
     R: BufRead,
     W: Write,
     F: FnMut(&str, &mut W) -> io::Result<String>,
 {
-    let description = if multi_project {
-        "Local Codex-style tools with per-chat project selection"
-    } else {
-        "Local Codex-style file, shell, Git, and MCP tools"
-    };
+    let description = "Local Codex-style tools with per-chat project selection";
     let heading = wizard.decorate(HEADING, "3. Add the connector in ChatGPT Web");
     let guide_label = wizard.decorate(EMPHASIS, "   Developer-mode guide:");
     let guide_url = wizard.decorate(ACCENT, DEVELOPER_MODE_GUIDE_URL);
@@ -845,7 +817,6 @@ fn merge_tunnel_config(
     tunnel_id: &str,
     key_path: &Path,
     work_dir: &Path,
-    multi_project: bool,
     conversation_auth_token: Option<&str>,
 ) -> anyhow::Result<()> {
     config.insert(
@@ -896,7 +867,7 @@ fn merge_tunnel_config(
                 .to_string(),
         ),
     );
-    config.insert("multiProject".to_string(), Value::Bool(multi_project));
+    config.remove("multiProject");
     config.remove("allowedCommands");
     let remove_empty_exec = config
         .get_mut("exec")
@@ -1321,7 +1292,7 @@ mod tests {
             config["workDir"],
             json!(fs::canonicalize(&project).unwrap())
         );
-        assert_eq!(config["multiProject"], json!(true));
+        assert!(config.get("multiProject").is_none());
         assert!(config.get("conversationAuthToken").is_none());
         assert_eq!(config["openaiTunnel"]["tunnelId"], json!(TUNNEL_ID));
         assert_eq!(
@@ -1344,11 +1315,7 @@ mod tests {
         assert!(output.contains("Name: Codexify"));
         assert!(!output.contains("Codexify - Projects"));
         assert!(!output.contains("Press Enter after the tunnel"));
-        assert!(
-            output.find("Use multi-project mode").unwrap()
-                < output.find("Projects access root").unwrap(),
-            "{output}"
-        );
+        assert!(!output.contains("Use multi-project mode"));
         assert!(output.contains(TUNNEL_ID));
         assert!(!output.contains("Require each new ChatGPT conversation"));
         assert!(!output.contains("Configure ChatGPT conversation authorization"));
@@ -1387,7 +1354,7 @@ mod tests {
         .unwrap()
         .clone();
         let second_key = root.path().join("second.key");
-        merge_tunnel_config(&mut config, TUNNEL_ID, &second_key, work_dir, false, None).unwrap();
+        merge_tunnel_config(&mut config, TUNNEL_ID, &second_key, work_dir, None).unwrap();
         assert!(!config.contains_key("openaiTunnel"));
         let tunnels = config["openaiTunnels"].as_array().unwrap();
         assert_eq!(tunnels.len(), 2);
@@ -1399,7 +1366,7 @@ mod tests {
             format!("file:{}", second_key.display())
         );
         let replacement = root.path().join("replacement.key");
-        merge_tunnel_config(&mut config, TUNNEL_ID, &replacement, work_dir, false, None).unwrap();
+        merge_tunnel_config(&mut config, TUNNEL_ID, &replacement, work_dir, None).unwrap();
         let tunnels = config["openaiTunnels"].as_array().unwrap();
         assert_eq!(tunnels.len(), 2);
         assert_eq!(
@@ -1409,13 +1376,13 @@ mod tests {
     }
 
     #[test]
-    fn single_project_mode_is_chosen_before_the_path_prompt() {
+    fn project_selection_is_always_enabled_without_a_mode_prompt() {
         let root = TempDir::new().unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(&project).unwrap();
         let config_path = project.join("codexify.config.json");
         let environment = environment(&root, &project);
-        let input = format!("n\n\n\n{TUNNEL_ID}\n\n");
+        let input = format!("\n\n{TUNNEL_ID}\n\n");
 
         let (result, output) = run_test_wizard(
             args(config_path.clone(), &project),
@@ -1427,14 +1394,9 @@ mod tests {
         assert!(outcome.restart_service);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(config["multiProject"], false);
-        assert!(output.contains("Project directory"), "{output}");
-        assert!(!output.contains("Projects access root"), "{output}");
-        assert!(
-            output.find("Use multi-project mode").unwrap()
-                < output.find("Project directory").unwrap(),
-            "{output}"
-        );
+        assert!(config.get("multiProject").is_none());
+        assert!(output.contains("Projects access root"));
+        assert!(!output.contains("Use multi-project mode"));
     }
 
     #[test]
@@ -1522,7 +1484,7 @@ mod tests {
             config["agentChat"]["automation"]["connectorName"],
             "My exact connector"
         );
-        assert_eq!(config["multiProject"], json!(true));
+        assert!(config.get("multiProject").is_none());
         assert_eq!(
             config["workDir"],
             json!(fs::canonicalize(&project).unwrap())

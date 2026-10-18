@@ -266,7 +266,9 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn run_browser(cli: Cli, command: BrowserCommand) -> anyhow::Result<()> {
-    use codexify::agent_automation::{BrowserCompanionManager, BrowserLifecycleState};
+    use codexify::agent_automation::{
+        BrowserCompanionControl, BrowserCompanionManager, BrowserLifecycleState,
+    };
 
     let config = if matches!(command, BrowserCommand::Status(_)) {
         load_config_quiet_read_only(cli)
@@ -287,18 +289,37 @@ async fn run_browser(cli: Cli, command: BrowserCommand) -> anyhow::Result<()> {
             ))?;
         }
         BrowserCommand::Start => {
-            let status = manager.start().await.map_err(anyhow::Error::msg)?;
+            BrowserCompanionControl::new(&config.markdown_chat.automation)
+                .map_err(anyhow::Error::msg)?
+                .start(&tokio_util::sync::CancellationToken::new())
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let status = manager.status().await;
             codexify::terminal::write_stdout(&render_browser_status(&status))?;
         }
         BrowserCommand::Stop => {
-            let status = manager.stop().await.map_err(anyhow::Error::msg)?;
+            let status = BrowserCompanionControl::new(&config.markdown_chat.automation)
+                .map_err(anyhow::Error::msg)?
+                .stop(&tokio_util::sync::CancellationToken::new())
+                .await
+                .map_err(anyhow::Error::msg)?;
             codexify::terminal::write_stdout(&render_browser_status(&status))?;
         }
         BrowserCommand::Login => {
+            BrowserCompanionControl::new(&config.markdown_chat.automation)
+                .map_err(anyhow::Error::msg)?
+                .start(&tokio_util::sync::CancellationToken::new())
+                .await
+                .map_err(anyhow::Error::msg)?;
             let status = manager.login().await.map_err(anyhow::Error::msg)?;
             codexify::terminal::write_stdout(&render_browser_status(&status))?;
         }
         BrowserCommand::Reveal => {
+            BrowserCompanionControl::new(&config.markdown_chat.automation)
+                .map_err(anyhow::Error::msg)?
+                .start(&tokio_util::sync::CancellationToken::new())
+                .await
+                .map_err(anyhow::Error::msg)?;
             let status = manager.reveal().await.map_err(anyhow::Error::msg)?;
             codexify::terminal::write_stdout(&render_browser_status(&status))?;
         }

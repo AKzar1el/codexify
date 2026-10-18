@@ -690,6 +690,7 @@ server.serve_forever()
     let root = tempfile::tempdir().unwrap();
     let browser_root = root.path().join("browser");
     let mut launch_config = enabled_config(&browser_root.join("descriptor.json"));
+    launch_config.request_blocking_enabled = true;
     launch_config.request_block_list = vec![r"^https?://example\.invalid/blocked".into()];
     let manager = BrowserCompanionManager::for_test(
         browser_root.clone(),
@@ -725,8 +726,17 @@ server.serve_forever()
         BrowserLifecycleState::Ready
     );
     assert!(manager.layout().log_path.is_file());
+    let newer_manager = BrowserCompanionManager::for_test(
+        browser_root.clone(),
+        enabled_config(&browser_root.join("descriptor.json")),
+        "1.8.0",
+        "macos",
+        "aarch64",
+        "https://example.invalid/releases/download",
+    )
+    .unwrap();
     assert_eq!(
-        manager.stop().await.unwrap().state,
+        newer_manager.stop().await.unwrap().state,
         BrowserLifecycleState::Stopped
     );
     assert!(!manager.layout().descriptor_path.exists());
@@ -782,4 +792,229 @@ async fn stop_refuses_to_signal_a_pid_until_the_authenticated_companion_responds
 
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
+}
+
+#[cfg(unix)]
+fn recovery_fixture() -> (
+    tempfile::TempDir,
+    BrowserCompanionManager,
+    codexify::agent_automation::BrowserCompanionControl,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("companion.c");
+    std::fs::write(
+        &source,
+        include_bytes!("fixtures/browser_companion_lifecycle.c"),
+    )
+    .unwrap();
+    let executable = root.path().join("companion");
+    let compiled = std::process::Command::new("/usr/bin/cc")
+        .args(["-std=c11", "-D_POSIX_C_SOURCE=200809L"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let browser = root.path().join("browser");
+    let config = enabled_config(&browser.join("descriptor.json"));
+    let manager = BrowserCompanionManager::for_test(
+        browser,
+        config.clone(),
+        "1.7.0",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        "https://example.invalid/releases/download",
+    )
+    .unwrap();
+    let archive = tar_package_with_entrypoint(
+        &manager.release_asset().platform,
+        "1.7.0",
+        manager.expected_build(),
+        "app/companion",
+        &std::fs::read(executable).unwrap(),
+    );
+    let checksums = checksum_line(&manager.release_asset().archive_name, &archive);
+    manager
+        .install_verified_archive(&archive, checksums.as_bytes())
+        .unwrap();
+    let control =
+        codexify::agent_automation::BrowserCompanionControl::with_manager(config, manager.clone());
+    (root, manager, control)
+}
+#[cfg(unix)]
+async fn wait_until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn browser_watchdog_reopens_a_closed_companion_and_honors_manual_stop_across_controls() {
+    use codexify::agent_automation::{BrowserCompanionClient, BrowserCompanionControl};
+    use tokio_util::sync::CancellationToken;
+    let (_root, manager, control) = recovery_fixture();
+    let token = CancellationToken::new();
+    let client = control.start(&token).await.unwrap();
+    let first = client.pid();
+    let profile = manager.layout().root.join("chrome-profile");
+    std::fs::create_dir(&profile).unwrap();
+    std::fs::write(profile.join("keep"), b"signed-in-profile").unwrap();
+    let worker = control.watch();
+    unsafe { libc::kill(first as i32, libc::SIGTERM) };
+    wait_until(|| {
+        BrowserCompanionClient::from_descriptor_path(&manager.layout().descriptor_path)
+            .is_ok_and(|c| c.pid() != first)
+    })
+    .await;
+    control.stop(&token).await.unwrap();
+    let starts = std::fs::read(manager.layout().root.join("starts")).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5300)).await;
+    assert!(!manager.layout().descriptor_path.exists());
+    assert_eq!(
+        std::fs::read(manager.layout().root.join("starts")).unwrap(),
+        starts
+    );
+    let config = enabled_config(&manager.layout().descriptor_path);
+    let reopened = BrowserCompanionControl::with_manager(config, manager.clone());
+    assert!(
+        reopened
+            .ensure_running(&token)
+            .await
+            .unwrap_err()
+            .contains("stopped by you")
+    );
+    let client = reopened.start(&token).await.unwrap();
+    assert_ne!(client.pid(), first);
+    reopened.stop(&token).await.unwrap();
+    drop(worker);
+    assert_eq!(
+        std::fs::read(profile.join("keep")).unwrap(),
+        b"signed-in-profile"
+    );
+    assert!(
+        std::fs::read_to_string(manager.layout().root.join("requests"))
+            .unwrap()
+            .lines()
+            .all(|line| matches!(
+                line,
+                "GET /v1/health HTTP/1.1" | "GET /v1/liveness HTTP/1.1"
+            ))
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn browser_recovery_restarts_unavailable_and_frozen_processes_but_keeps_busy_or_signed_out_sessions()
+ {
+    use tokio_util::sync::CancellationToken;
+    let (_root, manager, control) = recovery_fixture();
+    let token = CancellationToken::new();
+    let peer = control.clone();
+    let (first_start, second_start) = tokio::join!(control.start(&token), peer.start(&token));
+    let client = first_start.unwrap();
+    assert_eq!(client.pid(), second_start.unwrap().pid());
+    assert_eq!(
+        std::fs::read_to_string(manager.layout().root.join("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let first = client.pid();
+    let mode = manager.layout().root.join("health-mode");
+    for state in ["busy", "authentication_required", "session_unavailable"] {
+        std::fs::write(&mode, state).unwrap();
+        assert_eq!(control.ensure_running(&token).await.unwrap().pid(), first);
+    }
+    std::fs::write(&mode, "unavailable").unwrap();
+    let second = control.ensure_running(&token).await.unwrap().pid();
+    assert_ne!(second, first);
+    std::fs::write(&mode, "frozen").unwrap();
+    let third = tokio::time::timeout(
+        std::time::Duration::from_secs(40),
+        control.ensure_running(&token),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .pid();
+    assert_ne!(third, second);
+    control.stop(&token).await.unwrap();
+    assert!(
+        std::fs::read_to_string(manager.layout().root.join("requests"))
+            .unwrap()
+            .lines()
+            .all(|line| matches!(
+                line,
+                "GET /v1/health HTTP/1.1" | "GET /v1/liveness HTTP/1.1"
+            ))
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_stop_cancels_browser_startup_without_waiting_for_its_deadline() {
+    use tokio_util::sync::CancellationToken;
+    let (_root, manager, control) = recovery_fixture();
+    std::fs::write(manager.layout().root.join("delay-start"), b"delay").unwrap();
+    let starting = control.clone();
+    let start = tokio::spawn(async move { starting.start(&CancellationToken::new()).await });
+    wait_until(|| manager.layout().root.join("starts").exists()).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control.stop(&CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(start.await.unwrap().unwrap_err().contains("stopped by you"));
+    assert!(!manager.layout().descriptor_path.exists());
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_an_orphan_only_targets_the_managed_executable_with_the_matching_profile() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let (_root, manager, _control) = recovery_fixture();
+    let runtime = manager.layout().runtime_dir.join("app/companion");
+    // A copied shell blocks in a builtin without spawning unrelated subprocesses.
+    std::fs::copy("/bin/sh", &runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profile = manager.layout().root.join("chrome-profile");
+    std::fs::create_dir(&profile).unwrap();
+    let other = manager.layout().root.join("other-profile");
+    std::fs::create_dir(&other).unwrap();
+    for matching in [false, true] {
+        let mut child = std::process::Command::new(&runtime)
+            .args(["-c", "read -r value"])
+            .arg(format!(
+                "--user-data-dir={}",
+                if matching { &profile } else { &other }.display()
+            ))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        symlink(
+            format!("lifecycle-host-{pid}"),
+            profile.join("SingletonLock"),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        manager.stop().await.unwrap();
+        if matching {
+            child.wait().unwrap();
+        } else {
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        std::fs::remove_file(profile.join("SingletonLock")).unwrap();
+    }
 }

@@ -996,11 +996,7 @@ fn browser_companion_check_from_status(status: BrowserCompanionStatus) -> Doctor
 }
 
 fn effective_configuration_check(config: &AppConfig) -> DoctorCheck {
-    let mode = if config.multi_project {
-        "multi-project"
-    } else {
-        "single-project"
-    };
+    let mode = { "multi-project" };
     DoctorCheck::pass("configuration", "Effective configuration is valid").with_detail(format!(
         "workDir={}; port={}; mode={mode}; mcpServers={}",
         config.work_dir.display(),

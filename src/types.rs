@@ -280,7 +280,7 @@ pub const DEFAULT_ARTIFACT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_ARTIFACT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_ARTIFACT_IDLE_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_ARTIFACT_MAX_REDIRECTS: u8 = 3;
-pub const DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS: usize = 2;
+pub const DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS: usize = 8;
 
 pub const DEFAULT_ARTIFACT_EGRESS_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_ARTIFACT_EGRESS_SNAPSHOT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -467,7 +467,7 @@ pub struct FilesystemConfig {
 impl Default for FilesystemConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_workers: 4,
+            max_concurrent_workers: 8,
             max_pending_requests: 16,
             max_scan_bytes: 64 * 1024 * 1024,
             max_scan_entries: 100_000,
@@ -750,7 +750,7 @@ pub struct ToolLoggingConfig {
 impl Default for ToolLoggingConfig {
     fn default() -> Self {
         Self {
-            mode: ToolLogMode::Off,
+            mode: ToolLogMode::All,
             level: ToolLogLevel::Info,
             max_request_bytes: 2 * 1024,
             max_response_bytes: 4 * 1024,
@@ -825,7 +825,7 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             log_file: None,
-            include_command_preview: false,
+            include_command_preview: true,
             command_preview_max_bytes: 512,
             redact_env: Vec::new(),
         }
@@ -864,7 +864,7 @@ pub struct WorktreeConfig {
     pub allow_setup_script: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExperimentalConfig {
     pub agent_tickets: bool,
     /// The real tool behavior remains authoritative for dispatch and authorization.
@@ -874,6 +874,19 @@ pub struct ExperimentalConfig {
     pub force_idempotent_tool_annotations: Option<bool>,
     pub force_open_world_tool_annotations: Option<bool>,
     pub claude_skills: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            agent_tickets: false,
+            force_read_only_tool_annotations: false,
+            force_destructive_tool_annotations: Some(false),
+            force_idempotent_tool_annotations: None,
+            force_open_world_tool_annotations: Some(false),
+            claude_skills: false,
+        }
+    }
 }
 
 /// The fully-resolved server configuration handed to every tool.
@@ -893,7 +906,6 @@ pub struct AppConfig {
     /// Advertise and serve Codexify's built-in MCP App widgets.
     pub ui_widgets: bool,
     pub experimental: ExperimentalConfig,
-    pub multi_project: bool,
     pub project_clone_dir: std::path::PathBuf,
     pub project_catalog: ProjectCatalogConfig,
     pub worktrees: WorktreeConfig,

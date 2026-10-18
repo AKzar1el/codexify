@@ -32,6 +32,22 @@ let chipName = connector;
 let quietGenerationMs = 0;
 let generatingOnLoad = false;
 let acceptsStop:boolean|number|"reload" = true;
+let fixtureLanguage:"en"|"el"|"it"="en";
+const fixtureUi={
+  en:{send:"Send",stop:"Stop",counter:"of",efforts:["Instant","Medium","High","Extra High","Pro"]},
+  el:{send:"Αποστολή",stop:"Διακοπή",counter:"από",efforts:["Γρήγορο","Μεσαίο","Υψηλό","Πολύ υψηλό","Pro"]},
+  it:{send:"Invia",stop:"Interrompi",counter:"di",efforts:["Immediato","Medio","Alto","Molto alto","Pro"]},
+} as const;
+let localizedStopFallback=false;
+let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;duplicateSubmit?:boolean;changeUrl?:boolean}|undefined;
+// Same structural contract as ChatGPT, with localized labels and arbitrary Radix IDs.
+const stopDialogHtml = `<div class="codex-dialog-overlay" style="position:fixed;inset:0;z-index:50;background:#0005"></div>
+  <div role="dialog" id="radix-fixture" data-state="open" class="codex-dialog" aria-modal="true" aria-labelledby="radix-heading" aria-describedby="radix-description" style="position:fixed;inset:30% 20%;z-index:51;background:white">
+    <div><form><h2 id="radix-heading" class="sr-only">Arrêter cette réponse ?</h2><p id="radix-description" class="sr-only">Vous pourrez envoyer un autre message.</p>
+      <div class="heading-dialog">Arrêter cette réponse ?</div><div class="text-codex-description">Vous pourrez envoyer un autre message.</div>
+      <div><button type="button">Continuer la réflexion</button><button type="submit" class="bg-primary-solid text-primary-solid">Arrêter</button></div>
+    </form></div><button type="button">Fermer</button>
+  </div>`;
 let documentLoads = 0;
 let sessionRequests = 0;
 let changedAccountAfterReload = false;
@@ -61,13 +77,17 @@ beforeAll(async () => {
       return;
     }
     documentLoads++;
-    await route.fulfill({contentType:"text/html",body:`<!doctype html><html><style>[data-model-reasoning-effort-slider]{height:24px;min-width:240px}</style><body>
+    const dialogHtml=fixtureLanguage==="it"?stopDialogHtml
+      .replaceAll("Arrêter cette réponse ?","Interrompere questa risposta?")
+      .replaceAll("Vous pourrez envoyer un autre message.","Puoi chiedere di nuovo o inviare un messaggio di follow-up quando vuoi.")
+      .replaceAll("Continuer la réflexion","Continua a pensare").replaceAll("Arrêter","Interrompi").replaceAll("Fermer","Chiudi"):stopDialogHtml;
+    await route.fulfill({contentType:"text/html",body:`<!doctype html><html><meta charset="utf-8"><style>[data-model-reasoning-effort-slider]{height:24px;min-width:240px}</style><body>
       <section id="history"></section>
       <form data-chatgpt-composer>
         <div role="textbox" contenteditable="true" style="white-space:pre-wrap;min-height:24px" data-composer-markdown><p>${pill(chipName)}${initialDraft}</p></div>
-        <button type="submit" aria-label="Send" disabled>Send</button>
+        <button type="submit" aria-label="${fixtureUi[fixtureLanguage].send}" disabled>${fixtureUi[fixtureLanguage].send}</button>
         <button type="button" id="effort" data-testid="model-switcher-dropdown-button" aria-haspopup="menu" aria-controls="picker" aria-expanded="false">Pro</button>
-        ${generatingOnLoad ? '<button type="button" data-testid="stop-button">Stop</button>' : ''}
+        ${generatingOnLoad ? '<button type="button" data-fixture-stop '+(localizedStopFallback?'':'data-testid="stop-button"')+' aria-label="'+(fixtureUi[fixtureLanguage].stop)+'">'+(fixtureUi[fixtureLanguage].stop)+'</button>' : ''}
       </form>
       <div id="picker" role="menu" hidden>
         <div data-model-picker-view="advanced">
@@ -86,8 +106,8 @@ beforeAll(async () => {
         const mentions=document.querySelector('[data-mention-list-scroll-area]');
         window.family=${JSON.stringify(initialModel.family)};
         window.definitions={
-          '6':{min:0,value:4,labels:['Instant','Medium','High','Extra High','Pro'],locked:[]},
-          '5.6':{min:0,value:4,labels:['Instant','Medium','High','Extra High','Pro'],locked:[]},
+          '6':{min:0,value:4,labels:${JSON.stringify(fixtureUi[fixtureLanguage].efforts)},locked:[]},
+          '5.6':{min:0,value:4,labels:${JSON.stringify(fixtureUi[fixtureLanguage].efforts)},locked:[]},
           '5.5':{min:7,value:11,labels:${JSON.stringify(shiftedEfforts ? ['Instant','Medium','High','Extra High','Pro'] : ['Turbo','Instant','Medium','High','Pro'])},locked:[]}
         };
         window.definitions[window.family].value=${initialModel.value};
@@ -99,7 +119,7 @@ beforeAll(async () => {
         window.renderModel=()=>{
           const model=window.definitions[window.family],index=model.value-model.min;
           range.innerHTML='<div data-model-reasoning-effort-slider><span role="slider" aria-valuemin="'+model.min+'" aria-valuemax="'+(model.min+model.labels.length-1)+'" aria-valuenow="'+model.value+'"></span>'+model.labels.map((label,i)=>'<span data-selected="'+(i===index)+'" data-locked="'+model.locked.includes(i)+'" aria-label="'+(${hideEffortLabels}?'':label)+'"></span>').join('')+'</div>';
-          document.querySelector('#effort-description').textContent=window.family+' '+model.labels[index]+', '+(index+1)+' of '+model.labels.length+'.';
+          document.querySelector('#effort-description').textContent=window.family+' '+model.labels[index]+', '+(index+1)+${JSON.stringify(" "+fixtureUi[fixtureLanguage].counter+" ")}+model.labels.length+'.';
           control.textContent=model.labels[index];document.body.dataset.family=window.family;document.body.dataset.effort=model.labels[index];
           document.querySelectorAll('[data-family]').forEach(row=>row.setAttribute('aria-checked',String(row.dataset.family===window.family)));
         };
@@ -118,13 +138,28 @@ beforeAll(async () => {
         document.body.dataset.effortChanges="0";document.body.dataset.familyChanges="";
         editor.focus();const initialCaret=document.createRange();initialCaret.selectNodeContents(editor);initialCaret.collapse(false);
         window.getSelection().removeAllRanges();window.getSelection().addRange(initialCaret);
-        document.body.dataset.sends="0";document.body.dataset.stops="0";document.body.dataset.order="";window.enableSend=${ready};
+        document.body.dataset.sends="0";document.body.dataset.stops="0";document.body.dataset.order="";document.body.dataset.confirmations="0";window.enableSend=${ready};
+        const stopConfirmation=${JSON.stringify(stopConfirmation??null)};
+        const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';},200);
+        const showStopDialog=stop=>{
+          if(document.querySelector('[role="dialog"]'))return;
+          document.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
+          const dialog=document.querySelector('[role="dialog"]'),dialogForm=dialog.querySelector('form');
+          if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
+          if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
+          dialogForm.addEventListener('submit',event=>{
+            event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';
+            if(!stopConfirmation.persists){dialog.remove();document.querySelector('.codex-dialog-overlay').remove();finishStop(stop);}
+          });
+        };
+        if(stopConfirmation?.preexisting)showStopDialog(form.querySelector('[data-testid="stop-button"]'));
         form.addEventListener('click',event=>{
-          const stop=event.target.closest('[data-testid="stop-button"]');
+          const stop=event.target.closest('[data-fixture-stop]');
           if (!stop) return;
           document.body.dataset.stops=String(Number(document.body.dataset.stops)+1);
           document.body.dataset.order+='stop,';
-          if (${typeof acceptsStop==="number" ? `Number(document.body.dataset.stops)>=${acceptsStop}` : acceptsStop==="reload" ? documentLoads>=3 : acceptsStop}) setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';},200);
+          if(stopConfirmation)setTimeout(()=>showStopDialog(stop),stopConfirmation.delayMs??0);
+          else if (${typeof acceptsStop==="number" ? `Number(document.body.dataset.stops)>=${acceptsStop}` : acceptsStop==="reload" ? documentLoads>=3 : acceptsStop}) finishStop(stop);
         });
         editor.addEventListener('input',()=>{
           mentions.hidden=!editor.textContent.startsWith('@');
@@ -176,7 +211,7 @@ const surface: SingleBrowserSurface = {
 
 async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating=false,stopWorks:boolean|number|"reload"=true,model={family:"6",value:4,locked:[] as number[]}) {
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
-  generatingOnLoad=generating;acceptsStop=stopWorks;
+  generatingOnLoad=generating;acceptsStop=stopWorks;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
   documentLoads=0;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
   initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
   destinationLocks={};absentFamilies=[];duplicateEffortLabels=false;changeAccountAtRequest=Number.MAX_SAFE_INTEGER;
@@ -655,6 +690,123 @@ test.skipIf(!native)("offline messages and goals stop lingering generation befor
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
 },15_000);
+
+test.skipIf(!native)("offline Stop confirms an optional localized dialog before sending once",async()=>{
+  const prompts:ExecuteActionRequest["prompt"][]=[
+    {kind:"offline_chat",batchId:"dialog-batch",messages:[{id:"dialog-message",markdown:"Continue"}]},
+    {kind:"offline_goal",goalRevision:1},
+    {kind:"offline_combined",batchId:"dialog-combined",messages:[{id:"combined-dialog-message",markdown:"Continue"}],goalRevision:1},
+  ];
+  for(const [index,actionPrompt] of prompts.entries()) {
+    const driver=await fixture("",true,connector,0,true);
+    stopConfirmation={delayMs:index===1?350:0};
+    const offline:ExecuteActionRequest={...request,prompt:actionPrompt};
+    await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+    expect(await page.locator("body").getAttribute("data-order")).toBe("stop,confirm,stopped,send,");
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+    expect(await page.locator('[role="dialog"]').count()).toBe(0);
+    expect(documentLoads).toBe(2);
+  }
+},20_000);
+
+test.skipIf(!native)("offline Stop never confirms a preexisting or ambiguous dialog",async()=>{
+  for(const scenario of ["preexisting","duplicateSubmit"] as const) {
+    const driver=await fixture("",true,connector,0,true);
+    stopConfirmation={[scenario]:true};
+    const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
+    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    expect(failure).toMatchObject({code:"external_interference"});
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+    expect(await page.locator("body").getAttribute("data-stops")).toBe(scenario==="preexisting"?"0":"1");
+    expect(documentLoads).toBe(2);
+  }
+},15_000);
+
+test.skipIf(!native)("offline Stop rechecks account and conversation before confirming",async()=>{
+  for(const mismatch of ["account","conversation"]) {
+    const driver=await fixture("",true,connector,0,true);
+    stopConfirmation={changeUrl:mismatch==="conversation"};
+    if(mismatch==="account")changeAccountAtRequest=3;
+    const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
+    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    expect(failure).toMatchObject({code:mismatch==="account"?"authentication_required":"conversation_unavailable"});
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+    expect(documentLoads).toBe(2);
+  }
+},15_000);
+
+test.skipIf(!native)("an unresponsive Stop confirmation is bounded and does not resubmit",async()=>{
+  const driver=await fixture("",true,connector,0,true);
+  stopConfirmation={persists:true};
+  const coordinator=new SingleWindowCoordinator(driver,build);
+  const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
+  const began=Date.now();
+  await coordinator.execute(offline);
+  const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+  expect(Date.now()-began).toBeLessThan(10_000);
+  expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
+  expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+  expect((await coordinator.health()).activeActionId).toBeNull();
+  expect(documentLoads).toBe(2);
+},15_000);
+
+test.skipIf(!native)("a cancelled Stop confirmation never inserts or sends a prompt",async()=>{
+  const driver=await fixture("",true,connector,0,true);
+  stopConfirmation={persists:true};
+  const controller=new AbortController();
+  const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
+  const running=driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  await page.waitForFunction(()=>document.body.dataset.confirmations==="1");
+  controller.abort();
+  expect(await running).toBeDefined();
+  expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+  expect(await composerText(await activeComposer(page))).toBe("");
+},10_000);
+
+for(const locale of [
+  {code:"el",name:"Greek",medium:"Μεσαίο",extraHigh:"Πολύ υψηλό",message:"Συνέχισε από εδώ"},
+  {code:"it",name:"Italian",medium:"Medio",extraHigh:"Molto alto",message:"Continua da qui"},
+] as const) {
+test.skipIf(!native)(`${locale.name} pairing borrows Medium and restores the saved effort without English labels`,async()=>{
+  const driver=await fixture();fixtureLanguage=locale.code;
+  const events:Parameters<DriverExecution["emit"]>[0][]=[];
+  await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:event=>events.push(event)});
+  expect(await page.locator("body").getAttribute("data-sent-effort")).toBe(locale.medium);
+  expect(await page.locator("body").getAttribute("data-effort")).toBe("Pro");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+  expect(events.at(-1)).toMatchObject({type:"submission_complete"});
+},15_000);
+
+test.skipIf(!native)(`${locale.name} selection, Stop fallback and confirmation send one ordinary message`,async()=>{
+  const driver=await fixture("",true,connector,0,true);fixtureLanguage=locale.code;localizedStopFallback=true;stopConfirmation={delayMs:200};
+  const submitted:ExecuteActionRequest={...request,model:"gpt-6-sol",effort:"xhigh",prompt:{kind:"offline_chat",batchId:`${locale.code}-message`,messages:[{id:locale.code,markdown:locale.message}]}};
+  const events:Parameters<DriverExecution["emit"]>[0][]=[];
+  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+  expect(await page.locator("body").getAttribute("data-sent-effort")).toBe(locale.extraHigh);
+  expect(await page.locator("body").getAttribute("data-order")).toBe("stop,confirm,stopped,send,");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sent-text")).toContain(locale.message);
+  expect(events).toContainEqual({type:"model_verified",model:"gpt-6-sol",effort:"xhigh"});
+  expect(events.at(-1)).toMatchObject({type:"submission_complete"});
+},15_000);
+
+test.skipIf(!native)(`${locale.name} unavailable-model fallback preserves the preferred selection and sends once`,async()=>{
+  const driver=await fixture("",true,connector,0,false,true,{family:"6",value:3,locked:[4]});fixtureLanguage=locale.code;
+  const submitted=offlineRequest("gpt-6-astra","max");
+  const events:Parameters<DriverExecution["emit"]>[0][]=[];
+  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+  expect(events).toContainEqual({type:"model_verified",model:"gpt-5.6-sol",effort:"max"});
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+  expect(submitted.model).toBe("gpt-6-astra");
+},15_000);
+
+}
 
 test.skipIf(!native)("offline Stop requires the paired conversation and account before clicking",async()=>{
   for (const mismatch of ["conversation","account"]) {

@@ -1,11 +1,16 @@
 mod companion;
 mod install;
 mod model_fallback;
+mod process;
+mod recovery;
 mod store;
 mod supervisor;
 pub(crate) mod turn_analytics;
 pub mod turn_renewal;
 
+pub use recovery::{
+    BrowserCompanionControl, BrowserRecoveryWorker, watch as watch_browser_companion,
+};
 pub(crate) use store::conversation_url_for_retry;
 
 pub use companion::{

@@ -109,7 +109,7 @@ fn skill_roots_repo_before_user() {
 }
 
 #[test]
-fn skill_roots_walks_from_project_root_down() {
+fn skill_roots_stay_within_the_selected_workspace() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join(".git")).unwrap();
     let work_dir = dir.path().join("packages").join("app");
@@ -121,11 +121,8 @@ fn skill_roots_walks_from_project_root_down() {
 
     let outer = repo_root(dir.path());
     let inner = repo_root(&work_dir);
-    assert!(paths.contains(&outer));
+    assert!(!paths.contains(&outer));
     assert!(paths.contains(&inner));
-    let io = paths.iter().position(|p| p == &outer).unwrap();
-    let ii = paths.iter().position(|p| p == &inner).unwrap();
-    assert!(io < ii);
 }
 
 #[test]
@@ -689,7 +686,7 @@ fn doc_config(work_dir: &Path) -> AppConfig {
 }
 
 #[test]
-fn doc_paths_one_per_dir_root_down() {
+fn doc_paths_do_not_read_outside_the_selected_workspace() {
     let dir = TempDir::new().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -699,7 +696,7 @@ fn doc_paths_one_per_dir_root_down() {
     write_file(&inner, "inner");
     assert_eq!(
         project_doc_paths(&doc_config(&repo.join("src"))),
-        vec![outer, inner]
+        vec![inner]
     );
 }
 
@@ -760,7 +757,7 @@ fn doc_paths_empty_when_none() {
 // --- project-doc: loadProjectDoc ----------------------------------------
 
 #[test]
-fn load_doc_concatenates_outermost_first() {
+fn load_doc_uses_the_selected_workspace_boundary() {
     let dir = TempDir::new().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -770,7 +767,7 @@ fn load_doc_concatenates_outermost_first() {
         load_project_doc(&doc_config(&repo.join("src")))
             .unwrap()
             .text,
-        "root rules\n\nsrc rules"
+        "src rules"
     );
 }
 
@@ -808,19 +805,19 @@ fn load_doc_cuts_short_at_byte_budget() {
 }
 
 #[test]
-fn load_doc_shares_one_budget_across_docs() {
+fn load_doc_applies_budget_inside_the_selected_workspace() {
     let dir = TempDir::new().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     write_file(&repo.join("AGENTS.md"), "12345");
     write_file(&repo.join("src").join("AGENTS.md"), "67890");
     let mut config = doc_config(&repo.join("src"));
-    config.project_doc.max_bytes = Some(8);
+    config.project_doc.max_bytes = Some(3);
     let doc = load_project_doc(&config).unwrap();
     let contents: Vec<&str> = doc.entries.iter().map(|e| e.contents.as_str()).collect();
-    assert_eq!(contents, vec!["12345", "678"]);
+    assert_eq!(contents, vec!["678"]);
     let truncated: Vec<bool> = doc.entries.iter().map(|e| e.truncated).collect();
-    assert_eq!(truncated, vec![false, true]);
+    assert_eq!(truncated, vec![true]);
 }
 
 #[test]

@@ -244,9 +244,7 @@ impl ProjectBindingStore {
         config: &AppConfig,
     ) -> std::collections::HashMap<String, PathBuf> {
         let mut roots = std::collections::HashMap::new();
-        if !config.multi_project {
-            return roots;
-        }
+
         let Ok(access_root) = canonical_access_root(config) else {
             return roots;
         };
@@ -322,10 +320,6 @@ impl ProjectBindingStore {
         config: &AppConfig,
         identity: &ConversationIdentity,
     ) -> Result<AppConfig, String> {
-        if !config.multi_project {
-            return Ok(config.clone());
-        }
-
         let binding = match self.resolved_binding_state(config, identity)? {
             Some(ResolvedBindingState::Project(binding)) => binding,
             Some(ResolvedBindingState::WithoutProject(scratch_root)) => {
@@ -352,12 +346,6 @@ impl ProjectBindingStore {
         config: &AppConfig,
         identity: &ConversationIdentity,
     ) -> Result<ProjectBindingState, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
         let access_root = canonical_access_root(config)?;
         match self.resolved_binding_state_at(identity, &access_root)? {
             Some(ResolvedBindingState::Project(binding)) => {
@@ -403,12 +391,6 @@ impl ProjectBindingStore {
         identity: &ConversationIdentity,
         input: &str,
     ) -> Result<ProjectRootSelection, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
         let reference = ProjectReference::parse(input)?;
         let access_root = canonical_access_root(config)?;
         let binding_path = self.binding_path(&access_root, identity);
@@ -553,12 +535,6 @@ impl ProjectBindingStore {
         config: &AppConfig,
         identity: &ConversationIdentity,
     ) -> Result<WithoutProjectSelection, String> {
-        if !config.multi_project {
-            return Err(
-                "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                    .to_string(),
-            );
-        }
         let access_root = canonical_access_root(config)?;
         let binding_path = self.binding_path(&access_root, identity);
         let binding_lock = acquire_lock(&binding_path).await?;
@@ -614,9 +590,6 @@ impl ProjectBindingStore {
         identity: &ConversationIdentity,
         input: &str,
     ) -> Result<WorkspaceSelection, String> {
-        if !config.multi_project {
-            return Err("Workspace resumption requires multi-project mode.".into());
-        }
         let input = Path::new(input);
         if !input.is_absolute() {
             return Err("resumePath must be the absolute active workspace path.".into());
@@ -726,9 +699,6 @@ impl ProjectBindingStore {
         &self,
         config: &AppConfig,
     ) -> Result<HashSet<PathBuf>, String> {
-        if !config.multi_project {
-            return Ok(HashSet::new());
-        }
         let access_root = canonical_access_root(config)?;
         let mut roots = HashSet::new();
         for path in self.saved_binding_files(&access_root) {
@@ -1294,13 +1264,6 @@ impl ProjectBindingStore {
 }
 
 pub fn resolve_project_root(config: &AppConfig, input: &str) -> Result<(PathBuf, PathBuf), String> {
-    if !config.multi_project {
-        return Err(
-            "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                .to_string(),
-        );
-    }
-
     let input = input.trim();
     if input.is_empty() {
         return Err("path must be a non-empty string".to_string());
@@ -1354,12 +1317,6 @@ pub async fn prepare_project_root(
             })
         }
         ProjectReference::Git(repository) => {
-            if !config.multi_project {
-                return Err(
-                    "Project-root selection is disabled. Start codexify with `--multi-project` or set `multiProject` to true."
-                        .to_string(),
-                );
-            }
             let access_root = canonical_access_root(config)?;
             let resolved = resolve_git_project(config, &access_root, repository).await?;
             Ok(PreparedProjectRoot {
@@ -1703,8 +1660,8 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let access_root = std::fs::canonicalize(access_root).unwrap();
         let project = std::fs::canonicalize(project).unwrap();
-        let mut config = crate::config::default_config(access_root.clone());
-        config.multi_project = true;
+        let config = crate::config::default_config(access_root.clone());
+
         let identity = ConversationIdentity::from_openai_session("pre-rename-binding").unwrap();
         let store = ProjectBindingStore::new(root.path().join("state"));
         let legacy_path = store.legacy_binding_path(&access_root, &identity);
@@ -1743,8 +1700,8 @@ mod tests {
             root.path().join("state"),
             scratch_dir.clone(),
         );
-        let mut config = crate::config::default_config(access_root);
-        config.multi_project = true;
+        let config = crate::config::default_config(access_root);
+
         let identity = ConversationIdentity::from_openai_session("contained-scratch").unwrap();
 
         let error = store
@@ -1764,8 +1721,8 @@ mod tests {
         std::fs::create_dir_all(&access_root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         let access_root = std::fs::canonicalize(access_root).unwrap();
-        let mut config = crate::config::default_config(access_root.clone());
-        config.multi_project = true;
+        let config = crate::config::default_config(access_root.clone());
+
         let identity = ConversationIdentity::from_openai_session("mismatched-scratch").unwrap();
         let store = ProjectBindingStore::new(root.path().join("state"));
         store

@@ -184,7 +184,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
  const browser=await engine.launch();
  try {
   const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);await page.clock.install();
-  const defaults={workDir:null,debug:false,multiProject:false,exec:{defaultShell:'/bin/zsh',idleTimeoutMs:300000,maxSessions:8},filesystem:{maxConcurrentWorkers:4,maxLineBytes:1048576,maxPendingRequests:16},worktrees:{mode:'auto'},tree:{ignore:['node_modules','.git']},mcpServers:{},openaiTunnels:[]};
+  const defaults={workDir:null,debug:false,uiWidgets:true,multiProject:false,exec:{defaultShell:'/bin/zsh',idleTimeoutMs:300000,maxSessions:8},filesystem:{maxConcurrentWorkers:4,maxLineBytes:1048576,maxPendingRequests:16},worktrees:{mode:'auto'},tree:{ignore:['node_modules','.git']},mcpServers:{},openaiTunnels:[]};
   const fieldSchema={...defaults,multiProject:true,exec:{defaultShell:null,idleTimeoutMs:999,maxSessions:999},mcpServers:{example:{command:'example'}},openaiTunnels:[{tunnelId:'example'}]};
   let document={workDir:'/projects'},revision=1;
   const writes=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
@@ -207,7 +207,8 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   });
   await page.goto('http://127.0.0.1:43230/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'Codexify settings'});
-  const inheritedBoolean=dialog.getByRole('group',{name:'multiProject',exact:true}).getByRole('button',{name:'Off (default)',exact:true});
+  assert.equal(await dialog.getByRole('group',{name:'multiProject',exact:true}).count(),0);
+  const inheritedBoolean=dialog.getByRole('group',{name:'uiWidgets',exact:true}).getByRole('button',{name:'On (default)',exact:true});
   await inheritedBoolean.waitFor();assert.equal(await inheritedBoolean.getAttribute('aria-pressed'),'true');await inheritedBoolean.click();
   await dialog.getByRole('button',{name:'Tools & files',exact:true}).click();
   for(const [path,text] of Object.entries({'exec.defaultShell':'/bin/zsh (default)','exec.idleTimeoutMs':'300000 (default)','exec.maxSessions':'8 (default)','filesystem.maxConcurrentWorkers':'4 (default)','filesystem.maxLineBytes':'1048576 (default)','filesystem.maxPendingRequests':'16 (default)'})){
@@ -372,7 +373,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
 });
 
 
-for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: progress report interval defaults to twenty and saves without restart`,{timeout:20000},async()=>{
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: progress report interval defaults to twenty-five and saves without restart`,{timeout:20000},async()=>{
  const browser=await engine.launch();try{
   const page=await browser.newPage();page.setDefaultTimeout(5000);
   const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
@@ -394,11 +395,11 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   });
   await page.goto('http://127.0.0.1:43316/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
   const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
-  const interval=dialog.getByLabel('agentChat.rolloutReminderInterval',{exact:true});await interval.waitFor();assert.equal(await interval.inputValue(),'');assert.equal(await interval.getAttribute('placeholder'),'20 (default)');
+  const interval=dialog.getByLabel('agentChat.rolloutReminderInterval',{exact:true});await interval.waitFor();assert.equal(await interval.inputValue(),'');assert.equal(await interval.getAttribute('placeholder'),'25 (default)');
   await interval.fill('50');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.rolloutReminderInterval,50);
   assert.deepEqual(writes[0][1].changes,{'agentChat.rolloutReminderInterval':50});
   await interval.fill('');await dialog.getByText('All changes saved.',{exact:true}).waitFor();await page.waitForFunction(()=>document.querySelector('[data-setting="agentChat.rolloutReminderInterval"]').dataset.default==='true');
-  assert.equal(document.agentChat.rolloutReminderInterval,undefined);assert.equal(await interval.getAttribute('placeholder'),'20 (default)');assert.equal(writes.length,2);assert.deepEqual(errors,[]);
+  assert.equal(document.agentChat.rolloutReminderInterval,undefined);assert.equal(await interval.getAttribute('placeholder'),'25 (default)');assert.equal(writes.length,2);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
 

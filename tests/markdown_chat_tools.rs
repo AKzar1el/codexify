@@ -22,7 +22,7 @@ fn fixture() -> (
     ToolRequestContext,
 ) {
     let root = tempfile::tempdir().unwrap();
-    let mut config = default_config(root.path().to_path_buf());
+    let mut config = default_config(root.path().canonicalize().unwrap());
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.max_wait_ms = 1000;
@@ -50,6 +50,36 @@ fn fixture() -> (
         cancellation: CancellationToken::new(),
     };
     (root, config, SessionState::new(), context)
+}
+
+fn widget_args(
+    mut value: serde_json::Value,
+    config: &codexify::types::AppConfig,
+    session: &SessionState,
+    context: &ToolRequestContext,
+) -> serde_json::Value {
+    let chat = context
+        .markdown_chat
+        .chat(config, context.task_conversation.as_ref(), session)
+        .unwrap();
+    value["expected_chat_file"] = json!(chat.path());
+    value
+}
+async fn select_fixture_workspace(
+    config: &codexify::types::AppConfig,
+    context: &ToolRequestContext,
+) {
+    let mut config = config.clone();
+    config.worktrees.mode = codexify::types::WorktreeMode::Never;
+    context
+        .project_bindings
+        .select_project_root(
+            &config,
+            context.conversation.as_ref().unwrap(),
+            &config.work_dir.to_string_lossy(),
+        )
+        .await
+        .unwrap();
 }
 
 fn append(path: &std::path::Path, text: &str) {
@@ -224,7 +254,10 @@ async fn chat_await_honors_configured_timeout_with_and_without_a_workspace() {
     for unselected in [false, true] {
         for max_wait_ms in [1_000, 1_500] {
             let (_root, mut config, session, context) = fixture();
-            config.multi_project = unselected;
+
+            if !unselected {
+                select_fixture_workspace(&config, &context).await;
+            }
             config.markdown_chat.max_wait_ms = max_wait_ms;
             let tools = load_tools_for_config(&config);
             let waiter = tools
@@ -374,7 +407,12 @@ async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_fi
         "reports/report%20one.txt",
     ] {
         let result = file_tool
-            .call_with_context(json!({"href":href}), &config, &session, &context)
+            .call_with_context(
+                widget_args(json!({"href":href}), &config, &session, &context),
+                &config,
+                &session,
+                &context,
+            )
             .await;
         assert!(!result.is_error, "{href}: {}", result.joined_text());
         let file = &result
@@ -403,7 +441,12 @@ async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_fi
     std::fs::write(root.path().join("reports/part#1.txt"), "encoded filename").unwrap();
     let encoded = file_tool
         .call_with_context(
-            json!({"href":"reports/part%231.txt#section"}),
+            widget_args(
+                json!({"href":"reports/part%231.txt#section"}),
+                &config,
+                &session,
+                &context,
+            ),
             &config,
             &session,
             &context,
@@ -422,7 +465,12 @@ async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_fi
     ] {
         assert!(
             file_tool
-                .call_with_context(json!({"href":href}), &config, &session, &context)
+                .call_with_context(
+                    widget_args(json!({"href":href}), &config, &session, &context),
+                    &config,
+                    &session,
+                    &context
+                )
                 .await
                 .is_error,
             "{href}"
@@ -436,7 +484,12 @@ async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_fi
         .unwrap();
     let ambiguous = file_tool
         .call_with_context(
-            json!({"href":"sandbox:/mnt/data/report%20one.txt"}),
+            widget_args(
+                json!({"href":"sandbox:/mnt/data/report%20one.txt"}),
+                &config,
+                &session,
+                &context,
+            ),
             &config,
             &session,
             &context,
@@ -454,7 +507,12 @@ async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_fi
     assert!(
         file_tool
             .call_with_context(
-                json!({"href":foreign.resource.uri}),
+                widget_args(
+                    json!({"href":foreign.resource.uri}),
+                    &config,
+                    &session,
+                    &context
+                ),
                 &config,
                 &session,
                 &context
@@ -534,7 +592,8 @@ fn chat_widget_tools_are_app_only_and_chat_calls_never_link_a_widget() {
 
 #[tokio::test]
 async fn widget_send_is_idempotent_and_history_never_consumes_or_marks_delivery() {
-    let (_root, config, session, context) = fixture();
+    let (_root, mut config, session, context) = fixture();
+    config.markdown_chat.default_message_mode = codexify::markdown_chat::MessageMode::Steer;
     let tools = load_tools_for_config(&config);
     let sender = tools
         .iter()
@@ -549,7 +608,12 @@ async fn widget_send_is_idempotent_and_history_never_consumes_or_marks_delivery(
         .chat(&config, context.conversation.as_ref(), &session)
         .unwrap();
     let markdown = "## User request\n\n**Full text**\n```rust\nlet x = 1;\n```\n";
-    let args = json!({"request_id":"test-request-1", "message":markdown});
+    let args = widget_args(
+        json!({"request_id":"test-request-1", "message":markdown}),
+        &config,
+        &session,
+        &context,
+    );
     let first = sender
         .call_with_context(args.clone(), &config, &session, &context)
         .await;
@@ -606,7 +670,12 @@ async fn widget_send_is_idempotent_and_history_never_consumes_or_marks_delivery(
     );
     let conflict = sender
         .call_with_context(
-            json!({"request_id":"test-request-1", "message":"changed"}),
+            widget_args(
+                json!({"request_id":"test-request-1", "message":"changed"}),
+                &config,
+                &session,
+                &context,
+            ),
             &config,
             &session,
             &context,
@@ -1132,6 +1201,7 @@ async fn directory_watcher_handles_atomic_editor_replacement() {
 #[tokio::test]
 async fn timeout_instructs_another_await_without_claiming_a_read_receipt() {
     let (_root, config, session, context) = fixture();
+    select_fixture_workspace(&config, &context).await;
     let tools = load_tools_for_config(&config);
     let tool = tools
         .iter()
@@ -1458,6 +1528,7 @@ async fn chat_event_filters_and_repeated_awaits_deliver_only_requested_alerts() 
 #[tokio::test]
 async fn queued_widget_input_is_private_until_turn_completed_and_not_chat_await() {
     let (_root, config, session, context) = fixture();
+    select_fixture_workspace(&config, &context).await;
     let chat = context
         .markdown_chat
         .chat(&config, context.task_conversation.as_ref(), &session)
@@ -1468,7 +1539,7 @@ async fn queued_widget_input_is_private_until_turn_completed_and_not_chat_await(
     let find = |name| tools.iter().find(|t| t.name() == name).unwrap();
     let sent = find("chat_ui_send")
         .call_with_context(
-            json!({"request_id":"queued-one","message":"keep this private","message_mode":"queue"}),
+            widget_args(json!({"request_id":"queued-one","message":"keep this private","message_mode":"queue"}), &config, &session, &context),
             &config,
             &session,
             &context,
@@ -1524,6 +1595,7 @@ async fn queued_widget_input_is_private_until_turn_completed_and_not_chat_await(
 async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_directly() {
     for blocked_goal in [false, true] {
         let (_root, mut config, session, context) = fixture();
+        select_fixture_workspace(&config, &context).await;
         config.markdown_chat.default_message_mode = codexify::markdown_chat::MessageMode::Queue;
         let chat = context
             .markdown_chat
@@ -1595,7 +1667,12 @@ async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_d
         assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
         let answer = find("chat_ui_send")
             .call_with_context(
-                json!({"request_id":"answer","message":"Freezes too"}),
+                widget_args(
+                    json!({"request_id":"answer","message":"Freezes too"}),
+                    &config,
+                    &session,
+                    &context,
+                ),
                 &config,
                 &session,
                 &context,
@@ -1646,6 +1723,7 @@ async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_d
 #[tokio::test]
 async fn completed_waits_repeatedly_when_empty_and_unfinished_goals_hold_input() {
     let (_root, config, session, context) = fixture();
+    select_fixture_workspace(&config, &context).await;
     let tools = load_tools_for_config(&config);
     let complete = tools.iter().find(|t| t.name() == "turn_completed").unwrap();
     let chat = context

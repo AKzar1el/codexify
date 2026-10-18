@@ -13,7 +13,9 @@ fn ticket_test_config(root: &std::path::Path, enabled: bool) -> AppConfig {
     )
     .unwrap();
     let cli = crate::config::Cli::parse_from(["codexify", "--config", path.to_str().unwrap()]);
-    crate::config::load_config(cli).unwrap()
+    let mut config = crate::config::load_config(cli).unwrap();
+    config.work_dir = std::fs::canonicalize(&config.work_dir).unwrap();
+    config
 }
 
 #[test]
@@ -365,6 +367,7 @@ async fn agent_tickets_warn_on_every_rejection_without_consuming_user_messages_o
         .chat(&config, None, &handler.session)
         .unwrap();
     chat.ensure().await.unwrap();
+    bind_fixture_workspace(&handler, None).await;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
         handler
@@ -537,7 +540,7 @@ async fn agent_tickets_preserve_previous_ticket_on_server_observed_cancellation(
 fn agent_tickets_native_schemas_are_valid_with_chat_and_workspace_fields() {
     let root = tempfile::tempdir().unwrap();
     let mut config = ticket_test_config(root.path(), true);
-    config.multi_project = true;
+
     config.markdown_chat.enabled = true;
     config.conversation_auth_token = Some("a".repeat(64).into());
     for tool in crate::registry::load_tools_for_config(&config) {
@@ -618,7 +621,7 @@ fn agent_tickets_widget_helpers_do_not_require_markdown_chat() {
     let root = tempfile::tempdir().unwrap();
     for markdown_chat in [false, true] {
         let mut config = ticket_test_config(root.path(), true);
-        config.multi_project = true;
+
         config.markdown_chat.enabled = markdown_chat;
         let tools = crate::registry::load_tools_for_config(&config);
         for name in [

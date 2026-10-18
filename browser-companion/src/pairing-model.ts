@@ -1,7 +1,7 @@
 import type { Page } from "patchright";
 import { activeComposer } from "./composer";
 import { BrowserCompanionError } from "./errors";
-import { browserModelFamilyFromLabel } from "./models";
+import { readModelOptionRows,browserEffortIdFromLabel } from "./models";
 import {
   CHATGPT_EFFORT_CONTROL_SELECTOR, activateChatGptEffortMenu, discoverChatGptEfforts,
   moveChatGptEffortSlider, readChatGptEffortSnapshot, readCurrentEffortLabel,
@@ -23,10 +23,9 @@ export async function selectPairingMedium(page: Page, signal: AbortSignal): Prom
   if (await controls.count() !== 1) throw new BrowserCompanionError("Pairing requires one verifiable Medium control; the request was not sent", "model_unavailable");
   const control = controls.first();
   const checkedFamily = async (menu: Awaited<ReturnType<typeof activateChatGptEffortMenu>>) => {
-    const labels = await menu.menu.getByRole("menuitemradio", {includeHidden:true}).evaluateAll(elements =>
-      elements.filter(element => element.getAttribute("aria-checked") === "true").map(element => element.textContent ?? ""));
-    if (labels.length !== 1 || !normalize(labels[0]!)) throw new BrowserCompanionError("ChatGPT did not identify the pairing request's model family", "model_unavailable");
-    return browserModelFamilyFromLabel(labels[0]!) ?? normalize(labels[0]!);
+    const checked=(await readModelOptionRows(menu.menu)).filter(row=>row.checked);
+    if(checked.length!==1||!normalize(checked[0]!.label))throw new BrowserCompanionError("ChatGPT did not identify the pairing request's model family", "model_unavailable");
+    return checked[0]!.family??normalize(checked[0]!.label);
   };
   let menu = await activateChatGptEffortMenu(page, control);
   let original: Awaited<ReturnType<typeof readChatGptEffortSnapshot>>;
@@ -51,7 +50,7 @@ export async function selectPairingMedium(page: Page, signal: AbortSignal): Prom
     try {
       const current = await inspect();
       if (current.state.value === original.value && normalize(current.label) === normalize(label)) return;
-      if (mediumSelected && (current.state.value !== target || normalize(current.label).toLowerCase() !== "medium")) {
+      if (mediumSelected && (current.state.value !== target || browserEffortIdFromLabel(current.label) !== "medium")) {
         throw new BrowserCompanionError("ChatGPT changed the temporary pairing selection; it was not overwritten", "external_interference");
       }
       await moveChatGptEffortSlider(menu, original.value, restoreSignal);
@@ -62,10 +61,10 @@ export async function selectPairingMedium(page: Page, signal: AbortSignal): Prom
     } finally { await page.keyboard.press("Escape").catch(() => {}); }
   };
   try {
-    let index = original.labels.findIndex(value => value && normalize(value).toLowerCase() === "medium");
+    let index = original.labels.findIndex(value => value && browserEffortIdFromLabel(value) === "medium");
     if (index < 0) {
       const efforts = await discoverChatGptEfforts(menu);
-      index = efforts.find(effort => normalize(effort.label).toLowerCase() === "medium")?.index ?? -1;
+      index = efforts.find(effort => effort.id === "medium")?.index ?? -1;
     }
     if (index < 0 || !original.available[index]) {
       throw new BrowserCompanionError("Medium mode is unavailable for pairing; the pairing request was not sent", "model_unavailable");
@@ -76,7 +75,7 @@ export async function selectPairingMedium(page: Page, signal: AbortSignal): Prom
       if (verifySignal.aborted) throw new DOMException("Browser action aborted", "AbortError");
       try {
         const current = await inspect();
-        if (current.state.value !== target || normalize(current.label).toLowerCase() !== "medium") {
+        if (current.state.value !== target || browserEffortIdFromLabel(current.label) !== "medium") {
           throw new BrowserCompanionError("ChatGPT did not retain Medium mode for the pairing request", "model_unavailable");
         }
       } finally { await page.keyboard.press("Escape").catch(() => {}); }

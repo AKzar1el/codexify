@@ -287,7 +287,7 @@ impl Tool for SetProjectRoot {
     }
 
     fn describe(&self, config: &AppConfig) -> String {
-        if config.multi_project {
+        {
             format!(
                 "{} {} The access root is `{}` and Git clones are placed in `{}`. An ordinary project path must be inside the access root; resumePath may name an already validated managed worktree or scratch workspace outside it.",
                 Self::RESUME_GUIDANCE,
@@ -295,8 +295,6 @@ impl Tool for SetProjectRoot {
                 config.work_dir.display(),
                 config.project_clone_dir.display()
             )
-        } else {
-            "Project-root selection is disabled on this server. Start codexify with --multi-project or set multiProject to true to enable it.".into()
         }
     }
 

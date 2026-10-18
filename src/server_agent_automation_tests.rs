@@ -1,13 +1,7 @@
-fn automation_request(
-    name: &str,
-    arguments: Value,
-    conversation: &str,
-) -> CallToolRequestParams {
+fn automation_request(name: &str, arguments: Value, conversation: &str) -> CallToolRequestParams {
     let mut request = CallToolRequestParams::new(name.to_owned())
         .with_arguments(arguments.as_object().unwrap().clone());
-    request.meta = Some(
-        serde_json::from_value(json!({"openai/session":conversation})).unwrap(),
-    );
+    request.meta = Some(serde_json::from_value(json!({"openai/session":conversation})).unwrap());
     request
 }
 
@@ -31,7 +25,7 @@ impl crate::agent_automation::AutomationExecutor for ServerAutomationNoopExecuto
 #[tokio::test]
 async fn pairing_verification_respects_setup_and_receives_the_owner_generation() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().to_path_buf());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
@@ -45,6 +39,7 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
     let authorizations = handler.conversation_authorizations.clone();
     let conversation = "automation-pair-owner";
     let identity = ConversationIdentity::from_openai_session(conversation).unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let store = crate::agent_automation::AgentAutomationStore::for_config(&config).unwrap();
     let issued = store
         .issue_pairing(
@@ -63,8 +58,16 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
         )
         .unwrap();
 
-    let chat = handler.markdown_chat.chat(&config, Some(&identity), &handler.session).unwrap();
-    chat.append_user("during-pairing".into(), "Start the actual work with the selected model.".into()).await.unwrap();
+    let chat = handler
+        .markdown_chat
+        .chat(&config, Some(&identity), &handler.session)
+        .unwrap();
+    chat.append_user(
+        "during-pairing".into(),
+        "Start the actual work with the selected model.".into(),
+    )
+    .await
+    .unwrap();
     let (server_transport, client_transport) = tokio::io::duplex(32 * 1024);
     let task = tokio::spawn(async move {
         handler
@@ -120,15 +123,46 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
 
     assert!(structured["new_chat_message_from_user"].is_null());
     let pending = chat.unread_snapshot().await.unwrap();
-    assert_eq!(pending.messages.len(), 1);assert_eq!(pending.messages[0].id, "during-pairing");
+    assert_eq!(pending.messages.len(), 1);
+    assert_eq!(pending.messages[0].id, "during-pairing");
     let summary = chat.owner_summary().await.unwrap();
-    let until = summary.agent_presence_until_ms.expect("verification has a short presence lease");
-    assert!(until >= summary.last_agent_call_at_ms.unwrap() + crate::markdown_chat::PAIRING_PRESENCE_GRACE_MS);
-    assert_eq!(chat.widget_page(None,None).await.unwrap().delivered_through, 0);
-    let normal = client.call_tool(automation_request("get_agent_brief", json!({}), conversation)).await.unwrap();
+    let until = summary
+        .agent_presence_until_ms
+        .expect("verification has a short presence lease");
+    assert!(
+        until
+            >= summary.last_agent_call_at_ms.unwrap()
+                + crate::markdown_chat::PAIRING_PRESENCE_GRACE_MS
+    );
+    assert_eq!(
+        chat.widget_page(None, None)
+            .await
+            .unwrap()
+            .delivered_through,
+        0
+    );
+    let normal = client
+        .call_tool(automation_request(
+            "get_agent_brief",
+            json!({}),
+            conversation,
+        ))
+        .await
+        .unwrap();
     assert_ne!(normal.is_error, Some(true));
-    assert!(chat.owner_summary().await.unwrap().agent_presence_until_ms.is_none());
-    assert!(normal.structured_content.as_ref().unwrap()["new_chat_message_from_user"].as_str().unwrap().contains("Start the actual work"));
+    assert!(
+        chat.owner_summary()
+            .await
+            .unwrap()
+            .agent_presence_until_ms
+            .is_none()
+    );
+    assert!(
+        normal.structured_content.as_ref().unwrap()["new_chat_message_from_user"]
+            .as_str()
+            .unwrap()
+            .contains("Start the actual work")
+    );
 
     client.cancel().await.unwrap();
     task.await.unwrap();
@@ -137,7 +171,7 @@ async fn pairing_verification_respects_setup_and_receives_the_owner_generation()
 #[tokio::test]
 async fn model_visible_calls_register_the_stable_task_with_the_shared_supervisor() {
     let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::default_config(root.path().to_path_buf());
+    let mut config = crate::config::default_config(std::fs::canonicalize(root.path()).unwrap());
     config.memory.dir = Some(root.path().join("metadata").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
@@ -154,6 +188,7 @@ async fn model_visible_calls_register_the_stable_task_with_the_shared_supervisor
     handler.agent_automation = Some(supervisor.clone());
     let conversation = "automation-registration-owner";
     let identity = ConversationIdentity::from_openai_session(conversation).unwrap();
+    bind_fixture_workspace(&handler, Some(&identity)).await;
     let chat = handler
         .markdown_chat
         .chat(&config, Some(&identity), &handler.session)

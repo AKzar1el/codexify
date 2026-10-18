@@ -32,18 +32,20 @@ fn exec_configuration_contains_only_runtime_controls() {
 }
 
 #[test]
-fn loads_all_35_tools_including_continuation() {
+fn loads_default_tools_including_agent_chat_and_workspace_selection() {
     let tools = load_tools();
-    assert_eq!(tools.len(), 35);
+    assert_eq!(tools.len(), 52);
     assert!(!tools.iter().any(|tool| tool.name() == "run_command"));
 }
 
 #[test]
-fn multi_project_mode_adds_catalogue_and_session_selector() {
-    let tools = load_tools_for_mode(true);
-    assert_eq!(tools.len(), 37);
-    assert_eq!(tools[0].name(), "list_projects");
-    assert_eq!(tools[1].name(), "set_project_root");
+fn legacy_mode_argument_cannot_disable_workspace_selection() {
+    for legacy in [false, true] {
+        let tools = load_tools_for_mode(legacy);
+        assert_eq!(tools.len(), 52);
+        assert!(tools.iter().any(|t| t.name() == "list_projects"));
+        assert!(tools.iter().any(|t| t.name() == "set_project_root"));
+    }
 }
 
 #[test]
@@ -54,7 +56,7 @@ fn artifact_ingress_can_be_omitted_by_configuration() {
         .into_iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 35);
+    assert_eq!(names.len(), 62);
     assert!(!names.contains(&"import_host_file"));
 }
 
@@ -66,7 +68,7 @@ fn artifact_egress_can_be_omitted_by_configuration() {
         .into_iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 35);
+    assert_eq!(names.len(), 62);
     assert!(!names.contains(&"export_host_file"));
 }
 
@@ -101,9 +103,9 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     config.conversation_auth_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 37);
-    assert_eq!(tools[0].name(), "setup");
-    let schema = tools[0].input_schema();
+    assert_eq!(tools.len(), 63);
+    let setup = tools.iter().find(|t| t.name() == "setup").unwrap();
+    let schema = setup.input_schema();
     assert!(schema["properties"].get("ref").is_some());
     assert!(schema["properties"].get("checksum").is_none());
     assert!(schema["properties"].get("token").is_none());
@@ -111,7 +113,7 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     assert_eq!(schema["properties"]["ref"]["minLength"], 64);
     assert_eq!(schema["properties"]["ref"]["maxLength"], 64);
     assert_eq!(schema["properties"]["ref"]["pattern"], "^[0-9a-f]{64}$");
-    let description = tools[0].description().to_ascii_lowercase();
+    let description = setup.description().to_ascii_lowercase();
     assert!(description.contains("setup"));
     assert!(description.contains("`ref`"));
     assert!(!description.contains("auth"));
@@ -122,12 +124,14 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     assert!(!description.contains("token"));
     assert!(!description.contains("api key"));
 
-    config.multi_project = true;
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 42);
-    assert_eq!(tools[0].name(), "setup");
-    assert_eq!(tools[1].name(), "list_projects");
-    assert_eq!(tools[2].name(), "set_project_root");
+    assert_eq!(tools.len(), 63);
+    let setup = tools.iter().position(|t| t.name() == "setup").unwrap();
+    let select = tools
+        .iter()
+        .position(|t| t.name() == "set_project_root")
+        .unwrap();
+    assert!(setup < select);
 }
 
 #[test]
@@ -216,7 +220,7 @@ fn assert_nested_object_schemas_are_closed(schema: &Value, tool: &str, path: &st
 #[test]
 fn native_tool_annotations_match_the_audited_side_effect_matrix() {
     let mut config = default_config(PathBuf::from("/tmp"));
-    config.multi_project = true;
+
     config.conversation_auth_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
     let actual = load_tools_for_config(&config)
@@ -235,6 +239,27 @@ fn native_tool_annotations_match_the_audited_side_effect_matrix() {
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let expected = [
+        ("automation_verify_pairing", (false, false, false, false)),
+        ("chat_await", (false, false, false, false)),
+        ("chat_read", (false, false, false, false)),
+        ("chat_write", (false, false, false, true)),
+        ("chat_get_attachment", (true, false, true, false)),
+        ("chat_list_attachments", (true, false, true, false)),
+        ("chat_search_attachments", (true, false, true, false)),
+        ("chat_ui_file", (true, false, true, false)),
+        ("chat_ui_state", (true, false, true, false)),
+        ("chat_ui_send", (false, false, true, false)),
+        ("chat_ui_queue", (false, false, true, false)),
+        ("goal_read", (true, false, true, false)),
+        ("goal_set", (false, false, false, false)),
+        ("goal_resume", (false, false, false, false)),
+        ("goal_finish", (false, false, true, false)),
+        ("rollout_read", (true, false, true, false)),
+        ("rollout_update", (false, false, true, false)),
+        ("turn_completed", (false, false, false, false)),
+        ("setup_ui_list_projects", (true, false, true, false)),
+        ("setup_ui_update", (false, true, false, true)),
+        ("setup_ui_select_project", (false, false, true, true)),
         ("apply_patch", (false, true, false, false)),
         ("check_for_updates", (true, false, true, true)),
         ("clock_curr_time", (true, false, true, false)),
@@ -450,8 +475,8 @@ fn check_for_updates_is_available_only_to_the_setup_app() {
 
 #[test]
 fn project_picker_tools_are_available_to_the_model_and_setup_app() {
-    let mut config = default_config(PathBuf::from("/tmp"));
-    config.multi_project = true;
+    let config = default_config(PathBuf::from("/tmp"));
+
     let tools = load_tools_for_config(&config);
     for name in ["list_projects", "set_project_root"] {
         let tool = tools
@@ -713,6 +738,13 @@ fn tools_that_need_their_own_structured_content() {
     assert_eq!(
         needs_own,
         vec![
+            "automation_verify_pairing".to_string(),
+            "chat_await".to_string(),
+            "chat_get_attachment".to_string(),
+            "chat_list_attachments".to_string(),
+            "chat_read".to_string(),
+            "chat_search_attachments".to_string(),
+            "chat_write".to_string(),
             "check_for_updates".to_string(),
             "clock_curr_time".to_string(),
             "continue_task".to_string(),
@@ -721,11 +753,21 @@ fn tools_that_need_their_own_structured_content() {
             "export_host_file".to_string(),
             "get_environment".to_string(),
             "get_project_doc".to_string(),
+            "goal_finish".to_string(),
+            "goal_read".to_string(),
+            "goal_resume".to_string(),
+            "goal_set".to_string(),
             "import_host_file".to_string(),
+            "list_projects".to_string(),
+            "rollout_read".to_string(),
+            "rollout_update".to_string(),
             "self_update".to_string(),
             "self_update_status".to_string(),
+            "set_project_root".to_string(),
+            "setup".to_string(),
             "setup_status".to_string(),
             "skills_list".to_string(),
+            "turn_completed".to_string(),
             "write_stdin".to_string(),
         ]
     );

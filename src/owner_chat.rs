@@ -5,6 +5,8 @@ mod analytics;
 mod attachments;
 mod creation;
 mod pwa;
+mod schema_refresh;
+pub(crate) use schema_refresh::start as start_schema_refresh;
 mod settings;
 
 use std::io::{Read, Write};
@@ -385,9 +387,6 @@ struct LocatedChat {
 }
 
 fn state_roots(config: &AppConfig) -> Vec<PathBuf> {
-    if !config.multi_project {
-        return vec![crate::memory::memory_dir(config)];
-    }
     let base = config
         .memory
         .dir
@@ -401,22 +400,30 @@ fn state_roots(config: &AppConfig) -> Vec<PathBuf> {
     if !is_real_dir(&base) {
         return Vec::new();
     }
-    std::fs::read_dir(base)
+    let mut roots: Vec<_> = std::fs::read_dir(&base)
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| is_real_dir(path))
-        .collect()
+        .collect();
+    if is_real_dir(&base.join("chats")) {
+        roots.push(base);
+    }
+    roots
 }
 
 fn work_dir_for_root(config: &AppConfig, root: &FilePath) -> Option<PathBuf> {
-    if !config.multi_project {
-        return Some(config.work_dir.clone());
-    }
     let path = root.join("memory.json");
     if !is_real_file(&path) {
-        return None;
+        // Preserve visibility of legacy flat state directories without retaining
+        // the old single-project runtime mode or moving user data.
+        return config
+            .memory
+            .dir
+            .as_ref()
+            .filter(|dir| FilePath::new(dir) == root && is_real_dir(&root.join("chats")))
+            .map(|_| config.work_dir.clone());
     }
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() > 1024 * 1024 {
@@ -975,8 +982,14 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
     {
         public_action["lastError"] = json!(message);
     }
-    let companion = match companion_client(&state) {
-        Ok(client) => match client.health(&CancellationToken::new()).await {
+    let mut companion = match companion_client(&state) {
+        Ok(client) => match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.health(&CancellationToken::new()),
+        )
+        .await
+        .unwrap_or_else(|_| Err("Browser companion health check timed out".into()))
+        {
             Ok(health) => {
                 let key = catalog_context(&health);
                 if health.authenticated
@@ -998,6 +1011,27 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
         }
     };
+    if companion["status"] == "unavailable"
+        && let Ok(client) = companion_client(&state)
+    {
+        let responsive = matches!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.liveness(&CancellationToken::new())
+            )
+            .await,
+            Ok(Ok(Some(true)))
+        );
+        companion["responsive"] = json!(responsive);
+    }
+    if let Ok(control) = crate::agent_automation::BrowserCompanionControl::new(
+        &state.config.markdown_chat.automation,
+    ) && let (Some(public), Some(lifecycle)) = (
+        companion.as_object_mut(),
+        control.public_status().as_object(),
+    ) {
+        public.extend(lifecycle.clone());
+    }
     Ok(Json(json!({
         "enabled": true,
         "ownerGeneration": context.owner_generation,
@@ -1193,6 +1227,59 @@ async fn automation_unlink(
     })))
 }
 
+async fn browser_start(
+    State(state): State<OwnerState>,
+    Json(body): Json<OwnerMutationBody>,
+) -> ApiResult {
+    validate_owner_request_id(&body.request_id)?;
+    let control = crate::agent_automation::BrowserCompanionControl::new(
+        &state.config.markdown_chat.automation,
+    )
+    .map_err(internal_error)?;
+    let client = control
+        .start(&CancellationToken::new())
+        .await
+        .map_err(internal_error)?;
+    let mut companion = match tokio::time::timeout(
+        Duration::from_secs(2),
+        client.health(&CancellationToken::new()),
+    )
+    .await
+    {
+        Ok(Ok(health)) => public_companion_health(&health),
+        _ => {
+            json!({"status":"unavailable","authenticated":false,"responsive":true,"activeActionId":null})
+        }
+    };
+    if companion["status"] == "unavailable" {
+        companion["responsive"] = json!(true);
+    }
+    state.global.lock().await.reset_plan();
+    if let Some(supervisor) = &state.automation {
+        supervisor.notify();
+    }
+    Ok(Json(
+        json!({"companion":companion,"lifecycle":control.public_status()}),
+    ))
+}
+async fn browser_stop(
+    State(state): State<OwnerState>,
+    Json(body): Json<OwnerMutationBody>,
+) -> ApiResult {
+    validate_owner_request_id(&body.request_id)?;
+    let control = crate::agent_automation::BrowserCompanionControl::new(
+        &state.config.markdown_chat.automation,
+    )
+    .map_err(internal_error)?;
+    control
+        .stop(&CancellationToken::new())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(
+        json!({"companion":{"status":"unavailable","authenticated":false,"activeActionId":null},"lifecycle":control.public_status()}),
+    ))
+}
+
 async fn automation_login(
     State(state): State<OwnerState>,
     Path(id): Path<String>,
@@ -1200,7 +1287,14 @@ async fn automation_login(
 ) -> ApiResult {
     let located = selected(&state, &id)?;
     let _ = automation_context(&state, &located).await?;
-    let health = companion_client(&state)?
+    let client = crate::agent_automation::BrowserCompanionControl::new(
+        &state.config.markdown_chat.automation,
+    )
+    .map_err(internal_error)?
+    .start(&CancellationToken::new())
+    .await
+    .map_err(internal_error)?;
+    let health = client
         .login(&CancellationToken::new())
         .await
         .map_err(internal_error)?;
@@ -1881,6 +1975,7 @@ static OWNER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .replace("<!-- CHAT_TEMPLATE -->", &format!("<template id=\"chat-template\"><style>{style}\n#chat {{ max-width:none; height:100%; border:0; border-radius:0; display:flex; flex-direction:column; }} #panel {{ display:flex; flex:1; min-height:0; flex-direction:column; }} #panel[hidden] {{ display:none; }} #messages {{ flex:1; max-height:none; min-height:0; }}\n</style>{body}</template>"))
         .replace("/* CHAT_SCRIPT */", script)
         .replace("/* GLOBAL_SETTINGS_SCRIPT */", include_str!("global_settings_ui.js"))
+        .replace("/* OWNER_PWA_SCRIPT */", include_str!("owner_pwa_ui.js"))
         .replace("/* USAGE_ANALYTICS_SCRIPT */", include_str!("analytics_ui.js"))
         .replace("/* STATISTICS_EXTRAS_SCRIPT */", include_str!("statistics_extras_ui.js"))
 });
@@ -2073,6 +2168,8 @@ fn router(state: OwnerState) -> Router {
         .route("/api/chats/{id}", get(chat_state))
         .route("/api/chats/{id}/title", post(rename_chat))
         .route("/api/chats/{id}/organization", post(organize_chat))
+        .route("/api/browser/start", post(browser_start))
+        .route("/api/browser/stop", post(browser_stop))
         .route("/api/chats/{id}/automation", get(automation_state))
         .route(
             "/api/chats/{id}/automation/capabilities",
@@ -2461,9 +2558,10 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let mut config = crate::config::default_config(access);
-        config.multi_project = true;
+
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.memory.dir = Some(temp.path().join("state").to_string_lossy().into_owned());
         let bindings = Arc::new(crate::project_bindings::ProjectBindingStore::new(
             temp.path().join("bindings"),
@@ -2638,6 +2736,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(temp.path().into());
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Queue;
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-api-test").unwrap();
@@ -3049,6 +3148,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut config = crate::config::default_config(temp.path().into());
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("completed-sidebar").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
@@ -3319,6 +3419,7 @@ mod tests {
         let mut config = crate::config::default_config(temp.path().join("project"));
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
@@ -3723,6 +3824,7 @@ mod tests {
         let mut config = crate::config::default_config(temp.path().join("project"));
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.markdown_chat.automation.descriptor_path = descriptor.display().to_string();
@@ -4111,6 +4213,7 @@ mod tests {
         let mut config = crate::config::default_config(temp.path().join("project"));
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
@@ -4439,13 +4542,14 @@ mod tests {
     }
     fn goal_recovery_state(
         root: &FilePath,
-        multi_project: bool,
+        _legacy_mode: bool,
         executor: Arc<GoalRecoveryExecutor>,
     ) -> OwnerState {
         let mut config = crate::config::default_config(root.join("project"));
         std::fs::create_dir_all(&config.work_dir).unwrap();
-        config.multi_project = multi_project;
+
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(root.join("metadata").display().to_string());
@@ -4692,6 +4796,7 @@ mod tests {
         let mut config = crate::config::default_config(root.path().into());
         config.memory.dir = Some(root.path().join("metadata").display().to_string());
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         let task = ConversationIdentity::from_openai_session("queue-restart-owner").unwrap();
         let store = AgentAutomationStore::for_config(&config).unwrap();
         let goal = store

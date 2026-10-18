@@ -736,3 +736,33 @@ test('multi-step maintenance yields the UI lease to already queued work between 
  expect(order).toEqual(['first-step','other-operation','second-step']);
  expect((await coordinator.health()).status).toBe('idle');await coordinator.close();
 });
+
+test("liveness checks browser responsiveness without inspecting account sessions", async () => {
+  class LivenessDriver extends DeferredDriver {
+    available = true;
+    healthCalls = 0;
+    async liveness() { return this.available; }
+    async health(): ReturnType<DeferredDriver["health"]> { this.healthCalls++; throw new Error("Session API is unavailable"); }
+  }
+  const driver = new LivenessDriver(), coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
+  expect((await coordinator.liveness()).available).toBe(true);
+  driver.available = false;
+  expect((await coordinator.liveness()).available).toBe(false);
+  expect(driver.healthCalls).toBe(0);
+});
+
+test("liveness leaves a bounded active operation to its normal deadline", async () => {
+  class OperationDriver extends DeferredDriver {
+    probes = 0;
+    async liveness() { this.probes++; return false; }
+  }
+  const driver=new OperationDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  await coordinator.execute(request("liveness-active"));
+  await new Promise(resolve=>setTimeout(resolve,0));
+  expect((await coordinator.liveness()).available).toBe(true);
+  expect(driver.probes).toBe(0);
+  driver.releases.get("liveness-active")?.();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  expect((await coordinator.liveness()).available).toBe(false);
+  expect(driver.probes).toBe(1);
+});

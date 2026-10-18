@@ -46,6 +46,7 @@ export interface DriverExecution {
 export type BrowserStepRunner = <T>(operation:(signal:AbortSignal)=>Promise<T>,signal?:AbortSignal)=>Promise<T>;
 
 export interface BrowserDriver {
+  liveness?():Promise<boolean>;
   health(): Promise<{
     authenticated:boolean;
     accountFingerprint:string | null;
@@ -215,6 +216,13 @@ export class SingleWindowCoordinator {
     private readonly timeouts = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS }) {
     validateProtocolBuild(build);
     if (Object.values(timeouts).some(value => !Number.isFinite(value) || value <= 0)) throw new Error("Browser operation deadlines must be positive");
+  }
+
+  async liveness():Promise<{protocolVersion:number;build:string;available:boolean}> {
+    const available=!this.retired&&!this.driverClosed&&(this.activeActionId!==null||this.windowOperationActive||(this.driver.liveness
+      ? await this.driver.liveness()
+      : await this.driver.health().then(health=>health.status!=="unavailable"||health.authenticated).catch(()=>false)));
+    return {protocolVersion:PROTOCOL_VERSION,build:this.build,available};
   }
 
   async health(): Promise<CompanionHealth> {

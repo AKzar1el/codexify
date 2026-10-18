@@ -2,9 +2,10 @@
 // src/adapters/chatgpt-web/model-selection.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 import { activateChatGptEffortMenu, parseChatGptEffortSliderState, parseChatGptModelAnnouncement, readChatGptModelAnnouncements } from "./session";
 import type { Locator, Page } from "patchright";
+import {uiLabelPattern,parseEffortAnnouncement} from "./ui-localization";
 import { activeComposer, composerText } from "./composer";
 import { readChatGptEffortSnapshot, readCurrentEffortLabel, moveChatGptEffortSlider, CHATGPT_EFFORT_CONTROL_SELECTOR } from "./session";
-import { MODEL_FAMILY_LABELS, browserModelFamilyFromLabel, browserEffortIdFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
+import { readModelOptionRows, browserEffortIdFromLabel, modelsFromDiscoveredEfforts, resolveBrowserModel, type AccountCapabilities, type BrowserEffort, type BrowserModelFamily, type ResolvedBrowserModel } from "./models";
 import { BrowserCompanionError, ModelOptionUnavailableError } from "./errors";
 import { canonicalChatGptConversationUrl } from "./protocol";
 import { modelFallbacks } from "./model-fallback";
@@ -13,18 +14,15 @@ type EffortMenu = Awaited<ReturnType<typeof activateChatGptEffortMenu>>;
 
 function familyError(family: BrowserModelFamily, cause?: unknown): BrowserCompanionError {
   return new BrowserCompanionError(
-    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check the model in the browser; if ChatGPT uses an unsupported language, select English in Settings → General → Language and reload it.`,
+    `ChatGPT model ${family} could not be selected and verified. The pending message was not sent. Check the model in the browser; refresh the model catalog and retry.`,
     "model_unavailable",
     { cause },
   );
 }
 
-function familyOption(menu: EffortMenu, family: BrowserModelFamily) {
-  return menu.menu.getByRole("menuitemradio", {
-    name: MODEL_FAMILY_LABELS[family],
-    exact: true,
-    includeHidden: true,
-  });
+async function familyOption(menu: EffortMenu, family: BrowserModelFamily) {
+  await readModelOptionRows(menu.menu);
+  return menu.menu.locator(`[role="menuitemradio"][data-browser-model-family="${family}"]`);
 }
 
 /** Model and effort are separate browser controls; a generic Pro label proves neither family. */
@@ -36,7 +34,7 @@ export async function selectChatGptModelFamily(
 ): Promise<EffortMenu> {
   try {
     signal?.throwIfAborted();
-    const option = familyOption(menu, family);
+    const option = await familyOption(menu, family);
     if (await option.count() > 1) throw familyError(family);
     if (await option.count() === 1 && (await option.getAttribute("aria-disabled") === "true" || await option.getAttribute("disabled") !== null)) {
       throw new ModelOptionUnavailableError(`ChatGPT model ${family} is unavailable`,family);
@@ -58,8 +56,8 @@ export async function selectChatGptModelFamily(
       if (await trigger.getAttribute("aria-expanded") === "false") await trigger.click({ timeout: 5_000,signal });
     }
     if (await option.count() === 0) {
-      const labels=await menu.menu.getByRole("menuitemradio").filter({visible:true}).allTextContents();
-      if (labels.some(label=>browserModelFamilyFromLabel(label))) {
+      const rows=await readModelOptionRows(menu.menu);
+      if (rows.some(row=>row.family)) {
         throw new ModelOptionUnavailableError(`ChatGPT model ${family} is not offered in this conversation`,family);
       }
       throw familyError(family);
@@ -72,7 +70,7 @@ export async function selectChatGptModelFamily(
     const selected = await activate();
     const deadline = Date.now() + 1_000;
     do {
-      const current = familyOption(selected, family);
+      const current = await familyOption(selected, family);
       if (await current.count() > 1) throw familyError(family);
       if (await current.count() === 1 && await current.getAttribute("aria-checked") === "true") return selected;
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -113,11 +111,11 @@ export function chatGptModelSelectionMatches(
   // The current picker announces only the effort. Its checked family radio is
   // the model evidence; retain explicit version announcements when present.
   const hasVersion = descriptions.some(text => parseChatGptModelAnnouncement(text) !== undefined);
-  const selectedVersion = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?=\s|Leaving|$)/i
+  const selectedVersion = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?=\s|$)/i
     .exec(familyLabel?.normalize("NFKC").trim() ?? "")?.[1];
   if (!hasVersion && selectedVersion !== family) return false;
   const evidence = hasVersion ? descriptions : descriptions
-    .filter(text => { const label = text.trim().replace(/[,、]\s*\d+\s+of\s+\d+\.?$/i, ""); return label && browserEffortIdFromLabel(label) === effort; })
+    .filter(text => { const label = parseEffortAnnouncement(text)?.label ?? text.trim(); return label && browserEffortIdFromLabel(label) === effort; })
     .map(text => `${family} ${text}`);
   const observedName=/\b(Sol|Luna|Astra)\b/i.exec(familyLabel||"")?.[1]?.toLowerCase();
   return chatGptModelFamilyMatches(evidence, family, effort, observedName);
@@ -132,14 +130,14 @@ export async function assertChatGptModelFamily(
 ): Promise<void> {
   const deadline = Date.now() + settleMs;
   do {
-    const option = familyOption(menu, family);
+    const option = await familyOption(menu, family);
     const checked = await option.count() === 1 && await option.getAttribute("aria-checked") === "true";
     const state = parseChatGptEffortSliderState(
       await menu.slider.getAttribute("aria-valuemin"), await menu.slider.getAttribute("aria-valuemax"),
       await menu.slider.getAttribute("aria-valuenow"),
     );
     const descriptions = await readChatGptModelAnnouncements(menu.slider);
-    const familyLabel = checked ? await option.textContent() : null;
+    const familyLabel = checked ? (await readModelOptionRows(menu.menu)).find(row=>row.checked&&row.family===family)?.label??null : null;
     if (state && state.value === state.min + effortIndex && chatGptModelSelectionMatches(descriptions, family, effort, checked, familyLabel)) return;
     if (Date.now() >= deadline) break;
     await new Promise(resolve => setTimeout(resolve, 50));
@@ -151,13 +149,18 @@ export interface SelectedBrowserModel extends ResolvedBrowserModel {
   selection: { url:string; label:string } | null;
 }
 
+async function thinkControls(form:Locator):Promise<Locator> {
+  const semantic=form.locator('button[data-testid="think-button"],button[data-composer-navigation-target="reasoning"][aria-pressed]').filter({visible:true});
+  return await semantic.count()?semantic:form.getByRole("button",{name:uiLabelPattern("thinkControl"),exact:true}).filter({visible:true});
+}
+
 async function setLunaThinkMode(
   composer: Locator,
   enabled: boolean,
   signal?: AbortSignal,
 ): Promise<void> {
   const form = composer.locator("xpath=ancestor::form[1]");
-  const controls = form.getByRole("button", { name:"Think", exact:true }).filter({ visible:true });
+  const controls = await thinkControls(form);
   const count = await controls.count();
   if (count > 1) throw new BrowserCompanionError("ChatGPT exposed multiple Think controls", "model_unavailable");
   const action = { timeout:10_000, signal };
@@ -194,7 +197,7 @@ async function setLunaThinkMode(
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
-      const current = form.getByRole("button", { name:"Think", exact:true }).filter({ visible:true });
+      const current = await thinkControls(form);
       const currentCount = await current.count();
       if (currentCount > 1) throw new BrowserCompanionError("ChatGPT exposed multiple Think controls", "model_unavailable");
       pressed = currentCount === 1 ? await current.first().getAttribute("aria-pressed", action) : null;

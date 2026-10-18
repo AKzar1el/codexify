@@ -5,6 +5,7 @@ pub mod notification;
 mod offline;
 pub(crate) mod output;
 mod storage;
+mod title;
 mod wait;
 
 use std::collections::HashMap;
@@ -51,23 +52,39 @@ pub struct AgentAutomationConfig {
     pub chatgpt_project_url: Option<String>,
     #[serde(deserialize_with = "deserialize_request_block_list")]
     pub request_block_list: Vec<String>,
+    pub request_blocking_enabled: bool,
 }
 
 impl Default for AgentAutomationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             descriptor_path: DEFAULT_AUTOMATION_DESCRIPTOR_PATH.into(),
             connector_name: DEFAULT_AUTOMATION_CONNECTOR_NAME.into(),
             max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
-            auto_approve_tool_calls: false,
+            auto_approve_tool_calls: true,
             chatgpt_project_url: None,
-            request_block_list: Vec::new(),
+            request_block_list: vec![
+                r"^https?://(www\.)?chatgpt\.com/.*/rgstr".into(),
+                r"^https?://(www\.)?chatgpt\.com/backend-api/.*/conversations".into(),
+                r"^https?://(www\.)?chatgpt\.com/backend-api/conversations".into(),
+                r"^https?://(www\.)?chatgpt\.com/backend-api/sidebar".into(),
+                r"^https?://(www\.)?chatgpt\.com/backend-api/.*/sidebar".into(),
+            ],
+            request_blocking_enabled: false,
         }
     }
 }
 
 impl AgentAutomationConfig {
+    pub(crate) fn effective_request_block_list(&self) -> &[String] {
+        if self.request_blocking_enabled {
+            &self.request_block_list
+        } else {
+            &[]
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.request_block_list.len() > 128 {
             return Err(
@@ -151,8 +168,8 @@ pub(crate) fn now_ms() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageMode {
-    #[default]
     Steer,
+    #[default]
     Queue,
 }
 
@@ -177,10 +194,10 @@ pub struct MarkdownChatConfig {
 impl Default for MarkdownChatConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             port: Some(DEFAULT_OWNER_CHAT_PORT),
             max_wait_ms: DEFAULT_MAX_WAIT_MS,
-            default_message_mode: MessageMode::Steer,
+            default_message_mode: MessageMode::Queue,
             rollout_reminder_interval: rollout::DEFAULT_REMINDER_INTERVAL,
             rollout_enabled: true,
             _legacy_analytics_enabled: None,
@@ -308,11 +325,6 @@ impl MarkdownChatConfig {
         }
         if let Some(notifications) = &self.notifications {
             notifications.validate()?;
-        }
-        if self.automation.enabled && !self.enabled {
-            return Err(
-                "agentChat.automation.enabled requires agentChat.enabled to be true".into(),
-            );
         }
         self.automation.validate()?;
         Ok(())
@@ -528,18 +540,25 @@ mod tests {
     use super::*;
     #[test]
     fn request_block_list_defaults_and_configuration_bounds() {
-        for value in [
-            serde_json::json!({}),
-            serde_json::json!({"requestBlockList":null}),
+        for (value, expected_len) in [
+            (serde_json::json!({}), 5),
+            (serde_json::json!({"requestBlockList":null}), 0),
         ] {
             let config: AgentAutomationConfig = serde_json::from_value(value).unwrap();
-            assert!(config.request_block_list.is_empty());
+            assert_eq!(config.request_block_list.len(), expected_len);
+            assert!(!config.request_blocking_enabled);
+            assert!(config.effective_request_block_list().is_empty());
         }
         let mut config: AgentAutomationConfig = serde_json::from_value(
             serde_json::json!({"requestBlockList":["^https?://example\\.com/"]}),
         )
         .unwrap();
         assert!(config.validate().is_ok());
+        config.request_blocking_enabled = true;
+        assert_eq!(
+            config.effective_request_block_list(),
+            config.request_block_list.as_slice()
+        );
         for pattern in ["".to_string(), "é".to_string(), "x".repeat(4097)] {
             config.request_block_list = vec![pattern];
             assert!(config.validate().is_err());

@@ -170,7 +170,7 @@ impl Tool for ChatAttachments {
             if a.include_content && attachment.mime_type.starts_with("image/") {
                 let mut image_config = config.clone();
                 image_config.work_dir = root.into();
-                image_config.multi_project = false;
+
                 let image = crate::tools::view_image::ViewImage
                     .call(
                         json!({"path":attachment.unique_name}),

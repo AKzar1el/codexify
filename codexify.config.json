@@ -1,47 +1,61 @@
 {
   "schemaVersion": 1,
   "workDir": null,
-  "debug": false,
+  "debug": true,
   "uiWidgets": true,
   "experimental": {
     "agentTickets": false,
     "forceReadOnlyToolAnnotations": false,
-    "forceDestructiveToolAnnotations": null,
+    "forceDestructiveToolAnnotations": false,
     "forceIdempotentToolAnnotations": null,
-    "forceOpenWorldToolAnnotations": null,
+    "forceOpenWorldToolAnnotations": false,
     "claudeSkills": false
   },
   "agentChat": {
-    "enabled": false,
+    "enabled": true,
     "port": 3120,
     "maxWaitMs": 55000,
-    "defaultMessageMode": "steer",
-    "rolloutReminderInterval": 20,
+    "defaultMessageMode": "queue",
+    "rolloutReminderInterval": 25,
     "notifications": null,
     "automation": {
-      "enabled": false,
+      "enabled": true,
       "descriptorPath": "~/.codexify/browser/descriptor.json",
       "connectorName": "",
       "maxQueuedActions": 64,
-      "autoApproveToolCalls": false
-    }
+      "autoApproveToolCalls": true,
+      "requestBlockingEnabled": false,
+      "requestBlockList": [
+        "^https?://(www\\.)?chatgpt\\.com/.*/rgstr",
+        "^https?://(www\\.)?chatgpt\\.com/backend-api/.*/conversations",
+        "^https?://(www\\.)?chatgpt\\.com/backend-api/conversations",
+        "^https?://(www\\.)?chatgpt\\.com/backend-api/sidebar",
+        "^https?://(www\\.)?chatgpt\\.com/backend-api/.*/sidebar"
+      ]
+    },
+    "rolloutEnabled": true
   },
   "apiKey": null,
   "conversationAuthToken": null,
   "port": 3000,
-  "multiProject": false,
   "projectCloneDir": ".",
   "worktrees": {
     "mode": "auto",
     "root": null,
-    "upstreamRefreshMode": "never",
+    "upstreamRefreshMode": "best-effort",
     "autoCleanupEnabled": true,
     "keepCount": 15,
     "allowSetupScript": false
   },
   "tree": {
     "defaultDepth": 3,
-    "ignore": ["node_modules", ".git", "dist", ".next", "__pycache__"]
+    "ignore": [
+      "node_modules",
+      ".git",
+      "dist",
+      ".next",
+      "__pycache__"
+    ]
   },
   "ignore": {
     "useGitignore": true,
@@ -60,7 +74,9 @@
   "projectDoc": {
     "maxBytes": 32768,
     "fallbackFilenames": [],
-    "rootMarkers": [".git"]
+    "rootMarkers": [
+      ".git"
+    ]
   },
   "projectCatalog": {
     "codexConfig": {
@@ -77,7 +93,7 @@
     "maxTreeNodes": 1000
   },
   "filesystem": {
-    "maxConcurrentWorkers": 4,
+    "maxConcurrentWorkers": 8,
     "maxPendingRequests": 16,
     "maxScanBytes": 67108864,
     "maxScanEntries": 100000,
@@ -88,7 +104,7 @@
     "commandTimeoutMs": 30000
   },
   "toolLogging": {
-    "mode": "off",
+    "mode": "all",
     "level": "info",
     "maxRequestBytes": 2048,
     "maxResponseBytes": 4096,
@@ -96,9 +112,10 @@
   },
   "audit": {
     "logFile": null,
-    "includeCommandPreview": false,
+    "includeCommandPreview": true,
     "commandPreviewMaxBytes": 512,
-    "redactEnv": []
+    "redactEnv": [],
+    "enabled": true
   },
   "artifactIngress": {
     "enabled": true,
@@ -106,8 +123,10 @@
     "requestTimeoutMs": 120000,
     "idleTimeoutMs": 30000,
     "maxRedirects": 3,
-    "maxConcurrentDownloads": 2,
-    "allowedHosts": ["*"]
+    "maxConcurrentDownloads": 8,
+    "allowedHosts": [
+      "*"
+    ]
   },
   "artifactEgress": {
     "enabled": true,

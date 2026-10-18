@@ -7,8 +7,9 @@ async fn markdown_chat_workspace_actions_keep_messages_and_receipts_in_the_selec
             std::fs::create_dir_all(projects.join(name)).unwrap();
         }
         let mut config = crate::config::default_config(projects);
-        config.multi_project = true;
+
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.memory.dir = Some(root.path().join("memory").display().to_string());
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         let mut handler = handler_with_tools(
@@ -198,8 +199,9 @@ async fn workspace_picker_wait_and_switch_require_brief_without_touching_old_fil
             .unwrap();
         }
         let mut config = crate::config::default_config(projects);
-        config.multi_project = true;
+
         config.markdown_chat.enabled = true;
+        config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.max_wait_ms = 2000;
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         config.memory.dir = Some(root.path().join("memory").display().to_string());
@@ -398,7 +400,7 @@ async fn workspace_switch_notices_are_present_even_without_markdown_chat() {
     let root = tempfile::tempdir().unwrap();
     let mut config = crate::config::default_config(root.path().join("projects"));
     std::fs::create_dir_all(config.work_dir.join("a")).unwrap();
-    config.multi_project = true;
+
     config.worktrees.mode = crate::types::WorktreeMode::Never;
     let mut handler = handler_with_tools(
         root.path(),

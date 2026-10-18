@@ -106,8 +106,7 @@ The installer source is available for [macOS/Linux](https://github.com/devnoname
 codexify quickstart
 ```
 
-The wizard defaults to multi-project mode, asks for the matching projects root or
-single project directory, then guides you through creating a tunnel, its runtime
+The wizard asks for the projects access root, then guides you through creating a tunnel, its runtime
 API key, and the `Codexify` connector in ChatGPT. It prints the links and exact
 settings to use, saves your configuration, and starts the connection.
 Keep Codexify running while you use it; the background service handles that for a
@@ -145,10 +144,11 @@ projects, or use **Worktrees** to reuse an existing checkout. After selection,
 The agent receives the new path and must reload the project instructions. See the [workspace guide](https://github.com/devnoname120/codexify/wiki/Multi-Project-Mode)
 for project selection and worktree options.
 
-## Markdown chat (optional)
+## Agent chat
 
-Steer an active conversation by appending to a local Markdown file instead of
-sending another ChatGPT message. Enable the feature in your Codexify config:
+Agent chat is enabled by default. It delivers messages through a local Markdown
+file while the agent is online, and queues new requests by default. Existing
+explicit settings are preserved. Its listener and timeout can be configured:
 
 ```json
 {
@@ -176,7 +176,7 @@ by default. It is a chronological activity timeline of completed work, current
 work and next steps, and can reference supporting files.
 Agents read recent progress with `rollout_read` when a turn starts and append
 status, progress and next steps using `rollout_update`. Tool results request a
-checkpoint after **20 agent work calls** by default. Change
+checkpoint after **25 agent work calls** by default. Change
 `agentChat.rolloutReminderInterval` in **Settings → Chats & goals → Progress
 report interval**; it applies immediately. UI polling and idle chat waits do not
 count. Recent recovery reads include up to five complete reports, capped at
@@ -377,6 +377,61 @@ optional `agentChat.automation.chatgptProjectUrl` setting:
 Omit `chatgptProjectUrl` to create chats outside a ChatGPT project. Codexify uses
 its isolated Chrome profile and the existing shared browser action queue.
 
+### Settings and mobile installation
+
+The sidebar is titled **Codexify**. Its footer has **Install**, **Statistics** and
+**Settings** controls. Install opens the browser's installation prompt when
+supported; on iPhone and iPad it shows the Share → Add to Home Screen steps.
+The Install control is hidden when opened as an installed web app. Mobile
+settings use compact controls with consistent text sizes while editing, and
+footers and dialogs respect screen safe areas.
+
+All conversations now select a workspace. The legacy `multiProject` configuration
+key and `--multi-project` CLI flag are accepted for compatibility but cannot
+disable workspace selection.
+
+New installations enable debug output, audit logging with redacted command
+previews, and Info-level logging for all tool calls. Filesystem workers and
+parallel downloads default to 8. Worktree upstream refresh defaults to
+`best-effort`. Destructive and open-world annotation overrides default to false;
+other annotation switches remain independent.
+
+Schema-affecting configuration edits automatically queue a connector tool refresh
+after a 10-second debounce, including edits made outside Settings. Annotation
+changes apply live. Changes that need a server restart retain their queued
+refresh until **Restart Codexify** has applied them. Unrelated preferences do not
+refresh tools. Refresh uses the companion's existing tab and action queue.
+
+Request blocking has an independent **Block matching requests** switch under
+**Settings → Browser**. It is **off by default**, with these editable defaults:
+
+```text
+^https?://(www\.)?chatgpt\.com/.*/rgstr
+^https?://(www\.)?chatgpt\.com/backend-api/.*/conversations
+^https?://(www\.)?chatgpt\.com/backend-api/conversations
+^https?://(www\.)?chatgpt\.com/backend-api/sidebar
+^https?://(www\.)?chatgpt\.com/backend-api/.*/sidebar
+```
+
+Use **Restart Codexify** after changing the switch or patterns. Matching requests
+are blocked in Chrome before they reach the server. Disabling the switch retains
+the patterns for later use.
+
+The browser companion is monitored while automation is enabled. An installed
+companion recovers automatically after its window closes or stops responding.
+**Conversation settings → Browser connection** provides **Start browser** and
+**Stop browser**. Stop deliberately keeps it off, including after restarting
+Codexify, until Start is pressed. The CLI `browser start` and `browser stop`
+commands use the same control. Queued work, pairings and the signed-in profile
+are retained. Recovery does not submit or replay messages.
+
+The browser-only liveness probe evaluates a constant in the existing page; it
+neither queries ChatGPT's session endpoint nor waits for its Stop button.
+Signed-out sessions and bounded in-progress browser operations are left for
+their ordinary sign-in and action handling. A frozen process can be terminated
+only after its managed executable has been verified. System Chrome and other
+profiles are outside this recovery scope.
+
 ### Offline browser fallback
 
 The standalone page can optionally wake an offline agent through the user's
@@ -387,8 +442,8 @@ one-time Codexify tool call, and chooses the model and effort in standalone chat
 Codexify never guesses from the most recent browser tab, a project, or
 `openai/session`.
 
-Install the optional native companion after enabling
-`agentChat.automation.enabled`:
+Browser automation is enabled by default. Install and sign in to the native
+companion before using the browser fallback:
 
 ```bash
 codexify browser install

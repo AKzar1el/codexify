@@ -209,10 +209,8 @@ Or run it directly from a source checkout:
 cargo run --release -- quickstart
 ```
 
-The wizard first asks whether to use single-project or multi-project mode. New
-setups default to multi-project mode; an existing `multiProject` value remains the
-rerun default. It then asks for a **Projects access root** or **Project directory**
-using mode-specific wording. The remaining steps create an OpenAI Secure MCP
+The wizard asks for a **Projects access root**. Every conversation selects its
+own workspace below this root; there is no single-project mode. The remaining steps create an OpenAI Secure MCP
 Tunnel, prompt directly for the tunnel ID and hidden runtime API key, and create
 the matching ChatGPT developer-mode connector. The suggested tunnel and connector
 name is `Codexify`; existing configurations are not renamed. Advanced policies,
@@ -836,7 +834,7 @@ limits independently of output limits:
 ```json
 {
   "filesystem": {
-    "maxConcurrentWorkers": 4,
+    "maxConcurrentWorkers": 8,
     "maxPendingRequests": 16,
     "maxScanBytes": 67108864,
     "maxScanEntries": 100000,
@@ -1018,12 +1016,11 @@ names.
     "maxWaitMs": 55000,
     "notifications": null
   },
-  "multiProject": false,
   "projectCloneDir": ".",
   "worktrees": {
     "mode": "auto",
     "root": "/path/to/worktrees",
-    "upstreamRefreshMode": "never",
+    "upstreamRefreshMode": "best-effort",
     "autoCleanupEnabled": true,
     "keepCount": 15,
     "allowSetupScript": false
@@ -1063,7 +1060,7 @@ names.
     "maxPatchBytes": 4194304
   },
   "toolLogging": {
-    "mode": "off",
+    "mode": "all",
     "level": "info",
     "maxRequestBytes": 2048,
     "maxResponseBytes": 4096,
@@ -1071,7 +1068,7 @@ names.
   },
   "audit": {
     "logFile": null,
-    "includeCommandPreview": false,
+    "includeCommandPreview": true,
     "commandPreviewMaxBytes": 512,
     "redactEnv": []
   },
@@ -1081,7 +1078,7 @@ names.
     "requestTimeoutMs": 120000,
     "idleTimeoutMs": 30000,
     "maxRedirects": 3,
-    "maxConcurrentDownloads": 2,
+    "maxConcurrentDownloads": 8,
     "allowedHosts": ["*"]
   },
   "artifactEgress": {
@@ -1154,7 +1151,7 @@ repository-local path, add it to the repository's ignore rules. On Unix,
 quickstart changes the config mode to `0600` when it preserves a token-bearing
 config; manually created configs should be protected equivalently.
 
-`debug` defaults to `false`. When enabled, Codexify adds small component-only
+`debug` defaults to `true`. When enabled, Codexify adds small component-only
 timing metadata to every tool result. The setup, diff, and updater cards render
 the server execution time at their end; cards that invoke tools also distinguish
 widget-observed round-trip time from server time. It does not enable payload
@@ -1199,12 +1196,15 @@ advertised tool, including imported tools:
 | `forceIdempotentToolAnnotations` | `idempotentHint` |
 | `forceOpenWorldToolAnnotations` | `openWorldHint` |
 
-Each accepts `true`, `false`, or `null`. Omitted or `null` preserves the existing
-hint; an explicit boolean replaces it. An explicit idempotent override also
+Each accepts `true`, `false`, or `null`. Destructive and open-world overrides
+default to `false`; omitted or `null` restores that default. The idempotent
+override defaults to keeping each tool’s existing hint. An explicit boolean
+replaces the corresponding hint. An explicit idempotent override also
 replaces the non-idempotent annotation normally advertised for ticketed tools.
 These are metadata overrides and do not change actual tool behavior. The settings
-GUI offers **Keep tool hints (default)**, **True**, and **False**, saves changes
-automatically, and requires a restart and connector tool refresh to apply them.
+GUI shows the effective default alongside **True** and **False** and saves
+changes automatically. Hints apply live; connector tool refresh is queued
+automatically after ten seconds without another schema edit.
 
 ## Agent tickets
 
@@ -1360,7 +1360,7 @@ The `toolLogging` config block provides the same controls:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `mode` | `"off"` | `off`, `requests`, `responses`, or `all` |
+| `mode` | `"all"` | `off`, `requests`, `responses`, or `all` |
 | `level` | `"info"` | Event severity: `trace`, `debug`, `info`, `warn`, or `error` |
 | `maxRequestBytes` | `2048` | Maximum UTF-8 bytes retained from each redacted request; accepted range is `64`-`65536` |
 | `maxResponseBytes` | `4096` | Maximum UTF-8 bytes retained from each redacted response; accepted range is `64`-`65536` |
@@ -1396,8 +1396,9 @@ The `audit` config block has the same controls:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `logFile` | `null` | JSONL destination; a relative path resolves from the launch directory. Setting it enables auditing |
-| `includeCommandPreview` | `false` | Include bounded, redacted `exec_command` previews |
+| `enabled` | `true` | Enable audit logging independently of the destination |
+| `logFile` | Per-project `~/.codexify/projects/<project>/audit.jsonl` | JSONL destination; a relative path resolves from the launch directory. Omitted or null uses the default |
+| `includeCommandPreview` | `true` | Include bounded, redacted `exec_command` previews |
 | `commandPreviewMaxBytes` | `512` | Maximum UTF-8 byte length of a command preview; accepted range is `1`-`16384` |
 | `redactEnv` | `[]` | Environment-variable names whose current values must be removed from previews |
 
@@ -1429,7 +1430,7 @@ Native mode deliberately cannot be combined with a caller-supplied `apiKey` / `-
 
 The OpenAI runtime key authenticates the outbound control-plane connection. Codexify resolves the configured `env:NAME` or `file:/path` reference once, passes the value to the tunnel child under a private synthetic environment name, and removes the original environment variable from model-launched commands and bridged MCP children. The tunnel runtime starts with a small allowlist of ordinary OS variables rather than inheriting tunnel-client configuration, proxy, header, or trust-store overrides from the launching shell. On Unix, a referenced key file must not be readable by group or other users. These measures prevent accidental inheritance; they do not create a secret boundary against hostile code running as the same OS user, which can potentially inspect same-user processes or read an accessible key file.
 
-The top-level `multiProject` key is the config-file equivalent of `--multi-project`. In that mode the process reads one static `codexify.config.json`; project or scratch selection changes the effective work directory used by project-scoped tools, not the server configuration itself. The native Codex project table is the exception to the startup snapshot: `list_projects` rereads it on every call so newly trusted projects become discoverable without restarting Codexify. ChatGPT workspace bindings are independent of the `memory` block and are enabled even when `memory.enabled` is `false`.
+Workspace selection is always enabled. The legacy `multiProject` key and `--multi-project` flag are accepted but ignored. One static configuration controls the server; selecting a workspace changes only the effective work directory of project-scoped tools. Project bindings are independent of `memory.enabled`.
 
 `projectCloneDir` selects where `set_project_root` places a repository requested by Git URL but lacking a matching local checkout. It defaults to the multi-project access root (`--work-dir`); a relative value is resolved against that access root, while `--project-clone-dir` overrides the file setting. The directory must already exist, must be a directory, and must canonicalize to the access root or one of its descendants. The destination follows normal `git clone` naming (`<projectCloneDir>/<repository-name>`); an unrelated file or checkout at that path is never overwritten. Provider-agnostic repository URLs clone their default checkout. GitHub branch URLs clone the named branch when a repository must be created, while PR and commit URLs clone the repository and then detach at the fetched target commit.
 
@@ -1504,7 +1505,7 @@ The `artifactIngress` block governs [native host-file ingress](#native-host-file
 | `requestTimeoutMs` | `120000` | Whole import deadline, including network transfer and publication |
 | `idleTimeoutMs` | `30000` | Maximum wait between response-body chunks; must not exceed `requestTimeoutMs` |
 | `maxRedirects` | `3` | Maximum manually validated redirects, between `0` and `10` |
-| `maxConcurrentDownloads` | `2` | Process-wide concurrent import cap, between `1` and `16` |
+| `maxConcurrentDownloads` | `8` | Process-wide concurrent import cap, between `1` and `16` |
 | `allowedHosts` | `["*"]` | Host patterns a download URL and every redirect hop must match. `"*"` accepts any public HTTPS host while rejecting internal/reserved addresses (loopback, private, link-local, unique-local, CGNAT, `localhost`, cloud metadata). A bare host (`files.example.com`) matches exactly; a leading dot (`.example.com`) matches that host and its subdomains; an explicitly named host is trusted as given, including an internal one |
 
 The `artifactEgress` block governs [native host-file egress](#native-host-file-egress) and the opaque capabilities used to proxy resource links returned by bridged MCP servers:
@@ -1568,7 +1569,6 @@ For example:
 
 ```json
 {
-  "multiProject": true,
   "projectCatalog": {
     "codexConfig": {
       "enabled": true,
@@ -1645,9 +1645,11 @@ Each URI contains a random 256-bit bearer capability. Issued native resources ar
 
 ## Multi-project mode
 
-By default the server is pinned to one project: `--work-dir` *is* the project root, and every project-scoped tool resolves against it. Multi-project mode turns `--work-dir` into an *access root* instead, while each conversation chooses either one project beneath that root or a private scratch workspace, so a single running server can serve many repositories without a process per repo.
-
-Enable it with `--multi-project` or `"multiProject": true` (see [Server flags](#server-flags) and [Config file](#config-file)). One static `codexify.config.json` is read at startup; selection changes only the effective work directory the project tools use, never the server configuration itself.
+`--work-dir` is the access root. Each conversation chooses a project beneath it
+or an explicit private scratch workspace. A single server serves many repositories.
+Workspace selection is always enabled; legacy `multiProject` and `--multi-project`
+settings cannot disable it. One static configuration is read at startup; selection
+changes only the project tools' effective work directory.
 
 Each conversation makes exactly one workspace choice through [`set_project_root`](#tools): attach a project/repository target or choose `withoutProject: true` for a private scratch workspace. When neither an exact path nor an exact supported Git repository URL is known, [`list_projects`](#tools) provides a project-independent enumeration step. With per-conversation setup enabled, the setup card presents those results as a searchable chooser:
 
@@ -1831,15 +1833,17 @@ URL ending in `/project` to place these chats inside that project. Omit it to
 create chats at the top level. Project URLs cannot contain credentials, query
 parameters, or fragments. The browser remains isolated from system Chrome.
 
-`agentChat.automation.enabled` requires `agentChat.enabled`. The descriptor path
+Browser automation defaults to enabled and can refresh tools even when agent chat
+is disabled. The descriptor path
 must be absolute or start with `~/`; the connector name is bounded visible text;
-`maxQueuedActions` accepts 1–1024; and `autoApproveToolCalls` defaults to `false`.
+`maxQueuedActions` accepts 1–1024; and `autoApproveToolCalls` defaults to `true`.
 The first release reuses agent chat's existing five-minute offline threshold and
 always uses one shared window rather than a configurable tab count.
 
 `agentChat.automation.requestBlockList` is an optional array of case-sensitive
 RE2 regular expressions matched against complete browser request URLs. It defaults
-to `[]`. Matching requests are blocked by Chromium before transmission, including
+to the five patterns shown below. `requestBlockingEnabled` defaults to `false`;
+the list is retained while disabled. When enabled, matching requests are blocked by Chromium before transmission, including
 redirect destinations, frames, new tabs, and worker requests. Rules apply to all
 HTTP methods and resource types. Unsupported expressions prevent the companion
 from starting; patterns are never silently skipped. The list accepts up to 128
@@ -1851,15 +1855,19 @@ For example, merge this into the existing `agentChat.automation` object:
 
 ```json
 {
+  "requestBlockingEnabled": true,
   "requestBlockList": [
     "^https?://(www\\.)?chatgpt\\.com/.*/rgstr",
     "^https?://(www\\.)?chatgpt\\.com/backend-api/.*/conversations",
-    "^https?://(www\\.)?chatgpt\\.com/backend-api/conversations"
+    "^https?://(www\\.)?chatgpt\\.com/backend-api/conversations",
+    "^https?://(www\\.)?chatgpt\\.com/backend-api/sidebar",
+    "^https?://(www\\.)?chatgpt\\.com/backend-api/.*/sidebar"
   ]
 }
 ```
 
-After changing the list, restart the browser companion with
+After changing the switch or list, use **Restart Codexify** in Settings. This also
+restarts an idle companion when its request policy changed. CLI users can run
 `codexify browser stop` followed by `codexify browser start`. The filter applies
 only to Codexify's dedicated browser, whose profile and sign-in are preserved.
 
@@ -1894,6 +1902,32 @@ an explicit release mirror; the top-level installer propagates its
 The persistent profile, descriptor, install manifest, and runtime live under the
 private `~/.codexify/browser/` directory. The companion is a separate user-session
 process, so restarting the Codexify service does not intentionally stop it.
+
+The core keeps a five-second browser watchdog while automation is enabled. It
+uses the optional `/v1/liveness` probe in current companions (with health-route
+fallback for older compatible builds). This probe checks the existing renderer
+without a ChatGPT session request or a navigation. A bounded active UI operation
+retains its normal deadline rather than being interrupted by the watchdog.
+Failed recoveries back off for 30 seconds.
+
+Conversation settings offer **Start browser** and **Stop browser**, matching the
+CLI commands. An explicit stop is stored privately in `browser/lifecycle.json`
+and survives a core restart. Automatic maintenance and queued actions honor it;
+Start restores automatic recovery. Startup can be interrupted by Stop. A shared
+process lock serializes lifecycle mutations across tasks, windows and the CLI.
+Existing profiles and pairing state are retained. A server restart that needs
+to apply changed request rules temporarily defers recovery to the new worker.
+
+Unresponsive processes are stopped only after their OS executable matches a
+verified managed-runtime manifest. Managed descendants are cleaned up if the
+launcher freezes; on Unix a leftover private Chrome profile lock is checked
+against the actual process arguments before cleaning up an orphan. Other Chrome
+profiles are not stopped. A lost final action receipt remains Send-ambiguous and
+is never used as proof that resending a message is safe.
+
+Unless `CODEXIFY_BROWSER_HOME` overrides it, a custom descriptor directory is
+also that instance's browser home. This keeps automatic startup scoped to the
+configured private instance rather than borrowing the default profile.
 
 Browser ownership covers actual UI work and ends after semantic Send acceptance
 and any required preference restoration. ChatGPT's Stop button and response
@@ -1941,6 +1975,27 @@ the browser queue. A valid verification can still arrive later while its current
 one-time reference is valid; it clears any pairing error. Created conversation
 URLs are saved as soon as the browser confirms them, before model restoration,
 and remain available in settings and Retry pairing even if verification fails.
+
+Control discovery prefers test IDs, roles, state and model metadata. Where the
+browser exposes only display text, the companion uses a bundled projection of
+ChatGPT's published locale messages rather than English-only names. The catalog
+covers 65 locale modules plus the English defaults, including localized effort
+labels, counted slider announcements, account plans and attention dialogs.
+Slider position and range are verified alongside the localized label; positions
+alone never invent an effort identity. Conflicting localized labels fail closed
+instead of causing a guessed selection or an automatic model fallback.
+
+Model descriptions and retirement notices are separated from the model's primary
+label or machine identity. The account's chosen language does not change saved
+model/effort IDs. The optional Stop confirmation remains scoped to the initiating
+Stop action and is identified structurally. Unused English approval-clicking code
+has been removed; pairing draft recovery waits while any modal is visible.
+
+`browser-companion/ui-locales.json` records the public source URLs and SHA-256
+hashes. To refresh its reviewed message projection, run
+`node browser-companion/scripts/update-ui-locales.mjs` (or pass `--index-url` for a
+new locale-module index). The generator parses downloaded JavaScript as data;
+it never executes it. Locale downloads are not needed during normal operation.
 
 Pairing verification always uses a one-off **Medium** request. The companion reads the conversation's current model and effort, selects
 and verifies Medium before Send, then restores the original settings immediately
@@ -2181,7 +2236,7 @@ and live state take precedence.
 | `rollout_read` | None | Reads up to five most recent complete progress reports, in chronological order, capped at 64 KiB. Reads span dated archives when needed. |
 | `rollout_update` | `request_id`, `status`, `progress`, `next_steps` | Appends a timestamped report. The combined text limit is 16 KiB. A request ID may be retried with identical arguments without duplicating a report, including after rotation. |
 
-`agentChat.rolloutReminderInterval` defaults to **20** and accepts integers from
+`agentChat.rolloutReminderInterval` defaults to **25** and accepts integers from
 1 to 10000. It is editable under **Settings → Chats & goals → Progress report
 interval** and applies without a restart. Agent work calls, including errors,
 count; app-only polling, `chat_await`, `turn_completed`, and pairing verification
@@ -2200,7 +2255,7 @@ change goal state, complete turns, acknowledge chat input, or expose queued work
 
 ### Private message queue
 
-`agentChat.defaultMessageMode` accepts `steer` (default) or `queue`. It is editable
+`agentChat.defaultMessageMode` accepts `steer` or `queue` (default). It is editable
 in global settings and applies immediately. Return/the send button uses that
 mode; Cmd+Return on macOS and Ctrl+Return on Windows/Linux uses the other mode
 for one message. While the agent needs your answer, the composer temporarily
@@ -3036,7 +3091,7 @@ Native tunnel mode ignores `allowedHosts` and forces the accepted authorities to
 - **Host-authorized native-file ingress**: `import_host_file` accepts only ChatGPT's declared native-file object, rejects local source paths, constrains the download URL and every redirect hop to the configurable `artifactIngress.allowedHosts` allowlist (default `"*"`, which admits any public HTTPS host but never a loopback, private, link-local, unique-local, CGNAT, `localhost`, or metadata address), ignores ambient proxy credentials, and enforces whole-request, idle, size and concurrency limits. Its signed URL and file ID are never logged or returned: RMCP debug/trace payload logging is unconditionally suppressed even when `RUST_LOG` requests it. Destination publication uses a capability-confined directory handle, canonical-path and file-identity revalidation, a private partial file, SHA-256, and atomic no-overwrite linking so traversal, moved roots, symlink escapes, partial visibility and replacement races fail closed.
 - **Bounded durable native-file egress**: `export_host_file` accepts only a relative regular-file path inside the active project, opens it through a capability-confined directory handle without following the final symlink/reparse point, rejects traversal and escapes, enforces `artifactEgress.maxFileBytes` before and during streaming, and returns an original SHA-256 receipt plus a standard MCP resource link. The link carries a random 256-bit opaque capability rather than a local path. A private versioned record survives service restarts; eligible immutable snapshots share a global per-user LRU disk budget controlled by `snapshotMaxFileBytes` and `maxSnapshotBytes`. After snapshot eviction, `fallbackToSource` can serve the latest safe file only after revalidating the recorded root and relative path. Audit output records only the number of resource links, never their capabilities or filenames.
 - **Bounded transitive resource egress**: a `resource_link` returned by any bridged MCP tool is never passed downstream with its upstream URI. Codexify replaces it with a random 256-bit `codexify://upstream-resource/...` capability tied to that exact upstream peer and URI. `resources/read` forwards through the existing authenticated MCP transport, propagates downstream cancellation, applies the upstream tool timeout, enforces `artifactEgress.maxFileBytes` against advertised and actual content size, rewrites returned content URIs back to the opaque capability, and expires/evicts mappings according to the configured TTL/reference bounds.
-- **One bounded exception in single-project mode**: [AGENTS.md](#agentsmd) discovery may read above `--work-dir`, up to the nearest `.git`. It is read-only, opens only `AGENTS.override.md`, `AGENTS.md` and any `projectDoc.fallbackFilenames`, and `get_project_doc` reports the absolute path of every file it used. Set `projectDoc.maxBytes` to `0` to switch it off, or `projectDoc.rootMarkers` to `[]` to keep the search inside the work directory. Multi-project mode does not perform this upward walk; its selected directory is the exact project root.
+- **Instruction boundaries**: AGENTS.md and repository skills stay within the selected workspace; parent directories are not scanned.
 - **Namespaced diff state inside Git**: ChatGPT diff checkpoints are exactly two refs per task/project pair under `refs/codexify/diff/`. Synthetic snapshots contain only the selected project path, are built through a temporary index, and never modify the real index or working tree. Generic MCP-client checkpoints are in memory only. Existing `refs/codexify/review/` checkpoints are migrated lazily into the diff namespace. The namespace grows with the number of distinct persistent task/project pairs; the diff section documents inspection and manual removal.
 - **Bounded state writes outside the work directory**: `remember` and `update_plan` write `memory.json` under `~/.codexify/projects/`. Multi-project mode writes one small task-binding record or scratch marker under `~/.codexify/conversation-projects/`; durable scratch contents live separately under `~/.codexify/scratch/conversations/`. Full handoffs add a bounded private ownership/alias/token-digest document under `~/.codexify/conversation-continuations/`; raw continuation tokens and raw `openai/session` values are not stored. Physical-conversation authorization writes a small marker under `~/.codexify/conversation-authorizations/`. Native file export writes durable capability records and an LRU-bounded immutable snapshot pool under `~/.codexify/artifacts/`; records remain after snapshot eviction so old conversation links can use source fallback. Binding and authorization filenames are derived from a hash of `openai/session`. Authorization namespaces include a one-way digest of the canonical work directory and configured token, while marker contents store only the grant. Set `memory.enabled` to `false` to disable plans and notes; set `artifactEgress.enabled` to `false` to disable new native exports and bridged resource proxying. Delete only state whose capabilities or bindings you intentionally want to invalidate. See [Context and memory](#context-and-memory).
 - **Bounded reads outside the work directory**: [skills](#skills) may live in `~/.agents/skills`, `~/.codex/skills`, or an enabled installed Codex plugin. Automatic reads of `~/.claude/skills` and the Claude plugin registry require `experimental.claudeSkills`. Codex plugin discovery reads only Codex's user config, active plugin-cache package, manifest, and declared skill roots; `skills_read` then opens files only inside a discovered skill package. Its `resource` path is checked against the skill's own directory, so it cannot walk out into the rest of your home directory. `skills_list` reports the absolute path of every skill it found. Set `skills.enabled` to `false` to switch it off, `skills.includePlugins` to `false` to suppress plugin packages, or `skills.dirs` to point the standalone user scope somewhere you choose.

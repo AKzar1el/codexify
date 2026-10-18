@@ -15,7 +15,7 @@ fn fixture() -> (
     std::fs::create_dir_all(root.join("second")).unwrap();
     std::fs::write(root.join("first/keep.txt"), "keep the user's edits").unwrap();
     let mut config = default_config(root);
-    config.multi_project = true;
+
     config.worktrees.mode = WorktreeMode::Never;
     config.memory.dir = Some(temp.path().join("metadata").display().to_string());
     let store = ProjectBindingStore::new(temp.path().join("bindings"));
