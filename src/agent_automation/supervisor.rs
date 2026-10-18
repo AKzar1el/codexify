@@ -861,6 +861,10 @@ impl AgentAutomationSupervisor {
             .get(task.stable_key())
             .cloned()
             .ok_or("Browser automation task is not registered")?;
+        let connector_name = handle
+            .store
+            .connector_name(&self.config.connector_name)?
+            .ok_or("Configure the exact ChatGPT connector name before using browser automation")?;
         let pairing = handle.store.validate_pending_pairing(
             &handle.task,
             generation,
@@ -933,7 +937,7 @@ impl AgentAutomationSupervisor {
                 idempotency_key: random_id("execute")?,
                 url: candidate_url.clone(),
                 pairing_generation: generation,
-                connector_name: self.config.connector_name.clone(),
+                connector_name: connector_name.clone(),
                 model,
                 effort,
                 expected_account_fingerprint: account_fingerprint,
@@ -1219,6 +1223,10 @@ impl AgentAutomationSupervisor {
                     }
                 }
             }
+            let Some(connector_name) = task.store.connector_name(&self.config.connector_name)?
+            else {
+                continue;
+            };
             let obsolete_action =
                 renewing && state.action.kind != Some(AutomationActionKind::TurnRenewal);
             if !obsolete_action
@@ -1549,7 +1557,7 @@ impl AgentAutomationSupervisor {
                     idempotency_key,
                     url: url.clone(),
                     pairing_generation: state.pairing.generation,
-                    connector_name: self.config.connector_name.clone(),
+                    connector_name: connector_name.clone(),
                     model,
                     effort,
                     expected_account_fingerprint: account_fingerprint,
@@ -1568,7 +1576,7 @@ impl AgentAutomationSupervisor {
     pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
         let _run_guard = self.run_lock.lock().await;
         let (execution, task) = loop {
-            let Some(execution) = self.queue.lock().await.pop_front() else {
+            let Some(mut execution) = self.queue.lock().await.pop_front() else {
                 return Ok(None);
             };
             let Some(task) = self.tasks.read().await.get(&execution.task_key).cloned() else {
@@ -1606,6 +1614,21 @@ impl AgentAutomationSupervisor {
                 );
                 continue;
             }
+            let Some(connector_name) = task.store.connector_name(&self.config.connector_name)?
+            else {
+                let error =
+                    "Configure the exact ChatGPT connector name before using browser automation";
+                task.store.update_action_status(
+                    &task.task,
+                    &execution.request.action_id,
+                    AutomationActionStatus::Failed,
+                    Some(error),
+                    None,
+                    now_ms,
+                )?;
+                return Err(error.into());
+            };
+            execution.request.connector_name = connector_name;
             break (execution, task);
         };
 

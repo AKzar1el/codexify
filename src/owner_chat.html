@@ -116,6 +116,15 @@ input,select,textarea { font:inherit; }
 #new-chat-dialog .muted { color:var(--muted); font-size:12px; }
 #new-chat-submit { background:var(--accent) !important; color:var(--panel) !important; }
 #new-chat-dialog button:disabled { opacity:.5; cursor:default; }
+#connector-name-dialog{width:min(420px,calc(100vw - 32px));padding:24px;border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--ink);box-shadow:0 24px 90px #0003}
+#connector-name-dialog::backdrop{background:#10191673;backdrop-filter:blur(5px)}
+#connector-name-dialog h2{margin:0;font-size:20px}#connector-name-dialog p{line-height:1.5;color:var(--muted)}
+#connector-name-dialog label{display:block;margin:18px 0 7px;font-size:13px;font-weight:600}
+#connector-name-input{box-sizing:border-box;width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);font:inherit;font-size:16px}
+#connector-name-dialog .connector-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}
+#connector-name-dialog button{padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--ink);font:inherit;cursor:pointer}
+#connector-name-dialog button[type=submit]{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+#connector-name-dialog button:disabled{opacity:.5;cursor:default}#connector-name-error{color:#ad2d30!important;font-size:13px}
 </style>
 </head>
 <body>
@@ -128,6 +137,16 @@ input,select,textarea { font:inherit; }
   </aside>
   <main><div id="chat-host"><div id="placeholder">Select a conversation to view its chat.</div></div></main>
 </div>
+<dialog id="connector-name-dialog" aria-labelledby="connector-name-heading" aria-describedby="connector-name-description">
+  <form id="connector-name-form">
+    <h2 id="connector-name-heading">Configure your ChatGPT connector</h2>
+    <p id="connector-name-description">Enter the exact connector name shown in ChatGPT. Codexify needs it to create conversations and continue goals.</p>
+    <label for="connector-name-input">Exact connector name</label>
+    <input id="connector-name-input" name="connectorName" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="128" required>
+    <p id="connector-name-error" role="alert" hidden></p>
+    <div class="connector-actions"><button id="connector-name-cancel" type="button">Cancel</button><button id="connector-name-save" type="submit">Save and continue</button></div>
+  </form>
+</dialog>
 <dialog id="new-chat-dialog" aria-labelledby="new-chat-heading">
   <div class="sidebar-heading"><h2 id="new-chat-heading">New chat</h2><button type="button" id="new-chat-close" aria-label="Close new chat">✕</button></div>
   <p id="new-chat-loading" class="muted" role="status">Preparing a new ChatGPT chat…</p>
@@ -392,15 +411,57 @@ input,select,textarea { font:inherit; }
   function textNode(tag, className, text) {
     const node = document.createElement(tag); node.className = className; node.textContent = text; return node;
   }
-  async function api(path, options = {}) {
+  async function api(path, options = {}, connectorRetried = false) {
     const response = await fetch(path, {
       ...options,
       headers:{ Authorization:`Bearer ${token}`, ...(options.body ? {"Content-Type":"application/json"} : {}) },
       cache:"no-store"
     });
+    if (response.status === 428 && !connectorRetried && path !== "/api/settings/connector") {
+      if (await ensureConnectorName(true)) return api(path, options, true);
+      throw new Error("A connector name is required to continue.");
+    }
     if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
     return response;
   }
+  const connectorDialog = document.getElementById("connector-name-dialog");
+  const connectorInput = document.getElementById("connector-name-input");
+  const connectorError = document.getElementById("connector-name-error");
+  let connectorPrompt = null, connectorResolve = null, connectorSaving = false, connectorConfigured = false;
+  function finishConnectorPrompt(answer) {
+    const resolve = connectorResolve; connectorResolve = null; connectorPrompt = null;
+    if (connectorDialog.open) connectorDialog.close();
+    resolve?.(answer);
+  }
+  async function ensureConnectorName(force = false) {
+    if (force) connectorConfigured = false;
+    if (connectorConfigured) return true;
+    if (connectorPrompt) return connectorPrompt;
+    const state = await (await api("/api/settings/connector")).json();
+    if (state.configured) { connectorConfigured = true; return true; }
+    if (connectorPrompt) return connectorPrompt;
+    connectorInput.value = state.connectorName || "";
+    connectorError.hidden = true; connectorError.textContent = "";
+    connectorPrompt = new Promise(resolve => { connectorResolve = resolve; });
+    connectorDialog.showModal(); connectorInput.focus();
+    return connectorPrompt;
+  }
+  connectorDialog.addEventListener("close", () => { if (!connectorDialog.open) finishConnectorPrompt(false); });
+  connectorDialog.addEventListener("cancel", event => { if (connectorSaving) event.preventDefault(); });
+  document.getElementById("connector-name-cancel").addEventListener("click", () => finishConnectorPrompt(false));
+  bindBackdrop(connectorDialog, () => { if (!connectorSaving) finishConnectorPrompt(false); });
+  document.getElementById("connector-name-form").addEventListener("submit", async event => {
+    event.preventDefault(); if (connectorSaving) return;
+    const name = connectorInput.value.trim();
+    if (!name) { connectorInput.focus(); return; }
+    connectorSaving = true; connectorError.hidden = true;
+    for (const id of ["connector-name-save","connector-name-cancel"]) document.getElementById(id).disabled = true;
+    try {
+      await api("/api/settings/connector", {method:"POST",body:JSON.stringify({connectorName:name})});
+      connectorConfigured = true; finishConnectorPrompt(true);
+    } catch (error) { connectorError.textContent = error.message; connectorError.hidden = false; }
+    finally { connectorSaving = false; for (const id of ["connector-name-save","connector-name-cancel"]) document.getElementById(id).disabled = false; }
+  });
   function requestId(prefix) {
     const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     return `${prefix}-${random}`;
@@ -731,9 +792,11 @@ input,select,textarea { font:inherit; }
       finally { savingSelection = false; if (!closed) { renderModels(); render(current); await refreshState({ quiet:true }); } }
     }
     async function goalCommand(command) {
+      if ((command === "/goal run" || command.startsWith("/goal set ")) && !await ensureConnectorName()) return false;
       const response = await api(`/api/chats/${id}/send`, { method:"POST", body:JSON.stringify({ request_id:requestId("goal"), message:command }) });
       const local = (await response.json())?._meta?.[chatMeta];
       if (!closed && current && local && Object.hasOwn(local, "goal")) { current.goal = local.goal; render(current); }
+      return true;
     }
     const settingsDialog = byId("automation-settings");
     const showSettings = visible => {
@@ -787,7 +850,9 @@ input,select,textarea { font:inherit; }
       } catch (error) { if (!closed) pairingSubmissionError = error.message || "Chat pairing failed"; }
       finally { pairingSubmitting = false; if (!closed) { render(current); await refreshState({quiet:true}); } }
     }
-    const editGoal = () => {
+    const editGoal = async () => {
+      try { if (!await ensureConnectorName()) return; }
+      catch (error) { setError(error.message); return; }
       showSettings(false);
       nodes.goal.value = current?.goal?.markdown || "";
       nodes.setGoal.disabled = !nodes.goal.value.trim();
@@ -833,7 +898,7 @@ input,select,textarea { font:inherit; }
     nodes.pair.addEventListener("click", () => { if (current?.pairing?.creatingChat && !current.pairing.canonicalUrl) void run(async () => { await post("create/retry", {requestId:requestId("create-retry")}); }); else void submitPairing(nodes.url.value.trim()); });
     nodes.unlink.addEventListener("click", () => run(async () => { await post("unlink", { requestId:requestId("unlink") }); nodes.url.value = ""; pairingSubmissionError = ""; lastSubmittedPairingUrl = ""; }));
     nodes.reveal.addEventListener("click", () => run(async () => { await post("reveal"); }));
-    nodes.setGoal.addEventListener("click", () => run(async () => { await goalCommand(`/goal set ${nodes.goal.value}`); byId("goal-editor").hidden = true; }));
+    nodes.setGoal.addEventListener("click", () => run(async () => { if (await goalCommand(`/goal set ${nodes.goal.value}`)) byId("goal-editor").hidden = true; }));
     nodes.toggleGoal.addEventListener("click", () => run(async () => { await goalCommand(current?.goal?.status === "active" ? "/goal stop" : "/goal run"); }));
     nodes.clearGoal.addEventListener("click", () => run(async () => { await goalCommand("/goal clear"); }));
     nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); pairingSubmissionError = ""; }));
@@ -1288,7 +1353,9 @@ input,select,textarea { font:inherit; }
     } catch(error) {if(epoch===newEpoch) {newCatalog=null;for(const name of ["model","effort"])newNode(name).replaceChildren();newError(error.message);}}
     finally {if(epoch===newEpoch) {newPreparing=false;newReady();}}
   }
-  document.getElementById("new-chat").addEventListener("click", () => {
+  document.getElementById("new-chat").addEventListener("click", async () => {
+    try { if (!await ensureConnectorName()) return; }
+    catch (error) { showError(error.message); return; }
     newChoice=null;newCatalog=null;newBusy=false;newWorktreeEdited=false;newRequest=requestId("create-chat");const epoch=++newEpoch;
     for(const name of ["url","search"])newNode(name).value="";
     for(const name of ["model","effort"]) {newNode(name).replaceChildren();newNode(name).disabled=true;}

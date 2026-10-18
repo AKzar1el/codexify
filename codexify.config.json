@@ -21,7 +21,7 @@
     "automation": {
       "enabled": false,
       "descriptorPath": "~/.codexify/browser/descriptor.json",
-      "connectorName": "Codexify",
+      "connectorName": "",
       "maxQueuedActions": 64,
       "autoApproveToolCalls": false
     }

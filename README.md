@@ -183,6 +183,12 @@ count. Recent recovery reads include up to five complete reports, capped at
 64 KiB. At 256 KiB or 50 reports, the active file rotates into a dated archive
 inside `rollouts/`; older history is preserved and recent reads span rotations.
 
+Before creating a conversation or using a goal, configure the exact ChatGPT
+connector name. If it is missing, Codexify asks for it in a popup, saves it in
+`agentChat.automation.connectorName`, and continues the pending action without
+a restart. Cancelling leaves the action untouched. Quickstart saves the name
+you enter during setup; no connector name is assumed automatically.
+
 **Turn renewal** is independent of the progress journal and is **off by default**.
 Enable it in **Settings → Chats & goals → Turn renewal**. Its per-model/effort
 limits have individual enable switches and remain editable while disabled.

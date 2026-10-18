@@ -39,6 +39,16 @@ impl GlobalRuntime {
     }
 }
 
+async fn refresh_saved_connector(
+    state: &OwnerState,
+    client: &BrowserCompanionClient,
+) -> Result<Value, String> {
+    let name = require_connector_name(&state.config).map_err(|(_, error)| error)?;
+    client
+        .refresh_connector(&name, &CancellationToken::new())
+        .await
+}
+
 pub(super) fn start(state: OwnerState) {
     if state.config.loaded_config_path.is_none() {
         return;
@@ -109,12 +119,7 @@ pub(super) fn start(state: OwnerState) {
                                 record.state == crate::self_update::UpdatePhase::Succeeded
                             });
                         if succeeded {
-                            let result = client
-                                .refresh_connector(
-                                    &state.config.markdown_chat.automation.connector_name,
-                                    &CancellationToken::new(),
-                                )
-                                .await;
+                            let result = refresh_saved_connector(&state, &client).await;
                             if result.as_ref().is_err_and(|error| error.contains("423")) {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                                 continue;
@@ -168,6 +173,60 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
         json!({"version":env!("CARGO_PKG_VERSION"),"instanceId":std::process::id().to_string(),"latest":latest,"plan":global.plan,"connectorRefresh":refresh,
         "settingsAvailable":state.config.loaded_config_path.is_some(),"restartAvailable":std::env::var_os(crate::process_env::SERVICE_SUPERVISED_ENV).as_deref()==Some(std::ffi::OsStr::new("1"))&&crate::service::is_installed().unwrap_or(false)}),
     ))
+}
+
+pub(super) async fn connector(State(state): State<OwnerState>) -> ApiResult {
+    let name = crate::global_settings::connector_name(
+        state.config.loaded_config_path.as_deref(),
+        &state.config.markdown_chat.automation.connector_name,
+    )
+    .map_err(internal_error)?;
+    Ok(Json(
+        json!({"configured": name.is_some(), "connectorName": name,
+        "canSave": state.config.loaded_config_path.is_some()}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ConnectorBody {
+    connector_name: String,
+}
+
+pub(super) async fn save_connector(
+    State(state): State<OwnerState>,
+    Json(body): Json<ConnectorBody>,
+) -> ApiResult {
+    let name = body.connector_name.trim().to_string();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Enter the exact connector name (1 to 128 visible characters).".into(),
+        ));
+    }
+    let config = state.config.clone();
+    let saved_name = name.clone();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = crate::global_settings::snapshot(&config)?;
+        let revision = snapshot["revision"]
+            .as_str()
+            .ok_or("Configuration revision is unavailable")?;
+        let mut changes = serde_json::Map::from_iter([(
+            "agentChat.automation.connectorName".into(),
+            json!(saved_name),
+        )]);
+        if snapshot["document"]
+            .get("workDir")
+            .is_none_or(Value::is_null)
+        {
+            changes.insert("workDir".into(), json!(config.work_dir));
+        }
+        crate::global_settings::save(&config, revision, None, Some(changes))
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(json!({"configured":true,"connectorName":name})))
 }
 
 pub(super) async fn read(State(state): State<OwnerState>) -> ApiResult {
@@ -272,12 +331,7 @@ async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration
                 return Err("Browser companion is busy".to_string());
             }
             set_manual_refresh_phase(&state, &id, "running", None).await;
-            client
-                .refresh_connector(
-                    &state.config.markdown_chat.automation.connector_name,
-                    &CancellationToken::new(),
-                )
-                .await
+            refresh_saved_connector(&state, &client).await
         }
         .await;
         match result {
@@ -634,6 +688,81 @@ mod tests {
         let server =
             tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
         let client = reqwest::Client::new();
+        // Setup is owner-authenticated and checked before browser work starts.
+        assert_eq!(
+            client
+                .get(format!("{base}/api/settings/connector"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let setup: Value = client
+            .get(format!("{base}/api/settings/connector"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(setup["configured"], false);
+        assert!(setup["connectorName"].is_null());
+        assert_eq!(
+            client
+                .post(format!("{base}/api/new-chat"))
+                .bearer_auth("test-token")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        let unchanged = std::fs::read(&file).unwrap();
+        for name in [
+            "".to_string(),
+            "  ".into(),
+            "invalid\nname".into(),
+            "x".repeat(129),
+        ] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/api/settings/connector"))
+                    .bearer_auth("test-token")
+                    .json(&json!({"connectorName":name}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), unchanged);
+        }
+        assert_eq!(
+            client
+                .post(format!("{base}/api/settings/connector"))
+                .bearer_auth("test-token")
+                .json(&json!({"connectorName":"My exact connector"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let setup: Value = client
+            .get(format!("{base}/api/settings/connector"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(setup["configured"], true);
+        assert_eq!(setup["connectorName"], "My exact connector");
+
         assert_eq!(
             client
                 .get(format!("{base}/api/settings"))

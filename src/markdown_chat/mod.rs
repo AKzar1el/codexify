@@ -37,7 +37,7 @@ pub const OFFLINE_AFTER_MS: u64 = 300_000;
 pub const AUTOMATION_OFFLINE_AFTER_MS: u64 = OFFLINE_AFTER_MS - 60_000;
 pub const PAIRING_PRESENCE_GRACE_MS: u64 = 5_000;
 pub const DEFAULT_AUTOMATION_DESCRIPTOR_PATH: &str = "~/.codexify/browser/descriptor.json";
-pub const DEFAULT_AUTOMATION_CONNECTOR_NAME: &str = "Codexify";
+pub const DEFAULT_AUTOMATION_CONNECTOR_NAME: &str = "";
 pub const DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,12 +120,10 @@ impl AgentAutomationConfig {
                     .into(),
             );
         }
-        if self.connector_name.trim().is_empty()
-            || self.connector_name.len() > 128
-            || self.connector_name.chars().any(char::is_control)
-        {
+        if self.connector_name.len() > 128 || self.connector_name.chars().any(char::is_control) {
             return Err(
-                "agentChat.automation.connectorName must be 1 to 128 visible characters".into(),
+                "agentChat.automation.connectorName must contain at most 128 visible characters"
+                    .into(),
             );
         }
         if !(1..=1024).contains(&self.max_queued_actions) {

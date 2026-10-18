@@ -592,6 +592,10 @@ impl AgentAutomationStore {
         }
     }
 
+    pub(crate) fn connector_name(&self, fallback: &str) -> Result<Option<String>, String> {
+        crate::global_settings::connector_name(self.settings_path.as_deref(), fallback)
+    }
+
     pub fn task_directory(&self, task: &ConversationIdentity) -> Result<PathBuf, String> {
         validate_task_key(task.stable_key())?;
         Ok(self.root.join(task.stable_key()))

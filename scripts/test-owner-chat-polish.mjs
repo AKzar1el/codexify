@@ -36,6 +36,7 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
   const request=route.request(),url=new URL(request.url());
   if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   if(held&&(url.pathname==='/api/chats'||/^\/api\/chats\/[0-9a-f]+$/.test(url.pathname)))await gate;
+  if(url.pathname==='/api/settings/connector')return route.fulfill({json:{configured:true,connectorName:'Fixture connector'}});
   if(url.pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{kind:'pro',label:'Pro 20x'},latest:{updateAvailable:false},settingsAvailable:true,restartAvailable:false}});
   if(url.pathname==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
   if(url.pathname==='/api/analytics/turn-cutoffs')return route.fulfill({json:{samples:0,models:[]}});

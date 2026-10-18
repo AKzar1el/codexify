@@ -33,7 +33,7 @@ fn markdown_chat_defaults_and_validation() {
         config.automation.descriptor_path,
         "~/.codexify/browser/descriptor.json"
     );
-    assert_eq!(config.automation.connector_name, "Codexify");
+    assert!(config.automation.connector_name.is_empty());
     assert_eq!(config.automation.max_queued_actions, 64);
     assert!(!config.automation.auto_approve_tool_calls);
     assert!(config.validate().is_ok());
@@ -85,10 +85,7 @@ fn agent_chat_automation_defaults_overrides_and_validation() {
         defaulted.markdown_chat.automation.descriptor_path,
         "~/.codexify/browser/descriptor.json"
     );
-    assert_eq!(
-        defaulted.markdown_chat.automation.connector_name,
-        "Codexify"
-    );
+    assert!(defaulted.markdown_chat.automation.connector_name.is_empty());
     assert_eq!(defaulted.markdown_chat.automation.max_queued_actions, 64);
     assert!(!defaulted.markdown_chat.automation.auto_approve_tool_calls);
 
@@ -119,7 +116,7 @@ fn agent_chat_automation_defaults_overrides_and_validation() {
         serde_json::json!({"automation":{"enabled":true}}),
         serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":0}}),
         serde_json::json!({"enabled":true,"automation":{"maxQueuedActions":1025}}),
-        serde_json::json!({"enabled":true,"automation":{"connectorName":"  "}}),
+        serde_json::json!({"enabled":true,"automation":{"connectorName":"bad\nname"}}),
         serde_json::json!({"enabled":true,"automation":{"descriptorPath":""}}),
         serde_json::json!({"enabled":true,"automation":{"unexpected":true}}),
     ] {

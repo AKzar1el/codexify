@@ -143,6 +143,29 @@ fn revision(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Read the explicitly saved connector name so owner setup takes effect immediately.
+pub(crate) fn connector_name(
+    path: Option<&Path>,
+    fallback: &str,
+) -> Result<Option<String>, String> {
+    let name = match path {
+        Some(path) => {
+            let document: Value =
+                serde_json::from_str(&read_raw(path)?).map_err(|e| e.to_string())?;
+            document
+                .pointer("/agentChat/automation/connectorName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        }
+        None => fallback.to_string(),
+    };
+    if name.len() > 128 || name.chars().any(char::is_control) {
+        return Err("Connector name must contain at most 128 visible characters".into());
+    }
+    Ok((!name.trim().is_empty()).then_some(name))
+}
+
 pub fn save(
     config: &AppConfig,
     expected_revision: &str,
@@ -206,6 +229,12 @@ pub fn save(
             chat.remove("analyticsEnabled");
             chat.remove("turnRenewal");
             chat.remove("extras");
+            if let Some(automation) = chat.get_mut("automation").and_then(Value::as_object_mut) {
+                automation.remove("connectorName");
+                if automation.is_empty() {
+                    chat.remove("automation");
+                }
+            }
         }
         if value
             .get("agentChat")
@@ -693,5 +722,85 @@ mod tests {
         .unwrap();
         assert_eq!(reset["restartRequired"], false);
         assert_eq!(rollout_reminder_interval(&config).unwrap(), 20);
+    }
+}
+
+#[cfg(test)]
+mod connector_name_tests {
+    use super::*;
+
+    #[test]
+    fn missing_name_is_valid_configuration_but_not_ready_for_automation() {
+        let chat = crate::markdown_chat::MarkdownChatConfig {
+            enabled: true,
+            automation: crate::markdown_chat::AgentAutomationConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(chat.automation.connector_name.is_empty());
+        chat.validate().unwrap();
+        assert_eq!(connector_name(None, "").unwrap(), None);
+        assert_eq!(connector_name(None, "   ").unwrap(), None);
+        assert!(connector_name(None, "invalid\nname").is_err());
+        assert!(connector_name(None, &"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn saved_names_are_explicit_and_read_live_instead_of_using_the_startup_default() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(connector_name(Some(&path), "Codexify").unwrap(), None);
+        std::fs::write(
+            &path,
+            r#"{"agentChat":{"automation":{"connectorName":"My exact connector"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            connector_name(Some(&path), "Old name").unwrap().as_deref(),
+            Some("My exact connector")
+        );
+        std::fs::write(
+            &path,
+            r#"{"agentChat":{"automation":{"connectorName":"Renamed connector"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            connector_name(Some(&path), "Old name").unwrap().as_deref(),
+            Some("Renamed connector")
+        );
+    }
+
+    #[test]
+    fn saving_a_connector_preserves_other_settings_and_does_not_require_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let document =
+            json!({"workDir":root.path(),"debug":false,"port":37652,"codexMcp":{"enabled":false}});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path.clone());
+        let before = snapshot(&config).unwrap();
+        let changes = Map::from_iter([(
+            "agentChat.automation.connectorName".into(),
+            json!("My exact connector"),
+        )]);
+        let saved = save(
+            &config,
+            before["revision"].as_str().unwrap(),
+            None,
+            Some(changes),
+        )
+        .unwrap();
+        assert_eq!(saved["restartRequired"], false);
+        assert_eq!(saved["document"]["debug"], false);
+        assert_eq!(saved["document"]["port"], 37652);
+        assert_eq!(
+            connector_name(Some(&path), "").unwrap().as_deref(),
+            Some("My exact connector")
+        );
+        assert!(config.markdown_chat.automation.connector_name.is_empty());
     }
 }

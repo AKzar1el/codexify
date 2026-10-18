@@ -23,6 +23,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    if(path==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{label:'Pro 20x',kind:'pro'},latest:{updateAvailable:false}}});
    if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Saved Astra chat',workspace:'fixture',lastEntryEnd:0,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:0}],serverTimeMs:Date.now()}});
    if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},goal:null,action:{status:'idle'},selection,catalog:{models},companion:{authenticated:true,status:'idle'},presence:{lastAgentCallAtMs:null},serverTimeMs:Date.now()}});
+   if(path==='/api/settings/connector')return route.fulfill({json:{configured:true,connectorName:'Fixture connector'}});
    if(path==='/api/new-chat'||path.endsWith('/automation/capabilities'))return route.fulfill({json:{models,catalogRevision:'old-generic-catalog'}});
    if(path==='/api/projects')return route.fulfill({json:{catalog:{projects:[],total:0,warnings:[]},createWorktree:true}});
    return route.fulfill({json:{_meta:{['io.github.devnoname120/codexify/markdown-chat']:{chat_file:'/fixture/CHAT.md',revision:'0',messages:[],delivered_through:0,read_through:0,total_tool_calls:0,last_agent_call_at_ms:null,server_time_ms:Date.now(),has_more:false,unchanged:false}}}});

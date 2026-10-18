@@ -11,6 +11,7 @@ async function ownerTestPage(browser, options) {
   const page=await browser.newPage(options);
   const register=page.route.bind(page);
   page.route=(pattern,handler,settings)=>register(pattern,route=>{
+    if(new URL(route.request().url()).pathname==='/api/settings/connector')return route.fulfill({json:{configured:true,connectorName:'Fixture connector'}});
     if(new URL(route.request().url()).pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:null,latest:{updateAvailable:false},settingsAvailable:false,restartAvailable:false}});
     return handler(route);
   },settings);

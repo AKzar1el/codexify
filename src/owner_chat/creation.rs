@@ -65,6 +65,7 @@ pub(super) async fn prepare_chat(
     State(state): State<OwnerState>,
     Json(_body): Json<serde_json::Map<String, Value>>,
 ) -> ApiResult {
+    require_connector_name(&state.config)?;
     if !state.config.markdown_chat.automation.enabled {
         return Err(internal_error(
             "Enable agentChat.automation to create ChatGPT conversations",
@@ -182,6 +183,7 @@ pub(super) async fn create_chat(
     State(state): State<OwnerState>,
     Json(body): Json<CreateBody>,
 ) -> ApiResult {
+    require_connector_name(&state.config)?;
     if !state.config.markdown_chat.automation.enabled || state.automation.is_none() {
         return Err(internal_error(
             "Enable browser automation to create a new chat",
@@ -503,6 +505,7 @@ mod tests {
         config.multi_project = true;
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
+        config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(root.join("metadata").display().to_string());
         config.markdown_chat.automation.descriptor_path =
             root.join("descriptor.json").display().to_string();
@@ -578,6 +581,35 @@ mod tests {
             effort: "adaptive-choice".into(),
             catalog_revision: "creation-catalog".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_connector_rejects_preparation_and_creation_before_workspace_changes() {
+        let (_temp, mut state, executor, server) = fixture().await;
+        Arc::make_mut(&mut state.config)
+            .markdown_chat
+            .automation
+            .connector_name
+            .clear();
+        let error = prepare_chat(State(state.clone()), Json(Default::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::PRECONDITION_REQUIRED);
+        let error = create_chat(State(state.clone()), Json(body("missing-connector", true)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::PRECONDITION_REQUIRED);
+        let identity = creation_identity(&state.config, "missing-connector").unwrap();
+        assert!(
+            state
+                .project_bindings
+                .selected_project_root(&state.config, &identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 0);
+        assert!(executor.executions.lock().unwrap().is_empty());
+        server.abort();
     }
 
     #[tokio::test]

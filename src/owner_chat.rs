@@ -41,6 +41,13 @@ use crate::types::AppConfig;
 use crate::util::home_dir;
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+
+fn require_connector_name(config: &AppConfig) -> Result<String, (StatusCode, String)> {
+    crate::global_settings::connector_name(config.loaded_config_path.as_deref(),
+        &config.markdown_chat.automation.connector_name).map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED,
+            "Configure the exact ChatGPT connector name before using goals or creating conversations.".into()))
+}
 type BrowserOpener = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1291,6 +1298,7 @@ async fn automation_action_retry(
     Path(id): Path<String>,
     Json(body): Json<ActionMutationBody>,
 ) -> ApiResult {
+    require_connector_name(&state.config)?;
     validate_owner_request_id(&body.request_id)?;
     let located = selected(&state, &id)?;
     let context = automation_context(&state, &located).await?;
@@ -1627,6 +1635,13 @@ async fn chat_send(
             Ok(wrap(json!({"sent": sent, "organization": organization})))
         }
         OwnerMessage::Goal(command) => {
+            if matches!(
+                &command,
+                crate::agent_automation::OwnerGoalCommand::Set { .. }
+                    | crate::agent_automation::OwnerGoalCommand::Run
+            ) {
+                require_connector_name(&state.config)?;
+            }
             let context = automation_context(&state, &located).await?;
             let mut receipt = context
                 .store
@@ -2032,6 +2047,10 @@ fn router(state: OwnerState) -> Router {
         .route("/api/health", get(settings::health))
         .route("/api/global", get(settings::status))
         .route("/api/settings", get(settings::read).post(settings::save))
+        .route(
+            "/api/settings/connector",
+            get(settings::connector).post(settings::save_connector),
+        )
         .route("/api/analytics/turn-cutoffs", get(analytics::read))
         .route("/api/analytics/usage", get(analytics::usage))
         .route("/api/analytics/extras", get(analytics::extras))
@@ -3301,6 +3320,7 @@ mod tests {
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
+        config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-goal-api").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
@@ -3704,6 +3724,7 @@ mod tests {
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
+        config.markdown_chat.automation.connector_name = "Codexify".into();
         config.markdown_chat.automation.descriptor_path = descriptor.display().to_string();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-management-api").unwrap();
@@ -4091,6 +4112,7 @@ mod tests {
         std::fs::create_dir_all(&config.work_dir).unwrap();
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
+        config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-action-api").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
@@ -4425,6 +4447,7 @@ mod tests {
         config.multi_project = multi_project;
         config.markdown_chat.enabled = true;
         config.markdown_chat.automation.enabled = true;
+        config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(root.join("metadata").display().to_string());
         let supervisor =
             AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), executor);

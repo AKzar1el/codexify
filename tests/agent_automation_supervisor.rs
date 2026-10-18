@@ -585,6 +585,7 @@ async fn fixture_with_queue_limit(max_queued_actions: usize) -> Fixture {
     config.memory.dir = Some(root.path().join("state").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
+    config.markdown_chat.automation.connector_name = "Codexify".into();
     config.markdown_chat.automation.max_queued_actions = max_queued_actions;
 
     let task = ConversationIdentity::from_openai_session("supervisor-online").unwrap();
@@ -3724,6 +3725,7 @@ async fn real_pair_executor_records_the_candidate_before_the_async_send_receipt(
     app_config.memory.dir = Some(root.path().join("state").display().to_string());
     app_config.markdown_chat.enabled = true;
     app_config.markdown_chat.automation.enabled = true;
+    app_config.markdown_chat.automation.connector_name = "Codexify".into();
     app_config.markdown_chat.automation.descriptor_path =
         write_companion_descriptor(root.path(), &endpoint)
             .display()
@@ -7811,4 +7813,72 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
     let resumed = f.store.load(&f.task).unwrap();
     assert_eq!(resumed.action.send_accepted, Some(true));
     assert_eq!(resumed.action.automatic_retry_attempts, 0);
+}
+
+#[tokio::test]
+async fn missing_connector_keeps_goal_work_pending_until_an_exact_name_is_saved() {
+    let f = fixture().await;
+    let path = f._root.path().join("connector-settings.json");
+    std::fs::write(&path, "{}").unwrap();
+    let mut config = f.config.clone();
+    config.loaded_config_path = Some(path.clone());
+    config.markdown_chat.automation.connector_name.clear();
+    let store = Arc::new(AgentAutomationStore::for_config(&config).unwrap());
+    let goal = store
+        .set_goal(&f.task, "Keep this goal pending", 100)
+        .unwrap();
+    store.run_goal(&f.task, goal.revision, 101).unwrap();
+    let supervisor =
+        AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), f.executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor.scan_once(1000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert_eq!(
+        store.load(&f.task).unwrap().goal.unwrap().status,
+        codexify::agent_automation::GoalStatus::Active
+    );
+    std::fs::write(
+        &path,
+        r#"{"agentChat":{"automation":{"connectorName":"First exact name"}}}"#,
+    )
+    .unwrap();
+    supervisor.scan_once(1001).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 1);
+    std::fs::write(&path, "{}").unwrap();
+    assert!(
+        supervisor
+            .run_next(1002)
+            .await
+            .err()
+            .unwrap()
+            .contains("connector name")
+    );
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+    let failed = store.load(&f.task).unwrap();
+    assert_eq!(failed.action.send_accepted, Some(false));
+    std::fs::write(
+        &path,
+        r#"{"agentChat":{"automation":{"connectorName":"Saved exact name"}}}"#,
+    )
+    .unwrap();
+    f.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::SubmissionComplete {
+            canonical_url: "https://chatgpt.com/c/example".into(),
+        },
+    ]);
+    let retry_at = failed.automatic_retry_at_ms().unwrap();
+    supervisor.scan_once(retry_at).await.unwrap();
+    supervisor.run_next(retry_at + 1).await.unwrap();
+    let executions = f.executor.executions.lock().unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].request.connector_name, "Saved exact name");
 }

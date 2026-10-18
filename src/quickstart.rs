@@ -250,7 +250,7 @@ where
         multi_project,
     )?;
 
-    let default_connector_name = connector_name_default();
+    let default_connector_name = connector_name_default(&file_config);
     let connector_name = prompt_connector_name(&mut wizard, &default_connector_name)?;
     let conversation_auth_token = configured_conversation_auth_token(&file_config)?;
 
@@ -293,6 +293,18 @@ where
         multi_project,
         conversation_auth_token.as_deref(),
     )?;
+    let chat = file_config
+        .entry("agentChat")
+        .or_insert_with(|| serde_json::json!({}));
+    let automation = chat
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("agentChat must be an object"))?
+        .entry("automation")
+        .or_insert_with(|| serde_json::json!({}));
+    automation
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("agentChat.automation must be an object"))?
+        .insert("connectorName".into(), serde_json::json!(connector_name));
     let migration_backup = pending_migration
         .as_ref()
         .map(crate::config_migration::PendingConfigMigration::backup_original)
@@ -547,6 +559,13 @@ where
 {
     loop {
         let name = wizard.prompt("ChatGPT connector name", Some(default))?;
+        if name.len() > 128 {
+            writeln!(
+                wizard.output,
+                "The connector name must contain at most 128 visible characters."
+            )?;
+            continue;
+        }
         if name.chars().any(char::is_control) {
             let error = wizard.decorate(
                 FAILURE,
@@ -769,8 +788,14 @@ where
     Ok(())
 }
 
-fn connector_name_default() -> String {
-    "Codexify".to_string()
+fn connector_name_default(config: &Map<String, Value>) -> String {
+    config
+        .get("agentChat")
+        .and_then(|chat| chat.pointer("/automation/connectorName"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Codexify")
+        .to_string()
 }
 
 fn configured_tunnel_id(config: &Map<String, Value>) -> Option<String> {
@@ -1289,6 +1314,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(config["schemaVersion"], json!(1));
         assert_eq!(
+            config["agentChat"]["automation"]["connectorName"],
+            "Codexify"
+        );
+        assert_eq!(
             config["workDir"],
             json!(fs::canonicalize(&project).unwrap())
         );
@@ -1452,6 +1481,7 @@ mod tests {
             &config_path,
             serde_json::to_vec_pretty(&json!({
                 "apiKey": "legacy-local-token",
+                "agentChat": {"automation":{"connectorName":"My exact connector"}},
                 "multiProject": true,
                 "conversationAuthToken": CONVERSATION_TOKEN,
                 "allowedCommands": ["git"],
@@ -1488,6 +1518,10 @@ mod tests {
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(config.get("apiKey").is_none());
+        assert_eq!(
+            config["agentChat"]["automation"]["connectorName"],
+            "My exact connector"
+        );
         assert_eq!(config["multiProject"], json!(true));
         assert_eq!(
             config["workDir"],

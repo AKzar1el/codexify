@@ -79,6 +79,7 @@ async fn fixture(enabled: bool) -> Fixture {
     config.memory.dir = Some(root.path().join("state").display().to_string());
     config.markdown_chat.enabled = true;
     config.markdown_chat.automation.enabled = true;
+    config.markdown_chat.automation.connector_name = "Codexify".into();
     config.markdown_chat.turn_renewal.enabled = enabled;
     let task = ConversationIdentity::from_openai_session("renewal-test").unwrap();
     let chat = MarkdownChatStore::default()
@@ -298,7 +299,7 @@ async fn disabling_only_a_model_cancels_its_queued_renewal_before_send() {
     let f = fixture(true).await;
     let path = f._root.path().join("config.json");
     let document = |enabled| {
-        serde_json::json!({"agentChat":{"turnRenewal":{
+        serde_json::json!({"agentChat":{"automation":{"connectorName":"Codexify"},"turnRenewal":{
             "enabled":true,"limits":[{"model":"gpt-6-astra","effort":"max","minutes":55,"enabled":enabled}]
         }}})
     };
@@ -450,7 +451,7 @@ async fn hot_settings_disable_pending_handoff_without_restart() {
     let path = f._root.path().join("config.json");
     std::fs::write(
         &path,
-        r#"{"agentChat":{"rolloutEnabled":false,"turnRenewal":{"enabled":true}}}"#,
+        r#"{"agentChat":{"automation":{"connectorName":"Codexify"},"rolloutEnabled":false,"turnRenewal":{"enabled":true}}}"#,
     )
     .unwrap();
     let mut config = f.config.clone();
@@ -471,7 +472,7 @@ async fn hot_settings_disable_pending_handoff_without_restart() {
         .unwrap();
     std::fs::write(
         &path,
-        r#"{"agentChat":{"rolloutEnabled":true,"turnRenewal":{"enabled":false}}}"#,
+        r#"{"agentChat":{"automation":{"connectorName":"Codexify"},"rolloutEnabled":true,"turnRenewal":{"enabled":false}}}"#,
     )
     .unwrap();
     assert!(codexify::global_settings::rollout_enabled(&config).unwrap());
