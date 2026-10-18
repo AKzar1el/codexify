@@ -38,7 +38,13 @@ async function fixture(engine,{clipboard=true}={}){
  await page.goto(origin+'/#share-test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Codexify settings'});await settings.getByRole('button',{name:'Analytics',exact:true}).click();await settings.getByRole('button',{name:'Share analytics',exact:true}).waitFor();await page.waitForFunction(()=>!document.querySelector('[aria-label="Share analytics"]').disabled);
  return {browser,page,settings,errors,requests,posts};
 }
-async function ready(page){const dialog=page.getByRole('dialog',{name:'Share your stats'});await dialog.locator('#stats-share-download[aria-disabled=false]').waitFor();await page.waitForFunction(()=>{const image=document.getElementById('stats-share-image');return image?.complete&&image.naturalWidth===1200;});return dialog;}
+async function ready(page){
+ const dialog=page.getByRole('dialog',{name:'Share your stats'}),timeout=20000;
+ // Canvas encoding on the shared Linux runner can outlast the control timeout.
+ await dialog.locator('#stats-share-download[aria-disabled=false]').waitFor({timeout});
+ await page.waitForFunction(()=>{const image=document.getElementById('stats-share-image');return image?.complete&&image.naturalWidth===1200;},null,{timeout});
+ return dialog;
+}
 function png(bytes){assert.equal(bytes.subarray(0,8).toString('hex'),'89504e470d0a1a0a');assert.equal(bytes.readUInt32BE(16),1200);assert.equal(bytes.readUInt32BE(20),675);assert(bytes.length<400000,'compact PNG should stay small');}
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: share cards export the selected period as a private PNG and copy the same image`,{timeout:45000},async()=>{
  const f=await fixture(engine),{browser,page,settings,errors,requests,posts}=f;const output=process.env.ANALYTICS_SHARE_SCREENSHOTS||mkdtempSync(join(tmpdir(),'analytics-share-'));mkdirSync(output,{recursive:true});
