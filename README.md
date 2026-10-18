@@ -207,7 +207,7 @@ background discovery pass retries every 30 seconds, so restoring goals does not
 require opening their conversations. Paused and blocked goals remain paused or
 blocked.
 
-**Analytics**, planned for 2.1, is the last tab in global settings. Collection is
+**Analytics** is the last tab in global settings. Collection is
 always active and starts with new activity; nothing
 is backfilled. Choose seven days (default), 30 days, 90 days or lifetime to see
 stacked model/effort charts, completed goals, conversation leaderboards, activity

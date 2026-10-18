@@ -6,20 +6,63 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added — planned for 2.1
+## [2.1.0] - 2026-10-18
 
-- Colorful Analytics share cards with static PNG and animated SVG previews,
-  downloads and a copy-PNG action. The SVG counts up to the selected totals,
-  celebrates with flames and sparks, then holds the result in a six-second loop.
-  Motion can be paused in the preview and respects reduced-motion preferences.
-  Cards contain aggregate totals and Codexify branding; no images are uploaded
-  or made publicly accessible.
+### Added
 
-- A local Analytics dashboard in global settings with daily stacked model/effort
-  charts for turns, estimated active time and native tool calls; date ranges,
-  lifetime totals, conversation leaderboards, goal completions and milestones.
-  Collection is enabled by default, starts with new activity and can be paused.
-  It uses separate best-effort storage and never controls chat automation.
+- Always-on local Analytics with stacked model/effort charts, date ranges,
+  lifetime totals, conversation leaderboards, completed goals, streaks and
+  milestones. Collection starts with new activity, uses separate best-effort
+  storage and never blocks chat automation.
+- Colorful Analytics share cards with static PNG previews, copy and download,
+  plus animated SVG exports with counting totals, activity bars, flames and
+  sparks. Cards respect reduced-motion preferences, contain aggregate totals
+  and `codexify.dev` branding, and are generated locally without public hosting.
+- Private, persistent message queues with edit, delete and steer actions.
+  Configure steering or queuing as the default; Cmd+Enter on macOS or Ctrl+Enter
+  on Windows/Linux uses the other mode for that message. Only one queued message
+  is delivered per completed request, and unfinished goals keep queued tasks
+  private while automatic continuations run.
+- Separate `chat_await` and `turn_completed` tools: requested user answers go
+  straight to the agent, while completed requests can consume the next queued
+  task. Pending input requests survive ordinary tool activity.
+- A per-chat `rollout.md` progress journal, enabled by default, for chronological
+  progress, current work and next steps. The configurable reminder defaults to
+  every 20 work tool calls; bounded recent-report reads and dated rotation keep
+  recovery context manageable while preserving older reports.
+- Optional turn renewal, independent of the progress journal and disabled by
+  default. Model/effort deadlines ask the agent to write a final-answer handoff,
+  then continue automatically even without a goal. GPT-5.6 Sol Pro defaults to
+  115 minutes; other selections default to 55 minutes.
+- Passive model cutoff estimates from confirmed sends to the last native tool
+  call, excluding completed work, input waits, renewal handoffs and implausible
+  samples. Collection failures remain silent and cannot interrupt chat work.
+- Minimal Home Screen web app support with a manifest, icons, standalone display
+  and private authenticated launch. The app remains online-only.
+
+### Changed
+
+- Mobile layouts use full-width chat lists and conversations with a back button,
+  compact model/effort selectors and an aligned sidebar footer. Composer outlines
+  are rounded, and the mobile viewport avoids input-focus zoom.
+- Agent chat responses omit unnecessary message metadata while preserving
+  message timestamps and delivery tracking internally.
+
+### Fixed
+
+- Active goals are rediscovered at service startup and every 30 seconds, even
+  without queued messages or a pending handoff. Restoring a goal no longer
+  requires opening its conversation; paused and blocked goals keep their state.
+- Dismissing an error no longer stops the objective or disables its retries.
+  Native agent activity reconciles delivery and renewal state without replaying
+  messages whose submission is uncertain.
+- Automation state loading tolerates recoverable state inconsistencies without
+  preventing the conversation list from loading.
+- Replies to explicit input requests bypass the default queue mode without
+  consuming queued tasks. Completed work advances the queue, while a request
+  for user input keeps it on hold.
+- Queued attachment previews stay compact and unclipped, and recent chats no
+  longer show a duplicate divider below pinned conversations.
 
 ## [2.0.0] - 2026-10-17
 
@@ -696,7 +739,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/devnoname120/codexify/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/devnoname120/codexify/compare/v1.6.6...v1.7.0
 [1.6.6]: https://github.com/devnoname120/codexify/compare/v1.6.5...v1.6.6
