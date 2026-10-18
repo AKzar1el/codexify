@@ -1391,6 +1391,7 @@ async fn stop_requests_persist_without_acknowledging_messages_and_resume_only_on
 async fn chat_event_filters_and_repeated_awaits_deliver_only_requested_alerts() {
     use axum::{Router, routing::post};
     let (_root, mut config, session, mut context) = fixture();
+    select_fixture_workspace(&config, &context).await;
     let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
     let app = Router::new().route(
         "/",

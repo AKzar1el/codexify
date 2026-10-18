@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-18
+
 ### Added
 
 - Automatically recover an installed browser companion when it closes, stops
@@ -14,7 +16,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Start browser and Stop browser controls in conversation settings. An explicit
   stop persists until Start is pressed, including across server restarts. Stop
   can cancel startup; concurrent callers share the same lifecycle lock.
-
 - Expand achievements from 8 to 32 across completed goals, lifetime turns, tool
   calls, daily streaks, active goal hours and turns in one conversation. New
   long-term tiers reach 1,000 goals, 100,000 turns, 10 million tools and a
@@ -40,7 +41,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Strip Markdown from generated and custom chat titles while preserving their
   readable text. Sidebar labels, conversation headers and rename fields use the
   same plain title; message formatting remains intact.
-
 - Compact mobile settings keep the same readable control text size during
   editing, fix date-range text clipping, and respect iPhone screen safe areas.
 - Rename the chat sidebar to Codexify and always use workspace selection.
@@ -49,6 +49,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delivery, a 25-call progress interval and best-effort upstream refresh.
   Destructive and open-world annotation overrides default to false. Explicit
   saved settings remain in effect.
+
+### Fixed
+
+- Recognize localized ChatGPT controls, model efforts, plans and errors through
+  verified UI identities and the bundled locale catalog. Greek and Italian
+  pairing, submission, model fallback and Stop confirmation have regression
+  coverage; ambiguous controls are rejected before sending.
+- Handle ChatGPT's optional Stop-response confirmation without depending on its
+  displayed language, while keeping cancellation and stop deadlines bounded.
+- Browser action deadlines renew only when a new submission stage makes
+  progress. Repeated events cannot keep a stalled action alive indefinitely.
+- Resume cancelled chats and goals without resending messages already accepted
+  by ChatGPT. Goal failures use the same retry backoff as ordinary messages.
+- Require the configured connector name before creating chats or starting goals,
+  and offer setup instead of guessing a connector.
+- Use interactive macOS service scheduling to prevent background I/O throttling
+  from stalling child processes.
 
 ## [2.1.0] - 2026-10-18
 
@@ -93,15 +110,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   message timestamps and delivery tracking internally.
 
 ### Fixed
-
-- Browser automation recognizes localized control labels, model efforts, slider
-  announcements, plans and error dialogs using verified UI identities and a
-  bundled catalog from ChatGPT’s published locales. Greek pairing and submission
-  preserve the selected model and effort. Ambiguous translations are rejected.
-
-- Handle ChatGPT’s optional Stop-response confirmation before continuing an
-  offline chat or goal. Match the dialog structure without localized labels
-  and keep cancellation and stop deadlines bounded.
 
 - Active goals are rediscovered at service startup and every 30 seconds, even
   without queued messages or a pending handoff. Restoring a goal no longer
@@ -792,7 +800,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/devnoname120/codexify/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/devnoname120/codexify/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/devnoname120/codexify/compare/v1.7.0...v2.0.0
 [1.7.0]: https://github.com/devnoname120/codexify/compare/v1.6.6...v1.7.0
