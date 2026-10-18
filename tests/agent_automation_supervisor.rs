@@ -7749,7 +7749,7 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         .unwrap();
     f.store.run_goal(&f.task, goal.revision, 101).unwrap();
     let executor = Arc::new(PreSendFailureExecutor::default());
-    let supervisor =
+    let mut supervisor =
         AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
     supervisor
         .register_task(AutomationTaskHandle::new(
@@ -7761,13 +7761,35 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         .await
         .unwrap();
     let mut now = 1000;
-    for _ in 0..5 {
+    for (attempt, delay) in [
+        (0, 30_000),
+        (1, 60_000),
+        (2, 120_000),
+        (3, 120_000),
+        (3, 120_000),
+    ] {
         supervisor.scan_once(now).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 1);
         assert!(supervisor.run_next(now + 1).await.is_err());
         let failed = f.store.load(&f.task).unwrap();
         let retry_at = failed.automatic_retry_at_ms().unwrap();
-        assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + 180_000);
+        assert_eq!(failed.action.automatic_retry_attempts, attempt);
+        assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + delay);
+        // Reopening the store and supervisor must retain the retry stage, including
+        // the capped delay after the third failure, without abandoning the goal.
+        supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
         supervisor.scan_once(retry_at - 1).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 0);
         now = retry_at;
@@ -7778,4 +7800,15 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         1,
         "a failed Send does not count as another goal turn"
     );
+    f.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::SubmissionComplete {
+            canonical_url: "https://chatgpt.com/c/example".into(),
+        },
+    ]);
+    f.supervisor.scan_once(now).await.unwrap();
+    f.supervisor.run_next(now + 1).await.unwrap();
+    let resumed = f.store.load(&f.task).unwrap();
+    assert_eq!(resumed.action.send_accepted, Some(true));
+    assert_eq!(resumed.action.automatic_retry_attempts, 0);
 }

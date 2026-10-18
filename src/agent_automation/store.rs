@@ -346,12 +346,24 @@ impl AutomationTaskState {
         {
             return None;
         }
+        let delay = if action.status == AutomationActionStatus::Failed
+            && action.send_accepted == Some(false)
+            && !action.messages_fenced
+            && !action.goal_turn_counted
+        {
+            // Use the ordinary pre-Send retry schedule, capped at its last delay
+            // so an active goal is not abandoned after repeated browser failures.
+            AUTOMATIC_RETRY_DELAYS_MS[(action.automatic_retry_attempts as usize)
+                .min(AUTOMATIC_RETRY_DELAYS_MS.len() - 1)]
+        } else {
+            GOAL_RETRY_AFTER_MS
+        };
         action
             .updated_at_ms
             .into_iter()
             .chain(self.goal_wake.last_nudged_at_ms)
             .max()
-            .map(|last| last.saturating_add(GOAL_RETRY_AFTER_MS))
+            .map(|last| last.saturating_add(delay))
     }
 
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
@@ -1868,6 +1880,19 @@ impl AgentAutomationStore {
             // ledger so continuing a goal never replays an earlier user batch.
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
+                automatic_retry_attempts: if state.action.status == AutomationActionStatus::Failed
+                    && state.action.send_accepted == Some(false)
+                    && !state.action.messages_fenced
+                    && !state.action.goal_turn_counted
+                {
+                    state
+                        .action
+                        .automatic_retry_attempts
+                        .saturating_add(1)
+                        .min(AUTOMATIC_RETRY_DELAYS_MS.len() as u32)
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             state.goal_wake = GoalWakeState::default();
@@ -1944,6 +1969,7 @@ impl AgentAutomationStore {
             }
             count_accepted_goal_turn(state);
             state.action.send_accepted = Some(true);
+            state.action.automatic_retry_attempts = 0;
             state.action.status = if made_progress {
                 AutomationActionStatus::Idle
             } else {
@@ -2127,6 +2153,7 @@ impl AgentAutomationStore {
                 return Ok(());
             }
             state.action.send_accepted = Some(true);
+            state.action.automatic_retry_attempts = 0;
             count_accepted_goal_turn(state);
             Ok(())
         })
