@@ -185,11 +185,31 @@ inside `rollouts/`; older history is preserved and recent reads span rotations.
 
 **Turn renewal** is independent of the progress journal and is **off by default**.
 Enable it in **Settings → Chats & goals → Turn renewal**. Its per-model/effort
-limits remain visible and editable while disabled: GPT-5.6 Sol Pro defaults to
-115 minutes; GPT-6 Astra Pro and every other selection default to 55 minutes.
-Unlisted model/effort selections use 55 minutes. Limits are measured from the
-last confirmed message sent to ChatGPT by Codexify, using the actual selected
-model (including fallback), and apply without a service restart.
+limits have individual enable switches and remain editable while disabled.
+GPT-5.6 Sol Pro defaults to 115 minutes; other listed selections default to
+55 minutes. Unchecked and unlisted model/effort pairs are never renewed.
+Existing limit entries without an `enabled` flag remain enabled for compatibility.
+Limits are measured from the last confirmed message sent to ChatGPT by Codexify,
+using the actual selected model (including fallback), and apply without a service
+restart. Disabling a model also cancels its pending renewal continuation.
+
+For example, renew only GPT-5.6 Sol Pro after 115 minutes:
+
+```json
+{
+  "agentChat": {
+    "turnRenewal": {
+      "enabled": true,
+      "limits": [
+        { "model": "gpt-5.6-sol", "effort": "max", "minutes": 115, "enabled": true }
+      ]
+    }
+  }
+}
+```
+
+In settings, choose **Disable all**, then check **GPT-5.6 Sol Pro**. Models omitted
+from a custom list still appear unchecked so they can be enabled later.
 
 At the next tool response after the limit, the agent is asked to stop work and
 write a comprehensive handoff in its **normal final ChatGPT answer**. This is an

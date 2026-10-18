@@ -13,6 +13,11 @@ pub struct ModelTurnLimit {
     pub model: String,
     pub effort: String,
     pub minutes: u64,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+fn enabled_by_default() -> bool {
+    true
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -42,6 +47,7 @@ impl Default for TurnRenewalConfig {
                         model,
                         effort,
                         minutes,
+                        enabled: true,
                     }
                 })
                 .collect(),
@@ -73,11 +79,15 @@ impl TurnRenewalConfig {
         }
         Ok(())
     }
-    pub fn minutes(&self, model: Option<&str>, effort: Option<&str>) -> u64 {
+    pub fn minutes(&self, model: Option<&str>, effort: Option<&str>) -> Option<u64> {
         self.limits
             .iter()
             .find(|l| Some(l.model.as_str()) == model && Some(l.effort.as_str()) == effort)
-            .map_or(55, |l| l.minutes)
+            .filter(|l| l.enabled)
+            .map(|l| l.minutes)
+    }
+    pub fn enabled_for(&self, model: Option<&str>, effort: Option<&str>) -> bool {
+        self.enabled && self.minutes(model, effort).is_some()
     }
 }
 
@@ -254,11 +264,12 @@ impl AgentAutomationStore {
         }
         self.mutate(task, |state| {
             let Some(send) = &state.turn_renewal.send else {return Ok(None)};
+            let Some(minutes) = config.minutes(send.model.as_deref(), send.effort.as_deref()) else {return Ok(None)};
             if send.pairing_generation != state.pairing.generation
                 || state.pairing.verified_owner_generation != Some(send.owner_generation)
                 || state.action.status == AutomationActionStatus::Cancelled
             {return Ok(None);}
-            if now_ms.saturating_sub(send.at_ms) < config.minutes(send.model.as_deref(), send.effort.as_deref()).saturating_mul(60_000) {
+            if now_ms.saturating_sub(send.at_ms) < minutes.saturating_mul(60_000) {
                 return Ok(None);
             }
             let handoff = state.turn_renewal.handoff.get_or_insert_with(|| TurnHandoff {

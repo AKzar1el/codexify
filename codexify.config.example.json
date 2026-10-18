@@ -147,77 +147,92 @@
         {
           "model": "gpt-6-astra",
           "effort": "max",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.6-sol",
           "effort": "max",
-          "minutes": 115
+          "minutes": 115,
+          "enabled": true
         },
         {
           "model": "gpt-6-sol",
           "effort": "xhigh",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-6-sol",
           "effort": "high",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-6-sol",
           "effort": "medium",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.6-sol",
           "effort": "xhigh",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.6-sol",
           "effort": "high",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.6-sol",
           "effort": "medium",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.5-sol",
           "effort": "max",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.5-sol",
           "effort": "xhigh",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.5-sol",
           "effort": "high",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.5-sol",
           "effort": "medium",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-6-sol",
           "effort": "low",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.6-sol",
           "effort": "low",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         },
         {
           "model": "gpt-5.5-sol",
           "effort": "low",
-          "minutes": 55
+          "minutes": 55,
+          "enabled": true
         }
       ]
     }

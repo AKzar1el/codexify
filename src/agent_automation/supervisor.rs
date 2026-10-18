@@ -988,6 +988,9 @@ impl AgentAutomationSupervisor {
             let mut state = task.store.load(&task.task)?;
             task.store.notify_state(&task.chat, &state).await;
             let renewal_config = task.store.turn_renewal_settings()?;
+            let renewal_enabled = state.turn_renewal.send.as_ref().is_some_and(|send| {
+                renewal_config.enabled_for(send.model.as_deref(), send.effort.as_deref())
+            });
             super::turn_analytics::observe(
                 task.chat.path(),
                 task.task.stable_key(),
@@ -995,11 +998,11 @@ impl AgentAutomationSupervisor {
                 &state,
                 activity.last_call_at_ms,
                 activity.agent_stop_requested,
-                renewal_config.enabled,
+                renewal_enabled,
                 now_ms,
             );
             let renewal_invalid = activity.agent_stop_requested
-                || !renewal_config.enabled
+                || !renewal_enabled
                 || state.turn_renewal.send.as_ref().is_some_and(|send| {
                     send.owner_generation != task.owner_generation
                         || send.pairing_generation != state.pairing.generation
@@ -2574,20 +2577,23 @@ async fn execution_matches(
         return Ok(false);
     }
     let activity = task.chat.offline_activity().await?;
-    let renewing = if let ActionPrompt::TurnRenewal { ref handoff_id } = execution.request.prompt {
-        if !task.store.turn_renewal_settings()?.enabled
-            || state
+    let renewing =
+        if let ActionPrompt::TurnRenewal { ref handoff_id } = execution.request.prompt {
+            let config = task.store.turn_renewal_settings()?;
+            if !state.turn_renewal.send.as_ref().is_some_and(|send| {
+                config.enabled_for(send.model.as_deref(), send.effort.as_deref())
+            }) || state
                 .turn_renewal
                 .handoff
                 .as_ref()
                 .is_none_or(|h| h.id != *handoff_id || !h.report_complete)
-        {
-            return Ok(false);
-        }
-        true
-    } else {
-        false
-    };
+            {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
     if activity.agent_stop_requested
         || !renewing
             && (activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)

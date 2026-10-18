@@ -419,7 +419,14 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   await pro.fill('110');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.turnRenewal.limits.find(l=>l.model==='gpt-5.6-sol'&&l.effort==='max').minutes,110);assert.equal(document.agentChat.turnRenewal.enabled,undefined);
   await dialog.getByRole('group',{name:'agentChat.rolloutEnabled',exact:true}).getByRole('button',{name:'Off',exact:true}).click();await dialog.getByText('All changes saved.',{exact:true}).waitFor();
   await dialog.getByRole('group',{name:'agentChat.turnRenewal.enabled',exact:true}).getByRole('button',{name:'On',exact:true}).click();await page.waitForFunction(()=>document.querySelector('[data-setting-row="agentChat.turnRenewal.enabled"] button[aria-pressed="true"]').textContent==='On');await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.equal(document.agentChat.rolloutEnabled,false);assert.equal(document.agentChat.turnRenewal.enabled,true);
-  await page.setViewportSize({width:390,height:844});await pro.scrollIntoViewIfNeeded();await page.screenshot({path:`/tmp/turn-renewal-settings-${engineName}.png`});assert(await dialog.evaluate(e=>e.scrollWidth<=e.clientWidth));assert.deepEqual(errors,[]);assert.equal(writes.length,3);
+  assert.equal(await dialog.getByRole('checkbox').count(),15);assert.equal(await dialog.locator('.setting-turn-limit input[type=checkbox]:checked').count(),15);
+  const limits=dialog.locator('[data-setting-row="agentChat.turnRenewal.limits"]');
+  await limits.getByRole('button',{name:'Disable all',exact:true}).click();await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert(document.agentChat.turnRenewal.limits.every(limit=>limit.enabled===false));
+  await dialog.getByRole('checkbox',{name:'Renew GPT-5.6 Sol Pro',exact:true}).check();await dialog.getByText('All changes saved.',{exact:true}).waitFor();assert.deepEqual(document.agentChat.turnRenewal.limits.filter(limit=>limit.enabled).map(limit=>[limit.model,limit.effort,limit.minutes]),[['gpt-5.6-sol','max',110]]);
+  await dialog.getByRole('button',{name:'Close settings',exact:true}).click();document.agentChat.turnRenewal.limits=[{model:'gpt-5.6-sol',effort:'max',minutes:115}];revision++;
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  assert.equal(await dialog.locator('.setting-turn-limit').count(),15);assert.equal(await dialog.getByRole('checkbox',{name:'Renew GPT-5.6 Sol Pro',exact:true}).isChecked(),true);assert.equal(await dialog.getByRole('checkbox',{name:'Renew GPT-6 Astra Pro',exact:true}).isChecked(),false);assert.equal(await dialog.locator('.setting-turn-limit input[type=checkbox]:checked').count(),1);
+  await page.setViewportSize({width:390,height:844});await pro.scrollIntoViewIfNeeded();await page.screenshot({path:`/tmp/turn-renewal-settings-${engineName}.png`});assert(await dialog.evaluate(e=>e.scrollWidth<=e.clientWidth));assert.deepEqual(errors,[]);assert.equal(writes.length,5);
  }finally{await browser.close();}
 });
 

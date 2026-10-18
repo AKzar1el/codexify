@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Turn renewal can be enabled independently for each model and reasoning effort.
+  Disabled and unlisted selections are left alone, including after a model
+  fallback. Model switches apply immediately and cancel pending renewals.
+
 ## [2.1.0] - 2026-10-18
 
 ### Added

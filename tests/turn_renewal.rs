@@ -166,12 +166,12 @@ fn wall_ms() -> u64 {
 fn opt_in_defaults_and_strict_model_limits() {
     let mut c = TurnRenewalConfig::default();
     assert!(!c.enabled);
-    assert_eq!(c.minutes(Some("gpt-5.6-sol"), Some("max")), 115);
-    assert_eq!(c.minutes(Some("gpt-6-astra"), Some("max")), 55);
-    assert_eq!(c.minutes(Some("gpt-5.6-sol"), Some("high")), 55);
-    assert_eq!(c.minutes(Some("new-model"), Some("max")), 55);
+    assert_eq!(c.minutes(Some("gpt-5.6-sol"), Some("max")), Some(115));
+    assert_eq!(c.minutes(Some("gpt-6-astra"), Some("max")), Some(55));
+    assert_eq!(c.minutes(Some("gpt-5.6-sol"), Some("high")), Some(55));
+    assert_eq!(c.minutes(Some("new-model"), Some("max")), None);
     c.limits[0].minutes = 50;
-    assert_eq!(c.minutes(Some("gpt-6-astra"), Some("max")), 50);
+    assert_eq!(c.minutes(Some("gpt-6-astra"), Some("max")), Some(50));
     assert!(c.validate().is_ok());
     c.limits.push(c.limits[0].clone());
     assert!(c.validate().is_err());
@@ -207,6 +207,129 @@ async fn exact_deadline_and_restart_keep_first_actual_send() {
             .unwrap(),
         note
     );
+}
+
+#[test]
+fn model_switches_preserve_legacy_entries_and_leave_unlisted_selections_alone() {
+    let mut config: TurnRenewalConfig = serde_json::from_value(serde_json::json!({
+        "enabled":true,"limits":[{"model":"gpt-5.6-sol","effort":"max","minutes":115}]
+    }))
+    .unwrap();
+    assert!(config.enabled_for(Some("gpt-5.6-sol"), Some("max")));
+    assert!(!config.enabled_for(Some("gpt-5.6-sol"), Some("high")));
+    assert!(!config.enabled_for(Some("gpt-6-astra"), Some("max")));
+    assert!(!config.enabled_for(None, None));
+    config.limits[0].enabled = false;
+    assert_eq!(config.minutes(Some("gpt-5.6-sol"), Some("max")), None);
+    assert!(config.validate().is_ok());
+    config.limits.clear();
+    assert!(!config.enabled_for(Some("gpt-5.6-sol"), Some("max")));
+}
+
+#[tokio::test]
+async fn selected_model_renews_at_115_minutes_using_actual_fallback_proof() {
+    for (model, effort) in [
+        (Some("gpt-5.6-sol"), Some("max")),
+        (Some("gpt-5.6-sol"), Some("high")),
+        (Some("gpt-6-astra"), Some("max")),
+        (Some("unlisted-model"), Some("max")),
+        (None, None),
+    ] {
+        let f = fixture(true).await;
+        let mut config = f.config.clone();
+        config.markdown_chat.turn_renewal = serde_json::from_value(serde_json::json!({
+            "enabled":true,"limits":[{"model":"gpt-5.6-sol","effort":"max","minutes":115,"enabled":true}]
+        })).unwrap();
+        let store = AgentAutomationStore::for_config(&config).unwrap();
+        let generation = store.load(&f.task).unwrap().pairing.generation;
+        store
+            .queue_action(
+                &f.task,
+                "actual-send",
+                AutomationActionKind::OfflineChat,
+                generation,
+                None,
+                1000,
+            )
+            .unwrap();
+        store
+            .record_turn_send(
+                &f.task,
+                TurnSend {
+                    action_id: "actual-send".into(),
+                    at_ms: 1000,
+                    model: model.map(str::to_owned),
+                    effort: effort.map(str::to_owned),
+                    pairing_generation: generation,
+                    owner_generation: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.load(&f.task).unwrap().selection.model.as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert!(
+            store
+                .turn_renewal_notice(&f.task, 1000 + 115 * 60_000 - 1)
+                .unwrap()
+                .is_none()
+        );
+        let selected = model == Some("gpt-5.6-sol") && effort == Some("max");
+        assert_eq!(
+            store
+                .turn_renewal_notice(&f.task, 1000 + 115 * 60_000)
+                .unwrap()
+                .is_some(),
+            selected
+        );
+        assert_eq!(
+            store
+                .turn_renewal_notice(&f.task, u64::MAX)
+                .unwrap()
+                .is_some(),
+            selected
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabling_only_a_model_cancels_its_queued_renewal_before_send() {
+    let f = fixture(true).await;
+    let path = f._root.path().join("config.json");
+    let document = |enabled| {
+        serde_json::json!({"agentChat":{"turnRenewal":{
+            "enabled":true,"limits":[{"model":"gpt-6-astra","effort":"max","minutes":55,"enabled":enabled}]
+        }}})
+    };
+    std::fs::write(&path, document(true).to_string()).unwrap();
+    let mut config = f.config.clone();
+    config.loaded_config_path = Some(path.clone());
+    let store = Arc::new(AgentAutomationStore::for_config(&config).unwrap());
+    let supervisor =
+        AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), f.executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    store.turn_renewal_notice(&f.task, DUE).unwrap().unwrap();
+    f.executor.complete.store(true, Ordering::SeqCst);
+    supervisor.scan_once(DUE + 10_000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 1);
+    std::fs::write(&path, document(false).to_string()).unwrap();
+    // No scan between the settings change and dispatch: the final guard must
+    // reread the model switch rather than send the previously queued action.
+    assert!(supervisor.run_next(DUE + 10_001).await.unwrap().is_none());
+    assert!(f.executor.sent.lock().unwrap().is_empty());
+    supervisor.scan_once(DUE + 20_000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert!(store.load(&f.task).unwrap().turn_renewal.handoff.is_none());
+    assert!(store.turn_renewal_settings().unwrap().enabled);
 }
 #[tokio::test]
 async fn no_goal_renewal_waits_for_final_report_and_sends_once_without_queue() {
@@ -415,7 +538,7 @@ async fn completed_handoff_supersedes_old_browser_error_but_pausing_goal_cancels
     assert_eq!(f.supervisor.queued_count().await, 0);
 }
 #[tokio::test]
-async fn unlisted_or_unavailable_selection_uses_fifty_five_minutes() {
+async fn unknown_actual_selection_is_not_renewed() {
     let f = fixture(true).await;
     let pair = f.store.load(&f.task).unwrap().pairing.generation;
     f.store
@@ -457,7 +580,13 @@ async fn unlisted_or_unavailable_selection_uses_fifty_five_minutes() {
             .unwrap()
             .is_none()
     );
-    assert!(f.store.turn_renewal_notice(&f.task, DUE).unwrap().is_some());
+    assert!(f.store.turn_renewal_notice(&f.task, DUE).unwrap().is_none());
+    assert!(
+        f.store
+            .turn_renewal_notice(&f.task, u64::MAX)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

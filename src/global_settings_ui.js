@@ -78,7 +78,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
 #settings-dialog .setting-editor-tools{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:12px;color:var(--muted)}
 #settings-dialog .setting-editor-tools button,#settings-dialog .setting-reset{border:0;background:transparent;color:var(--muted);font-size:11px;padding:2px 0;border-radius:3px}
 #settings-dialog .setting-editor-tools button:hover,#settings-dialog .setting-reset:hover{color:var(--accent)}
-.setting-turn-limits{display:grid;gap:10px;width:100%}.setting-turn-limit{display:grid;grid-template-columns:minmax(0,1fr) 80px 28px;align-items:center;gap:8px;font-size:13px}.setting-turn-limit input{min-width:0;width:100%;box-sizing:border-box}#settings-dialog .setting-control .setting-reset{margin-top:6px}
+.setting-turn-limits{display:grid;gap:10px;width:100%}.setting-turn-limit{display:grid;grid-template-columns:minmax(0,1fr) 80px 28px;align-items:center;gap:8px;font-size:13px}.setting-turn-limit input{min-width:0;width:100%;box-sizing:border-box}.setting-turn-limit-label{display:flex;align-items:center;gap:9px;cursor:pointer;min-width:0}.setting-turn-limit-label span{overflow-wrap:anywhere}.setting-turn-limit input[type=checkbox]{width:16px;height:16px;margin:0;flex:none;accent-color:var(--accent);cursor:pointer}.setting-turn-limit[data-enabled=false] .setting-turn-limit-label{color:var(--muted)}#settings-dialog .setting-control .setting-reset{margin-top:6px}
 #settings-dialog .setting-object-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}
 #settings-dialog .setting-object-summary button{font-size:12px;white-space:nowrap}
 #settings-dialog .cutoff-body{padding:14px 18px}#settings-dialog .cutoff-body p{margin:0 0 12px}#settings-dialog .cutoff-body p:last-child{margin-bottom:0}#settings-dialog .cutoff-scroll{overflow-x:auto;margin:14px 0}#settings-dialog .cutoff-scroll table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}#settings-dialog .cutoff-scroll :is(th,td){text-align:right;white-space:nowrap;padding:9px 8px;border-bottom:1px solid var(--line)}#settings-dialog .cutoff-scroll :is(th,td):first-child{text-align:left;white-space:normal;overflow-wrap:anywhere;min-width:120px}#settings-dialog .cutoff-scroll th{color:var(--muted);font-weight:500}
@@ -134,7 +134,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     workDir:['Project directory Codexify can access.','general'],projectCloneDir:['Where new Git repositories are cloned.','general'],multiProject:['Allow chats to work across projects.','general'],uiWidgets:['Show embedded chat interfaces in tool responses.','general'],port:['HTTP port used by the server.','general'],debug:['Include diagnostic timing information.','advanced'],
     'agentChat.rolloutEnabled':['Keep chronological per-chat progress reports and checkpoint reminders. Independent of turn renewal. Applies immediately.','chats','Progress journal'],
     'agentChat.turnRenewal.enabled':['Ask for a final handoff at the model limit, then continue automatically after the report finishes. Applies immediately.','chats','Turn renewal'],
-    'agentChat.turnRenewal.limits':['Minutes from the last accepted ChatGPT send. All limits remain editable while turn renewal is off. Unlisted selections use 55 minutes.','chats','Turn limits by model'],
+    'agentChat.turnRenewal.limits':['Renew only checked model and effort pairs, measured from the last accepted ChatGPT send using the actual model. Unchecked and unlisted selections are left alone. Limits stay editable while off. Applies immediately.','chats','Turn limits by model'],
     'agentChat.enabled':['Enable conversations and agent messaging.','chats'], 'agentChat.rolloutReminderInterval':['Agent work tool calls between progress checkpoint reminders. UI polling and idle wait loops do not count. Applies immediately.','chats','Progress report interval'], 'agentChat.defaultMessageMode':['Default composer action. Cmd+Enter on Mac or Ctrl+Enter on Windows/Linux uses the other mode for one message.','chats','Default message mode'], 'agentChat.port':['Port for the owner chat interface.','chats'], 'agentChat.maxWaitMs':['Maximum duration of a chat_await or turn_completed call, in milliseconds.','chats'],
     'agentChat.automation.enabled':['Use the browser companion to send messages and continue goals.','browser'], 'agentChat.automation.connectorName':['The connector to mention when sending messages in ChatGPT.','browser'], 'agentChat.automation.chatgptProjectUrl':['ChatGPT project used for new conversations.','browser'], 'agentChat.automation.descriptorPath':['Location of the browser companion connection descriptor.','browser'], 'agentChat.automation.requestBlockList':['One case-sensitive Chrome regex per line. Matching requests never reach the server. Restart the browser companion after changing this list.','browser','Blocked requests'], 'agentChat.automation.maxQueuedActions':['Maximum number of actions waiting to be sent.','chats'], 'agentChat.automation.autoApproveToolCalls':['Automatically approve tool calls in ChatGPT.','browser'],
     'agentChat.notifications.events.completed':['A chat or goal finishes.','notifications','Completion'], 'agentChat.notifications.events.inputRequired':['A chat needs your reply. Repeated alerts are deduplicated.','notifications','Input required'], 'agentChat.notifications.events.goalBlocked':['A goal becomes blocked.','notifications','Goal blocked'], 'agentChat.notifications.events.errors':['An error prevents a chat from continuing.','notifications','Chat errors'], 'agentChat.notifications.events.messages':['Notify for new agent messages.','notifications','New messages'], 'agentChat.notifications.events.offline':['Notify when an agent goes offline.','notifications','Agent offline'], 'agentChat.notifications.urls':['Apprise destination URLs, one per line.','notifications','Delivery destinations'], 'agentChat.notifications.pythonPath':['Python executable used to deliver notifications.','notifications','Python executable'], 'agentChat.notifications.timeoutMs':['Notification delivery timeout, in milliseconds.','notifications','Delivery timeout'],
@@ -195,15 +195,32 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     let control,read;
     if(path==='agentChat.turnRenewal.limits') {
       control=document.createElement('div');control.className='setting-turn-limits';
-      const limits=structuredClone(value??storedAt(snapshot.defaults,path)??sample);
+      const defaults=storedAt(snapshot.defaults,path)??sample??[],saved=value??defaults;
+      const key=limit=>`${limit.model}\u0000${limit.effort}`;
+      const supplied=new Map(saved.map(limit=>[key(limit),limit]));
+      const limits=defaults.map(limit=>({...structuredClone(supplied.get(key(limit))??limit),enabled:supplied.has(key(limit))&&supplied.get(key(limit)).enabled!==false}));
+      const known=new Set(limits.map(key));
+      for(const limit of saved)if(!known.has(key(limit)))limits.push({...structuredClone(limit),enabled:limit.enabled!==false});
+      const checks=[];
       for(const limit of limits) {
-        const line=document.createElement('label');line.className='setting-turn-limit';
-        const name=document.createElement('span');name.textContent=`${limit.model} · ${limit.effort==='max'?'Pro':limit.effort}`;
+        const line=document.createElement('div');line.className='setting-turn-limit';line.dataset.enabled=String(limit.enabled);
+        const model={'gpt-6-astra':'GPT-6 Astra','gpt-6-sol':'GPT-6 Sol','gpt-5.6-sol':'GPT-5.6 Sol','gpt-5.5-sol':'GPT-5.5 Sol','gpt-5.6-luna':'GPT-5.6 Luna'}[limit.model]??limit.model;
+        const effort={max:'Pro',xhigh:'Extra High',high:'High',medium:'Medium',low:'Instant'}[limit.effort]??limit.effort;
+        const name=document.createElement('span');name.textContent=`${model} ${effort}`;
+        const label=document.createElement('label');label.className='setting-turn-limit-label';
+        const enabled=document.createElement('input');enabled.type='checkbox';enabled.checked=limit.enabled;enabled.setAttribute('aria-label',`Renew ${model} ${effort}`);
+        enabled.addEventListener('change',()=>{limit.enabled=enabled.checked;line.dataset.enabled=String(enabled.checked);queue(path,structuredClone(limits),control);});
+        label.append(enabled,name);checks.push({limit,line,enabled});
         const input=document.createElement('input');input.type='number';input.min='1';input.max='1440';input.step='1';input.value=limit.minutes;input.className='setting-input';input.setAttribute('aria-label',`${limit.model} ${limit.effort} turn limit in minutes`);
         input.addEventListener('input',()=>{const n=Number(input.value);if(!Number.isInteger(n)||n<1||n>1440){input.setAttribute('aria-invalid','true');invalidFields.set(path,'Turn limits must be whole minutes between 1 and 1440.');message(invalidFields.get(path),true);return;}limit.minutes=n;input.removeAttribute('aria-invalid');queue(path,structuredClone(limits),control);});
-        const unit=document.createElement('span');unit.textContent='min';line.append(name,input,unit);control.append(line);
+        const unit=document.createElement('span');unit.textContent='min';line.append(label,input,unit);control.append(line);
       }
-      const reset=document.createElement('button');reset.type='button';reset.className='setting-reset';reset.textContent='Use defaults';reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});controls.append(control,reset);
+      const tools=document.createElement('div');tools.className='setting-editor-tools';tools.style.margin='0 0 12px';
+      for(const [text,checked] of [['Enable all',true],['Disable all',false]]) {
+        const button=document.createElement('button');button.type='button';button.textContent=text;
+        button.addEventListener('click',()=>{for(const row of checks){row.limit.enabled=checked;row.enabled.checked=checked;row.line.dataset.enabled=String(checked);}queue(path,structuredClone(limits),control);});tools.append(button);
+      }
+      const reset=document.createElement('button');reset.type='button';reset.textContent='Use defaults';reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});tools.append(reset);controls.append(tools,control);
     } else if(typeof sample==='boolean') {
       control=document.createElement('div');control.className='setting-boolean';control.setAttribute('role','group');control.setAttribute('aria-label',path);
       const hintOverride=annotationHintOverrides.has(path);
