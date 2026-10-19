@@ -37,14 +37,14 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
  try {
   const context=await browser.newContext();const page=await context.newPage();let permission='read_only',refreshes=0,deletes=0,billingReads=0,failConnector=false,fastRefresh=false,replaceRefresh=false,refreshDelay=300,permissionVisits=0;const visits:string[]=[];
   let releaseBilling:(()=>void)|undefined,billingEntered:(()=>void)|undefined,holdBilling:Promise<void>|undefined;
-  let planAccount='fixture-account',permissionLabel='Permiso',allowLabel='Permitir todo';
+  let planAccount='fixture-account',permissionLabel='Permiso',allowLabel='Permitir todo',originalHtml='<form><div id="prompt-textarea" contenteditable="true"></div></form>',sessionAvailable=true;
   const witness:{summary?:string;remember:(summary:string)=>void}={remember:summary=>witness.summary=summary};
   await page.context().route('https://chatgpt.com/**',async route=>{
    const path=new URL(route.request().url()).pathname;
    if(route.request().isNavigationRequest())visits.push(path);
-   if(path==='/api/auth/session')return route.fulfill({json:{user:{id:'fixture-user'},account:{id:new URL(route.request().frame().page().url()).pathname==='/settings/billing'?planAccount:'fixture-account',planType:'pro',structure:'personal'}}});
+   if(path==='/api/auth/session')return route.fulfill({json:sessionAvailable?{user:{id:'fixture-user'},account:{id:new URL(route.request().frame().page().url()).pathname==='/settings/billing'?planAccount:'fixture-account',planType:'pro',structure:'personal'}}:{}});
    if(path==='/settings/billing'){billingReads++;billingEntered?.();if(holdBilling)await holdBilling;return route.fulfill({contentType:'text/html; charset=utf-8',body:'<h2>ChatGPT Pro 200</h2>'});}
-   if(path==='/c/original')return route.fulfill({contentType:'text/html; charset=utf-8',body:'<form><div id="prompt-textarea" contenteditable="true"></div></form>'});
+   if(path==='/c/original')return route.fulfill({contentType:'text/html; charset=utf-8',body:originalHtml});
    if(path==='/set-permission'){permission='allow_all';return route.fulfill({json:{ok:true}});}
    if(path==='/refresh'){refreshes++;return route.fulfill({json:{ok:true}});}
    if(path==='/delete'){deletes++;return route.fulfill({json:{ok:true}});}
@@ -142,6 +142,25 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
     failConnector=true;
     const freshDriver=new ChatGptBrowserDriver({page:async()=>page,navigate:async url=>{await page.goto(url);return page;},reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{}},protocolBuild('fresh-test'));
     await expectFailure(freshDriver.refreshConnector('Fixture connector'),'App ID');expect(page.url()).toBe(original);
+    // A failed conversation can have no composer. Its layout is independent of
+    // account authentication and must not indefinitely defer global maintenance.
+    failConnector=false;
+    for(const body of [
+      '<main><h2>Could not load this ChatGPT conversation</h2><button type="button">Try again</button></main>',
+      '<div data-app-shell-focus-area="main"><div><div class="flex flex-col items-center justify-center"><div class="flex flex-col items-center justify-center text-center max-w-xl"><div class="flex flex-col items-center"><div class="font-medium text-default text-lg">Unavailable</div></div><div class="flex flex-wrap items-center justify-center"><button type="button">Riprova</button></div></div></div></div></div>',
+    ]) {
+      originalHtml=body;await page.reload();
+      expect(await driver.health()).toMatchObject({authenticated:true,status:'idle'});
+      const beforeFailedPage=refreshes;
+      await driver.accountPlan(`failed-page-${refreshes}`);
+      await driver.refreshConnector('Fixture connector');
+      expect(refreshes).toBe(beforeFailedPage+1);expect(page.url()).toBe(original);
+      expect(await driver.health()).toMatchObject({authenticated:true,status:'idle'});
+    }
+    sessionAvailable=false;await page.reload();
+    expect(await driver.health()).toMatchObject({authenticated:false,status:'authentication_required'});
+    visits.length=0;await expectFailure(driver.refreshConnector('Fixture connector'),'');expect(visits).toEqual([]);
+    sessionAvailable=true;originalHtml='<form><div id="prompt-textarea" contenteditable="true"></div></form>';await page.reload();
     expect((await driver.health()).status).toBe('idle');
     expect(beginCalls).toBe(endCalls);expect(owned).toBeFalse();expect(newPage).not.toHaveBeenCalled();expect(addedPages).toBe(0);expect(context.pages()).toEqual(initialPages);
   } finally {newPage.mockRestore();}

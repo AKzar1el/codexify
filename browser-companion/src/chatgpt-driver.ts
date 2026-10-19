@@ -5,7 +5,7 @@ import {ConnectorAppCache} from "./connector-cache";
 import {approveConversationCard} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
-import { conversationUnavailableVisible, throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
+import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
@@ -269,19 +269,23 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if(this.pendingRefresh?.page===page&&page.url()===this.pendingRefresh.url) {
         return {authenticated:true,accountFingerprint:this.pendingRefresh.account.fingerprint,status:"idle",detail:null};
       }
+      if (new URL(page.url()).pathname.startsWith("/auth/")) {
+        throw new BrowserCompanionError("Sign in to ChatGPT in the browser companion", "authentication_required");
+      }
+      let account:ChatGptAccount;
       try {
-        await assertAuthenticatedChatGptPage(page);
+        account = await this.healthAccount.read(page);
       } catch (error) {
         if (page.isClosed()) throw new BrowserCompanionError("The shared Chrome ChatGPT window was closed", "external_interference", {cause:error});
-        if (!await conversationUnavailableVisible(page)) {
+        if (!await page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true}).count()) {
           throw new BrowserCompanionError(
             "ChatGPT authentication could not be verified in the shared browser window",
             "authentication_required",
             { cause:error },
           );
         }
+        throw error;
       }
-      const account = await this.healthAccount.read(page);
       try {
         await throwIfSessionAttention(page);
       } catch (error) {
@@ -306,6 +310,13 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           status:"unavailable",
           detail:asCompanionError(error).message,
         };
+      }
+      // A verified account remains available for navigation and maintenance
+      // when this conversation has failed to render its composer. Actions
+      // still verify the target page and a fresh account before any Send.
+      if (!await page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true}).count()) {
+        return {authenticated:true,accountFingerprint:account.fingerprint,status:"idle",
+          detail:"The current ChatGPT page has no composer; navigation is available"};
       }
       const composer = await activeComposer(page, 2_000).catch(() => null);
       if (!composer) {
@@ -471,11 +482,15 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     let started=false;
     let completed=false;
     try {
-      await throwIfSessionAttention(page);
+      try { await throwIfSessionAttention(page); }
+      catch(error) {
+        // A page-local load failure must not prevent opening global settings.
+        if (!(error instanceof BrowserCompanionError && error.code === "conversation_unavailable")) throw error;
+      }
       // Ownership tracks our UI operation, never ChatGPT's response lifetime.
       const composers=page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true});
       const count=await composers.count();
-      if(count>1||count===0&&!new URL(previousUrl).pathname.startsWith('/settings/'))throw new BrowserCompanionError("Browser companion is busy; the shared composer is not ready");
+      if(count>1)throw new BrowserCompanionError("Browser companion is busy; the shared composer is ambiguous");
       if(await this.surface.page()!==page||page.url()!==previousUrl)throw new BrowserCompanionError("ChatGPT changed pages before account maintenance", "external_interference");
       this.maintenance={page,account};started=true;
       signal?.throwIfAborted();
