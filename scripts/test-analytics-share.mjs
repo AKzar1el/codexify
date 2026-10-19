@@ -118,7 +118,21 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
     const context=await browser.newContext({javaScriptEnabled:false,viewport:{width:1200,height:675},deviceScaleFactor:1});const frame=await context.newPage();let imageRequests=0;
     await frame.route('http://127.0.0.1:43330/**',route=>{imageRequests++;return route.fulfill({contentType:route.request().url().endsWith('.svg')?'image/svg+xml':'text/html',body:route.request().url().endsWith('.svg')?svg:'<style>body{margin:0}img{display:block;width:1200px;height:675px}</style><img src="/stats.svg" alt="Stats">'});});
     await frame.goto('http://127.0.0.1:43330/');await frame.locator('img').waitFor();await frame.waitForTimeout(150);const early=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-start.png`)});await frame.waitForTimeout(700);const middle=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-count.png`)});assert.notDeepEqual(early,middle,'SVG must animate as an image without JavaScript');
-    await frame.waitForTimeout(1200);await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-fire.png`)});await frame.waitForTimeout(2100);const final=await frame.screenshot({path:join(output,`${name.toLowerCase()}-motion-final.png`)});await frame.waitForTimeout(550);assert.equal(createHash('sha256').update(await frame.screenshot()).digest('hex'),createHash('sha256').update(final).digest('hex'),'final totals must hold still before the loop restarts');assert.equal(imageRequests,2);await context.close();await page.bringToFront();
+    assert.equal(imageRequests,2,'the image makes no external resource requests');
+    await context.close();
+    // Slow screenshots must not move a sample across the six-second loop.
+    // Use the native SVG clock for exact hold/restart frames; the image above
+    // independently proves the same export animates without page scripts.
+    const timedContext=await browser.newContext({viewport:{width:1200,height:675},deviceScaleFactor:1}),timed=await timedContext.newPage();
+    await timed.route('http://127.0.0.1:43330/stats.svg',route=>route.fulfill({contentType:'image/svg+xml',body:svg}));await timed.goto('http://127.0.0.1:43330/stats.svg');
+    const seek=seconds=>timed.evaluate(async seconds=>{document.documentElement.pauseAnimations();document.documentElement.setCurrentTime(seconds);await document.fonts.ready;await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));},seconds);
+    await seek(2.1);await timed.screenshot({path:join(output,`${name.toLowerCase()}-motion-fire.png`)});
+    // Check the statistic tiles, excluding fractional rasterization in the
+    // decorative activity strip below them.
+    const tiles={x:45,y:160,width:1100,height:405};
+    await seek(4);await timed.screenshot({path:join(output,`${name.toLowerCase()}-motion-final.png`)});const final=await timed.screenshot({clip:tiles});
+    await seek(4.55);assert.equal(createHash('sha256').update(await timed.screenshot({clip:tiles})).digest('hex'),createHash('sha256').update(final).digest('hex'),'final totals must hold still before the loop restarts');
+    await seek(6.2);assert.notEqual(createHash('sha256').update(await timed.screenshot({clip:tiles})).digest('hex'),createHash('sha256').update(final).digest('hex'),'the next loop restarts the animation');await timedContext.close();await page.bringToFront();
    }
    assert.equal(requests.length,before,'export makes no requests');await dialog.getByRole('button',{name:'Close share preview',exact:true}).click();
   }
