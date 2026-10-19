@@ -42,6 +42,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Celebrations use five larger staggered fireworks, glowing sparks and rising
   trails, while remaining click-through and lasting less than four seconds.
 
+### Fixed
+
+- Download attachments directly, avoiding popup download failures in
+  Linux WebKit and keeping the current chat open.
+
 ## [2.2.1] - 2026-10-18
 
 ### Fixed
