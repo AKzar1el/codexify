@@ -960,7 +960,9 @@ fn build_mentions_native_file_egress_only_when_the_tool_is_enabled() {
     let dir = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-    let enabled = brief_config(dir.path(), state.path(), "bash");
+    let mut enabled = brief_config(dir.path(), state.path(), "bash");
+    assert!(!build_instructions(&enabled).contains("export_host_file"));
+    enabled.artifact_egress.enabled = true;
     assert!(build_instructions(&enabled).contains("Use export_host_file"));
 
     let mut disabled = enabled;

@@ -283,6 +283,8 @@ impl AgentAutomationStore {
         &self,
         task: &ConversationIdentity,
         expected: &super::AutomationTaskState,
+        activity_epoch: &str,
+        activity_sequence: u64,
         now_ms: u64,
     ) -> Result<bool, String> {
         self.mutate(task, |state| {
@@ -305,14 +307,28 @@ impl AgentAutomationStore {
                         | AutomationActionStatus::Ambiguous
                         | AutomationActionStatus::Stalled
                 )
-                || state
-                    .action
-                    .updated_at_ms
-                    .is_none_or(|at| now_ms < at.saturating_add(super::store::GOAL_RETRY_AFTER_MS))
+                || state.automatic_retry_at_ms().is_none_or(|at| now_ms < at)
             {
                 return Ok(false);
             }
-            state.action = Default::default();
+            if state.action.send_accepted == Some(false) {
+                state.action = super::AutomationActionState {
+                    automatic_retry_attempts: state.action.automatic_retry_attempts + 1,
+                    automatic_retry_in_progress: true,
+                    ..Default::default()
+                };
+            } else {
+                state.goal_wake.recovery_attempts += 1;
+                state.goal_wake.activity_epoch = Some(activity_epoch.into());
+                state.goal_wake.activity_sequence = Some(activity_sequence);
+                state.goal_wake.nudged_epoch = None;
+                state.goal_wake.nudged_sequence = None;
+                state.goal_wake.last_nudged_at_ms = None;
+                state.action = super::AutomationActionState {
+                    automatic_retry_in_progress: true,
+                    ..Default::default()
+                };
+            }
             Ok(true)
         })
     }

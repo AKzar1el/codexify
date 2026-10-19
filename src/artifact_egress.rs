@@ -832,6 +832,7 @@ mod tests {
 
     fn config() -> ArtifactEgressConfig {
         ArtifactEgressConfig {
+            enabled: true,
             max_file_bytes: 1024,
             snapshot_max_file_bytes: 1024,
             max_snapshot_bytes: 2048,

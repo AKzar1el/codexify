@@ -82,6 +82,18 @@ describe("fixed prompt contract", () => {
     expect(prompt).toContain("rollout.md");
   });
 
+  test("generated instructions use paragraphs without hard-wrapped prose", () => {
+    for (const prompt of [
+      {kind:"pair_verify" as const, reference:"A".repeat(43)},
+      {kind:"offline_goal" as const, goalRevision:1},
+      {kind:"create_chat" as const, reference:"A".repeat(43), continuationToken:"B".repeat(42) + "A", setupReference:"fixture-setup"},
+    ]) {
+      for (const paragraph of renderActionPrompt(prompt).split("\n\n")) {
+        expect(paragraph).not.toContain("\n");
+      }
+    }
+  });
+
   test("unread Markdown is escaped as data and combined work uses one prompt", () => {
     const prompt = renderActionPrompt({
       kind: "offline_combined",
@@ -103,6 +115,9 @@ describe("fixed prompt contract", () => {
     expect(prompt).toContain("rollout_read");
     expect(prompt).toContain("rollout_update");
     expect(prompt).toContain("current instructions and live state take precedence");
+    expect(prompt.split("\n\n")[0]).not.toContain("\n");
+    expect(prompt.split("\n\n").find(paragraph => paragraph.startsWith("This task also"))).not.toContain("\n");
+    expect(prompt).toContain("<message>[2026-10-17T14:00:00.123Z]\nUse &lt;tag&gt; &amp; keep **Markdown**.</message>");
   });
 
   test("strict execute schema rejects arbitrary browser commands and oversized batches", () => {

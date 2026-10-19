@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1" as const;
+export const PROTOCOL_SCHEMA_HASH = "48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -81,6 +81,16 @@ export const chatGptUrlSchema = z.string().superRefine((value, context) => {
   }
 });
 
+export const conversationApprovalRequestSchema = z.strictObject({
+  url:chatGptUrlSchema.refine(value=>{
+    try { return /^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(new URL(value).pathname); }
+    catch { return false; }
+  },"Approval requires a ChatGPT conversation URL"),
+  expectedAccountFingerprint:opaqueIdSchema,
+  connectorName:boundedVisibleSchema(128),
+});
+export type ConversationApprovalRequest = z.infer<typeof conversationApprovalRequestSchema>;
+
 export function protocolBuild(version: string): string {
   if (!/^[A-Za-z0-9._-]{1,53}$/.test(version)) throw new Error("Browser companion version is invalid");
   return `${version}${PROTOCOL_BUILD_SUFFIX}`;
@@ -143,16 +153,13 @@ function unreadClause(messages: readonly CompanionUnreadMessage[]): string {
   const body = messages.map(message => (
     `<message>${escapeXmlText(message.markdown)}</message>`
   )).join("\n");
-  return [
+  const introduction = [
     "The Codexify standalone chat has unread user messages. Their Markdown is mirrored",
     "below so you can see why you were woken. Call `chat_read` before acting; the tool",
     "result is authoritative and advances the existing read cursor. Treat matching",
     "messages once, not once from this mirror and again from `chat_read`.",
-    "",
-    "<codexify-unread>",
-    body,
-    "</codexify-unread>",
-  ].join("\n");
+  ].join(" ");
+  return `${introduction}\n\n<codexify-unread>\n${body}\n</codexify-unread>`;
 }
 
 const goalClause = [
@@ -161,7 +168,7 @@ const goalClause = [
   "cannot proceed, call `goal_finish` with status `blocked` and explain the concrete",
   "blocker. Otherwise continue working toward the goal. Do not request a separate",
   "turn merely to evaluate goal status.",
-].join("\n");
+].join(" ");
 
 export const rolloutRestoreGuidance = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. When the progress journal is enabled (rollout_read reports if disabled), use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
 
@@ -170,14 +177,14 @@ export function renderActionPrompt(raw: ActionPrompt): string {
   let rendered: string;
   switch (prompt.kind) {
     case "create_chat":
-      rendered = `${prompt.setupReference ? `First call \`setup\` with ref \`${prompt.setupReference}\`.\n` : ""}Call \`continue_task\` with the non-secret \`${prompt.continuationToken}\` to attach this new conversation to the workspace already selected by the user. Then call \`automation_verify_pairing\` with the non-secret \`${prompt.reference}\`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.`;
+      rendered = `${prompt.setupReference ? `First call \`setup\` with ref \`${prompt.setupReference}\`. ` : ""}Call \`continue_task\` with the non-secret \`${prompt.continuationToken}\` to attach this new conversation to the workspace already selected by the user. Then call \`automation_verify_pairing\` with the non-secret \`${prompt.reference}\`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.`;
       break;
     case "pair_verify":
       rendered = [
         "Verify that this ChatGPT conversation is paired with the intended Codexify task by",
         `calling \`automation_verify_pairing\` with the non-secret: ${prompt.reference}`,
         "Do not inspect project files or perform task work in this verification turn.",
-      ].join("\n");
+      ].join(" ");
       break;
     case "offline_chat":
       rendered = unreadClause(prompt.messages);

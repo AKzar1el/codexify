@@ -381,7 +381,7 @@ pub struct ArtifactEgressConfig {
 impl Default for ArtifactEgressConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             max_file_bytes: DEFAULT_ARTIFACT_EGRESS_MAX_FILE_BYTES,
             snapshot_max_file_bytes: DEFAULT_ARTIFACT_EGRESS_SNAPSHOT_MAX_FILE_BYTES,
             max_snapshot_bytes: DEFAULT_ARTIFACT_EGRESS_MAX_SNAPSHOT_BYTES,

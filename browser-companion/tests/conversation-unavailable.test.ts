@@ -1,0 +1,182 @@
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { chromium, type BrowserContext, type Page } from "patchright";
+import { fingerprintAccountIdentity } from "../src/account";
+import { SingleWindowCoordinator } from "../src/browser-window";
+import { throwIfSessionAttention } from "../src/browser-session";
+import { ChatGptBrowserDriver, type SingleBrowserSurface } from "../src/chatgpt-driver";
+import { privateChromeExecutable } from "../src/chrome-executable";
+import { protocolBuild, type ActionPrompt, type ExecuteActionRequest } from "../src/protocol";
+
+const native = process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME === "1";
+const build = protocolBuild("conversation-error-test");
+const url = "https://chatgpt.com/c/unavailable-fixture";
+const projectUrl = "https://chatgpt.com/g/g-p-fixture-project/c/unavailable-fixture";
+const message = "ChatGPT conversation temporarily not accessible";
+const account = fingerprintAccountIdentity("fixture-user", "fixture-account");
+const labels = [
+  ["Could not load this ChatGPT conversation", "Retry"],
+  ["Δεν ήταν δυνατή η φόρτωση αυτής της συνομιλίας ChatGPT", "Επανάληψη"],
+  ["Impossibile caricare questa conversazione ChatGPT", "Riprova"],
+] as const;
+
+// Captured page structure: no error test ID or ARIA alert, and no composer.
+// Keep the generated class names in the fixture, but never use them as selectors.
+function errorPage(title: string, retry: string): string {
+  return `<div class="WorkspaceContent-dnr6uY relative isolate flex min-h-0 flex-1 overflow-hidden">
+    <div class="MainContentViewport-OinMfT" data-app-shell-main-content-layout="default">
+      <div class="MainContentFrame-sss8BP" data-app-shell-thread-edge-divider="false">
+        <div class="relative flex min-h-0 flex-1">
+          <div class="flex h-full min-h-0 min-w-0 flex-1 flex-col outline-none" data-app-shell-focus-area="main">
+            <div class="relative h-full min-h-0"><div class="w-full items-center px-3 flex flex-col justify-center py-6">
+              <div class="flex w-full max-w-xl flex-col items-center text-center justify-center gap-3">
+                <div class="flex flex-col items-center gap-2"><div class="leading-6 font-medium text-default text-lg">${title}</div></div>
+                <div class="flex w-full flex-wrap items-center justify-center gap-2"><button type="button" class="no-drag cursor-interaction">${retry}</button></div>
+              </div>
+            </div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+const healthyPage = '<form data-chatgpt-composer><div id="prompt-textarea" contenteditable="true" style="min-height:24px"></div></form>';
+let context: BrowserContext;
+let page: Page;
+let profile: string;
+let currentHtml = errorPage(...labels[0]);
+let sessionRequests = 0;
+let clicks = 0;
+const documentLoads: string[] = [];
+const surface: SingleBrowserSurface = {
+  page:async () => page,
+  navigate:async destination => { await page.goto(destination); return page; },
+  reveal:async () => {}, beginAction:async () => {}, endAction:async () => {}, close:async () => {},
+};
+
+beforeAll(async () => {
+  if (!native) return;
+  profile = await mkdtemp(join(tmpdir(), "conversation-error-fixture-"));
+  const executablePath = await privateChromeExecutable(join(import.meta.dirname, "../.browsers", `${process.platform}-${process.arch}`));
+  context = await chromium.launchPersistentContext(profile, {channel:"chrome", executablePath, headless:true});
+  page = context.pages()[0]!;
+  await page.exposeFunction("recordClick", () => { clicks++; });
+  await context.route("https://chatgpt.com/**", async route => {
+    if (new URL(route.request().url()).pathname === "/api/auth/session") {
+      sessionRequests++;
+      await route.fulfill({json:{user:{id:"fixture-user"}, account:{id:"fixture-account", planType:"pro", structure:"personal"}}});
+    } else {
+      documentLoads.push(route.request().url());
+      await route.fulfill({contentType:"text/html", body:`<!doctype html><meta charset="utf-8">${currentHtml}<script>document.addEventListener('click',()=>window.recordClick());</script>`});
+    }
+  });
+}, 30_000);
+afterAll(async () => { await context?.close(); if (profile) await rm(profile, {recursive:true, force:true}); });
+
+test.skipIf(!native)("conversation load failures are recognized in English, Greek and Italian on both chat URL forms", async () => {
+  for (const [title, retry] of labels) {
+    currentHtml = errorPage(title, retry);
+    for (const destination of [url, projectUrl]) {
+      await surface.navigate(destination);
+      const error = await throwIfSessionAttention(page).then(() => undefined, error => error);
+      expect(error).toMatchObject({code:"conversation_unavailable", message});
+    }
+  }
+  expect(clicks).toBe(0);
+});
+
+test.skipIf(!native)("a failed conversation does not falsely sign out a verified account or block navigation to another chat", async () => {
+  currentHtml = errorPage("Unavailable", "Another language");
+  await surface.navigate(url);
+  const driver = new ChatGptBrowserDriver(surface, build);
+  const before = sessionRequests;
+  expect(await driver.health()).toEqual({authenticated:true, accountFingerprint:account, status:"idle", detail:message});
+  expect(sessionRequests).toBe(before + 1);
+  currentHtml = healthyPage;
+  await surface.navigate("https://chatgpt.com/c/another-fixture");
+  expect(await driver.health()).toEqual({authenticated:true, accountFingerprint:account, status:"idle", detail:null});
+  expect(context.pages()).toEqual([page]);
+});
+
+test.skipIf(!native)("ordinary sends and goal retries retain the specific conversation error before Send", async () => {
+  const prompts: ActionPrompt[] = [
+    {kind:"offline_chat", batchId:"batch", messages:[{id:"message", markdown:"Continue"}]},
+    {kind:"offline_goal", goalRevision:1},
+  ];
+  for (const [index, prompt] of prompts.entries()) {
+    const failedUrl = index === 0 ? url : projectUrl;
+    currentHtml = errorPage("Unavailable", "Riprova");
+    await surface.navigate(failedUrl);
+    const coordinator = new SingleWindowCoordinator(new ChatGptBrowserDriver(surface, build), build);
+    const request: ExecuteActionRequest = {
+      actionId:`unavailable-${index}`, idempotencyKey:`unavailable-${index}`, url:failedUrl, expectedUrl:failedUrl,
+      pairingGeneration:1, connectorName:"Fixture connector", expectedAccountFingerprint:account,
+      model:"gpt-6-sol", effort:"high", prompt, autoApproveToolCalls:false,
+    };
+    await coordinator.execute(request);
+    const events = [];
+    for await (const event of coordinator.events(request.actionId, 0)) events.push(event);
+    expect(events.at(-1)).toMatchObject({type:"failed", code:"conversation_unavailable", message});
+    expect(events.some(event => event.type === "authentication_required" || event.type === "send_accepted")).toBeFalse();
+    expect(await coordinator.action(request.actionId)).toMatchObject({state:"failed", sendAccepted:false, attention:{code:"conversation_unavailable", message}});
+    expect((await coordinator.health()).activeActionId).toBeNull();
+  }
+  expect(clicks).toBe(0);
+});
+
+test.skipIf(!native)("retry reloads the failed conversation and navigates back to it from another failed chat", async () => {
+  currentHtml = errorPage("Unavailable", "Riprova");
+  await surface.navigate(projectUrl);
+  const coordinator = new SingleWindowCoordinator(new ChatGptBrowserDriver(surface, build), build);
+  const base: ExecuteActionRequest = {
+    actionId:"initial-failed-goal", idempotencyKey:"initial-failed-goal", url:projectUrl, expectedUrl:projectUrl,
+    pairingGeneration:1, connectorName:"Fixture connector", expectedAccountFingerprint:account,
+    model:"gpt-6-sol", effort:"high", prompt:{kind:"offline_goal", goalRevision:1}, autoApproveToolCalls:false,
+  };
+  const run = async (request: ExecuteActionRequest) => {
+    const loadsBefore = documentLoads.length;
+    await coordinator.execute(request);
+    for await (const _event of coordinator.events(request.actionId, 0)) { /* Wait for the terminal receipt. */ }
+    // A fresh document request proves an actual reload even at the same URL.
+    expect(documentLoads.slice(loadsBefore)).toEqual([projectUrl]);
+    expect(page.url()).toBe(projectUrl);
+    expect(await coordinator.action(request.actionId)).toMatchObject({state:"failed", sendAccepted:false, attention:{code:"conversation_unavailable", message}});
+    expect((await coordinator.health()).activeActionId).toBeNull();
+  };
+  await run(base);
+  await run({...base, actionId:"retry-same-conversation", idempotencyKey:"retry-same-conversation"});
+  await surface.navigate(url);
+  await run({...base, actionId:"retry-from-another-conversation", idempotencyKey:"retry-from-another-conversation"});
+  expect(clicks).toBe(0);
+});
+
+test.skipIf(!native)("ordinary content, hidden panels, other routes and incomplete error structures are not conversation load failures", async () => {
+  const html = errorPage(...labels[0]);
+  const cases = [
+    html.replace('data-app-shell-focus-area="main"', 'data-unrelated="main"'),
+    html.replace('class="WorkspaceContent-dnr6uY', 'hidden class="WorkspaceContent-dnr6uY'),
+    html.replace('<button type="button"', '<button type="button">Other action</button><button type="button"'),
+    html.replace('text-default text-lg', 'text-default'),
+    html.replace('<div class="relative h-full min-h-0">', '<div data-message-author-role="assistant" class="relative h-full min-h-0">'),
+    html.replace('<div class="relative h-full min-h-0">', healthyPage + '<div class="relative h-full min-h-0">'),
+  ];
+  for (const body of cases) {
+    currentHtml = body;
+    await surface.navigate(url);
+    await throwIfSessionAttention(page);
+  }
+  currentHtml = html;
+  for (const destination of ["https://chatgpt.com/", "https://chatgpt.com/settings", "https://chatgpt.com/auth/login"]) {
+    await surface.navigate(destination);
+    await throwIfSessionAttention(page);
+  }
+});
+
+test.skipIf(!native)("a sign-in page remains an authentication failure", async () => {
+  currentHtml = '<a href="/auth/login">Sign in</a>';
+  await surface.navigate("https://chatgpt.com/auth/login");
+  expect(await new ChatGptBrowserDriver(surface, build).health()).toMatchObject({authenticated:false, status:"authentication_required"});
+});

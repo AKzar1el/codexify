@@ -258,7 +258,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     const now=Date.now(),id="f".repeat(64),errors=[],operations=[];
     page.on('pageerror',error=>errors.push(error.message));
     const chat={id,title:"Failed message",workspace:"test",lastEntryEnd:1,lastEntryAtMs:now,lastAgentCallAtMs:null,totalToolCalls:1};
-    let action={id:"failed-action",kind:"offline_chat",status:"failed",lastError:"ChatGPT connector menu did not open",sendAccepted:false,retryMode:"retry",automaticRetryAtMs:null,automaticRetryAttempts:3};
+    let action={id:"failed-action",kind:"offline_chat",status:"failed",lastError:"ChatGPT connector menu did not open",sendAccepted:false,retryMode:"retry",automaticRetryAtMs:null,automaticRetryAttempts:5};
     await routeOwner(page, 'http://127.0.0.1:43219/**',route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
@@ -279,7 +279,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     assert.equal(await host.getByRole('button',{name:'Dismiss error',exact:true}).isVisible(),true);
     assert.equal(await host.locator('#automation-settings').isVisible(),false);
     assert.equal(await inline.textContent(),'Retry');
-    assert((await host.locator('#automation-error').textContent()).includes('All three automatic retries failed'));
+    assert((await host.locator('#automation-error').textContent()).includes('All 5 automatic retries failed'));
     await page.locator('.conversation .presence.error').waitFor();
     assert((await page.locator('.conversation .presence.error').getAttribute('aria-label')).includes('connector menu'));
     assert.equal(await page.locator('.conversation .presence.error').evaluate(node=>getComputedStyle(node).color),'rgb(196, 49, 59)');
@@ -289,7 +289,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     await page.locator('.conversation .presence.error').waitFor({state:'detached'});
     assert.equal(operations.length,1);
     action={id:'pending-retry',kind:'offline_chat',status:'failed',lastError:'Connector menu unavailable',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:Date.now()+30000,automaticRetryAttempts:0};
-    await host.locator('#automation-error').getByText(/Retrying automatically in \d+s \(retry 1 of 3\)/).waitFor();
+    await host.locator('#automation-error').getByText(/Retrying automatically in \d+s \(retry 1 of 5\)/).waitFor();
     await page.locator('.conversation .presence.retrying .presence-spinner').waitFor();
     await inline.waitFor();
     await inline.click();await inline.waitFor({state:'hidden'});
@@ -1126,9 +1126,10 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     assert((await panel.locator("#automation-error").textContent()).includes("The message was not sent"));
     await panel.locator("#goal-retry").click();
     await panel.locator("#goal-retry").waitFor({state:"hidden"});
-    automation.action = { id:"goal-attention", kind:"offline_goal", status:"ambiguous", goalRevision:1, lastError:"The previous turn could not be confirmed", retryMode:"continue_goal", sendAccepted:true };
+    automation.action = { id:"goal-attention", kind:"offline_goal", status:"ambiguous", goalRevision:1, lastError:"The previous turn could not be confirmed", retryMode:"continue_goal", sendAccepted:true, automaticRetryAttempts:3, automaticRetryLimit:3 };
     await panel.locator("#goal-retry").getByText("Continue", {exact:true}).waitFor();
     assert((await panel.locator("#automation-error").textContent()).includes("will not be resent"));
+    assert((await panel.locator("#automation-error").textContent()).includes("All 3 automatic retries failed"));
     await panel.locator("#goal-retry").click();
     await panel.locator("#goal-retry").waitFor({state:"hidden"});
     automation.action = { id:"message-attention", kind:"offline_chat", status:"ambiguous", goalRevision:null, lastError:"Message submission could not be confirmed", retryMode:null, sendAccepted:true };
@@ -1422,7 +1423,7 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
       });
       await page.goto(`http://127.0.0.1:43225/?chat=${id}#test-token`);
       const host=page.locator('#chat-host'),dismiss=host.getByRole('button',{name:'Dismiss error',exact:true}),error=host.locator('#automation-error');
-      for(const failure of [action,{...action,id:'exhausted',automaticRetryAtMs:null,automaticRetryAttempts:3},{...action,id:'uncertain',status:'ambiguous',sendAccepted:true,retryMode:null,automaticRetryAtMs:null}]) {
+      for(const failure of [action,{...action,id:'exhausted',automaticRetryAtMs:null,automaticRetryAttempts:5},{...action,id:'uncertain',status:'ambiguous',sendAccepted:true,retryMode:null,automaticRetryAtMs:null}]) {
         action=failure;
         await error.waitFor();await dismiss.waitFor();
         const controls=host.locator('#automation-error-row');

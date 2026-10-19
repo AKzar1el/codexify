@@ -34,7 +34,8 @@ fn exec_configuration_contains_only_runtime_controls() {
 #[test]
 fn loads_default_tools_including_agent_chat_and_workspace_selection() {
     let tools = load_tools();
-    assert_eq!(tools.len(), 52);
+    assert_eq!(tools.len(), 51);
+    assert!(!tools.iter().any(|tool| tool.name() == "export_host_file"));
     assert!(!tools.iter().any(|tool| tool.name() == "run_command"));
 }
 
@@ -42,7 +43,7 @@ fn loads_default_tools_including_agent_chat_and_workspace_selection() {
 fn legacy_mode_argument_cannot_disable_workspace_selection() {
     for legacy in [false, true] {
         let tools = load_tools_for_mode(legacy);
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 51);
         assert!(tools.iter().any(|t| t.name() == "list_projects"));
         assert!(tools.iter().any(|t| t.name() == "set_project_root"));
     }
@@ -56,20 +57,44 @@ fn artifact_ingress_can_be_omitted_by_configuration() {
         .into_iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 62);
+    assert_eq!(names.len(), 61);
     assert!(!names.contains(&"import_host_file"));
 }
 
 #[test]
-fn artifact_egress_can_be_omitted_by_configuration() {
+fn file_materialization_is_opt_in_without_disabling_other_file_tools() {
     let mut config = default_config(PathBuf::from("/tmp"));
-    config.artifact_egress.enabled = false;
-    let names = load_tools_for_config(&config)
-        .into_iter()
-        .map(|tool| tool.name())
-        .collect::<Vec<_>>();
-    assert_eq!(names.len(), 62);
-    assert!(!names.contains(&"export_host_file"));
+    assert!(!config.artifact_egress.enabled);
+    let names = |config: &AppConfig| {
+        load_tools_for_config(config)
+            .into_iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+    };
+    let disabled = names(&config);
+    assert!(!disabled.contains(&"export_host_file"));
+    for name in [
+        "read_file",
+        "write_file",
+        "import_host_file",
+        "chat_get_attachment",
+    ] {
+        assert!(
+            disabled.contains(&name),
+            "materialization must not disable {name}"
+        );
+    }
+    config.artifact_egress.enabled = true;
+    let enabled = names(&config);
+    assert!(enabled.contains(&"export_host_file"));
+    assert_eq!(enabled.len(), disabled.len() + 1);
+    assert_eq!(
+        enabled
+            .into_iter()
+            .filter(|name| *name != "export_host_file")
+            .collect::<Vec<_>>(),
+        disabled
+    );
 }
 
 #[test]
@@ -103,7 +128,7 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     config.conversation_auth_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 63);
+    assert_eq!(tools.len(), 62);
     let setup = tools.iter().find(|t| t.name() == "setup").unwrap();
     let schema = setup.input_schema();
     assert!(schema["properties"].get("ref").is_some());
@@ -125,7 +150,7 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     assert!(!description.contains("api key"));
 
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 63);
+    assert_eq!(tools.len(), 62);
     let setup = tools.iter().position(|t| t.name() == "setup").unwrap();
     let select = tools
         .iter()
@@ -220,6 +245,7 @@ fn assert_nested_object_schemas_are_closed(schema: &Value, tool: &str, path: &st
 #[test]
 fn native_tool_annotations_match_the_audited_side_effect_matrix() {
     let mut config = default_config(PathBuf::from("/tmp"));
+    config.artifact_egress.enabled = true;
 
     config.conversation_auth_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
@@ -320,7 +346,6 @@ fn includes_expected_tool_names() {
         "read_file",
         "write_file",
         "import_host_file",
-        "export_host_file",
         "check_for_updates",
         "doctor",
         "self_update",
@@ -750,7 +775,6 @@ fn tools_that_need_their_own_structured_content() {
             "continue_task".to_string(),
             "doctor".to_string(),
             "exec_command".to_string(),
-            "export_host_file".to_string(),
             "get_environment".to_string(),
             "get_project_doc".to_string(),
             "goal_finish".to_string(),

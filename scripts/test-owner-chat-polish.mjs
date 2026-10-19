@@ -87,12 +87,12 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
    await page.waitForFunction(()=>!document.getElementById('settings-browser-start').disabled);
    assert(await start.isEnabled());assert(await stop.isEnabled());
    await start.click();await state.filter({hasText:'Connected'}).waitFor();
-   assert(await start.isDisabled());await stop.click();await state.filter({hasText:'Browser stopped by you'}).waitFor();
+   assert(await start.isDisabled());await stop.click();await state.filter({hasText:'Browser auto-start paused'}).waitFor();
    assert(await start.isEnabled());assert(await stop.isDisabled());assert(await models.isDisabled());
    f.holdBrowserStart();await start.click();await settings.getByRole('button',{name:'Starting…',exact:true}).waitFor();
    assert(await stop.isEnabled(),'Stop remains available during startup');await stop.click();
-   await state.filter({hasText:'Browser stopped by you'}).waitFor();f.releaseBrowserStart();
-   await page.waitForTimeout(100);assert.equal(await state.textContent(),'Browser stopped by you');
+   await state.filter({hasText:'Browser auto-start paused'}).waitFor();f.releaseBrowserStart();
+   await page.waitForTimeout(100);assert.equal(await state.textContent(),'Browser auto-start paused');
    f.failBrowserStart();await start.click();await settings.locator('#settings-browser-feedback').filter({hasText:'Browser startup failed'}).waitFor();assert(await start.isEnabled());
    assert.deepEqual(f.browserOperations,['start','stop','start','stop','start']);assert.deepEqual(f.operations,[]);
    await settings.getByRole('button',{name:'Sign in',exact:true}).click();await settings.getByText('Complete sign-in in the browser.',{exact:true}).waitFor();

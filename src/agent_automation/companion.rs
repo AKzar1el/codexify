@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
+    "48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
+    "+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -476,6 +476,29 @@ impl BrowserCompanionClient {
             return Err("Turn handoff receipt has an incompatible protocol".into());
         }
         Ok(receipt.complete)
+    }
+
+    pub async fn approve_pending_conversation(
+        &self,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, String> {
+        validate_chatgpt_url(url)?;
+        validate_opaque(account, "browser account fingerprint")?;
+        validate_visible(connector_name, 128, "browser connector name")?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Receipt {
+            protocol_version: u32,
+            build: String,
+            approved: bool,
+        }
+        let receipt: Receipt = self.request_json(Method::POST, "/v1/approvals/conversation",
+            Some(&serde_json::json!({"url":url,"expectedAccountFingerprint":account,"connectorName":connector_name})), cancellation).await?;
+        self.validate_envelope(receipt.protocol_version, &receipt.build)?;
+        Ok(receipt.approved)
     }
 
     pub async fn login(&self, cancellation: &CancellationToken) -> Result<CompanionHealth, String> {
@@ -1414,10 +1437,10 @@ fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result
 
 fn render_action_prompt(prompt: &ActionPrompt) -> String {
     const GOAL_CLAUSE: &str = concat!(
-        "This task also has an active Codexify goal. Call `goal_read` for the current\n",
-        "revision. If it is complete, call `goal_finish` with status `completed`. If work\n",
-        "cannot proceed, call `goal_finish` with status `blocked` and explain the concrete\n",
-        "blocker. Otherwise continue working toward the goal. Do not request a separate\n",
+        "This task also has an active Codexify goal. Call `goal_read` for the current ",
+        "revision. If it is complete, call `goal_finish` with status `completed`. If work ",
+        "cannot proceed, call `goal_finish` with status `blocked` and explain the concrete ",
+        "blocker. Otherwise continue working toward the goal. Do not request a separate ",
         "turn merely to evaluate goal status."
     );
 
@@ -1436,9 +1459,9 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
             .join("\n");
         format!(
             concat!(
-                "The Codexify standalone chat has unread user messages. Their Markdown is mirrored\n",
-                "below so you can see why you were woken. Call `chat_read` before acting; the tool\n",
-                "result is authoritative and advances the existing read cursor. Treat matching\n",
+                "The Codexify standalone chat has unread user messages. Their Markdown is mirrored ",
+                "below so you can see why you were woken. Call `chat_read` before acting; the tool ",
+                "result is authoritative and advances the existing read cursor. Treat matching ",
                 "messages once, not once from this mirror and again from `chat_read`.\n\n",
                 "<codexify-unread>\n",
                 "{}\n",
@@ -1457,7 +1480,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
             "{}Call `continue_task` with the non-secret `{}` to attach this new conversation to the workspace already selected by the user. Then call `automation_verify_pairing` with the non-secret `{}`. If pairing reports that creation is not ready, retry verification. Finish this initialization turn after verification; do not inspect project files or perform task work.",
             setup_reference
                 .as_ref()
-                .map(|reference| format!("First call `setup` with ref `{reference}`.\n"))
+                .map(|reference| format!("First call `setup` with ref `{reference}`. "))
                 .unwrap_or_default(),
             continuation_token,
             reference,
@@ -1465,8 +1488,8 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
 
         ActionPrompt::PairVerify { reference } => format!(
             concat!(
-                "Verify that this ChatGPT conversation is paired with the intended Codexify task by\n",
-                "calling `automation_verify_pairing` with the non-secret: {}\n",
+                "Verify that this ChatGPT conversation is paired with the intended Codexify task by ",
+                "calling `automation_verify_pairing` with the non-secret: {} ",
                 "Do not inspect project files or perform task work in this verification turn."
             ),
             reference
@@ -1755,6 +1778,15 @@ mod prompt_display_tests {
         assert!(shown.contains("Keep &lt;data&gt; &amp; **all text**."));
         assert!(shown.contains("<codexify-unread>\n<message>"));
         assert!(shown.contains("goal_read"));
+        assert!(!shown.split("\n\n").next().unwrap().contains('\n'));
+        let goal_paragraph = shown
+            .split("\n\n")
+            .find(|paragraph| paragraph.starts_with("This task also"))
+            .unwrap();
+        assert!(!goal_paragraph.contains('\n'));
+        assert!(shown.contains(
+            "<message>[2026-10-17T14:00:00.123Z]\nKeep &lt;data&gt; &amp; **all text**.</message>"
+        ));
         let wire = serde_json::to_value(prompt).unwrap();
         assert_eq!(wire["batchId"], "private-batch-identity");
         assert_eq!(wire["messages"][0]["id"], "private-message-identity");

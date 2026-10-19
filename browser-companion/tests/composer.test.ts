@@ -68,7 +68,15 @@ test("composer verification preserves exact whitespace and rejects connector-onl
 test("pairing replacement recognizes only the complete unchanged verification template", () => {
   const draft = renderActionPrompt({kind:"pair_verify",reference:"A".repeat(43)});
   expect(isPairingVerificationDraft(draft)).toBeTrue();
-  for (const text of ["my own draft", draft + " edited", draft.replace("Do not inspect", "Please inspect"), draft.replace("A".repeat(43), "short"), draft.replaceAll("\n", " ")]) {
+  const legacy = [
+    "Verify that this ChatGPT conversation is paired with the intended Codexify task by",
+    `calling \`automation_verify_pairing\` with the non-secret: ${"A".repeat(43)}`,
+    "Do not inspect project files or perform task work in this verification turn.",
+    "",
+    draft.split("\n\n").at(-1),
+  ].join("\n");
+  expect(isPairingVerificationDraft(legacy)).toBeTrue();
+  for (const text of ["my own draft", draft + " edited", legacy + " edited", draft.replace("Do not inspect", "Please inspect"), draft.replace("A".repeat(43), "short"), draft.replaceAll("\n", " ")]) {
     expect(isPairingVerificationDraft(text)).toBeFalse();
   }
 });

@@ -94,13 +94,17 @@ pub(crate) fn start(config: Arc<AppConfig>) {
             }
             if !matches!(
                 intent["phase"].as_str(),
-                Some("queued" | "waiting_for_restart" | "running")
+                Some("queued" | "waiting_for_restart" | "starting_browser" | "running")
             ) || intent["dueAtMs"].as_u64().unwrap_or(u64::MAX) > crate::markdown_chat::now_ms()
             {
                 continue;
             }
             if intent["requiresRestart"] == true && intent["originPid"] == std::process::id() {
                 continue;
+            }
+            if intent["phase"] == "waiting_for_restart" {
+                intent["requiresRestart"] = json!(false);
+                set_phase(&config, &mut intent, "queued", None).await;
             }
             {
                 let health = async {
@@ -141,6 +145,7 @@ pub(crate) fn start(config: Arc<AppConfig>) {
             {
                 continue;
             }
+            set_phase(&config, &mut intent, "starting_browser", None).await;
             let client = match refresh_client(&config).await {
                 Ok(client) => client,
                 Err(error) => {

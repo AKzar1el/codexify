@@ -1,4 +1,4 @@
-function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onOpenChat=()=>{}}) {
+function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onOpenChat=()=>{},onReadiness=()=>{}}) {
   const byId=id=>document.getElementById(id);
   const icons={
     general:'<path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="4"/>',
@@ -29,6 +29,15 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
 :is(#global-settings,#global-statistics,#global-install):hover{background:var(--bg);color:var(--ink)}
 :is(#global-settings,#global-statistics,#global-install) svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 #global-update{display:inline-flex;align-items:center;justify-content:center;min-height:32px;margin-left:4px;border:0;background:var(--selected);color:var(--accent);padding:0 10px;border-radius:8px;font:inherit;font-size:13px;line-height:20px;cursor:pointer}
+#global-update[aria-busy=true]::before,.global-progress-spinner{content:"";display:inline-block;flex:none;width:14px;height:14px;margin-right:6px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:global-progress-spin .8s linear infinite}
+@keyframes global-progress-spin{to{transform:rotate(360deg)}}
+body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}body.system-progress-visible #layout{flex:1;min-height:0;height:auto}
+#global-progress{display:flex;align-items:center;gap:10px;flex:none;padding:10px max(16px,env(safe-area-inset-right)) 10px max(16px,env(safe-area-inset-left));border-bottom:1px solid var(--line);background:var(--selected);color:var(--ink);font-size:13px;line-height:1.4}
+#global-progress[hidden]{display:none}#global-progress-copy{flex:1;min-width:0}#global-progress-title{font-weight:600}#global-progress-detail{color:var(--muted);font-size:12px}#global-progress[data-error=true]{background:var(--panel);color:#b42328}#global-progress button{flex:none;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--ink);padding:6px 10px;font-size:12px}#global-progress-close{border:0!important;background:transparent!important;font-size:18px!important}
+#global-footer[data-maintenance=true]{flex-wrap:wrap}#global-footer[data-maintenance=true] #global-footer-actions{min-width:0;flex-wrap:wrap}
+@media(max-width:760px),(hover:none) and (pointer:coarse){body.system-progress-visible #layout{top:calc(var(--owner-viewport-top,0px) + var(--system-progress-height,60px));height:calc(var(--owner-viewport-height,100dvh) - var(--system-progress-height,60px))}#global-progress{position:fixed;z-index:10;top:var(--owner-viewport-top,0px);left:0;width:100%;gap:7px;padding:8px max(12px,env(safe-area-inset-right)) 8px max(12px,env(safe-area-inset-left));padding-top:max(8px,env(safe-area-inset-top));font-size:12px}#global-progress-detail{font-size:11px}#global-progress button{padding:5px 7px;font-size:11px}}
+@media(prefers-reduced-motion:reduce){.global-progress-spinner,#global-update[aria-busy=true]::before{animation:none}}
+@media(prefers-color-scheme:dark){#global-progress[data-error=true]{color:#ff989b}}
 #global-footer [hidden]{display:none!important}
 #global-footer button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media(max-width:760px),(hover:none) and (pointer:coarse){#global-footer{flex:none;gap:8px;min-height:49px;padding:2px 14px;font-size:13px}#global-footer-actions{gap:4px}:is(#global-settings,#global-statistics,#global-install){width:44px;height:44px}#global-version{font-size:12px}#global-update{font-size:12px}}
@@ -125,6 +134,11 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   const dialog=document.createElement('dialog');dialog.id='settings-dialog';dialog.setAttribute('aria-labelledby','settings-heading');
   dialog.innerHTML=`<div class="settings-shell"><header id="settings-toolbar"><button type="button" id="settings-analytics-back" class="settings-icon-button" aria-label="Back to settings" hidden>${icon('arrow')}</button><div class="settings-heading-copy"><h2 id="settings-heading">Codexify settings</h2><p>Changes save automatically. Some settings require a restart.</p></div><button type="button" id="settings-raw-toggle" aria-label="View raw config">${icon('code')}<span>View raw config</span></button><button type="button" id="settings-close" class="settings-icon-button" aria-label="Close settings">${icon('close')}</button></header><div class="settings-body"><nav id="settings-sidebar" aria-label="Settings categories"><label class="settings-search">${icon('search')}<input id="settings-search" type="search" placeholder="Search settings" aria-label="Search settings"></label><div id="settings-nav"></div></nav><main id="settings-main"><h3 id="settings-content-heading"></h3><p id="settings-content-description"></p><div id="settings-form"></div><div id="settings-raw-panel" hidden><p>Edit the complete JSON configuration. Changes are validated before saving.</p><textarea id="settings-raw" aria-label="Raw configuration JSON" spellcheck="false"></textarea><div class="settings-raw-actions"><span id="settings-file"></span><button type="button" id="settings-save-raw" class="settings-primary">Save raw config</button></div></div></main></div><footer class="settings-footer"><p id="settings-save-state" role="status"></p><div class="settings-maintenance"><button type="button" id="settings-reload" hidden>Reload settings</button><button type="button" id="settings-refresh-connector">Refresh connector</button><button type="button" id="settings-update" hidden>Update Codexify</button><button type="button" id="settings-restart">${icon('restart')}Restart Codexify</button></div></footer></div>`;
   document.body.append(dialog);
+  const progress=document.createElement('section');progress.id='global-progress';progress.hidden=true;progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');
+  progress.innerHTML='<span class="global-progress-spinner" aria-hidden="true"></span><div id="global-progress-copy"><div id="global-progress-title"></div><div id="global-progress-detail"></div></div><button type="button" id="global-progress-action" hidden></button><button type="button" id="global-progress-close" aria-label="Dismiss update status" hidden>×</button>';
+  document.body.prepend(progress);
+  const progressSize=typeof ResizeObserver==='function'?new ResizeObserver(()=>{document.documentElement.style.setProperty('--system-progress-height',`${progress.hidden?0:progress.getBoundingClientRect().height}px`);}):null;
+  progressSize?.observe(progress);
   const categories=[
     {id:'general',name:'General',description:'Project access, server preferences, and the chat interface.'},
     {id:'chats',name:'Chats & goals',description:'Configure chat delivery and the automation queue.'},
@@ -141,7 +155,9 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   const names={workDir:'Project access directory',projectCloneDir:'Git clone directory',uiWidgets:'Embedded chat widgets',apiKey:'API key',conversationAuthToken:'Conversation setup reference',openaiTunnel:'Primary OpenAI tunnel',openaiTunnels:'Additional OpenAI tunnels',mcpServers:'MCP servers',allowedHosts:'Allowed host names',debug:'Debug mode'};
   const annotationHintOverrides=new Set(['experimental.forceDestructiveToolAnnotations','experimental.forceIdempotentToolAnnotations','experimental.forceOpenWorldToolAnnotations']);
   const metadata={
+    'artifactEgress.enabled':['Let ChatGPT materialize and offer downloads of project files and full attachments. ChatGPT may ask permission for each file. Off by default; inline attachment text and image previews remain available. Restart Codexify to apply.','tools','File materialization in ChatGPT'],
     'audit.enabled':['Record bounded, redacted tool activity in a private local audit log.','advanced','Audit logging'],
+    'audit.logFile':['Optional JSONL destination. Leave blank to use the per-project default shown in the field. Ignored when Audit logging is off.','advanced','Log file'],
     'agentChat.automation.requestBlockingEnabled':['Block matching requests before they leave the browser. Off by default. Use Restart Codexify to apply.','browser','Block matching requests'],
     'agentChat.extras.achievements':['Celebrate newly earned badges. Your badge collection stays in Statistics. Applies immediately.','extras','Achievement celebrations'],
     'agentChat.extras.animations':['Colorful bursts and motion, lasting a few seconds. Respects reduced motion. Applies immediately.','extras','Animations'],
@@ -168,13 +184,59 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   const label=key=>names[key]||key.replace(/([a-z])([A-Z])/g,'$1 $2').replace(/Ms$/,' (ms)').replace(/^./,letter=>letter.toUpperCase());
   const RESET=Symbol('default'),invalidFields=new Map(),invalidText=new Map();
   let snapshot=null,global=null,dirty={},saving=false,savePromise=null,saveTimer,maintenance=false,statusTimer,previousInstance=null,rawEdited=false,shownRefreshState=null,category='general',rawMode=false,fields=[],saveError=null,inFlightChanges={},refreshSubmitting=false,refreshTimer=null,refreshEpoch=0;
+  let notice=null,noticeTimer=null,maintenanceKind=null,statusReading=false,lastStatusAt=0,connectionLost=false,dismissedUpdate=null;
+  const updatePending=value=>['preparing','scheduled','installing','validating','restarting'].includes(value?.state);
+  const updateFailure=value=>['failed','rolled_back'].includes(value?.state);
+  const updateMessage=value=>({
+    preparing:['Downloading and verifying update…','The update is being prepared. You can keep writing a draft.'],
+    scheduled:['Update verified','Waiting for the updater to install the new version…'],
+    installing:['Installing update…','Replacing the installed application with the verified release.'],
+    validating:['Validating update…','Checking the installed application before restarting.'],
+    restarting:['Restarting Codexify…','Waiting for Codexify and its MCP tools to start.'],
+  }[value?.state]);
+  function refreshNeedsRestart(refresh=global?.connectorRefresh) {
+    return refresh?.phase==='waiting_for_restart'&&!refresh.updateId&&String(refresh.originPid??global?.instanceId)===String(global?.instanceId);
+  }
+  function renderRuntime() {
+    const update=global?.update,readiness=global?.readiness,refresh=global?.connectorRefresh;
+    const recoveringUpdate=Boolean(update?.state==='succeeded'&&update.targetVersion===global?.version&&['waiting_for_restart','starting_browser','queued','running'].includes(refresh?.phase)&&readiness?.loading);
+    const updating=maintenanceKind==='update'||updatePending(update)||recoveringUpdate,busy=maintenance||updatePending(update)||recoveringUpdate;
+    const message=updateMessage(update);
+    let view=notice;
+    if(notice?.guardSettings||notice?.error&&!updateFailure(update))view=notice;
+    else if(connectionLost)view={title:'Starting Codexify…',detail:'Waiting for the service and MCP tools to finish loading.',loading:true};
+    else if(message)view={title:message[0],detail:message[1],loading:true};
+    else if(readiness?.loading)view={title:readiness.detail||'Loading Codexify…',detail:readiness.phase==='starting_browser'?'The server is back. Messages that need the browser will be available when it is ready.':'Your draft is kept while startup finishes.',loading:true};
+    else if(['queued','starting_browser','running'].includes(refresh?.phase))view={title:refresh.phase==='starting_browser'?'Starting the browser companion…':refresh.phase==='running'?'Refreshing ChatGPT connector tools…':'Connector refresh queued…',detail:'Waiting for the browser to finish refreshing the connector tools.',loading:true};
+    else if(!maintenance&&updateFailure(update)&&dismissedUpdate!==(update.updateId||update.failureDetail))view={title:update.state==='rolled_back'?'Update rolled back':'Update failed',detail:update.failureDetail||'The update could not complete. Try again or check the service logs.',error:true,dismiss:true,action:'update',label:'Retry update'};
+    else if(!maintenance&&readiness&&['browser_stopped','sign_in_required','manual_refresh_required'].includes(readiness.phase))view={title:readiness.detail,action:'browser',label:'Browser settings'};
+    else if(!maintenance&&refreshNeedsRestart(refresh))view={title:'Restart required to refresh tools',detail:'Your settings are saved. Restart Codexify to apply them; the connector will refresh automatically.',action:'restart',label:'Restart Codexify'};
+    else if(!maintenance&&refresh?.phase==='failed')view={title:'Connector refresh failed',detail:refresh.result?.error||'Open settings to retry the connector refresh.',action:'settings',label:'Open settings',error:true};
+    const blocked=busy||connectionLost?{loading:true,browserOnly:false,detail:view?.title}:readiness||{loading:false};
+    onReadiness(blocked);
+    progress.hidden=!view;document.body.classList.toggle('system-progress-visible',Boolean(view));
+    if(view){byId('global-progress-title').textContent=view.title;byId('global-progress-detail').textContent=view.detail||'';progress.dataset.error=String(Boolean(view.error));progress.querySelector('.global-progress-spinner').hidden=!view.loading;byId('global-progress-close').hidden=!view.dismiss;const action=byId('global-progress-action');action.hidden=!view.action;action.textContent=view.label||'';action.dataset.action=view.action||'';action.disabled=maintenance;}
+    const button=byId('global-update');button.hidden=!global?.latest?.updateAvailable&&!updating&&!updateFailure(update);button.disabled=maintenance||updatePending(update);button.setAttribute('aria-busy',String(updating));button.textContent=updating?'Updating…':updateFailure(update)?'Retry update':'Update';button.title=view&&updating?`${view.title} ${view.detail||''}`:'Update Codexify';
+    byId('settings-update').disabled=button.disabled;byId('global-footer').dataset.maintenance=String(busy);
+    document.documentElement.style.setProperty('--system-progress-height',`${progress.hidden?0:progress.getBoundingClientRect().height}px`);
+  }
+  function runtimeNotice(title,detail='',error=false) {
+    clearTimeout(noticeTimer);notice={title,detail,error,loading:maintenance,dismiss:!maintenance};renderRuntime();
+    if(!maintenance&&!error)noticeTimer=setTimeout(()=>{notice=null;renderRuntime();},5000);
+  }
+  byId('global-progress-close').addEventListener('click',()=>{notice=null;dismissedUpdate=global?.update?.updateId||global?.update?.failureDetail;renderRuntime();});
+  byId('global-progress-action').addEventListener('click',()=>{
+    if(byId('global-progress-action').dataset.action==='update'){void maintain('update');return;}
+    if(byId('global-progress-action').dataset.action==='restart'){void maintain('restart');return;}
+    category=byId('global-progress-action').dataset.action==='browser'?'browser':'general';byId('global-settings').click();
+  });
   let browser=null,browserOperation=null,browserRevision=0,browserReading=false,browserFeedback='',browserFeedbackError=false,browserFeedbackOperation=null;
   const browserCard=document.createElement('section');browserCard.id='settings-browser';browserCard.className='settings-card';browserCard.setAttribute('aria-labelledby','settings-browser-heading');
   browserCard.innerHTML='<div class="settings-card-heading settings-browser-heading"><h4 id="settings-browser-heading">Browser session</h4><p id="settings-browser-state" role="status">Checking browser…</p></div><div class="settings-browser-body"><p class="settings-browser-copy">The ChatGPT browser session is shared by all conversations.</p><div class="settings-browser-actions"><button type="button" id="settings-browser-start">Start browser</button><button type="button" id="settings-browser-stop">Stop browser</button><button type="button" id="settings-browser-login">Sign in</button><button type="button" id="settings-browser-models">Refresh models</button></div><p id="settings-browser-feedback" role="status" hidden></p></div>';
   const browserNodes=Object.fromEntries(['state','start','stop','login','models','feedback'].map(key=>[key,browserCard.querySelector(`#settings-browser-${key}`)]));
   function renderBrowser(){
     const c=browser||{},stopping=browserOperation==='stop'||c.stopping,starting=browserOperation==='start'||c.recovering;
-    browserNodes.state.textContent=stopping?'Stopping browser…':starting?'Starting browser…':!browser?'Checking browser…':c.manuallyStopped?'Browser stopped by you':c.waitingForServerRestart?'Waiting for Codexify to restart':c.responsive&&c.status==='unavailable'?'Browser is running; check the ChatGPT page':c.authenticated?`Connected · ${(c.status||'idle').replace(/^./,v=>v.toUpperCase())}`:c.status==='unavailable'?(c.detail||'Browser companion is unavailable'):'ChatGPT sign-in required';
+    browserNodes.state.textContent=stopping?'Stopping browser…':starting?'Starting browser…':!browser?'Checking browser…':c.manuallyStopped?'Browser auto-start paused':c.waitingForServerRestart?'Waiting for Codexify to restart':c.responsive&&c.status==='unavailable'?'Browser is running; check the ChatGPT page':c.authenticated?`Connected · ${(c.status||'idle').replace(/^./,v=>v.toUpperCase())}`:c.status==='unavailable'?(c.detail||'Browser companion is unavailable'):'ChatGPT sign-in required';
     browserNodes.state.dataset.state=c.manuallyStopped||stopping||starting||c.waitingForServerRestart?'disconnected':c.authenticated?'connected':c.status==='unavailable'?'unavailable':'disconnected';
     browserNodes.start.disabled=!browser||Boolean(browserOperation)||(!c.manuallyStopped&&c.status!=='unavailable'&&!c.recovering);
     browserNodes.stop.disabled=!browser||browserOperation==='stop'||(c.manuallyStopped===true&&browserOperation!=='start');
@@ -247,7 +309,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     dirty[path]=value;saveError=null;message('Saving…');clearTimeout(saveTimer);saveTimer=setTimeout(()=>void saveChanges(),600);
   }
   function drawField(field) {
-    const {path,name,help,sample}=field,value=draftAt(path),row=document.createElement('div');row.className='setting-row';row.dataset.settingRow=path;
+    const {path,name,help,sample}=field,storedValue=draftAt(path),value=path==='audit.logFile'&&typeof storedValue==='string'&&!storedValue.trim()?undefined:storedValue,row=document.createElement('div');row.className='setting-row';row.dataset.settingRow=path;
     const copy=document.createElement('div'),caption=document.createElement('label');caption.className='setting-label';caption.textContent=name;caption.title=path;copy.append(caption);
     if(help){const description=document.createElement('p');description.className='setting-help';description.textContent=help;copy.append(description);}
     const controls=document.createElement('div');controls.className='setting-control';row.append(copy,controls);
@@ -367,7 +429,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   byId('settings-search').addEventListener('input',()=>{renderForm();byId('settings-main').scrollTop=0;});
   function renderEditor() {
     invalidFields.clear();invalidText.clear();fields=[];collect(snapshot.fieldSchema||snapshot.defaults,snapshot.document);renderForm();byId('settings-file').textContent=snapshot.path;byId('settings-raw').value=snapshot.raw;
-    byId('settings-restart').disabled=maintenance||!global?.restartAvailable;refreshButton();
+    byId('settings-restart').disabled=maintenance||updatePending(global?.update)||!global?.restartAvailable;refreshButton();
     message(snapshot.restartRequired?'Saved. Restart Codexify to apply changes.':'All changes saved.');
     if(global?.connectorRefresh?.source==='manual'||['queued','running'].includes(global?.connectorRefresh?.phase)){shownRefreshState=null;renderRefresh(global.connectorRefresh);}
   }
@@ -391,9 +453,10 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     const success=await savePromise;if(!success)return false;return Object.keys(dirty).length?saveChanges():!invalidFields.size;
   }
   function refreshButton() {
-    const phase=global?.connectorRefresh?.phase,pending=phase==='queued'||phase==='running'||phase==='waiting_for_restart';
+    const phase=global?.connectorRefresh?.phase,pending=['queued','running','starting_browser','waiting_for_restart'].includes(phase);
     const button=byId('settings-refresh-connector');button.disabled=refreshSubmitting||pending;
-    button.textContent=phase==='waiting_for_restart'?'After restart':phase==='queued'?'Queued…':phase==='running'?'Refreshing…':'Refresh connector';
+    button.textContent=phase==='waiting_for_restart'?(refreshNeedsRestart()?'Restart required':'Starting…'):phase==='starting_browser'?'Starting browser…':phase==='queued'?'Queued…':phase==='running'?'Refreshing…':'Refresh connector';
+    button.title=refreshNeedsRestart()?'Restart Codexify to apply the changed tools. The connector will refresh automatically.':pending?(global?.readiness?.loading?global.readiness.detail:'Waiting for the update, browser startup, or connector refresh to finish.'):'Refresh the ChatGPT connector tools';
     if(pending&&!refreshTimer)refreshTimer=setInterval(()=>{if(!document.hidden&&!maintenance)void pollStatus();},3000);
     else if(!pending&&refreshTimer){clearInterval(refreshTimer);refreshTimer=null;}
   }
@@ -402,7 +465,8 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     const refreshState=refresh?`${refresh.refreshId||refresh.updateId||''}:${refresh.phase}`:null;
     if(refreshState===shownRefreshState)return;shownRefreshState=refreshState;
     if(invalidFields.size||saveError)return;
-    if(refresh?.phase==='waiting_for_restart')message('Saved. Restart Codexify to apply the schema change; tools will refresh automatically.');
+    if(refresh?.phase==='waiting_for_restart')message(refreshNeedsRestart()?'Saved. Restart Codexify to apply the schema change; tools will refresh automatically.':global?.readiness?.detail||'Codexify is starting. Connector tools will refresh when it is ready.');
+    else if(refresh?.phase==='starting_browser')message('Starting the browser companion before refreshing connector tools…');
     else if(refresh?.phase==='queued')message('Connector refresh queued. Waiting for browser access.');
     else if(refresh?.phase==='running')message('Refreshing connector tools…');
     else if(refresh?.phase==='failed')message(refresh.source==='manual'||refresh.source==='settings'
@@ -415,33 +479,63 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     node.textContent=label;node.hidden=!label;node.title=label?(plan.sourceLabel||label):'';onPlan(plan);
   }
   async function pollStatus() {
+    if(statusReading)return false;statusReading=true;lastStatusAt=Date.now();
     try{
       const epoch=refreshEpoch,next=await(await api('/api/global')).json();if(epoch!==refreshEpoch)return;global=next;byId('global-version').textContent=global.version?`v${global.version}`:'';
+      connectionLost=false;
       renderPlan(global.plan);
-      for(const id of ['global-update','settings-update'])byId(id).hidden=!global.latest?.updateAvailable;
-      byId('settings-restart').disabled=maintenance||!global.restartAvailable;byId('global-settings').disabled=global.settingsAvailable===false;
-      renderRefresh(global.connectorRefresh);
-    }catch{if(!global)renderPlan(null);}
+      byId('settings-update').hidden=!global.latest?.updateAvailable&&!updatePending(global.update);
+      byId('settings-restart').disabled=maintenance||updatePending(global.update)||!global.restartAvailable;byId('global-settings').disabled=global.settingsAvailable===false;
+      if(notice?.recovering&&global.readiness?.ready!==false&&!global.readiness?.loading&&!updatePending(global.update)&&!maintenance)runtimeNotice('Codexify is ready.');
+      renderRefresh(global.connectorRefresh);renderRuntime();return true;
+    }catch{if(!global)renderPlan(null);else connectionLost=true;renderRuntime();return false;}
+    finally{statusReading=false;}
   }
   async function waitForRestart(targetVersion=null) {
     const deadline=Date.now()+180000;let sawUnavailable=false;
-    while(Date.now()<deadline){await new Promise(resolve=>setTimeout(resolve,1500));try{const health=await(await api('/api/health')).json();if(health.status==='ok'&&(health.tunnelsConfigured==null||health.tunnelsReady===health.tunnelsConfigured)){await pollStatus();if(targetVersion?global?.version===targetVersion:global?.instanceId!==previousInstance||sawUnavailable){message(targetVersion?'Codexify updated. Refreshing connector tools…':'Codexify restarted.');return;}}else sawUnavailable=true;}catch{sawUnavailable=true;}}
-    throw new Error('Codexify has not returned healthy yet. Check its service logs, then reload this page.');
+    while(Date.now()<deadline){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      try{
+        const health=await(await api('/api/health')).json();await pollStatus();
+        if(targetVersion&&updateFailure(global?.update))throw new Error(global.update.failureDetail||(global.update.state==='rolled_back'?'The update was rolled back.':'The update failed.'));
+        const changed=targetVersion?global?.version===targetVersion:previousInstance!=null&&global?.instanceId!=null?global.instanceId!==previousInstance:sawUnavailable;
+        const readiness=global?.readiness||health.readiness;
+        if(health.status==='ok'&&changed&&!updatePending(global?.update)){
+          if(!readiness||readiness.ready||readiness.loading===false){
+            const text=readiness?.ready===false?(targetVersion?'Update installed; startup needs attention.':'Codexify restarted; startup needs attention.'):(targetVersion?'Codexify updated.':'Codexify restarted.');
+            message(text);return text;
+          }
+          renderRuntime();
+        }else {if(health.status!=='ok')sawUnavailable=true;if(!global?.readiness?.loading&&!updateMessage(global?.update))runtimeNotice('Starting Codexify…','Waiting for the service and MCP tools to finish loading.');}
+      }catch(error){
+        if(targetVersion&&updateFailure(global?.update))throw error;
+        sawUnavailable=true;connectionLost=true;renderRuntime();
+      }
+    }
+    throw new Error(global?.readiness?.loading?`${global.readiness.detail} This is taking longer than expected. Startup is still being monitored; check Browser settings or the service logs.`:'Codexify is still starting or reconnecting. Startup is being monitored; check the service logs if it does not recover.');
   }
   async function maintain(kind) {
-    if(maintenance)return;if(rawEdited){message('Save raw configuration changes before continuing.',true);return;}if(!await saveChanges()){message(saveError||'Fix the highlighted settings before restarting.',true);return;}maintenance=true;message(kind==='update'?'Downloading and verifying the update…':'Restarting Codexify…');
+    if(maintenance||updatePending(global?.update))return;if(rawEdited){message('Save raw configuration changes before continuing.',true);runtimeNotice('Save settings before continuing','Save the unsaved raw configuration in settings before updating or restarting.',true);notice.guardSettings=true;notice.action='settings';notice.label='Open settings';renderRuntime();return;}
+    maintenance=true;maintenanceKind=kind;dismissedUpdate=null;runtimeNotice(kind==='update'?'Downloading and verifying the update…':'Restarting Codexify…',kind==='update'?'Preparing the verified release. Your draft is kept.':'Waiting for the service and MCP tools to finish loading.');
     for(const id of ['settings-restart','settings-update','global-update'])byId(id).disabled=true;
-    try{previousInstance=global?.instanceId;const result=await(await api(`/api/settings/${kind}`,{method:'POST',body:'{}'})).json();if(kind==='update'&&result.status!=='scheduled'){message('Codexify is already up to date.');return;}await waitForRestart(kind==='update'?result.targetVersion:null);}
-    catch(error){message(error.message||'Maintenance failed.',true);}
-    finally{maintenance=false;for(const id of ['settings-restart','settings-update','global-update'])byId(id).disabled=false;await pollStatus();}
+    let completed=null;
+    try{
+      if(!await saveChanges())throw new Error(saveError||'Fix the highlighted settings before restarting.');
+      message(kind==='update'?'Downloading and verifying the update…':'Restarting Codexify…');
+      previousInstance=global?.instanceId;
+      const result=await(await api(`/api/settings/${kind}`,{method:'POST',body:'{}'})).json();
+      if(kind==='update'&&result.status!=='scheduled'){completed='Codexify is already up to date.';message(completed);return;}
+      completed=await waitForRestart(kind==='update'?result.targetVersion:null);
+    }catch(error){message(error.message||'Maintenance failed.',true);notice={title:kind==='update'?'Update needs attention':'Restart needs attention',detail:error.message||'Maintenance failed.',error:true,dismiss:true,recovering:!updateFailure(global?.update)&&(connectionLost||global?.readiness?.loading)};}
+    finally{maintenance=false;maintenanceKind=null;for(const id of ['settings-restart','settings-update','global-update'])byId(id).disabled=false;if(completed)runtimeNotice(completed);await pollStatus();renderRuntime();}
   }
-  byId('global-settings').addEventListener('click',async()=>{dialog.showModal();if(!await saveChanges())return;message('Loading settings…');try{await load();}catch(error){message(error.message,true);}});
+  byId('global-settings').addEventListener('click',async()=>{dialog.showModal();if(rawEdited){message('Raw configuration changes are not saved yet.');return;}if(!await saveChanges())return;message('Loading settings…');try{await load();}catch(error){message(error.message,true);}});
   byId('settings-close').addEventListener('click',()=>dialog.close());
   bindBackdrop(dialog,()=>dialog.close());
   byId('settings-reload').addEventListener('click',async()=>{if(saving)await savePromise;clearTimeout(saveTimer);rawEdited=false;try{await load();}catch(error){message(error.message,true);}});
   byId('settings-raw-toggle').addEventListener('click',async()=>{if(!snapshot||!await saveChanges())return;rawMode=!rawMode;if(rawMode&&!rawEdited)byId('settings-raw').value=snapshot.raw;renderForm();byId('settings-main').scrollTop=0;});
   byId('settings-raw').addEventListener('input',()=>{rawEdited=true;message('Raw configuration changes are not saved yet.');});
-  byId('settings-save-raw').addEventListener('click',async()=>{const raw=byId('settings-raw').value;byId('settings-save-raw').disabled=true;try{if(!await saveChanges())return;snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify({revision:snapshot.revision,raw})})).json();rawEdited=false;extras.preferences({...snapshot.defaults?.agentChat?.extras,...snapshot.document?.agentChat?.extras});window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'queue'}));renderEditor();}catch(error){message(error.message,true);}finally{byId('settings-save-raw').disabled=false;}});
+  byId('settings-save-raw').addEventListener('click',async()=>{const raw=byId('settings-raw').value;byId('settings-save-raw').disabled=true;try{if(!await saveChanges())return;snapshot=await(await api('/api/settings',{method:'POST',body:JSON.stringify({revision:snapshot.revision,raw})})).json();rawEdited=false;if(notice?.guardSettings){notice=null;renderRuntime();}extras.preferences({...snapshot.defaults?.agentChat?.extras,...snapshot.document?.agentChat?.extras});window.dispatchEvent(new CustomEvent('codexify-message-mode-change',{detail:snapshot.document?.agentChat?.defaultMessageMode??snapshot.defaults?.agentChat?.defaultMessageMode??'queue'}));renderEditor();}catch(error){message(error.message,true);}finally{byId('settings-save-raw').disabled=false;}});
   byId('settings-restart').addEventListener('click',()=>void maintain('restart'));
   for(const id of ['global-update','settings-update'])byId(id).addEventListener('click',()=>void maintain('update'));
   byId('settings-refresh-connector').addEventListener('click',async()=>{
@@ -450,10 +544,10 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     try {
       if(!await saveChanges())return;message('Queuing connector refresh…');
       const receipt=await(await api('/api/settings/refresh-connector',{method:'POST',body:'{}'})).json();
-      refreshEpoch++;global={...global,connectorRefresh:receipt};renderRefresh(receipt);
+      refreshEpoch++;global={...global,connectorRefresh:receipt};renderRefresh(receipt);renderRuntime();
     }catch(error){message(error.message,true);}
     finally{refreshSubmitting=false;refreshButton();}
   });
-  void pollStatus();statusTimer=setInterval(()=>{if(!document.hidden&&!maintenance)void pollStatus();},15000);
-  return {close(){clearInterval(statusTimer);clearInterval(refreshTimer);clearInterval(browserTimer);clearTimeout(saveTimer);}};
+  void pollStatus();statusTimer=setInterval(()=>{if(!document.hidden&&(maintenance||connectionLost||global?.readiness?.loading||updatePending(global?.update)||Date.now()-lastStatusAt>=15000))void pollStatus();},2000);
+  return {close(){clearInterval(statusTimer);clearInterval(refreshTimer);clearInterval(browserTimer);clearTimeout(saveTimer);clearTimeout(noticeTimer);progressSize?.disconnect();}};
 }

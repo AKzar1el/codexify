@@ -1589,7 +1589,7 @@ if [ "$RESTART_SERVICE" -eq 1 ]; then
     fi
     log 'stopped the Codexify service'
     # Use the old executable while its browser protocol still matches the running companion.
-    if ! "$TARGET" browser stop >> "$LOG" 2>&1; then
+    if ! "$TARGET" browser stop-for-restart >> "$LOG" 2>&1; then
         log 'optional browser companion could not be stopped; connector maintenance will report its state after restart'
     fi
 fi
@@ -1744,7 +1744,7 @@ try {{
         $FailureDetail = 'The Codexify service could not be stopped.'
         & $Target service disable *>> $Log
         if ($LASTEXITCODE -ne 0) {{ throw 'failed to stop the Codexify service' }}
-        try {{ & $Target browser stop *>> $Log }} catch {{ Write-UpdateLog 'optional browser companion could not be stopped before update' }}
+        try {{ & $Target browser stop-for-restart *>> $Log }} catch {{ Write-UpdateLog 'optional browser companion could not be stopped before update' }}
         Write-UpdateLog 'stopped the Codexify service'
     }}
 
@@ -2504,6 +2504,8 @@ mod tests {
         )
         .unwrap();
         assert!(script.contains("service disable"));
+        assert!(script.contains("\"$TARGET\" browser stop-for-restart"));
+        assert!(!script.contains("\"$TARGET\" browser stop >>"));
         assert!(script.contains("service enable"));
         assert!(script.contains("SERVICE_PORT=43123"));
         assert!(script.contains("SERVICE_READY_TIMEOUT_MS=60000"));
@@ -2542,6 +2544,8 @@ mod tests {
         .unwrap();
 
         assert!(script.contains("$ServicePort = 43123"));
+        assert!(script.contains("& $Target browser stop-for-restart"));
+        assert!(!script.contains("& $Target browser stop *>>"));
         assert!(script.contains("$ServiceReadyTimeoutMs = 60000"));
         assert!(script.contains(
             "service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs"

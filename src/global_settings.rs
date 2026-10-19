@@ -772,6 +772,39 @@ mod tests {
         );
         assert_eq!(saved["document"]["workDir"], initial["document"]["workDir"]);
     }
+
+    #[test]
+    fn settings_allow_disabled_audit_without_a_destination_and_publish_its_default() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path);
+        let initial = snapshot(&config).unwrap();
+        let saved = save(
+            &config,
+            initial["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([("audit.enabled".into(), json!(false))])),
+        )
+        .unwrap();
+        assert_eq!(saved["document"]["audit"]["enabled"], false);
+        assert!(saved["document"]["audit"].get("logFile").is_none());
+        assert_eq!(
+            saved["defaults"]["audit"]["logFile"],
+            json!(config.audit.log_file)
+        );
+        assert!(
+            saved["defaults"]["audit"]["logFile"]
+                .as_str()
+                .unwrap()
+                .ends_with("audit.jsonl")
+        );
+    }
     #[test]
     fn message_mode_changes_apply_immediately_and_do_not_require_restart() {
         use crate::markdown_chat::MessageMode;
@@ -924,6 +957,7 @@ mod tests {
         }
         assert_eq!(defaults["filesystem"]["maxConcurrentWorkers"], 8);
         assert_eq!(defaults["artifactIngress"]["maxConcurrentDownloads"], 8);
+        assert_eq!(defaults["artifactEgress"]["enabled"], false);
         assert_eq!(defaults["agentChat"]["rolloutReminderInterval"], 25);
         assert_eq!(defaults["agentChat"]["defaultMessageMode"], "queue");
         assert_eq!(defaults["toolLogging"]["level"], "info");
@@ -983,6 +1017,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_schema_intent(&config).unwrap()["refreshId"], "new");
+    }
+
+    #[test]
+    fn file_materialization_settings_preserve_opt_in_and_require_schema_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let cli = || {
+            crate::config::Cli::try_parse_from(["codexify", "--config", path.to_str().unwrap()])
+                .unwrap()
+        };
+        let config = crate::config::load_config_quiet_read_only(cli()).unwrap();
+        let mut shown = snapshot(&config).unwrap();
+        assert_eq!(shown["defaults"]["artifactEgress"]["enabled"], false);
+        assert!(!config.artifact_egress.enabled);
+        for enabled in [true, false] {
+            shown = save(
+                &config,
+                shown["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "artifactEgress.enabled".into(),
+                    json!(enabled),
+                )])),
+            )
+            .unwrap();
+            assert_eq!(shown["schemaRefreshRequired"], true);
+            assert_eq!(shown["schemaRestartRequired"], true);
+            assert_eq!(shown["restartRequired"], true);
+            let loaded = crate::config::load_config_quiet_read_only(cli()).unwrap();
+            assert_eq!(loaded.artifact_egress.enabled, enabled);
+            assert!(loaded.artifact_ingress.enabled);
+            assert_eq!(shown["document"]["artifactEgress"]["enabled"], enabled);
+        }
     }
 }
 

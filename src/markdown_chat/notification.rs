@@ -461,7 +461,7 @@ mod tests {
                 .is_none()
         );
         state.action.last_error = Some("Chat cannot be opened".into());
-        state.action.automatic_retry_attempts = 3;
+        state.action.automatic_retry_attempts = 5;
         notify_automation(&chat, &cfg, "test", &state)
             .await
             .unwrap();

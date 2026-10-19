@@ -247,7 +247,9 @@ impl BrowserCompanionControl {
         let _file = self.file_lock(cancellation).await?;
         self.manager.stop().await
     }
-    pub(crate) async fn stop_for_restart(&self) -> Result<(), String> {
+    /// A service maintenance stop must preserve an explicit manual-stop choice.
+    #[doc(hidden)]
+    pub async fn stop_for_restart(&self) -> Result<(), String> {
         self.save_desired(self.desired()?.automatic_start, Some(std::process::id()))?;
         let _guard = self.runtime.lock.lock().await;
         let _file = self.file_lock(&CancellationToken::new()).await?;

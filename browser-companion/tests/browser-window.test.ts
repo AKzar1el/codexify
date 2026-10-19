@@ -653,6 +653,24 @@ test("a stopped browser is not reported as a ChatGPT authentication failure",asy
   expect(failure).toBeInstanceOf(Error);expect(failure.message).not.toContain("authentication");expect(driver.runs).toEqual([]);
 });
 
+test("passive approval checks yield to active sends and never start another action",async()=>{
+  class ApprovalDriver extends DeferredDriver {
+    checks=0;
+    async approvePendingConversation(){this.checks++;return true;}
+  }
+  const driver=new ApprovalDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  const action=request("approval-yields");
+  await coordinator.execute(action);
+  while(!driver.releases.has(action.actionId))await Bun.sleep(1);
+  const approval={url:action.url,expectedAccountFingerprint:"account-1",connectorName:"Codexify"};
+  expect(await coordinator.approvePendingConversation(approval)).toMatchObject({approved:false});
+  expect(driver.checks).toBe(0);expect((await coordinator.health()).activeActionId).toBe(action.actionId);
+  driver.releases.get(action.actionId)!();await collect(coordinator,action.actionId);
+  expect(await coordinator.approvePendingConversation(approval)).toMatchObject({approved:true});
+  expect(driver.checks).toBe(1);expect(driver.runs).toEqual([action.actionId]);
+  await coordinator.close();
+});
+
 const shortBudget = {operationMs:45,cleanupMs:40,hardStopMs:30};
 
 test('verified submission phases each receive the operation timeout budget',async()=>{

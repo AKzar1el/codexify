@@ -858,6 +858,91 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
 }
 #[cfg(unix)]
 #[tokio::test]
+async fn service_maintenance_preserves_recovery_and_manual_stop_without_replaying_actions() {
+    use tokio_util::sync::CancellationToken;
+    let (root, manager, control) = recovery_fixture();
+    let token = CancellationToken::new();
+    let first = control.start(&token).await.unwrap().pid();
+    let profile = manager.layout().root.join("chrome-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("keep"), b"signed-in-profile").unwrap();
+
+    // A normal server restart holds recovery in the old server, but does not
+    // claim that the user chose to stop the browser permanently.
+    control.stop_for_restart().await.unwrap();
+    assert_eq!(control.public_status()["manuallyStopped"], false);
+    assert_eq!(control.public_status()["waitingForServerRestart"], true);
+    assert!(
+        control
+            .ensure_running(&token)
+            .await
+            .unwrap_err()
+            .contains("waiting for Codexify to restart")
+    );
+
+    let config = root.path().join("maintenance.json");
+    std::fs::write(&config, json!({
+        "workDir":root.path(),"codexMcp":{"enabled":false},
+        "agentChat":{"automation":{"enabled":true,"descriptorPath":manager.layout().descriptor_path}}
+    }).to_string()).unwrap();
+    let maintenance_stop = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_codexify"));
+        command
+            .args(["browser", "stop-for-restart", "--config"])
+            .arg(&config)
+            .env("CODEXIFY_BROWSER_HOME", &manager.layout().root);
+        command
+    };
+    // This is the same separate-process handoff used by both updater scripts.
+    // The next server sees a different PID and may recover automatically.
+    let output = maintenance_stop().output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(control.public_status()["manuallyStopped"], false);
+    assert_eq!(control.public_status()["waitingForServerRestart"], false);
+    let next = control.ensure_running(&token).await.unwrap().pid();
+    assert_ne!(first, next);
+
+    control.stop(&token).await.unwrap();
+    let starts = std::fs::read(manager.layout().root.join("starts")).unwrap();
+    let output = maintenance_stop().output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(control.public_status()["manuallyStopped"], true);
+    assert!(
+        control
+            .ensure_running(&token)
+            .await
+            .unwrap_err()
+            .contains("stopped by you")
+    );
+    assert_eq!(
+        std::fs::read(manager.layout().root.join("starts")).unwrap(),
+        starts
+    );
+    assert_eq!(
+        std::fs::read(profile.join("keep")).unwrap(),
+        b"signed-in-profile"
+    );
+    assert!(
+        std::fs::read_to_string(manager.layout().root.join("requests"))
+            .unwrap()
+            .lines()
+            .all(|line| matches!(
+                line,
+                "GET /v1/health HTTP/1.1" | "GET /v1/liveness HTTP/1.1"
+            ))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn browser_watchdog_reopens_a_closed_companion_and_honors_manual_stop_across_controls() {
     use codexify::agent_automation::{BrowserCompanionClient, BrowserCompanionControl};
     use tokio_util::sync::CancellationToken;

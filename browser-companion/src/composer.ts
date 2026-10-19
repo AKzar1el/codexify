@@ -34,10 +34,14 @@ export function verifyOwnedComposerText(actual: string, expected: string): boole
 }
 
 export function isPairingVerificationDraft(text: string): boolean {
-  const reference = text.match(/\ncalling `automation_verify_pairing` with the non-secret: ([A-Za-z0-9_-]+)\n/)?.[1];
+  const reference = text.match(/[\n ]calling `automation_verify_pairing` with the non-secret: ([A-Za-z0-9_-]+)[\n ]/)?.[1];
   if (!reference) return false;
   try {
-    return text === renderActionPrompt({ kind:"pair_verify", reference });
+    const current = renderActionPrompt({ kind:"pair_verify", reference });
+    // An interrupted pairing can leave the exact pre-update, hard-wrapped draft.
+    const legacy = current.replace("task by calling", "task by\ncalling")
+      .replace(`${reference} Do not inspect`, `${reference}\nDo not inspect`);
+    return text === current || text === legacy;
   } catch {
     return false;
   }

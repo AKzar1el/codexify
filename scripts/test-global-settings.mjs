@@ -5,6 +5,95 @@ import {createRequire} from 'node:module';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: audit log file shows its default and is optional while logging is off`,{timeout:20000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  const logFile='/private/.codexify/projects/fixture/audit.jsonl',writes=[];
+  let document={audit:{enabled:false,logFile:''}},revision=1;
+  const snapshot=()=>({document,defaults:{audit:{enabled:true,logFile}},fieldSchema:{audit:{enabled:true,logFile:null}},raw:JSON.stringify(document),revision:String(revision),restartRequired:false});
+  await routeOwner(page,'http://127.0.0.1:43266/**',route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.0',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=request.postDataJSON();writes.push(body);
+    if(body.raw!=null)document=JSON.parse(body.raw);
+    else for(const [key,value] of Object.entries(body.changes))document.audit[key.split('.').at(-1)]=value;
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43266/#test-token');
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});
+  await dialog.getByRole('button',{name:'Advanced',exact:true}).click();
+  const input=dialog.getByLabel('audit.logFile',{exact:true}),row=dialog.locator('[data-setting-row="audit.logFile"]');
+  assert.equal(await input.getAttribute('placeholder'),`${logFile} (default)`);
+  assert.equal(await input.evaluate(node=>node.required),false);
+  assert.match(await row.textContent(),/Optional.*Ignored when Audit logging is off/);
+  assert.deepEqual(writes,[]);
+  await dialog.getByRole('group',{name:'audit.enabled',exact:true}).getByRole('button',{name:'On',exact:true}).click();await page.clock.fastForward(700);
+  await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  assert.equal(document.audit.enabled,true);
+  await dialog.getByLabel('audit.logFile',{exact:true}).fill('/custom/audit.jsonl');await page.clock.fastForward(700);
+  await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  assert.equal(document.audit.logFile,'/custom/audit.jsonl');
+  await dialog.getByLabel('audit.logFile',{exact:true}).fill('');await page.clock.fastForward(700);
+  await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  assert.equal(document.audit.logFile,undefined);
+  await dialog.getByRole('group',{name:'audit.enabled',exact:true}).getByRole('button',{name:'Off',exact:true}).click();await page.clock.fastForward(700);
+  await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  assert.deepEqual(document.audit,{enabled:false});
+ }finally{await browser.close();}
+});
+
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: file materialization defaults off and can be enabled, disabled, and reset`,{timeout:20000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  const example=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
+  assert.equal(example.artifactEgress.enabled,false);
+  const defaults={artifactIngress:{enabled:true},artifactEgress:{enabled:example.artifactEgress.enabled}};
+  const writes=[];let document={},revision=1;
+  const snapshot=()=>({document,defaults,raw:JSON.stringify(document),revision:String(revision),restartRequired:revision>1});
+  await routeOwner(page,'http://127.0.0.1:43265/**',route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.0',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=request.postDataJSON();writes.push(body);assert.equal(body.revision,String(revision));
+    if(body.raw!=null)document=JSON.parse(body.raw);
+    else {document.artifactEgress??={};document.artifactEgress.enabled=body.changes['artifactEgress.enabled'];}
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43265/#test-token');
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});
+  await dialog.getByRole('button',{name:'Tools & files',exact:true}).click();
+  const row=dialog.locator('[data-setting-row="artifactEgress.enabled"]'),group=row.getByRole('group');
+  await row.getByText('File materialization in ChatGPT',{exact:true}).waitFor();
+  assert.match(await row.textContent(),/inline attachment text and image previews remain available/);
+  assert.equal(await group.getByRole('button',{name:'Off (default)',exact:true}).getAttribute('aria-pressed'),'true');
+  assert.deepEqual(writes,[]);
+  for(const [label,value] of [['On',true],['Off',false],['Off (default)',null]]){
+   await group.getByRole('button',{name:label,exact:true}).click();await page.clock.fastForward(700);
+   await dialog.getByText('Saved. Restart Codexify to apply changes.',{exact:true}).waitFor();
+   if(value===null)assert.equal(JSON.parse(writes.at(-1).raw).artifactEgress?.enabled,undefined);
+   else assert.deepEqual(writes.at(-1).changes,{'artifactEgress.enabled':value});
+   assert.equal(document.artifactEgress?.enabled,value===null?undefined:value);
+   assert.equal(await group.getByRole('button',{name:label,exact:true}).getAttribute('aria-pressed'),'true');
+  }
+  assert.equal(document.artifactIngress,undefined,'the independent import preference must not be written');
+ }finally{await browser.close();}
+});
+
 for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: Pro labels repair old generic catalogs and preserve Astra/Pro selection`,{timeout:30000},async()=>{
  const browser=await engine.launch();
  try {
@@ -90,7 +179,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   await dialog.getByRole('button',{name:'Restart Codexify',exact:true}).click();
   await page.clock.fastForward(6000);await dialog.getByText('Codexify restarted.',{exact:true}).waitFor();assert.equal(operations[0],'/api/settings/restart');
   await dialog.getByRole('button',{name:'Update Codexify',exact:true}).click();await page.clock.fastForward(6000);
-  await page.getByText('v1.8.0',{exact:true}).waitFor();assert.equal(await page.locator('#global-update').isVisible(),false);
+  await page.getByText('v1.8.0',{exact:true}).waitFor();await dialog.getByText('Codexify updated.',{exact:true}).waitFor();await page.locator('#global-update').waitFor({state:'hidden'});
   await dialog.getByRole('button',{name:'Refresh connector',exact:true}).click();await dialog.getByText('Connector refresh completed; Allow all tools is selected.',{exact:true}).waitFor();assert.equal(refreshes,1);
   await page.setViewportSize({width:375,height:850});const box=await dialog.boundingBox();assert(box&&box.x>=0&&box.x+box.width<=375);
   assert.deepEqual(errors,[]);

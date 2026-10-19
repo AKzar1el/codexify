@@ -182,11 +182,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn returns_a_resource_link_and_matching_structured_receipt() {
+    async fn default_disables_materialization_and_opt_in_returns_a_matching_resource() {
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("report.txt"), b"final report\n").unwrap();
-        let config = crate::config::default_config(root.path().to_path_buf());
+        let mut config = crate::config::default_config(root.path().to_path_buf());
+        let disabled = ExportHostFile
+            .run(
+                json!({ "path": "report.txt" }),
+                &config,
+                &ArtifactEgressStore::new_at(
+                    config.artifact_egress.clone(),
+                    state.path().join("artifacts"),
+                ),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(disabled.is_error);
+        assert!(disabled.joined_text().contains("artifact_egress_disabled"));
+        assert!(
+            !disabled
+                .content
+                .iter()
+                .any(|block| matches!(block, ToolContent::ResourceLink(_)))
+        );
+        config.artifact_egress.enabled = true;
         let store = ArtifactEgressStore::new_at(
             config.artifact_egress.clone(),
             state.path().join("artifacts"),

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,9 +13,7 @@ use super::companion::{
     MAX_PROMPT_BYTES, MAX_UNREAD_MESSAGES, rendered_action_prompt_bytes,
     same_chatgpt_conversation_url,
 };
-use super::store::{
-    GOAL_RETRY_AFTER_MS, MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure,
-};
+use super::store::{MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure};
 use super::{
     AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AutomationActionKind,
     AutomationActionStatus, BrowserCompanionClient, CompanionActionSnapshot, CompanionActionState,
@@ -80,6 +79,14 @@ pub struct AutomationLiveState {
 
 #[async_trait]
 pub trait AutomationExecutor: Send + Sync {
+    async fn approve_pending_conversation(
+        &self,
+        _url: &str,
+        _account: &str,
+        _connector_name: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn turn_handoff_complete(
         &self,
         _url: &str,
@@ -140,6 +147,30 @@ impl BrowserAutomationExecutor {
 
 #[async_trait]
 impl AutomationExecutor for BrowserAutomationExecutor {
+    async fn approve_pending_conversation(
+        &self,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        if !self.config.auto_approve_tool_calls {
+            return Ok(false);
+        }
+        let lifecycle = super::BrowserCompanionControl::new(&self.config)?.public_status();
+        if lifecycle["manuallyStopped"] == true || lifecycle["waitingForServerRestart"] == true {
+            return Ok(false);
+        }
+        // Passive checks reuse an existing companion; they never start or reveal it.
+        let client = BrowserCompanionClient::from_config(&self.config)?;
+        let cancellation = CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            client.approve_pending_conversation(url, account, connector_name, &cancellation),
+        )
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| "ChatGPT approval check timed out".to_string())?
+    }
     async fn turn_handoff_complete(
         &self,
         url: &str,
@@ -457,6 +488,8 @@ pub struct AgentAutomationSupervisor {
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
     action_timeouts: ActionTimeouts,
+    approval_next_scan_ms: AtomicU64,
+    approval_resume_until_ms: Mutex<HashMap<String, u64>>,
 }
 
 struct ActionTimeouts {
@@ -503,6 +536,8 @@ impl AgentAutomationSupervisor {
             run_lock: Mutex::new(()),
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
+            approval_next_scan_ms: AtomicU64::new(0),
+            approval_resume_until_ms: Mutex::new(HashMap::new()),
             action_timeouts: ActionTimeouts {
                 start,
                 progress,
@@ -946,6 +981,16 @@ impl AgentAutomationSupervisor {
 
     pub async fn scan_once(&self, now_ms: u64) -> Result<(), String> {
         let _scan_guard = self.scan_lock.lock().await;
+        let check_approvals = self.config.auto_approve_tool_calls
+            && now_ms >= self.approval_next_scan_ms.load(Ordering::Relaxed);
+        if check_approvals {
+            self.approval_next_scan_ms
+                .store(now_ms.saturating_add(5_000), Ordering::Relaxed);
+        }
+        self.approval_resume_until_ms
+            .lock()
+            .await
+            .retain(|_, until| now_ms < *until);
         let tasks = self
             .tasks
             .read()
@@ -963,6 +1008,79 @@ impl AgentAutomationSupervisor {
                 now_ms,
             )?;
             let mut state = task.store.load(&task.task)?;
+            if self
+                .approval_resume_until_ms
+                .lock()
+                .await
+                .contains_key(task.task.stable_key())
+            {
+                continue;
+            }
+            if check_approvals
+                && !activity.agent_stop_requested
+                && state.pairing.verified_owner_generation == Some(task.owner_generation)
+                && let (Some(url), Some(account), Some(connector)) = (
+                    state.pairing.canonical_url.as_deref(),
+                    state.pairing.account_fingerprint.as_deref(),
+                    task.store.connector_name(&self.config.connector_name)?,
+                )
+                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(true) = self
+                    .executor
+                    .approve_pending_conversation(url, account, &connector)
+                    .await
+            {
+                // Granting this approval resumes the existing turn. It does not
+                // acknowledge queued messages or justify another browser Send.
+                if let Some(id) = state.action.id.as_deref() {
+                    if state.action.status == AutomationActionStatus::Queued
+                        && state.action.kind != Some(AutomationActionKind::PairVerify)
+                        && state.action.send_accepted != Some(true)
+                    {
+                        self.queue
+                            .lock()
+                            .await
+                            .retain(|queued| queued.request.action_id != id);
+                        task.store
+                            .clear_persisted_queued_action(&task.task, id, now_ms)?;
+                        self.live.write().await.remove(task.task.stable_key());
+                    } else if state.action.status == AutomationActionStatus::ApprovalRequired
+                        && state.action.send_accepted == Some(false)
+                    {
+                        task.store.update_action_status(
+                            &task.task,
+                            id,
+                            AutomationActionStatus::Idle,
+                            None,
+                            None,
+                            now_ms,
+                        )?;
+                        self.live.write().await.remove(task.task.stable_key());
+                    }
+                }
+                self.approval_resume_until_ms.lock().await.insert(
+                    task.task.stable_key().to_string(),
+                    now_ms.saturating_add(5_000),
+                );
+                continue;
+            }
+            let activity_epoch = activity
+                .activity_epoch
+                .as_deref()
+                .unwrap_or("legacy-activity");
+            let activity_sequence = if activity.activity_sequence == 0 {
+                activity.tool_call_count
+            } else {
+                activity.activity_sequence
+            };
+            if task.store.reset_goal_recovery_after_activity(
+                &task.task,
+                &state,
+                activity_epoch,
+                activity_sequence,
+            )? {
+                state = task.store.load(&task.task)?;
+            }
             task.store.notify_state(&task.chat, &state).await;
             let renewal_config = task.store.turn_renewal_settings()?;
             let renewal_enabled = state.turn_renewal.send.as_ref().is_some_and(|send| {
@@ -1009,10 +1127,7 @@ impl AgentAutomationSupervisor {
                                 | AutomationActionStatus::Ambiguous
                                 | AutomationActionStatus::Stalled
                         )
-                        && state
-                            .action
-                            .updated_at_ms
-                            .is_some_and(|at| now_ms >= at.saturating_add(GOAL_RETRY_AFTER_MS));
+                        && state.automatic_retry_at_ms().is_some_and(|at| now_ms >= at);
                     if retry_goal {
                         // A goal retry contains only Continue, never user messages. Require
                         // fresh proof that its final handoff is still the latest completed
@@ -1027,9 +1142,13 @@ impl AgentAutomationSupervisor {
                                     .turn_handoff_complete(url, account, &handoff.id),
                             )
                             .await
-                            && task
-                                .store
-                                .retry_goal_turn_renewal(&task.task, &state, now_ms)?
+                            && task.store.retry_goal_turn_renewal(
+                                &task.task,
+                                &state,
+                                activity_epoch,
+                                activity_sequence,
+                                now_ms,
+                            )?
                         {
                             state = task.store.load(&task.task)?;
                         } else {
@@ -1220,6 +1339,11 @@ impl AgentAutomationSupervisor {
             {
                 state = task.store.load(&task.task)?;
             }
+            if !obsolete_action && state.goal_recovery_exhausted() {
+                task.store
+                    .mark_goal_recovery_exhausted(&task.task, &state)?;
+                continue;
+            }
             if let Some(retry_at) = state.goal_retry_at_ms().filter(|_| !obsolete_action) {
                 if now_ms < retry_at {
                     continue;
@@ -1383,9 +1507,8 @@ impl AgentAutomationSupervisor {
                 && state.goal_wake.nudged_epoch.as_deref() == Some(activity_epoch.as_str())
                 && state.goal_wake.nudged_sequence == Some(activity_sequence)
                 && state
-                    .goal_wake
-                    .last_nudged_at_ms
-                    .is_none_or(|last| now_ms < last.saturating_add(GOAL_RETRY_AFTER_MS))
+                    .goal_recovery_retry_at_ms()
+                    .is_none_or(|at| now_ms < at)
             {
                 continue;
             }
@@ -2012,6 +2135,11 @@ impl AgentAutomationSupervisor {
                 .filter(|answer| answer.len() <= MAX_PRIVATE_TEXT_BYTES),
             terminal_at_ms,
         )?;
+        if status == AutomationActionStatus::ApprovalRequired && self.config.auto_approve_tool_calls
+        {
+            self.approval_next_scan_ms.store(0, Ordering::Relaxed);
+            self.notify();
+        }
         self.update_live_terminal(
             &execution,
             status,

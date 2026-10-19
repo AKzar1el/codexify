@@ -55,11 +55,11 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     let mut different = state.clone();
     different.action.last_error = Some("Selector verification failed before Send".into());
     assert_eq!(different.automatic_retry_at_ms(), Some(30_100));
-    for (attempts, delay) in [(1, 60_000), (2, 120_000)] {
+    for (attempts, delay) in [(1, 60_000), (2, 120_000), (3, 240_000), (4, 480_000)] {
         different.action.automatic_retry_attempts = attempts;
         assert_eq!(different.automatic_retry_at_ms(), Some(100 + delay));
     }
-    different.action.automatic_retry_attempts = 3;
+    different.action.automatic_retry_attempts = 5;
     assert!(different.automatic_retry_at_ms().is_none());
     different.action.automatic_retry_in_progress = true;
     assert!(
@@ -91,6 +91,43 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     active.revision += 1;
     state.goal = Some(active);
     assert!(state.automatic_retry_at_ms().is_none());
+}
+
+#[test]
+fn pairing_reference_remains_valid_until_sixty_minutes() {
+    assert_eq!(PAIRING_REFERENCE_TTL_MS, 60 * 60 * 1000);
+    for (elapsed, valid) in [
+        (59 * 60_000, true),
+        (60 * 60_000, true),
+        (60 * 60_000 + 1, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("automation")).unwrap();
+        let task = task("hour-long-pairing");
+        let pairing = store
+            .issue_pairing(&task, "https://chatgpt.com/c/hour", 0, 1000)
+            .unwrap();
+        store
+            .record_pairing_canonical_url(
+                &task,
+                pairing.generation,
+                "https://chatgpt.com/c/hour",
+                1001,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .verify_pairing(
+                    &task,
+                    pairing.generation,
+                    0,
+                    &pairing.reference,
+                    1000 + elapsed
+                )
+                .is_ok(),
+            valid
+        );
+    }
 }
 
 #[test]

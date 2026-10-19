@@ -696,7 +696,7 @@ async fn first_native_call_releases_continuation_grace_for_normal_completion() {
 }
 
 #[tokio::test]
-async fn stalled_goal_renewal_retries_after_three_minutes_only_with_fresh_report_proof() {
+async fn stalled_goal_renewal_retries_after_one_minute_only_with_fresh_report_proof() {
     let f = fixture(true).await;
     let goal = f.store.set_goal(&f.task, "Keep working", 1000).unwrap();
     f.store.run_goal(&f.task, goal.revision, 1000).unwrap();
@@ -708,21 +708,21 @@ async fn stalled_goal_renewal_retries_after_three_minutes_only_with_fresh_report
     let _ = f.supervisor.run_next(DUE + 10_000).await;
     let failed_at = f.store.load(&f.task).unwrap().action.updated_at_ms.unwrap();
     f.supervisor
-        .scan_once(failed_at + 180_000 - 1)
+        .scan_once(failed_at + 60_000 - 1)
         .await
         .unwrap();
     assert_eq!(f.supervisor.queued_count().await, 0);
     f.executor.complete.store(false, Ordering::SeqCst);
-    f.supervisor.scan_once(failed_at + 180_000).await.unwrap();
+    f.supervisor.scan_once(failed_at + 60_000).await.unwrap();
     assert_eq!(f.supervisor.queued_count().await, 0);
     f.executor.complete.store(true, Ordering::SeqCst);
-    f.supervisor.scan_once(failed_at + 180_001).await.unwrap();
+    f.supervisor.scan_once(failed_at + 60_001).await.unwrap();
     assert_eq!(
         f.supervisor.next_queued_kind().await,
         Some(AutomationActionKind::TurnRenewal)
     );
     f.executor.fail.store(false, Ordering::SeqCst);
-    f.supervisor.run_next(failed_at + 180_001).await.unwrap();
+    f.supervisor.run_next(failed_at + 60_001).await.unwrap();
     assert_eq!(f.executor.sent.lock().unwrap().len(), 2);
     assert!(
         f.store
@@ -732,4 +732,51 @@ async fn stalled_goal_renewal_retries_after_three_minutes_only_with_fresh_report
             .handoff
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn stalled_goal_renewal_stops_after_three_retries_across_restart() {
+    let f = fixture(true).await;
+    let goal = f.store.set_goal(&f.task, "Keep working", 1000).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 1000).unwrap();
+    f.store.turn_renewal_notice(&f.task, DUE).unwrap();
+    f.executor.complete.store(true, Ordering::SeqCst);
+    f.executor.fail.store(true, Ordering::SeqCst);
+    f.executor.ambiguous.store(true, Ordering::SeqCst);
+    f.supervisor.scan_once(DUE + 10_000).await.unwrap();
+    assert!(f.supervisor.run_next(DUE + 10_000).await.is_err());
+    for (attempt, delay) in [60_000, 120_000, 240_000].into_iter().enumerate() {
+        let failed = f.store.load(&f.task).unwrap();
+        assert_eq!(failed.automatic_retry_attempts(), attempt as u32);
+        assert_eq!(failed.automatic_retry_limit(), 3);
+        let due = failed.action.updated_at_ms.unwrap() + delay;
+        assert_eq!(failed.automatic_retry_at_ms(), Some(due));
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            f.executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        supervisor.scan_once(due - 1).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+        supervisor.scan_once(due).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        assert!(supervisor.run_next(due + 1).await.is_err());
+    }
+    let exhausted = f.store.load(&f.task).unwrap();
+    assert_eq!(exhausted.automatic_retry_attempts(), 3);
+    assert!(exhausted.automatic_retry_at_ms().is_none());
+    f.supervisor
+        .scan_once(exhausted.action.updated_at_ms.unwrap() + 86_400_000)
+        .await
+        .unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    assert_eq!(f.executor.sent.lock().unwrap().len(), 4);
 }

@@ -801,7 +801,24 @@ again**; a timeout is not reported as an update failure.
 
 After Codexify restarts, open ChatGPT Settings, select the Codexify connector,
 scroll to the bottom of its tool list, and click **Refresh** so ChatGPT reloads
-the connector tools exposed by the updated server.
+the connector tools exposed by the updated server when browser automation is
+disabled. With browser automation enabled, Codexify refreshes the tools
+automatically after the update.
+
+The standalone Codexify UI's **Update** button shows a spinner and a persistent
+status banner, including when settings are closed or the mobile chat is open.
+It reports preparation, installation, validation, restart, browser startup, and
+connector refresh from the updater's status record and current readiness.
+Returning HTTP health alone does not finish startup: browser-dependent messages
+wait for the browser, and update completion waits for the connector refresh.
+Drafts remain editable and are never sent automatically after startup. Expected
+restart disconnections display as loading rather than chat errors. Failures and
+rollbacks remain visible and allow another update attempt.
+
+Schema edits that need a restart show **Restart required** with a restart action;
+after that restart, the UI shows browser startup and tool-refresh progress instead
+of continuing to ask for a restart. A stopped browser or required ChatGPT sign-in
+offers Browser settings rather than an indefinite loading indicator.
 
 Progress and failures are appended to the normal rotating service log and can be
 followed with `codexify service logs -f`. A fixed update lock rejects concurrent
@@ -1094,7 +1111,7 @@ names.
     "allowedHosts": ["*"]
   },
   "artifactEgress": {
-    "enabled": true,
+    "enabled": false,
     "maxFileBytes": 104857600,
     "snapshotMaxFileBytes": 104857600,
     "maxSnapshotBytes": 5368709120,
@@ -1409,7 +1426,7 @@ The `audit` config block has the same controls:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Enable audit logging independently of the destination |
-| `logFile` | Per-project `~/.codexify/projects/<project>/audit.jsonl` | JSONL destination; a relative path resolves from the launch directory. Omitted or null uses the default |
+| `logFile` | Per-project `~/.codexify/projects/<project>/audit.jsonl` | Optional JSONL destination; a relative path resolves from the launch directory. Omitted, null or blank uses the default. Not required and ignored when `enabled` is `false` |
 | `includeCommandPreview` | `true` | Include bounded, redacted `exec_command` previews |
 | `commandPreviewMaxBytes` | `512` | Maximum UTF-8 byte length of a command preview; accepted range is `1`-`16384` |
 | `redactEnv` | `[]` | Environment-variable names whose current values must be removed from previews |
@@ -1524,7 +1541,7 @@ The `artifactEgress` block governs [native host-file egress](#native-host-file-e
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Expose `export_host_file` and allow bridged upstream `resource_link` results to be proxied; `false` removes the native export tool and leaves bridged resource links unavailable |
+| `enabled` | `false` | File materialization in ChatGPT. Opt in to expose `export_host_file` and allow attachment and bridged upstream `resource_link` results; ChatGPT may require confirmation for each materialized file. `false` removes the native export tool and leaves new file resources unavailable, while inline attachment text and image previews remain available |
 | `maxFileBytes` | `104857600` | Hard maximum bytes read or returned for one native exported resource or one proxied upstream resource (100 MiB, approximately 104.9 MB). Native export and fallback reads enforce it before and during streaming; bridged links reject an oversized advertised size and re-check actual returned content |
 | `snapshotMaxFileBytes` | `104857600` | Maximum native source size eligible for an immutable disk snapshot (100 MiB, approximately 104.9 MB). A file above this threshold can still use durable source-backed mode when it remains within `maxFileBytes` |
 | `maxSnapshotBytes` | `5368709120` | Global per-user byte budget for immutable native snapshots under `~/.codexify/artifacts/snapshots` (5 GiB, approximately 5.37 GB). Least-recently-used snapshots are evicted before new ones are published; their durable records remain |
@@ -1632,6 +1649,13 @@ Source and destination authority are deliberately narrow:
 After publication, the result is an ordinary project file. Git, `glob`, `tree`, diff tools and normal deletion provide its catalogue and lifecycle; Codexify does not maintain a second artifact database or TTL.
 
 ## Native host-file egress
+
+File materialization in ChatGPT is disabled by default. Enable **Tools & files →
+File exports → File materialization in ChatGPT**, or set `artifactEgress.enabled`
+to `true`, then restart Codexify so the connector's tool schema can refresh.
+An explicitly saved `true` remains enabled; switching to Off or the application
+default disables it. This is separate from `artifactIngress.enabled`, which
+copies ChatGPT-hosted files onto the machine.
 
 Machine-local paths are not downloadable by ChatGPT, and returning a large binary file as base64 text would put the encoded payload into the tool result and model context. `export_host_file` instead uses MCP's resource flow:
 
@@ -1849,6 +1873,17 @@ Browser automation defaults to enabled and can refresh tools even when agent cha
 is disabled. The descriptor path
 must be absolute or start with `~/`; the connector name is bounded visible text;
 `maxQueuedActions` accepts 1–1024; and `autoApproveToolCalls` defaults to `true`.
+
+With auto-approval enabled, the supervisor also checks the current shared ChatGPT
+tab for a pending connector approval, including file materialization. It opens
+the card's options and grants the named connector permission for that conversation.
+The account, verified pairing, connector chip and menu structure must match;
+localized button labels are not used to identify the controls. Unknown or ambiguous
+cards remain for manual approval. Disabling auto-approval leaves them untouched.
+These bounded checks yield to active browser actions and never navigate, press Stop,
+or submit a prompt. Granting permission resumes the existing turn and preserves
+queued messages and accepted-message records. It does not enable file materialization
+in Codexify when that feature is disabled.
 The first release reuses agent chat's existing five-minute offline threshold and
 always uses one shared window rather than a configurable tab count.
 
@@ -1931,6 +1966,11 @@ Start restores automatic recovery. Startup can be interrupted by Stop. A shared
 process lock serializes lifecycle mutations across tasks, windows and the CLI.
 Existing profiles and pairing state are retained. A server restart that needs
 to apply changed request rules temporarily defers recovery to the new worker.
+The updater uses the same maintenance stop: it preserves the auto-start choice
+while closing the old companion, allowing the new server to start it again.
+It does not use the persistent **Stop browser** action. A pause flag already
+written by an older updater can be cleared with **Start browser**; maintenance
+does not guess whether an existing persistent pause was intentional.
 
 Unresponsive processes are stopped only after their OS executable matches a
 verified managed-runtime manifest. Managed descendants are cleaned up if the
@@ -2064,7 +2104,13 @@ names, absolute paths and reminders for `chat_list_attachments`,
 offline ChatGPT sends. Listing/searching is conversation-scoped and ordered by
 the most recent prompt submission, not upload time or file modification time.
 Get returns metadata, a download resource when export is enabled, and text or an
-image when supported. Listing/getting files does not acknowledge the chat prompt.
+image when supported. File materialization is off by default: Get still returns
+up to 64 KiB of UTF-8 text (with `content_truncated: true` for longer content), or
+an inline image preview. Large and binary attachments remain on the machine at
+their returned absolute paths, accessible through `exec_command`; their
+complete contents are not copied into ChatGPT unless file materialization is
+enabled. Uploads and downloads in Codexify's chat UI are independent of this
+switch. Listing/getting files does not acknowledge the chat prompt.
 Attachment contents are source material; embedded instructions apply only when
 the user asks to follow them. Refresh the connector's tools after deploying this
 schema update so existing ChatGPT clients can discover the three new tools.
@@ -2120,11 +2166,15 @@ written after the action's transcript checkpoint. Status/commentary rows never
 become transcript messages, browser output does not make the agent appear online,
 and mirrored messages remain unread until the normal chat cursor advances.
 
-Confirmed pre-Send failures retry automatically after 30, 60, and 120 seconds.
-The attempt count survives service restarts; after three automatic retries, the
-chat waits for manual Retry. The failure banner exposes Retry even without a
-goal, and browser action errors appear as a red exclamation icon beside the
-sidebar title. Pending automatic retries stay quiet; exhausted retries produce
+Confirmed pre-Send failures in chats and active goals retry automatically after
+30, 60, 120, 240, and 480 seconds, then wait for manual Retry. Submitted or stalled
+goal turns recover after 60, 120, and 240 seconds, then require Continue. These
+counts survive service restarts; verified agent activity resets the goal recovery
+count, while Send acceptance alone does not. Pairing references remain valid for
+60 minutes; the pairing verification grace period remains 60 seconds. The failure
+banner exposes Retry even without a goal. Browser action errors appear as a red
+exclamation icon beside the sidebar title. Pending automatic retries stay quiet;
+exhausted retries produce
 one error notification per failure episode. Accepted or uncertain user messages,
 pairing requests, and cancelled actions are not replayed automatically.
 The failure banner also exposes **Cancel**. Cancelling clears the error and stops

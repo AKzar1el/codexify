@@ -26,6 +26,7 @@ import {
   cancelActionRequestSchema,
   descriptorSchema,
   executeActionRequestSchema,
+  conversationApprovalRequestSchema,
   revealWindowRequestSchema,
   type CompanionDescriptor,
 } from "./protocol";
@@ -191,6 +192,10 @@ async function route(
   if(request.method === "POST" && url.pathname === "/v1/turns/handoff") {
     const body=z.strictObject({url:chatGptUrlSchema,expectedAccountFingerprint:opaqueIdSchema,handoffId:z.string().regex(/^renew-[a-f0-9]{64}$/)}).parse(await readJson(request));
     json(response,200,await coordinator.turnHandoffComplete(body.url,body.expectedAccountFingerprint,body.handoffId,operation.signal));return;
+  }
+  if(request.method === "POST" && url.pathname === "/v1/approvals/conversation") {
+    const body=conversationApprovalRequestSchema.parse(await readJson(request));
+    json(response,200,await coordinator.approvePendingConversation(body,operation.signal));return;
   }
   if (request.method === "POST" && url.pathname === "/v1/connectors/refresh") {
     const body=z.strictObject({name:z.string().min(1).max(256)}).parse(await readJson(request));

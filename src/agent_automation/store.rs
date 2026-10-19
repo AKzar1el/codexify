@@ -20,13 +20,14 @@ const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
 const CHAT_SUBMISSION_FILE: &str = "chat-submission.json";
-pub(crate) const GOAL_RETRY_AFTER_MS: u64 = 180_000;
+pub(crate) const GOAL_RETRY_DELAYS_MS: [u64; 3] = [60_000, 120_000, 240_000];
 const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
-pub const PAIRING_REFERENCE_TTL_MS: u64 = 10 * 60 * 1000;
+pub const PAIRING_REFERENCE_TTL_MS: u64 = 60 * 60 * 1000;
 pub const PAIRING_VERIFICATION_GRACE_MS: u64 = 60_000;
-const AUTOMATIC_RETRY_DELAYS_MS: [u64; 3] = [30_000, 60_000, 120_000];
+const AUTOMATIC_RETRY_DELAYS_MS: [u64; 5] = [30_000, 60_000, 120_000, 240_000, 480_000];
+const GOAL_RECOVERY_EXHAUSTED: &str = "Automatic goal recovery stopped after three retries without agent activity. Use Continue to try again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -266,6 +267,7 @@ pub struct GoalWakeState {
     pub nudged_epoch: Option<String>,
     pub nudged_sequence: Option<u64>,
     pub last_nudged_at_ms: Option<u64>,
+    pub recovery_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,8 +331,10 @@ impl AutomationTaskState {
             && self.pairing.verified_owner_generation == Some(owner_generation)
     }
 
-    pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
-        let goal = self.goal.as_ref()?;
+    fn offline_goal_retry_eligible(&self) -> bool {
+        let Some(goal) = self.goal.as_ref() else {
+            return false;
+        };
         let action = &self.action;
         if goal.status != GoalStatus::Active
             || action.goal_revision != Some(goal.revision)
@@ -351,21 +355,21 @@ impl AutomationTaskState {
                     && action.send_accepted == Some(true)
                     && action.messages_fenced)
         {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
+        if !self.offline_goal_retry_eligible() {
             return None;
         }
-        let delay = if action.status == AutomationActionStatus::Failed
-            && action.send_accepted == Some(false)
-            && !action.messages_fenced
-            && !action.goal_turn_counted
-        {
-            // Use the ordinary pre-Send retry schedule, capped at its last delay
-            // so an active goal is not abandoned after repeated browser failures.
-            AUTOMATIC_RETRY_DELAYS_MS[(action.automatic_retry_attempts as usize)
-                .min(AUTOMATIC_RETRY_DELAYS_MS.len() - 1)]
+        let delay = if confirmed_unsent_failure(&self.action) {
+            *AUTOMATIC_RETRY_DELAYS_MS.get(self.action.automatic_retry_attempts as usize)?
         } else {
-            GOAL_RETRY_AFTER_MS
+            *GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?
         };
-        action
+        self.action
             .updated_at_ms
             .into_iter()
             .chain(self.goal_wake.last_nudged_at_ms)
@@ -373,7 +377,70 @@ impl AutomationTaskState {
             .map(|last| last.saturating_add(delay))
     }
 
+    pub(crate) fn goal_recovery_retry_at_ms(&self) -> Option<u64> {
+        let delay = GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?;
+        self.action
+            .updated_at_ms
+            .into_iter()
+            .chain(self.goal_wake.last_nudged_at_ms)
+            .max()
+            .map(|last| last.saturating_add(*delay))
+    }
+
+    pub(crate) fn goal_recovery_exhausted(&self) -> bool {
+        self.offline_goal_retry_eligible()
+            && !confirmed_unsent_failure(&self.action)
+            && self.goal_wake.recovery_attempts as usize >= GOAL_RETRY_DELAYS_MS.len()
+    }
+
+    pub fn automatic_retry_limit(&self) -> usize {
+        if self.uses_goal_recovery() {
+            GOAL_RETRY_DELAYS_MS.len()
+        } else {
+            AUTOMATIC_RETRY_DELAYS_MS.len()
+        }
+    }
+
+    pub fn automatic_retry_attempts(&self) -> u32 {
+        if self.uses_goal_recovery() {
+            self.goal_wake.recovery_attempts
+        } else {
+            self.action.automatic_retry_attempts
+        }
+    }
+
+    fn uses_goal_recovery(&self) -> bool {
+        self.goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Active)
+            && !confirmed_unsent_failure(&self.action)
+            && matches!(
+                self.action.kind,
+                Some(
+                    AutomationActionKind::OfflineGoal
+                        | AutomationActionKind::OfflineCombined
+                        | AutomationActionKind::TurnRenewal
+                )
+            )
+    }
+
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
+        if self.action.kind == Some(AutomationActionKind::TurnRenewal)
+            && self.uses_goal_recovery()
+            && self
+                .turn_renewal
+                .handoff
+                .as_ref()
+                .is_some_and(|h| h.report_complete)
+            && matches!(
+                self.action.status,
+                AutomationActionStatus::Failed
+                    | AutomationActionStatus::Ambiguous
+                    | AutomationActionStatus::Stalled
+            )
+        {
+            return self.goal_recovery_retry_at_ms();
+        }
         if matches!(
             self.action.status,
             AutomationActionStatus::Failed
@@ -454,6 +521,13 @@ impl AutomationTaskState {
         ) || (self.action.status == AutomationActionStatus::Unverified
             && self.action.last_error.is_some())
     }
+}
+
+fn confirmed_unsent_failure(action: &AutomationActionState) -> bool {
+    action.status == AutomationActionStatus::Failed
+        && action.send_accepted == Some(false)
+        && !action.messages_fenced
+        && !action.goal_turn_counted
 }
 
 fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
@@ -1908,26 +1982,84 @@ impl AgentAutomationStore {
             }
             // The active goal authorizes another turn. Keep the accepted-message
             // ledger so continuing a goal never replays an earlier user batch.
+            let unsent = confirmed_unsent_failure(&state.action);
+            if !unsent {
+                state.goal_wake.recovery_attempts += 1;
+            }
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 automatic_retry_in_progress: true,
-                automatic_retry_attempts: if state.action.status == AutomationActionStatus::Failed
-                    && state.action.send_accepted == Some(false)
-                    && !state.action.messages_fenced
-                    && !state.action.goal_turn_counted
-                {
-                    state
-                        .action
-                        .automatic_retry_attempts
-                        .saturating_add(1)
-                        .min(AUTOMATIC_RETRY_DELAYS_MS.len() as u32)
+                automatic_retry_attempts: if unsent {
+                    state.action.automatic_retry_attempts + 1
                 } else {
                     0
                 },
                 ..Default::default()
             };
-            state.goal_wake = GoalWakeState::default();
+            // Keep the activity baseline and recovery count across the next Send.
+            // Send acceptance alone does not prove that the agent recovered.
+            state.goal_wake.nudged_epoch = None;
+            state.goal_wake.nudged_sequence = None;
+            state.goal_wake.last_nudged_at_ms = None;
             Ok(true)
+        })
+    }
+
+    pub(crate) fn reset_goal_recovery_after_activity(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        activity_epoch: &str,
+        activity_sequence: u64,
+    ) -> Result<bool, String> {
+        if expected.goal_wake.recovery_attempts == 0
+            || expected.goal_wake.activity_epoch.is_none()
+            || (expected.goal_wake.activity_epoch.as_deref() == Some(activity_epoch)
+                && expected.goal_wake.activity_sequence == Some(activity_sequence))
+        {
+            return Ok(false);
+        }
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.goal_wake != expected.goal_wake
+                || state.goal != expected.goal
+            {
+                return Ok(false);
+            }
+            state.goal_wake = GoalWakeState::default();
+            if state.action.status == AutomationActionStatus::Stalled
+                && state.action.send_accepted == Some(true)
+                && matches!(
+                    state.action.kind,
+                    Some(AutomationActionKind::OfflineGoal | AutomationActionKind::OfflineCombined)
+                )
+            {
+                state.action.status = AutomationActionStatus::Idle;
+                state.action.last_error = None;
+            }
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn mark_goal_recovery_exhausted(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action == expected.action
+                && state.goal_wake == expected.goal_wake
+                && state.goal == expected.goal
+                && state.goal_recovery_exhausted()
+            {
+                state.action.status = AutomationActionStatus::Stalled;
+                state
+                    .action
+                    .last_error
+                    .get_or_insert_with(|| GOAL_RECOVERY_EXHAUSTED.into());
+                state.action.automatic_retry_in_progress = false;
+            }
+            Ok(())
         })
     }
 
@@ -2019,6 +2151,7 @@ impl AgentAutomationStore {
                     nudged_epoch: Some(activity_epoch.to_owned()),
                     nudged_sequence: Some(activity_sequence),
                     last_nudged_at_ms: Some(now_ms),
+                    recovery_attempts: state.goal_wake.recovery_attempts,
                 }
             };
             Ok(true)
@@ -3042,6 +3175,9 @@ fn validate_action(action: &AutomationActionState) -> Result<(), String> {
 }
 
 fn validate_goal_wake(wake: &GoalWakeState) -> Result<(), String> {
+    if wake.recovery_attempts as usize > GOAL_RETRY_DELAYS_MS.len() {
+        return Err("Agent automation goal recovery count is invalid".into());
+    }
     for value in [wake.activity_epoch.as_deref(), wake.nudged_epoch.as_deref()]
         .into_iter()
         .flatten()

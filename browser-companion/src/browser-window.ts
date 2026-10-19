@@ -12,6 +12,8 @@ import {
   cancelActionRequestSchema,
   canonicalChatGptConversationUrl,
   executeActionRequestSchema,
+  conversationApprovalRequestSchema,
+  type ConversationApprovalRequest,
   renderActionPrompt,
   type ActionEvent,
   type ActionPrompt,
@@ -46,6 +48,7 @@ export interface DriverExecution {
 export type BrowserStepRunner = <T>(operation:(signal:AbortSignal)=>Promise<T>,signal?:AbortSignal)=>Promise<T>;
 
 export interface BrowserDriver {
+  approvePendingConversation?(request:ConversationApprovalRequest,signal:AbortSignal):Promise<boolean>;
   liveness?():Promise<boolean>;
   health(): Promise<{
     authenticated:boolean;
@@ -237,6 +240,17 @@ export class SingleWindowCoordinator {
       accountFingerprint:health.authenticated ? health.accountFingerprint : null,
       activeActionId:this.activeActionId,
     };
+  }
+
+  async approvePendingConversation(raw:ConversationApprovalRequest,signal?:AbortSignal):Promise<{protocolVersion:number;build:string;approved:boolean}> {
+    const request = conversationApprovalRequestSchema.parse(raw);
+    const receipt = (approved:boolean) => ({protocolVersion:PROTOCOL_VERSION,build:this.build,approved});
+    if (this.activeActionId || this.windowOperationActive || !this.driver.approvePendingConversation) return receipt(false);
+    const bounded = AbortSignal.any([AbortSignal.timeout(5_000),...(signal ? [signal] : [])]);
+    return this.withWindowOperation(async operationSignal => {
+      if (this.activeActionId) return receipt(false);
+      return receipt(await this.driver.approvePendingConversation!(request,operationSignal));
+    },bounded);
   }
 
   async login(signal?: AbortSignal): Promise<CompanionHealth> {

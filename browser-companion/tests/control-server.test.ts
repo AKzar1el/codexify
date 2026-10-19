@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp } from "node:fs/promises";
 import { expect, test } from "bun:test";
-import type { CapabilityCatalog } from "../src/protocol";
+import type { CapabilityCatalog, ConversationApprovalRequest } from "../src/protocol";
 import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } from "../src/browser-window";
 import { startControlServer } from "../src/control-server";
 import { protocolBuild } from "../src/protocol";
@@ -81,6 +81,30 @@ function executeBody() {
     autoApproveToolCalls:false,
   };
 }
+
+test("conversation approvals require the private bearer and a strict conversation/account/connector request",async()=>{
+  class ApprovalDriver extends ImmediateDriver {
+    checks:ConversationApprovalRequest[]=[];
+    async approvePendingConversation(request:ConversationApprovalRequest){this.checks.push(request);return true;}
+  }
+  const root=await mkdtemp(join(tmpdir(),"approval-control-"));
+  const driver=new ApprovalDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+  try {
+    const body={url:"https://chatgpt.com/c/approval",expectedAccountFingerprint:"account-test",connectorName:"Fixture connector"};
+    const post=(payload:unknown,authorized=true)=>fetch(`${server.endpoint}/v1/approvals/conversation`,{
+      method:"POST",headers:{"Content-Type":"application/json",...(authorized?{Authorization:`Bearer ${server.token}`}:{})},body:JSON.stringify(payload)});
+    expect((await post(body,false)).status).toBe(401);
+    expect((await post({...body,extra:true})).status).toBe(400);
+    expect((await post({...body,url:"https://example.com/c/approval"})).status).toBe(400);
+    expect((await post({...body,url:"https://chatgpt.com/settings"})).status).toBe(400);
+    expect((await post({...body,url:"not-a-url"})).status).toBe(400);
+    expect(driver.checks).toEqual([]);
+    const response=await post(body);expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({protocolVersion:1,build:TEST_BUILD,approved:true});
+    expect(driver.checks).toEqual([body]);
+  } finally {await server.close();}
+});
 
 test("private loopback server enforces bearer auth and streams bounded NDJSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "codexify-browser-control-"));

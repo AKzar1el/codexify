@@ -200,6 +200,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   const modifierLabel = primaryModifier === "metaKey" ? "Cmd" : "Ctrl";
   let statusKind = "normal";
   let available = bridge === null;
+  let runtimeLoading = null;
   let externalReadOnly = false, pageRetired = false;
   let workspace, generation = 0;
   const saved = (bridge?.getState?.() || window.openai?.widgetState)?.privateContent || {};
@@ -237,6 +238,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     return inputRequired || Number.isSafeInteger(agentWaitingUntil) && Date.now() + clockOffset < agentWaitingUntil ? "steer" : defaultMessageMode;
   }
   function messageHint() {
+    if (startupBlocked()) return `${runtimeLoading.detail || "Codexify is starting."} Your draft is kept.`;
     return composerMessageMode() === "queue" ? `Enter to queue. ${modifierLabel}+Enter to steer. Shift + Enter for a new line.` : `Enter to send. ${modifierLabel}+Enter to queue. Shift + Enter for a new line.`;
   }
   function changeMessageMode(mode) {
@@ -399,17 +401,17 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     const presence = presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil).state;
     const active = presence === "online" || presence === "waiting";
     const hasDraft = input.value.length > 0 || Boolean(attachments?.count());
-    const mode = stopping ? "stopping" : active && !hasDraft && !sending ? "stop" : "send";
+    const mode = startupBlocked() ? "loading" : stopping ? "stopping" : active && !hasDraft && !sending ? "stop" : "send";
     if (send.dataset.mode !== mode) {
-      const label = mode === "stopping" ? "Stopping agent" : mode === "stop" ? "Stop agent" : "Send message";
-      const svg = icon(mode === "stopping" ? ["M12 3a9 9 0 1 1-9 9"] : mode === "stop" ? ["M7 7h10v10H7Z"] : ["M12 19V5m-6 6 6-6 6 6"], mode === "stopping" ? "stop-spinner" : "");
+      const label = mode === "loading" ? "Waiting for Codexify" : mode === "stopping" ? "Stopping agent" : mode === "stop" ? "Stop agent" : "Send message";
+      const svg = icon(["stopping","loading"].includes(mode) ? ["M12 3a9 9 0 1 1-9 9"] : mode === "stop" ? ["M7 7h10v10H7Z"] : ["M12 19V5m-6 6 6-6 6 6"], ["stopping","loading"].includes(mode) ? "stop-spinner" : "");
       svg.setAttribute("viewBox", "0 0 24 24");
       if (mode === "stop") svg.querySelector("path").setAttribute("fill", "currentColor");
       send.replaceChildren(svg); send.dataset.mode = mode;
       send.setAttribute("aria-label", label); send.title = label;
     }
     if(mode==="send") {const messageMode=composerMessageMode(),label=messageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=`${label}. ${modifierLabel}+Enter uses the other mode for this message.`;send.dataset.messageMode=messageMode;}
-    send.disabled = !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
+    send.disabled = startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
     attachments?.update();
     list.scrollTop = atBottom ? list.scrollHeight : historyTop;
     size();
@@ -774,6 +776,17 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     resizeInput();
     if (value) { revision = null; void refresh(); }
   }
+  function startupBlocked() {
+    if (!runtimeLoading?.loading) return false;
+    const presence = presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil).state;
+    return !runtimeLoading.browserOnly || !["online","waiting"].includes(presence);
+  }
+  function setLoading(value) {
+    if (tornDown) return;
+    runtimeLoading = value;
+    resizeInput();
+    if (statusKind === "normal" || statusKind === "connection") status(messageHint(),false,"normal");
+  }
   function setReadOnly(value) {
     value = value === true;
     if (tornDown || externalReadOnly === value) return;
@@ -815,11 +828,11 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       if (!currentGeneration(origin)) return;
       applyPage(page,false,modeVersion,expectedQueueVersion); failures = 0;
       if (statusKind !== "action") status(isReadOnly() ? "This chat is read-only here." : messageHint(), false, "normal");
-    } catch (error) { if (currentGeneration(origin)) { failures++; status(error.message || "Connection unavailable. Messages are retained.", true, "connection"); workspaceMismatch(error); } }
+    } catch (error) { if (currentGeneration(origin)) { if(startupBlocked()){failures=0;status(messageHint(),false,"normal");}else{failures++;status(error.message || "Connection unavailable. Messages are retained.", true, "connection");workspaceMismatch(error);} } }
     finally { if (currentGeneration(origin)) { refreshing = false; schedule(); } }
   }
   async function deliver(message) {
-    if (!available || isReadOnly() || !chatFile || message.chat_file !== chatFile || sending || stopping || tornDown) return;
+    if (startupBlocked() || !available || isReadOnly() || !chatFile || message.chat_file !== chatFile || sending || stopping || tornDown) return;
     const origin = generation;
     sending = true; message.failed = false; message.pending = true;
     pendingSends.set(message.id, message); render(); resizeInput(); save();
@@ -856,7 +869,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     }
   }
   async function stopAgent() {
-    if (!available || isReadOnly() || !chatFile || sending || stopping || tornDown) return;
+    if (startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || tornDown) return;
     const origin = generation;
     stopRequestId ||= crypto.randomUUID();
     stopping = true; resizeInput();
@@ -879,7 +892,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   });
   el("composer").addEventListener("submit", event => {
     event.preventDefault();
-    if (!available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
+    if (startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
     if (attachments?.blocked()) {status("Wait for uploads to finish, or remove failed attachments.",true,"action",false);return;}
     const message = { id:crypto.randomUUID(), role:"user", message_mode:submitMode||composerMessageMode(), markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
     input.value = ""; resizeInput(); void deliver(message); input.focus(); list.scrollTop = list.scrollHeight;
@@ -956,6 +969,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   if (!bridge && window.openai?.callTool) void refresh();
   return {
     setAvailable,
+    setLoading,
     setReadOnly,
     setWorkspace,
     setTheme:theme,

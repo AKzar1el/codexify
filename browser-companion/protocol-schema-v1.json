@@ -16,7 +16,8 @@
     "POST /v1/new-chat/capabilities",
     "POST /v1/account/plan",
     "POST /v1/connectors/refresh",
-    "POST /v1/turns/handoff"
+    "POST /v1/turns/handoff",
+    "POST /v1/approvals/conversation"
   ],
   "sessionStatuses": [
     "idle",
@@ -142,6 +143,12 @@
     },
     "completion": "observed refresh control busy/idle cycle and Allow all tools selected",
     "schemaVerified": false
+  },
+  "conversationApproval": {
+    "request": ["url", "expectedAccountFingerprint", "connectorName"],
+    "response": ["protocolVersion", "build", "approved"],
+    "scope": "Current verified conversation and its configured connector only; no navigation or message submission",
+    "policy": "Core calls only while autoApproveToolCalls is enabled; checks yield to browser actions"
   },
   "launchConfiguration": {
     "requestBlockList": "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST: JSON array of RE2 URL patterns; verified browser-wide before navigation"

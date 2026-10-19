@@ -159,7 +159,7 @@ async fn attachment_tools_list_search_read_and_isolate_the_current_conversation(
     assert!(!read.is_error);
     let data = read.structured_content.unwrap();
     assert_eq!(data["content"], "Attachment text\nSecond line");
-    assert!(!data["resource_uri"].is_null());
+    assert!(data["resource_uri"].is_null());
     for (tool, value) in [(list, &listed), (get, &data)] {
         assert!(
             jsonschema::is_valid(&tool.output_schema().unwrap(), value),
@@ -186,6 +186,122 @@ async fn attachment_tools_list_search_read_and_isolate_the_current_conversation(
         1,
         "listing and reading files must not acknowledge the prompt"
     );
+}
+
+#[tokio::test]
+async fn attachment_inline_content_survives_with_file_materialization_disabled() {
+    use codexify::markdown_chat::attachments::AttachmentStore;
+    use codexify::types::ToolContent;
+    let (root, mut config, session, mut context) = fixture();
+    let chat = context
+        .markdown_chat
+        .chat(&config, context.task_conversation.as_ref(), &session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    let store = AttachmentStore::for_chat(chat.path()).unwrap();
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+    let prefix = "a".repeat(65_535);
+    let cases = [
+        (
+            "small.txt",
+            "text/plain",
+            b"Small attachment".to_vec(),
+            Some("Small attachment"),
+            false,
+            false,
+        ),
+        (
+            "large.txt",
+            "text/plain",
+            format!("{prefix}λ{}", "b".repeat(1024)).into_bytes(),
+            Some(prefix.as_str()),
+            true,
+            false,
+        ),
+        (
+            "binary.bin",
+            "application/octet-stream",
+            vec![0, 1, 255],
+            None,
+            false,
+            false,
+        ),
+        (
+            "large.bin",
+            "application/octet-stream",
+            vec![255; 70_000],
+            None,
+            true,
+            false,
+        ),
+        (
+            "image.png",
+            "image/png",
+            image.into_inner(),
+            None,
+            false,
+            true,
+        ),
+    ];
+    for enabled in [false, true] {
+        config.artifact_egress.enabled = enabled;
+        context.artifact_egress = Arc::new(codexify::artifact_egress::ArtifactEgressStore::new_at(
+            config.artifact_egress.clone(),
+            root.path().join(format!("artifacts-{enabled}")),
+        ));
+        let tools = load_tools_for_config(&config);
+        let get = tools
+            .iter()
+            .find(|tool| tool.name() == "chat_get_attachment")
+            .unwrap();
+        for (name, mime, bytes, text, truncated, is_image) in &cases {
+            let request = format!("{enabled}-{}", name.replace('.', "-"));
+            let file = store
+                .upload(&request, name, mime, None, false, bytes.clone())
+                .unwrap();
+            chat.append_user_with_attachments(
+                request,
+                "Inspect the attachment".into(),
+                vec![file.id.clone()],
+            )
+            .await
+            .unwrap();
+            let result = get
+                .call_with_context(
+                    json!({"attachment_id":file.id}),
+                    &config,
+                    &session,
+                    &context,
+                )
+                .await;
+            assert!(!result.is_error, "{name}: {}", result.joined_text());
+            let data = result.structured_content.as_ref().unwrap();
+            assert_eq!(data["content"], json!(text), "{name}");
+            assert_eq!(data["content_truncated"], *truncated, "{name}");
+            assert!(data["preview_error"].is_null(), "{name}");
+            assert_eq!(data["resource_uri"].is_string(), enabled, "{name}");
+            assert_eq!(
+                result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ToolContent::ResourceLink(_))),
+                enabled,
+                "{name}"
+            );
+            assert_eq!(
+                result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ToolContent::Image { .. })),
+                *is_image,
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&file.path).unwrap(), *bytes, "{name}");
+        }
+    }
 }
 
 #[test]
@@ -376,7 +492,12 @@ async fn chat_tool_results_expose_the_required_next_action() {
 
 #[tokio::test]
 async fn chat_file_links_resolve_real_exports_and_reject_ambiguous_or_foreign_files() {
-    let (root, config, session, context) = fixture();
+    let (root, mut config, session, mut context) = fixture();
+    config.artifact_egress.enabled = true;
+    context.artifact_egress = Arc::new(codexify::artifact_egress::ArtifactEgressStore::new_at(
+        config.artifact_egress.clone(),
+        root.path().join("artifacts"),
+    ));
     std::fs::create_dir(root.path().join("reports")).unwrap();
     std::fs::write(
         root.path().join("reports/report one.txt"),

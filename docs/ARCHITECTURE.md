@@ -945,8 +945,8 @@ The default registry has 30 model-visible tools plus the app-only `doctor` and
 `set_project_root`. Conversation authorization prepends the ChatGPT-facing
 `setup` wire tool, raising both advertised and model-visible counts by one.
 `artifactIngress.enabled = false` independently removes `import_host_file`, while
-`artifactEgress.enabled = false` independently removes `export_host_file`; each
-reduces the applicable count by one. Project-catalogue discovery and
+`artifactEgress.enabled = false` (the default) independently removes
+`export_host_file`; each reduces the applicable count by one. Project-catalogue discovery and
 selection, clocks, the four transitive-MCP catalog tools, and direct/gateway
 compatibility tools are project-independent; every other native tool is blocked
 until a conversation binding or transport fallback is available.
@@ -1450,7 +1450,7 @@ focuses on relationships and defaults.
                        "requestTimeoutMs": 120000, "idleTimeoutMs": 30000,
                        "maxRedirects": 3, "maxConcurrentDownloads": 2,
                        "allowedHosts": ["*"] },
-  "artifactEgress": { "enabled": true, "maxFileBytes": 104857600,
+  "artifactEgress": { "enabled": false, "maxFileBytes": 104857600,
                       "snapshotMaxFileBytes": 104857600,
                       "maxSnapshotBytes": 5368709120,
                       "fallbackToSource": true, "maxReferences": 64,

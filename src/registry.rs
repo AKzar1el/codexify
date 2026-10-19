@@ -7,13 +7,13 @@
 
 use crate::tool::Tool;
 use crate::tools;
-use crate::types::{AppConfig, DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS};
+use crate::types::{AppConfig, ArtifactEgressConfig, DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS};
 
 pub fn load_tools() -> Vec<Box<dyn Tool>> {
     load_tools_with_options(
         false,
         true,
-        true,
+        ArtifactEgressConfig::default().enabled,
         true,
         DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS,
     )

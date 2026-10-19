@@ -1803,6 +1803,7 @@ mod tests {
         ] {
             let (url, server_task) = spawn_resource_upstream().await;
             let mut config = crate::config::default_config(std::env::temp_dir());
+            config.artifact_egress.enabled = true;
             config.mcp_servers.insert(
                 "files".to_string(),
                 McpServerSpec {
@@ -1856,6 +1857,19 @@ mod tests {
             }
 
             drop(bridge);
+            config.artifact_egress.enabled = false;
+            let disabled = connect_upstreams(&config).await;
+            let result = call_resource_fixture(&disabled, exposure).await;
+            assert!(!result.is_error, "{}", result.joined_text());
+            assert!(
+                !result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ToolContent::ResourceLink(_)))
+            );
+            assert!(result.joined_text().contains("disabled"));
+            assert!(!result.joined_text().contains("fixture://"));
+            drop(disabled);
             server_task.abort();
             let _ = server_task.await;
         }
@@ -1865,6 +1879,7 @@ mod tests {
     async fn bridged_resource_capabilities_expire_and_reads_are_cancellable() {
         let (url, server_task) = spawn_resource_upstream().await;
         let mut config = crate::config::default_config(std::env::temp_dir());
+        config.artifact_egress.enabled = true;
         config.artifact_egress.reference_ttl_ms = 5;
         config.mcp_servers.insert(
             "files".to_string(),
@@ -1897,6 +1912,7 @@ mod tests {
 
         drop(bridge);
         config.artifact_egress = crate::types::ArtifactEgressConfig::default();
+        config.artifact_egress.enabled = true;
         let bridge = connect_upstreams(&config).await;
         let slow = call_bridge_tool(&bridge, "files__slow_download", json!({})).await;
         let slow_uri = slow

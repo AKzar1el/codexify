@@ -261,6 +261,9 @@ pub enum BrowserCommand {
     Start,
     /// Stop the companion without removing its installed runtime or profile.
     Stop,
+    /// Temporarily stop the companion for service maintenance, preserving auto-start.
+    #[command(hide = true)]
+    StopForRestart,
     /// Show installation, process, authentication, and protocol state.
     Status(BrowserStatusArgs),
     /// Start the companion when needed and reveal its ChatGPT sign-in surface.
@@ -1663,13 +1666,18 @@ fn resolve_audit(
     const MAX_COMMAND_PREVIEW_BYTES: usize = 16 * 1024;
 
     let file = file.unwrap_or_default();
-    let log_file = cli
+    let cli_log_file = cli
         .audit_log
         .as_deref()
-        .or(file.log_file.as_deref())
+        .filter(|value| !value.trim().is_empty());
+    let log_file = cli_log_file
+        .or(file
+            .log_file
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()))
         .map(resolve_path)
         .or_else(|| Some(default_audit_path(work_dir)))
-        .filter(|_| file.enabled.unwrap_or(true) || cli.audit_log.is_some());
+        .filter(|_| file.enabled.unwrap_or(true) || cli_log_file.is_some());
     let include_command_preview =
         cli.audit_command_preview || file.include_command_preview.unwrap_or(true);
     let command_preview_max_bytes = file
@@ -3031,6 +3039,30 @@ mod tests {
     }
 
     #[test]
+    fn audit_log_file_uses_the_default_for_empty_values_and_is_optional_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.json");
+        for enabled in [true, false] {
+            for path in [None, Some(json!(null)), Some(json!("")), Some(json!(" \t"))] {
+                let mut audit = json!({"enabled":enabled});
+                if let Some(path) = path {
+                    audit["logFile"] = path;
+                }
+                std::fs::write(
+                    &config_path,
+                    json!({"codexMcp":{"enabled":false},"audit":audit}).to_string(),
+                )
+                .unwrap();
+                let config = load_config(cli(root.path(), &config_path)).unwrap();
+                assert_eq!(
+                    config.audit.log_file,
+                    enabled.then(|| default_audit_path(root.path()))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn local_entry_can_add_gateway_mode_without_repeating_launch_config() {
         let imported = HashMap::from([("demo".to_string(), imported_server())]);
         let explicit = HashMap::from([(
@@ -3523,6 +3555,7 @@ mod tests {
             ("install", "install"),
             ("start", "start"),
             ("stop", "stop"),
+            ("stop-for-restart", "stop-for-restart"),
             ("login", "login"),
             ("reveal", "reveal"),
         ] {
@@ -3534,6 +3567,7 @@ mod tests {
                 BrowserCommand::Install => "install",
                 BrowserCommand::Start => "start",
                 BrowserCommand::Stop => "stop",
+                BrowserCommand::StopForRestart => "stop-for-restart",
                 BrowserCommand::Login => "login",
                 BrowserCommand::Reveal => "reveal",
                 BrowserCommand::Status(_) => "status",
@@ -3783,7 +3817,7 @@ mod tests {
     fn artifact_egress_config_accepts_durable_defaults_and_camel_case_overrides() {
         let empty: FileConfig = serde_json::from_str(r#"{"artifactEgress":{}}"#).unwrap();
         let empty = empty.artifact_egress.unwrap();
-        assert!(empty.enabled);
+        assert!(!empty.enabled);
         assert_eq!(
             empty.max_file_bytes,
             crate::types::DEFAULT_ARTIFACT_EGRESS_MAX_FILE_BYTES
@@ -3809,7 +3843,7 @@ mod tests {
         let configured: FileConfig = serde_json::from_str(
             r#"{
                 "artifactEgress": {
-                    "enabled": false,
+                    "enabled": true,
                     "maxFileBytes": 4096,
                     "snapshotMaxFileBytes": 2048,
                     "maxSnapshotBytes": 8192,
@@ -3821,7 +3855,7 @@ mod tests {
         )
         .unwrap();
         let configured = configured.artifact_egress.unwrap();
-        assert!(!configured.enabled);
+        assert!(configured.enabled);
         assert_eq!(configured.max_file_bytes, 4096);
         assert_eq!(configured.snapshot_max_file_bytes, 2048);
         assert_eq!(configured.max_snapshot_bytes, 8192);

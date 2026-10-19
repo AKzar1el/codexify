@@ -26,6 +26,37 @@ const terminalErrorAlert = (page: Page): Locator => page
   .filter({hasText:uiLabelPattern("terminalFailure",false)})
   .filter({hasText:/help\.openai\.com/i}).filter({visible:true}).last();
 
+export async function conversationUnavailableVisible(page: Page): Promise<boolean> {
+  const url = new URL(page.url());
+  if (url.origin !== "https://chatgpt.com" || !/^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(url.pathname)) return false;
+  return page.evaluate(() => {
+    const main = document.querySelector('[data-app-shell-focus-area="main"]');
+    // This is the full-page load failure, not text or controls inside a turn,
+    // an empty new chat, or a signed-out page. The error has no stable test ID.
+    if (!main || main.querySelector('form, [role="textbox"], textarea, [contenteditable="true"], article, [data-turn-key], [data-turn-id], [data-message-author-role]')) return false;
+    const visible = (element: Element): boolean => {
+      if (!element.getClientRects().length || element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+      for (let node: Element | null = element; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      }
+      return true;
+    };
+    const panels = main.querySelectorAll(':scope > div > .flex.flex-col.items-center.justify-center > .flex.flex-col.items-center.justify-center.text-center.max-w-xl');
+    return [...panels].some(panel => {
+      if (panel.children.length !== 2 || !visible(panel)) return false;
+      const [message, actions] = [...panel.children];
+      const heading = message!.querySelector(':scope > .font-medium.text-default.text-lg');
+      const buttons = actions!.querySelectorAll('button');
+      return message!.matches('.flex.flex-col.items-center')
+        && actions!.matches('.flex.flex-wrap.items-center.justify-center')
+        && !!heading?.textContent?.trim() && visible(heading)
+        && buttons.length === 1 && buttons[0]!.matches('button[type="button"]') && visible(buttons[0]!)
+        && !panel.querySelector('a, input, select, [role="button"]');
+    });
+  });
+}
+
 export async function toolApprovalVisible(page: Page): Promise<boolean> {
   // This guard protects pairing-draft replacement. Any visible modal blocks it;
   // recognizing an English approval question is neither necessary nor sufficient.
@@ -42,6 +73,9 @@ export async function throwIfSessionAttention(page: Page): Promise<void> {
   }
   if (await subscriptionFailureAlert(page).isVisible().catch(() => false)) {
     throw new BrowserCompanionError("ChatGPT could not load the current subscription.", "failed");
+  }
+  if (await conversationUnavailableVisible(page)) {
+    throw new BrowserCompanionError("ChatGPT conversation temporarily not accessible", "conversation_unavailable");
   }
   if (await page.getByTestId("regenerate-thread-error-button").last().isVisible().catch(() => false)
     || await terminalErrorAlert(page).isVisible().catch(() => false)) {

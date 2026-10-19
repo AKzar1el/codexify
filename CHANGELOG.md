@@ -6,6 +6,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Updates show progress outside settings, through installation, restart, browser
+  startup and connector refresh. Startup keeps drafts editable and waits before
+  sending messages that need unavailable services. Connector refresh explains
+  when a restart is required and offers the restart action directly.
+
+- File materialization in ChatGPT is disabled by default and has a named switch
+  under Tools & files → File exports. Opting in enables native file exports and
+  full attachment resources; inline attachment text and image previews remain
+  available while it is off. Explicit saved preferences are preserved.
+
+### Fixed
+
+- Auto-approval handles the current conversation's connector permission cards,
+  including file materialization, by selecting conversation scope. It verifies
+  the account and connector, supports localized menus, and resumes the existing
+  turn without sending another prompt or consuming queued messages.
+- Empty audit Log File settings use the per-project default destination and show
+  that path in settings. The destination is optional when audit logging is off.
+- Generated ChatGPT instructions use naturally wrapping paragraphs instead of
+  hard line breaks, while preserving user-message formatting and paragraph breaks.
+- Recognize ChatGPT's conversation-load failure and report "ChatGPT conversation
+  temporarily not accessible" instead of requiring authentication. Detection uses
+  the page structure across UI languages, while other conversations remain usable.
+- Updates use a temporary browser-maintenance stop instead of recording a
+  permanent manual stop, so automatic browser recovery resumes after updating.
+  Explicit Stop browser preferences and the signed-in profile are preserved.
+  The browser status describes a paused auto-start setting without attributing
+  it to a user action.
+
 ## [2.3.0] - 2026-10-19
 
 ### Added

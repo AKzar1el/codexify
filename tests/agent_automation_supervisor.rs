@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.b2ebec1ce2cff0fb54da925c0e313e6c73c85e54165fb0fef6a5b4fa002555e1";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -571,6 +571,225 @@ struct Fixture {
     store: Arc<AgentAutomationStore>,
     supervisor: Arc<AgentAutomationSupervisor>,
     executor: Arc<FakeExecutor>,
+}
+
+struct ApprovalExecutor {
+    inner: Arc<FakeExecutor>,
+    pending: AtomicBool,
+    checks: Mutex<Vec<(String, String, String)>>,
+}
+
+#[tokio::test]
+async fn conversation_approval_defers_an_already_queued_send_without_fencing_its_messages() {
+    let f = fixture().await;
+    f.chat
+        .append_user(
+            "queued-for-approval".into(),
+            "Do not acknowledge this just by approving".into(),
+        )
+        .await
+        .unwrap();
+    let executor = Arc::new(ApprovalExecutor {
+        inner: f.executor.clone(),
+        pending: AtomicBool::new(false),
+        checks: Mutex::new(Vec::new()),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor.scan_once(1000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 1);
+    let before = f.store.load(&f.task).unwrap();
+    executor.pending.store(true, Ordering::SeqCst);
+    supervisor.scan_once(6000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.action.status, AutomationActionStatus::Idle);
+    assert_eq!(after.chat_mirror, before.chat_mirror);
+    assert!(!after.action.messages_fenced);
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        f.chat
+            .read(false)
+            .await
+            .unwrap()
+            .text
+            .contains("Do not acknowledge this just by approving")
+    );
+}
+
+#[tokio::test]
+async fn conversation_approval_preserves_previously_accepted_message_fences() {
+    let f = fixture().await;
+    f.chat
+        .append_user(
+            "accepted-before-approval".into(),
+            "Previously submitted".into(),
+        )
+        .await
+        .unwrap();
+    f.executor.events.lock().unwrap().extend([
+        CompanionEventKind::SendAccepted,
+        CompanionEventKind::SubmissionComplete {
+            canonical_url: "https://chatgpt.com/c/example".into(),
+        },
+    ]);
+    f.supervisor.scan_once(1000).await.unwrap();
+    f.supervisor.run_next(1001).await.unwrap();
+    let accepted = f.store.load(&f.task).unwrap();
+    assert!(accepted.action.messages_fenced);
+    let executor = Arc::new(ApprovalExecutor {
+        inner: f.executor.clone(),
+        pending: AtomicBool::new(true),
+        checks: Mutex::new(Vec::new()),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor);
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor.scan_once(6000).await.unwrap();
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.action, accepted.action);
+    assert_eq!(after.chat_mirror, accepted.chat_mirror);
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[async_trait]
+impl AutomationExecutor for ApprovalExecutor {
+    async fn approve_pending_conversation(
+        &self,
+        url: &str,
+        account: &str,
+        connector: &str,
+    ) -> Result<bool, String> {
+        self.checks
+            .lock()
+            .unwrap()
+            .push((url.into(), account.into(), connector.into()));
+        Ok(self.pending.swap(false, Ordering::SeqCst))
+    }
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.inner.execute(execution, events, cancellation).await
+    }
+}
+
+#[tokio::test]
+async fn conversation_approval_resumes_the_existing_turn_without_sending_or_consuming_queued_messages()
+ {
+    let f = fixture().await;
+    f.chat
+        .append_user(
+            "approval-pending-message".into(),
+            "Keep my message unread".into(),
+        )
+        .await
+        .unwrap();
+    let goal = f
+        .store
+        .set_goal(&f.task, "Continue the current goal", 100)
+        .unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    let executor = Arc::new(ApprovalExecutor {
+        inner: f.executor.clone(),
+        pending: AtomicBool::new(true),
+        checks: Mutex::new(Vec::new()),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    let before = f.store.load(&f.task).unwrap();
+    supervisor.scan_once(1000).await.unwrap();
+    supervisor.scan_once(1001).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        executor.checks.lock().unwrap().as_slice(),
+        &[(
+            "https://chatgpt.com/c/example".into(),
+            "account-1".into(),
+            "Codexify".into()
+        )]
+    );
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.goal, before.goal);
+    assert_eq!(after.chat_mirror, before.chat_mirror);
+    assert_eq!(after.action.send_accepted, before.action.send_accepted);
+    assert!(
+        f.chat
+            .read(false)
+            .await
+            .unwrap()
+            .text
+            .contains("Keep my message unread")
+    );
+    supervisor.scan_once(6001).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 1);
+}
+
+#[tokio::test]
+async fn conversation_approval_honors_disabled_auto_approval_stopped_agents_and_unverified_pairings()
+ {
+    for mode in ["disabled", "stopped", "unverified"] {
+        let f = fixture().await;
+        if mode == "stopped" {
+            f.chat
+                .request_agent_stop("stop-approval".into())
+                .await
+                .unwrap();
+        }
+        if mode == "unverified" {
+            f.store.unlink_pairing(&f.task, 103).unwrap();
+        }
+        let mut config = f.config.markdown_chat.automation.clone();
+        config.auto_approve_tool_calls = mode != "disabled";
+        let executor = Arc::new(ApprovalExecutor {
+            inner: f.executor.clone(),
+            pending: AtomicBool::new(true),
+            checks: Mutex::new(Vec::new()),
+        });
+        let supervisor = AgentAutomationSupervisor::new(config, executor.clone());
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        supervisor.scan_once(1000).await.unwrap();
+        assert!(executor.checks.lock().unwrap().is_empty(), "{mode}");
+        assert_eq!(f.executor.calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 async fn fixture() -> Fixture {
@@ -2242,7 +2461,13 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
     assert_eq!(supervisor.queued_count().await, 0);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     let mut last_retry_at = 0;
-    for (attempt, delay) in [(0, 30_000), (1, 60_000), (2, 120_000)] {
+    for (attempt, delay) in [
+        (0, 30_000),
+        (1, 60_000),
+        (2, 120_000),
+        (3, 240_000),
+        (4, 480_000),
+    ] {
         let failed = fixture.store.load(&fixture.task).unwrap();
         assert_eq!(failed.action.automatic_retry_attempts, attempt);
         assert!(failed.is_automatically_retrying());
@@ -2280,7 +2505,7 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
         last_retry_at = retry_at;
     }
     let exhausted = fixture.store.load(&fixture.task).unwrap();
-    assert_eq!(exhausted.action.automatic_retry_attempts, 3);
+    assert_eq!(exhausted.action.automatic_retry_attempts, 5);
     assert!(exhausted.automatic_retry_at_ms().is_none());
     assert!(!exhausted.is_automatically_retrying());
     assert_eq!(exhausted.retry_mode(), Some("retry"));
@@ -2289,7 +2514,7 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
         .await
         .unwrap();
     assert_eq!(supervisor.queued_count().await, 0);
-    assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         fixture.chat.unread_snapshot().await.unwrap().messages.len(),
         1
@@ -7679,7 +7904,7 @@ async fn native_delivery_does_not_reuse_an_older_submission_intent_for_a_new_act
 }
 
 #[tokio::test]
-async fn offline_goal_retries_every_three_minutes_without_tool_activity_across_restart() {
+async fn offline_goal_retries_three_times_with_backoff_without_tool_activity_across_restart() {
     for submitted_only in [false, true] {
         let f = fixture().await;
         let goal = f
@@ -7702,14 +7927,14 @@ async fn offline_goal_retries_every_three_minutes_without_tool_activity_across_r
         f.supervisor.scan_once(first).await.unwrap();
         f.supervisor.run_next(first + 1).await.unwrap();
         let mut previous_action = f.store.load(&f.task).unwrap().action.id;
-        for retry in 0..5 {
+        for (retry, delay) in [60_000, 120_000, 240_000].into_iter().enumerate() {
             let state = f.store.load(&f.task).unwrap();
             let deadline = state
                 .goal_wake
                 .last_nudged_at_ms
                 .unwrap()
                 .max(state.action.updated_at_ms.unwrap())
-                + 180_000;
+                + delay;
             let restarted = AgentAutomationSupervisor::new(
                 f.config.markdown_chat.automation.clone(),
                 f.executor.clone(),
@@ -7727,7 +7952,7 @@ async fn offline_goal_retries_every_three_minutes_without_tool_activity_across_r
             assert_eq!(
                 restarted.queued_count().await,
                 0,
-                "do not retry before three minutes"
+                "do not retry before the scheduled delay"
             );
             restarted.scan_once(deadline).await.unwrap();
             assert_eq!(
@@ -7746,13 +7971,74 @@ async fn offline_goal_retries_every_three_minutes_without_tool_activity_across_r
             restarted.run_next(deadline + 1).await.unwrap();
             previous_action = queued.action.id;
         }
-        let executions = f.executor.executions.lock().unwrap();
-        assert_eq!(executions.len(), 6);
-        assert!(executions.iter().all(|e| matches!(
-            e.request.prompt,
-            ActionPrompt::OfflineGoal { .. }
-        ) && e.unread_message_ids.is_empty()));
-        assert_eq!(f.store.load(&f.task).unwrap().goal.unwrap().turn_count, 7);
+        {
+            let executions = f.executor.executions.lock().unwrap();
+            assert_eq!(executions.len(), 4);
+            assert!(executions.iter().all(|e| matches!(
+                e.request.prompt,
+                ActionPrompt::OfflineGoal { .. }
+            ) && e.unread_message_ids.is_empty()));
+        }
+        assert_eq!(f.store.load(&f.task).unwrap().goal.unwrap().turn_count, 5);
+        let exhausted_at =
+            f.store.load(&f.task).unwrap().action.updated_at_ms.unwrap() + 86_400_000;
+        let restarted = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            f.executor.clone(),
+        );
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        restarted.scan_once(exhausted_at).await.unwrap();
+        assert_eq!(restarted.queued_count().await, 0);
+        let exhausted = f.store.load(&f.task).unwrap();
+        assert!(exhausted.automatic_retry_at_ms().is_none());
+        assert!(exhausted.action_needs_attention());
+        assert_eq!(exhausted.retry_mode(), Some("continue_goal"));
+        assert_eq!(f.executor.calls.load(Ordering::SeqCst), 4);
+        restarted
+            .retry_failed_action(
+                &f.task,
+                exhausted.action.id.as_deref().unwrap(),
+                exhausted_at + 1,
+            )
+            .await
+            .unwrap();
+        restarted.run_next(exhausted_at + 2).await.unwrap();
+        let resumed = f.store.load(&f.task).unwrap();
+        assert_eq!(resumed.goal_wake.recovery_attempts, 0);
+        assert_ne!(resumed.action.id, exhausted.action.id);
+        let retry_at = resumed
+            .goal_wake
+            .last_nudged_at_ms
+            .unwrap()
+            .max(resumed.action.updated_at_ms.unwrap())
+            + 60_000;
+        restarted.scan_once(retry_at).await.unwrap();
+        assert_eq!(restarted.queued_count().await, 1);
+        restarted.run_next(retry_at + 1).await.unwrap();
+        assert_eq!(
+            f.store.load(&f.task).unwrap().goal_wake.recovery_attempts,
+            1
+        );
+        // New agent activity, rather than another accepted Send, resets recovery.
+        f.chat.record_agent_call(retry_at + 10).await.unwrap();
+        restarted.scan_once(retry_at + 10).await.unwrap();
+        assert_eq!(
+            f.store.load(&f.task).unwrap().goal_wake.recovery_attempts,
+            0
+        );
+        restarted
+            .scan_once(retry_at + 10 + AUTOMATION_OFFLINE_AFTER_MS)
+            .await
+            .unwrap();
+        assert_eq!(restarted.queued_count().await, 1);
     }
 }
 
@@ -7785,7 +8071,7 @@ async fn cancelled_goal_only_action_does_not_strand_an_active_objective() {
         let deadline = if later_activity {
             1010 + AUTOMATION_OFFLINE_AFTER_MS
         } else {
-            1001 + 180_000
+            1001 + 60_000
         };
         let restarted = AgentAutomationSupervisor::new(
             f.config.markdown_chat.automation.clone(),
@@ -7832,7 +8118,7 @@ async fn offline_goal_retry_respects_activity_pause_stop_and_completion() {
             .goal_wake
             .last_nudged_at_ms
             .unwrap()
-            + 180_000;
+            + 60_000;
         match change {
             "online" => {
                 f.chat.record_agent_call(deadline - 1).await.unwrap();
@@ -7886,19 +8172,30 @@ async fn offline_goal_retry_never_replays_a_previously_accepted_user_batch() {
     f.supervisor.run_next(1001).await.unwrap();
     let accepted = f.store.load(&f.task).unwrap();
     assert!(accepted.action.messages_fenced);
-    let deadline = accepted.goal_wake.last_nudged_at_ms.unwrap() + 180_000;
-    f.supervisor.scan_once(deadline - 1).await.unwrap();
+    for delay in [60_000, 120_000, 240_000] {
+        let state = f.store.load(&f.task).unwrap();
+        let deadline = state
+            .goal_wake
+            .last_nudged_at_ms
+            .unwrap()
+            .max(state.action.updated_at_ms.unwrap())
+            + delay;
+        f.supervisor.scan_once(deadline - 1).await.unwrap();
+        assert_eq!(f.supervisor.queued_count().await, 0);
+        f.supervisor.scan_once(deadline).await.unwrap();
+        f.supervisor.run_next(deadline + 1).await.unwrap();
+    }
+    f.supervisor.scan_once(86_400_000).await.unwrap();
     assert_eq!(f.supervisor.queued_count().await, 0);
-    f.supervisor.scan_once(deadline).await.unwrap();
-    f.supervisor.run_next(deadline + 1).await.unwrap();
     let executions = f.executor.executions.lock().unwrap();
-    assert_eq!(executions.len(), 2);
+    assert_eq!(executions.len(), 4);
     assert_eq!(executions[0].unread_message_ids, vec!["accepted-once"]);
-    assert!(executions[1].unread_message_ids.is_empty());
-    assert!(matches!(
-        executions[1].request.prompt,
-        ActionPrompt::OfflineGoal { .. }
-    ));
+    assert!(
+        executions[1..]
+            .iter()
+            .all(|execution| execution.unread_message_ids.is_empty()
+                && matches!(execution.request.prompt, ActionPrompt::OfflineGoal { .. }))
+    );
     assert_eq!(
         f.store.load(&f.task).unwrap().chat_mirror,
         accepted.chat_mirror
@@ -7906,7 +8203,7 @@ async fn offline_goal_retry_never_replays_a_previously_accepted_user_batch() {
 }
 
 #[tokio::test]
-async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_objective() {
+async fn offline_goal_pre_send_failures_stop_after_five_retries_and_allow_manual_retry() {
     let f = fixture().await;
     let goal = f
         .store
@@ -7930,8 +8227,8 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         (0, 30_000),
         (1, 60_000),
         (2, 120_000),
-        (3, 120_000),
-        (3, 120_000),
+        (3, 240_000),
+        (4, 480_000),
     ] {
         supervisor.scan_once(now).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 1);
@@ -7940,8 +8237,7 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         let retry_at = failed.automatic_retry_at_ms().unwrap();
         assert_eq!(failed.action.automatic_retry_attempts, attempt);
         assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + delay);
-        // Reopening the store and supervisor must retain the retry stage, including
-        // the capped delay after the third failure, without abandoning the goal.
+        // Reopening the store and supervisor must retain the retry stage.
         supervisor = AgentAutomationSupervisor::new(
             f.config.markdown_chat.automation.clone(),
             executor.clone(),
@@ -7959,7 +8255,13 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
         assert_eq!(supervisor.queued_count().await, 0);
         now = retry_at;
     }
-    assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
+    supervisor.scan_once(now).await.unwrap();
+    assert!(supervisor.run_next(now + 1).await.is_err());
+    let exhausted = f.store.load(&f.task).unwrap();
+    assert!(exhausted.automatic_retry_at_ms().is_none());
+    supervisor.scan_once(now + 86_400_000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 6);
     assert_eq!(
         f.store.load(&f.task).unwrap().goal.unwrap().turn_count,
         1,
@@ -7971,8 +8273,15 @@ async fn offline_goal_pre_send_failures_retry_without_exhausting_the_active_obje
             canonical_url: "https://chatgpt.com/c/example".into(),
         },
     ]);
-    f.supervisor.scan_once(now).await.unwrap();
-    f.supervisor.run_next(now + 1).await.unwrap();
+    f.supervisor
+        .retry_failed_action(
+            &f.task,
+            exhausted.action.id.as_deref().unwrap(),
+            now + 86_400_001,
+        )
+        .await
+        .unwrap();
+    f.supervisor.run_next(now + 86_400_002).await.unwrap();
     let resumed = f.store.load(&f.task).unwrap();
     assert_eq!(resumed.action.send_accepted, Some(true));
     assert_eq!(resumed.action.automatic_retry_attempts, 0);

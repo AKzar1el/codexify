@@ -290,6 +290,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   const errorNode = document.getElementById("error");
   const search = document.getElementById("chat-search");
   let selected = null, controller = null, chats = [], clockOffset = 0, presenceTimer = null;
+  let runtimeLoading = null;
   let chatListScrollTop = 0;
   const mobileLayout = matchMedia("(max-width:760px),(hover:none) and (pointer:coarse)");
   const viewport = document.querySelector('meta[name="viewport"]');
@@ -770,7 +771,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       byId("goal-retry").title = retryMode === "continue_goal" ? "Start a new goal turn without resending previous messages" : "Retry the action that failed before sending";
       const retrySeconds = automaticRetry ? Math.max(0, Math.ceil((state.action.automaticRetryAtMs - Date.now() - clockOffset) / 1000)) : null;
       const goalRetry = goal?.status === "active" && (state.action?.kind === "offline_goal" || state.action?.kind === "offline_combined" && state.action.sendAccepted && state.action.messagesFenced);
-      const retryStatus = automaticRetry ? goalRetry ? `Retrying the goal automatically in ${retrySeconds}s. You can also continue now.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of 3). You can also retry now.` : "";
+      const retryLimit = state.action?.automaticRetryLimit ?? 5;
+      const retryStatus = automaticRetry ? goalRetry ? `Retrying the goal automatically in ${retrySeconds}s. You can also continue now.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}). You can also retry now.` : "";
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
@@ -785,8 +787,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       else if (automaticRetry) setStateError(`${failure} ${retryStatus}`);
       else if (actionNeedsAttention) {
         const preparation = state.action?.status === "authentication_required" ? "Sign in from Codexify settings → Browser, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
-        const exhausted = state.action?.automaticRetryAttempts >= 3 ? "All three automatic retries failed. " : "";
-        const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? "Use Continue to start another goal turn. Previously submitted messages will not be resent." : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
+        const exhausted = state.action?.automaticRetryAttempts >= retryLimit ? `All ${retryLimit} automatic retries failed. ` : "";
+        const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? `${exhausted}Use Continue to start another goal turn. Previously submitted messages will not be resent.` : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
         setStateError(`${failure} ${nextStep}`);
       } else if (state.action?.lastError) setStateError(state.action.lastError);
       else setStateError("");
@@ -820,7 +822,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
           render(state);
           if (state.enabled && state.pairing?.status === "verified" && !catalogAttempted && state.companion?.authenticated && state.companion.status==='idle' && !state.companion.manuallyStopped && !state.companion.recovering && !state.companion.stopping) await loadModels();
         }
-      } catch (error) { if (!closed) setError(error.message || "Chat automation state unavailable"); }
+      } catch (error) { if (!closed && !runtimeLoading?.loading) setError(error.message || "Chat automation state unavailable"); }
       finally { requestInFlight = false; }
     }
     async function run(operation) {
@@ -1299,8 +1301,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       }
     };
     const chatController = window.mountCodexifyChat(scope, bridge);
+    chatController.setLoading(runtimeLoading);
     chatController.setAvailable(true);
-    controller = { close() { automation.close(); chatController.close(); } };
+    controller = { setLoading:value=>chatController.setLoading(value), close() { automation.close(); chatController.close(); } };
     renderList();
   }
   function selectFromUrl() {
@@ -1341,7 +1344,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       showError("");
       selectFromUrl();
       renderList();
-    } catch (error) { if (sequence === listRequest) showError(error.message || "Chat list unavailable"); }
+    } catch (error) { if (sequence === listRequest && !runtimeLoading?.loading) showError(error.message || "Chat list unavailable"); }
     finally { if (pendingList?.sequence === sequence) pendingList = null; }
   }
   const newDialog = document.getElementById("new-chat-dialog");
@@ -1452,7 +1455,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   });
   bindBackdrop(newDialog, () => { if (!newBusy) newDialog.close(); });
   startOwnerPwa({bindBackdrop});
-  startGlobalSettings({api,bindBackdrop,getChats:()=>chats,onOpenChat:id=>select(id),onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
+  startGlobalSettings({api,bindBackdrop,getChats:()=>chats,onOpenChat:id=>select(id),onReadiness:value=>{runtimeLoading=value;controller?.setLoading(value);},onPlan:plan=>{accountPlan=plan;if(newCatalog)for(const option of newNode("model").options){const model=newCatalog.models.find(model=>model.id===option.value);if(model)option.textContent=displayModelLabel(model);}}});
   search.addEventListener("input", () => {
     clearTimeout(searchTimer); ++listRequest; pendingList = null; renderList();
     searchTimer = setTimeout(refresh, 200);

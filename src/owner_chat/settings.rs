@@ -8,6 +8,7 @@ pub(super) struct GlobalRuntime {
     plan_retry_at_ms: u64,
     refresh: Option<Value>,
     manual_refresh: Option<Value>,
+    update: Option<Value>,
 }
 impl GlobalRuntime {
     pub(super) fn reset_plan(&mut self) {
@@ -58,7 +59,10 @@ pub(super) fn start(state: OwnerState) {
         loop {
             let pending = crate::global_settings::read_refresh_intent().filter(|intent| {
                 intent["targetVersion"] == env!("CARGO_PKG_VERSION")
-                    && intent["phase"] == "waiting_for_restart"
+                    && matches!(
+                        intent["phase"].as_str(),
+                        Some("waiting_for_restart" | "starting_browser")
+                    )
             });
             if state.config.markdown_chat.automation.enabled
                 && companion_client(&state).is_err()
@@ -74,6 +78,8 @@ pub(super) fn start(state: OwnerState) {
                         record.state == crate::self_update::UpdatePhase::Succeeded
                     })
             {
+                intent["phase"] = json!("starting_browser");
+                let _ = crate::global_settings::write_refresh_intent(&intent);
                 let upgraded = async {
                     let manager = crate::agent_automation::BrowserCompanionManager::from_config(
                         &state.config.markdown_chat.automation,
@@ -118,7 +124,15 @@ pub(super) fn start(state: OwnerState) {
                     let intent = crate::global_settings::read_refresh_intent();
                     if let Some(mut intent) = intent.filter(|intent| {
                         intent["targetVersion"] == env!("CARGO_PKG_VERSION")
-                            && intent["phase"] == "waiting_for_restart"
+                            && matches!(
+                                intent["phase"].as_str(),
+                                Some(
+                                    "waiting_for_restart"
+                                        | "starting_browser"
+                                        | "queued"
+                                        | "running"
+                                )
+                            )
                     }) {
                         // Wait for the updater's readiness check, rather than refreshing a half-started server.
                         let succeeded = intent["updateId"]
@@ -128,8 +142,12 @@ pub(super) fn start(state: OwnerState) {
                                 record.state == crate::self_update::UpdatePhase::Succeeded
                             });
                         if succeeded {
+                            intent["phase"] = json!("running");
+                            let _ = crate::global_settings::write_refresh_intent(&intent);
                             let result = refresh_saved_connector(&state, &client).await;
                             if result.as_ref().is_err_and(|error| error.contains("423")) {
+                                intent["phase"] = json!("queued");
+                                let _ = crate::global_settings::write_refresh_intent(&intent);
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                                 continue;
                             }
@@ -154,19 +172,27 @@ pub(super) fn start(state: OwnerState) {
 }
 
 pub(super) async fn health(State(state): State<OwnerState>) -> ApiResult {
-    let response = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}/health", state.config.port))
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(internal_error)?;
-    let body = response.json::<Value>().await.map_err(internal_error)?;
+    let schema = crate::global_settings::read_schema_intent(&state.config);
+    let (mut body, readiness) = super::readiness::snapshot(&state, schema.as_ref()).await;
+    body["readiness"] = readiness;
     Ok(Json(body))
+}
+
+fn update_progress(current: Option<&Value>, intent: Option<&Value>) -> Option<Value> {
+    let update_id = current
+        .and_then(|value| value["updateId"].as_str())
+        .or_else(|| intent.and_then(|value| value["updateId"].as_str()));
+    if current.is_some_and(|value| value["state"] == "preparing" || value["updateId"].is_null()) {
+        return current.cloned();
+    }
+    update_id
+        .and_then(|id| crate::self_update::read_update_status(id).ok())
+        .and_then(|record| serde_json::to_value(record).ok())
+        .or_else(|| current.cloned())
 }
 
 pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
     let latest = crate::self_update::inspect_latest_version().await;
-    let global = state.global.lock().await;
     let latest = match latest {
         Ok(value) => {
             json!({"version":value.latest.to_string(),"updateAvailable":value.status==crate::self_update::LatestVersionStatus::UpdateAvailable})
@@ -174,12 +200,15 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
         Err(_) => json!({"version":null,"updateAvailable":false,"unavailable":true}),
     };
     let schema = crate::global_settings::read_schema_intent(&state.config);
+    let global = state.global.lock().await;
+    let update_intent = crate::global_settings::read_refresh_intent();
+    let update = update_progress(global.update.as_ref(), update_intent.as_ref());
     let refresh = schema
         .as_ref()
         .filter(|value| {
             matches!(
                 value["phase"].as_str(),
-                Some("queued" | "running" | "waiting_for_restart" | "failed")
+                Some("queued" | "running" | "starting_browser" | "waiting_for_restart" | "failed")
             )
         })
         .cloned()
@@ -191,8 +220,11 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
                 .or_else(crate::global_settings::read_refresh_intent)
         })
         .or(schema);
+    let plan = global.plan.clone();
+    drop(global);
+    let (_, readiness) = super::readiness::snapshot(&state, refresh.as_ref()).await;
     Ok(Json(
-        json!({"version":env!("CARGO_PKG_VERSION"),"instanceId":std::process::id().to_string(),"latest":latest,"plan":global.plan,"connectorRefresh":refresh,
+        json!({"version":env!("CARGO_PKG_VERSION"),"instanceId":std::process::id().to_string(),"latest":latest,"plan":plan,"connectorRefresh":refresh,"readiness":readiness,"update":update,
         "settingsAvailable":state.config.loaded_config_path.is_some(),"restartAvailable":std::env::var_os(crate::process_env::SERVICE_SUPERVISED_ENV).as_deref()==Some(std::ffi::OsStr::new("1"))&&crate::service::is_installed().unwrap_or(false)}),
     ))
 }
@@ -345,10 +377,44 @@ pub(super) async fn restart(State(state): State<OwnerState>) -> ApiResult {
 }
 
 pub(super) async fn update(State(state): State<OwnerState>) -> ApiResult {
-    let receipt = crate::self_update::trigger(state.config.port)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(serde_json::to_value(receipt).map_err(internal_error)?))
+    {
+        let mut global = state.global.lock().await;
+        let pending = update_progress(
+            global.update.as_ref(),
+            crate::global_settings::read_refresh_intent().as_ref(),
+        );
+        if pending.as_ref().is_some_and(|value| {
+            matches!(
+                value["state"].as_str(),
+                Some("preparing" | "scheduled" | "installing" | "validating" | "restarting")
+            )
+        }) {
+            return Err((
+                StatusCode::CONFLICT,
+                "An update is already being prepared.".into(),
+            ));
+        }
+        global.update = Some(json!({"state":"preparing"}));
+    }
+    match crate::self_update::trigger(state.config.port).await {
+        Ok(receipt) => {
+            let value = serde_json::to_value(receipt).map_err(internal_error)?;
+            state.global.lock().await.update = if value["status"] == "scheduled" {
+                Some(
+                    json!({"state":"scheduled","updateId":value["updateId"],"targetVersion":value["targetVersion"]}),
+                )
+            } else {
+                None
+            };
+            Ok(Json(value))
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            state.global.lock().await.update =
+                Some(json!({"state":"failed","failureDetail":detail}));
+            Err(internal_error(detail))
+        }
+    }
 }
 
 pub(super) async fn refresh_connector(State(state): State<OwnerState>) -> ApiResult {
@@ -435,6 +501,22 @@ async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_current_update_failure_is_not_replaced_by_an_older_update_intent() {
+        let failed = json!({"state":"failed","failureDetail":"Update verification failed"});
+        let preparing = json!({"state":"preparing"});
+        let old = json!({"updateId":"invalid-old-id"});
+        assert_eq!(
+            update_progress(Some(&failed), Some(&old)),
+            Some(failed.clone())
+        );
+        assert_eq!(
+            update_progress(Some(&preparing), Some(&old)),
+            Some(preparing.clone())
+        );
+        assert_eq!(update_progress(None, None), None);
+    }
     #[derive(Clone, Default)]
     struct RefreshFixture {
         mode: Arc<std::sync::atomic::AtomicUsize>,
@@ -711,6 +793,7 @@ mod tests {
     #[test]
     fn cached_plan_survives_transient_health_failures_and_resets_for_a_verified_new_account() {
         let mut runtime = GlobalRuntime {
+            update: None,
             plan: Some(json!({"label":"Pro 20x","kind":"pro"})),
             plan_account: Some("account-one".into()),
             plan_attempted: true,

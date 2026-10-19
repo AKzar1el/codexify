@@ -301,7 +301,10 @@ async fn run_browser(cli: Cli, command: BrowserCommand) -> anyhow::Result<()> {
         BrowserCompanionControl, BrowserCompanionManager, BrowserLifecycleState,
     };
 
-    let config = if matches!(command, BrowserCommand::Status(_)) {
+    let config = if matches!(
+        command,
+        BrowserCommand::Status(_) | BrowserCommand::StopForRestart
+    ) {
         load_config_quiet_read_only(cli)
     } else {
         load_config_quiet(cli)
@@ -335,6 +338,14 @@ async fn run_browser(cli: Cli, command: BrowserCommand) -> anyhow::Result<()> {
                 .await
                 .map_err(anyhow::Error::msg)?;
             codexify::terminal::write_stdout(&render_browser_status(&status))?;
+        }
+        BrowserCommand::StopForRestart => {
+            BrowserCompanionControl::new(&config.markdown_chat.automation)
+                .map_err(anyhow::Error::msg)?
+                .stop_for_restart()
+                .await
+                .map_err(anyhow::Error::msg)?;
+            codexify::terminal::write_stdout(&render_browser_status(&manager.status().await))?;
         }
         BrowserCommand::Login => {
             BrowserCompanionControl::new(&config.markdown_chat.automation)

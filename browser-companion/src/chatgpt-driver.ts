@@ -2,9 +2,10 @@ import type { Locator, Page } from "patchright";
 import {completedHandoff} from "./turn-renewal";
 import {classifyPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
+import {approveConversationCard} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
-import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
+import { conversationUnavailableVisible, throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
@@ -12,7 +13,7 @@ import { asCompanionError, BrowserCompanionError } from "./errors";
 import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
 import { buildCapabilityCatalog, type AccountCapabilities } from "./models";
-import { canonicalChatGptConversationUrl, validateChatGptConversationUrl, type CapabilityCatalog, type ExecuteActionRequest } from "./protocol";
+import { canonicalChatGptConversationUrl, validateChatGptConversationUrl, type CapabilityCatalog, type ExecuteActionRequest, type ConversationApprovalRequest } from "./protocol";
 import {
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
@@ -199,6 +200,8 @@ async function exactConversationPage(
   try {
     await assertAuthenticatedChatGptPage(page);
   } catch (error) {
+    // The load-failure surface may have appeared since the first inspection.
+    await throwIfSessionAttention(page);
     throw new BrowserCompanionError(
       "ChatGPT authentication could not be verified for the paired conversation",
       "authentication_required",
@@ -243,6 +246,14 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     finally{if(timeout)clearTimeout(timeout);}
   }
 
+  async approvePendingConversation(request:ConversationApprovalRequest,signal:AbortSignal):Promise<boolean> {
+    const page = await this.surface.page();
+    await this.surface.beginAction();
+    try {
+      return await approveConversationCard(page,request,this.connectorApps.get(request.expectedAccountFingerprint,request.connectorName),signal);
+    } finally { await this.surface.endAction(); }
+  }
+
   async health(): Promise<{
     authenticated:boolean;
     accountFingerprint:string | null;
@@ -262,16 +273,24 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         await assertAuthenticatedChatGptPage(page);
       } catch (error) {
         if (page.isClosed()) throw new BrowserCompanionError("The shared Chrome ChatGPT window was closed", "external_interference", {cause:error});
-        throw new BrowserCompanionError(
-          "ChatGPT authentication could not be verified in the shared browser window",
-          "authentication_required",
-          { cause:error },
-        );
+        if (!await conversationUnavailableVisible(page)) {
+          throw new BrowserCompanionError(
+            "ChatGPT authentication could not be verified in the shared browser window",
+            "authentication_required",
+            { cause:error },
+          );
+        }
       }
       const account = await this.healthAccount.read(page);
       try {
         await throwIfSessionAttention(page);
       } catch (error) {
+        if (error instanceof BrowserCompanionError && error.code === "conversation_unavailable") {
+          // The account was verified independently. This page-local failure
+          // leaves the browser free to navigate; the target action reports it
+          // if that conversation still cannot load. Do not block all chats.
+          return {authenticated:true, accountFingerprint:account.fingerprint, status:"idle", detail:error.message};
+        }
         if (error instanceof BrowserCompanionError && error.code === "authentication_required") {
           this.healthAccount.invalidate();
           return {
@@ -530,6 +549,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
       }
       ownedPage = page;
+      if (await page.locator('[data-codex-approval-surface="true"], [data-testid="tool-approval-card"]').filter({visible:true}).count()) {
+        throw new BrowserCompanionError("ChatGPT is waiting for a connector approval before this conversation can continue", "approval_required");
+      }
       const renewal=execution.request.prompt.kind === "turn_renewal" ? execution.request.prompt : null;
       const verifyHandoff=async()=>{
         if(renewal && !await completedHandoff(page,canonicalUrl,account.fingerprint,renewal.handoffId,execution.signal)) {
