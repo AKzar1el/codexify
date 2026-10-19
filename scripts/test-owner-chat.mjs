@@ -13,6 +13,7 @@ async function ownerTestPage(browser, options) {
   page.route=(pattern,handler,settings)=>register(pattern,route=>{
     if(new URL(route.request().url()).pathname==='/api/settings/connector')return route.fulfill({json:{configured:true,connectorName:'Fixture connector'}});
     if(new URL(route.request().url()).pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:null,latest:{updateAvailable:false},settingsAvailable:false,restartAvailable:false}});
+    if(new URL(route.request().url()).pathname==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
     return handler(route);
   },settings);
   return page;
@@ -566,7 +567,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     const ring=icons.nth(1).locator(".goal-outer-ring");
     assert.equal(await ring.evaluate(node=>getComputedStyle(node).animationName),"presence-spin");
     const initialRotation=await ring.evaluate(node=>getComputedStyle(node).transform);
-    await page.waitForTimeout(150);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     assert.notEqual(await ring.evaluate(node=>getComputedStyle(node).transform),initialRotation);
     const phaseError=await page.evaluate(async()=>{
       const sample=()=>{

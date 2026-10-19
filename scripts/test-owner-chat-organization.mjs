@@ -19,6 +19,7 @@ async function fixture(browser) {
   if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
   assert.equal(request.headers().authorization,'Bearer test-token');
   if(url.pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{kind:'pro',label:'Pro 20x'},latest:{updateAvailable:false},settingsAvailable:false,restartAvailable:false}});
+  if(url.pathname==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
   if(url.pathname==='/api/chats') {
    const query=(url.searchParams.get('q')||'').toLowerCase();
    return route.fulfill({json:{chats:[...chats].sort((a,b)=>b.lastEntryAtMs-a.lastEntryAtMs),matchedChatIds:chats.filter(chat=>(chat.title+' '+chat.workspace).toLowerCase().includes(query)).map(chat=>chat.id),serverTimeMs:Date.now()}});
