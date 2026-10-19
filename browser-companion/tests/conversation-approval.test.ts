@@ -125,3 +125,16 @@ test.skipIf(!native)("an approval blocking a newly opened target stops ordinary 
   expect(await page.locator('#prompt-textarea').textContent()).toBe("");
   expect(await page.evaluate(()=> JSON.parse(document.body.dataset.clicks!).send)).toBe(0);
 });
+
+test.skipIf(!native)("retry preserves a current approval without reloading, then grants conversation scope without another prompt",async()=>{
+  fixture();await surface.navigate(url);let navigations=0;
+  const guardedSurface:SingleBrowserSurface={...surface,navigate:async()=>{navigations++;throw Error('Retry would discard the pending approval');}};
+  const coordinator=new SingleWindowCoordinator(new ChatGptBrowserDriver(guardedSurface,build),build);
+  const action={actionId:'retry-with-approval',idempotencyKey:'retry-with-approval',url,expectedUrl:url,pairingGeneration:1,connectorName:name,expectedAccountFingerprint:request.expectedAccountFingerprint,model:'gpt-6-sol',effort:'high',prompt:{kind:'offline_goal' as const,goalRevision:1},autoApproveToolCalls:true};
+  await coordinator.execute(action);for await(const _event of coordinator.events(action.actionId,0)){}
+  expect(await coordinator.action(action.actionId)).toMatchObject({state:'approval_required',sendAccepted:false});
+  expect(navigations).toBe(0);expect(await page.locator('[data-codex-approval-surface]').isVisible()).toBeTrue();
+  expect(await coordinator.approvePendingConversation(request)).toMatchObject({approved:true});
+  expect(await page.evaluate(()=>JSON.parse(document.body.dataset.clicks!))).toEqual({arrow:1,once:0,conversation:1,deny:0,send:0});
+  expect(navigations).toBe(0);expect(context.pages()).toEqual([page]);
+});

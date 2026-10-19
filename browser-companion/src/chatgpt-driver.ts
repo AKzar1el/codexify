@@ -552,8 +552,21 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if (process.env.CODEXIFY_BROWSER_TRACE_SUBMISSION === "1") console.error(`[submission-step] ${execution.request.actionId} ${name}`);
     };
     try {
-      execution.emit({ type:"navigating" });
       const creating = execution.request.prompt.kind === "create_chat";
+      if (!creating) {
+        const current = await this.surface.page();
+        let sameConversation = false;
+        try { sameConversation = canonicalChatGptConversationUrl(current.url()) === canonicalChatGptConversationUrl(execution.request.expectedUrl); } catch {}
+        // Reloading can discard an in-memory approval card. Preserve it for the
+        // conversation approval handler instead of restarting the blocked turn.
+        if (sameConversation && await current.locator('[data-codex-approval-surface="true"], [data-testid="tool-approval-card"]').filter({visible:true}).count()) {
+          if ((await readChatGptAccount(current)).fingerprint !== execution.request.expectedAccountFingerprint) {
+            throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
+          }
+          throw new BrowserCompanionError("ChatGPT is waiting for a connector approval before this conversation can continue", "approval_required");
+        }
+      }
+      execution.emit({ type:"navigating" });
       const opened = creating ? await openNewChat(this.surface, execution.request.url === "https://chatgpt.com/new" ? null : execution.request.url, execution.signal) : null;
       const exact = opened ? {page:opened, canonicalUrl:opened.url()} : await exactConversationPage(this.surface, execution.request.url, execution.request.expectedUrl, execution.signal);
       const page = exact.page;
