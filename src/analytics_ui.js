@@ -265,7 +265,8 @@ function analyticsShareTopModel(models=[]) {
 }
 function analyticsShareNumber(key,value) {
  const n=Math.max(0,Number.isFinite(value)?value:0)/(key==='activeMs'?3600000:1);
- return key==='activeMs'&&n>0&&n<.05?'<0.1':new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:key==='activeMs'||n>=10000?1:0}).format(n);
+ const text=key==='activeMs'&&n>0&&n<.05?'<0.1':new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:key==='activeMs'||n>=10000?1:0}).format(n);
+ return key==='activeMs'?text+'h':text;
 }
 function analyticsShareTiles(snapshot) {
  const top=snapshot.topModel,known=top&&top.model!=='unattributed';
@@ -275,13 +276,13 @@ function analyticsShareTiles(snapshot) {
   {key:'turns',label:'Turns',x:66,y:180,width:330,angle:-.025,color:'#dfff75'},
   {key:'toolCalls',label:'Tool calls',x:435,y:187,width:330,angle:.02,color:'#ff91c8'},
   {key:'goals',label:'Goals completed',x:804,y:179,width:330,angle:-.018,color:'#80eadb'},
-  {key:'activeMs',label:'Hours · estimated',x:66,y:387,width:330,angle:.018,color:'#ffd28b'},
-  {key:'topModel',label:`Top model${effort?' · '+effort:''}${known?' · '+analyticsShareNumber('turns',top.turns)+' turns':''}`,value:model,x:435,y:387,width:699,angle:-.008,color:'#fff9ea'}
+  {key:'activeMs',label:'Thinking hours',x:66,y:387,width:330,angle:.018,color:'#ffd28b'},
+  {key:'topModel',label:`Top model${known?' · '+analyticsShareNumber('turns',top.turns)+' turns':''}`,value:model+(effort?(effort==='Pro'?' Pro':` (${effort})`):''),x:435,y:387,width:699,angle:-.008,color:'#fff9ea'}
  ].map(card=>({...card,height:174,value:card.value??analyticsShareNumber(card.key,snapshot.totals[card.key])}));
 }
 function analyticsShareDescription(snapshot) {
  const model=analyticsShareTiles(snapshot).find(card=>card.key==='topModel');
- return `Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed, ${analyticsShareNumber('activeMs',snapshot.totals.activeMs)} estimated agent-hours. ${model.label}: ${model.value}.`;
+ return `Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed, ${analyticsShareNumber('activeMs',snapshot.totals.activeMs)} thinking time. ${model.label}: ${model.value}.`;
 }
 
 function renderAnalyticsSharePNG(snapshot) {
