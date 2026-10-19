@@ -215,6 +215,7 @@ impl Default for MarkdownChatConfig {
 pub struct ExtrasConfig {
     pub achievements: bool,
     pub animations: bool,
+    pub sounds: bool,
     pub weekly_recap: bool,
     pub daily_streaks: bool,
     pub personal_records: bool,
@@ -224,6 +225,7 @@ impl Default for ExtrasConfig {
         Self {
             achievements: true,
             animations: true,
+            sounds: true,
             weekly_recap: true,
             daily_streaks: true,
             personal_records: true,

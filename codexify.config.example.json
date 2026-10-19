@@ -246,6 +246,7 @@
     "extras": {
       "achievements": true,
       "animations": true,
+      "sounds": true,
       "weeklyRecap": true,
       "dailyStreaks": true,
       "personalRecords": true

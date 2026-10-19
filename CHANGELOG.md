@@ -6,6 +6,42 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-19
+
+### Added
+
+- Cached image thumbnails for chat attachment cards. Opening or downloading an
+  image still uses the original; unchanged previews reuse browser-cached bytes.
+- Estimated agent-hours and the most-used model on shared statistics cards,
+  including PNG, animated SVG and weekly recap exports.
+- `codexify update` uses the verified updater from the terminal, restarting a
+  background service only when it is running.
+- Brief synthesized celebration sounds, with an independent Sounds option in
+  Extras and playback unlocked by interaction with the page.
+
+### Changed
+
+- Add a one-day analytics range, including shared statistics cards, while
+  keeping seven days as the default.
+- Show the sidebar waiting icon while a completed request waits for the next
+  message, without treating that message as an answer to an unfinished request.
+- Hide generated filenames on pasted image attachment cards and previews.
+  Files chosen through the file picker keep their original name visible.
+- Conversation unread markers sync across browsers through a persisted owner
+  read position, including migration of existing browser-local read history.
+- Unread dots track incoming messages only, so outgoing messages and delivery
+  or read receipt changes do not make a conversation appear unread.
+- Conversation goal bars appear immediately from sidebar state, then reconcile
+  with the live automation response without shifting the initial chat layout.
+- Browser start, stop, sign-in and model refresh controls live in global
+  settings under Browser and work without selecting a conversation.
+- Analytics automatically fetch fresh totals, streaks and records whenever
+  opened, while keeping the last figures visible during loading.
+- Sidebar chat and goal icons keep spinning in red during automatic recovery;
+  terminal errors keep the static attention icon.
+- Celebrations use five larger staggered fireworks, glowing sparks and rising
+  trails, while remaining click-through and lasting less than four seconds.
+
 ## [2.2.1] - 2026-10-18
 
 ### Fixed
@@ -809,7 +845,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/devnoname120/codexify/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/devnoname120/codexify/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/devnoname120/codexify/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/devnoname120/codexify/compare/v2.0.0...v2.1.0

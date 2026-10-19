@@ -758,14 +758,32 @@ pub async fn trigger(service_port: u16) -> anyhow::Result<SelfUpdateReceipt> {
         ReleaseSource::default(),
         env!("CARGO_PKG_VERSION"),
         service_port,
+        UpdateOrigin::Server,
     )
     .await
+}
+
+pub async fn trigger_for_cli(service_port: u16) -> anyhow::Result<SelfUpdateReceipt> {
+    trigger_from(
+        ReleaseSource::default(),
+        env!("CARGO_PKG_VERSION"),
+        service_port,
+        UpdateOrigin::Cli,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum UpdateOrigin {
+    Server,
+    Cli,
 }
 
 async fn trigger_from(
     source: ReleaseSource,
     current_version_text: &str,
     service_port: u16,
+    origin: UpdateOrigin,
 ) -> anyhow::Result<SelfUpdateReceipt> {
     let current_version =
         Version::parse(current_version_text).context("parse the running Codexify version")?;
@@ -777,12 +795,19 @@ async fn trigger_from(
     let target = installed_executable(&home);
     ensure_running_installed_binary(&target)?;
 
-    let service_restart = service_supervised();
+    let service_restart = match origin {
+        UpdateOrigin::Server => service_supervised(),
+        UpdateOrigin::Cli => {
+            service::status()
+                .context("inspect the Codexify service before updating")?
+                .running
+        }
+    };
     if service_restart && !service::is_installed().context("query the Codexify service")? {
         bail!("the server is service-supervised, but its service definition is missing");
     }
     #[cfg(windows)]
-    if !service_restart {
+    if !service_restart && matches!(origin, UpdateOrigin::Server) {
         bail!(
             "Windows self-update requires Codexify to be running under its background service so the executable can be unlocked and restarted; run the installer manually or install the service first"
         );
@@ -1855,9 +1880,9 @@ pub(crate) fn schedule_worker(worker: &Path, id: &str, supervised: bool) -> anyh
     }
     #[cfg(windows)]
     {
-        if !supervised {
-            bail!("Windows self-update requires the Codexify background service");
-        }
+        // A CLI caller exits before replacement. MCP callers still require a
+        // supervised service in trigger_from so their executable can be unlocked.
+        let _ = supervised;
         schedule_windows(worker, id)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

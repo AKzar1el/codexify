@@ -38,6 +38,9 @@
     blocked(){return this.items.some(i=>i.state!=='ready');}
     count(){return this.items.length;}
     update(){this.add.disabled=!this.canOperate();}
+    thumbnailUrl(record){return this.bridge.attachmentThumbnailUrl?.(record.id)||this.bridge.attachmentUrl(record.id);}
+    isPastedImage(record){return record.pasted===true&&record.mimeType.startsWith('image/');}
+    displayName(record){return this.isPastedImage(record)?'Pasted image':record.originalName;}
     formatSize(n){if(n<1024)return `${n} B`;if(n<1048576)return `${(n/1024).toFixed(1)} KiB`;return `${(n/1048576).toFixed(1)} MiB`;}
     fileIcon(type){
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');
@@ -45,27 +48,29 @@
     }
     card(record,url,onClick){
       const card=document.createElement('button');card.type='button';card.className='attachment-card';
-      card.setAttribute('aria-label',`Open attachment ${record.originalName}`);
-      card.title=`${record.originalName}\n${record.mimeType} · ${this.formatSize(record.size||0)}\nCreated: ${record.createdAt||'Uploading'}\nModified: ${record.lastModifiedAt||'Unknown'}`;
+      const label=this.displayName(record);
+      card.setAttribute('aria-label',`Open attachment ${label}`);
+      card.title=`${label}\n${record.mimeType} · ${this.formatSize(record.size||0)}\nCreated: ${record.createdAt||'Uploading'}\nModified: ${record.lastModifiedAt||'Unknown'}`;
       const visual=document.createElement('span');visual.className='attachment-visual';
       if(record.mimeType.startsWith('image/')&&url){
-        const image=document.createElement('img');image.alt=record.originalName;image.src=url;image.onerror=()=>{visual.replaceChildren(this.fileIcon(record.mimeType));};visual.append(image);
+        const image=document.createElement('img');image.alt=label;image.loading='lazy';image.decoding='async';image.src=url;image.onerror=()=>{visual.replaceChildren(this.fileIcon(record.mimeType));};visual.append(image);
       }else visual.append(this.fileIcon(record.mimeType));
-      const name=document.createElement('span');name.className='attachment-name';name.textContent=record.originalName;
       const size=document.createElement('span');size.className='attachment-size';size.textContent=this.formatSize(record.size||0);
-      card.append(visual,name,size);card.onclick=onClick;return card;
+      card.append(visual);
+      if(!this.isPastedImage(record)){const name=document.createElement('span');name.className='attachment-name';name.textContent=record.originalName;card.append(name);}
+      card.append(size);card.onclick=onClick;return card;
     }
     renderDraft(){
       const history=this.scope.getElementById('messages'),top=history.scrollTop,bottom=history.scrollHeight-top-history.clientHeight<50;
       this.row.replaceChildren();this.row.hidden=!this.items.length;
       for(const item of this.items){
-        const record=item.record||{originalName:item.file.name||'Pasted image.png',mimeType:item.file.type,size:item.file.size};
+        const record=item.record||{originalName:item.file.name||'Pasted image.png',mimeType:item.file.type,size:item.file.size,pasted:item.pasted};
         const wrapper=document.createElement('div');wrapper.className='draft-attachment';
-        const url=item.preview||(item.record?this.bridge.attachmentUrl(item.record.id):null);
+        const url=item.preview||(item.record?this.thumbnailUrl(item.record):null);
         const card=this.card(record,url,()=>{if(item.state==='ready')this.open(item.record);});
         if(item.state!=='ready')card.disabled=true;
         card.querySelector('.attachment-size').textContent=item.state==='uploading'?'Uploading…':item.state==='failed'?item.error:this.formatSize(record.size);
-        const remove=document.createElement('button');remove.type='button';remove.className='attachment-remove';remove.setAttribute('aria-label',`Remove attachment ${record.originalName}`);remove.title='Remove attachment';remove.textContent='×';
+        const remove=document.createElement('button');remove.type='button';remove.className='attachment-remove';remove.setAttribute('aria-label',`Remove attachment ${this.displayName(record)}`);remove.title='Remove attachment';remove.textContent='×';
         remove.onclick=()=>{item.controller?.abort();this.items=this.items.filter(i=>i!==item);if(item.preview){URL.revokeObjectURL(item.preview);this.urls.delete(item.preview);}this.renderDraft();this.changed();};
         wrapper.append(card,remove);
         if(item.state==='failed'&&item.file){const retry=document.createElement('button');retry.type='button';retry.className='attachment-upload-retry';retry.textContent='Retry upload';retry.onclick=()=>void this.upload(item);wrapper.append(retry);}
@@ -100,17 +105,19 @@
     renderMessage(container,records){
       const valid=(Array.isArray(records)?records:[]).filter(a=>this.valid(a));const signature=JSON.stringify(valid);
       if(container.dataset.attachments===signature)return;container.dataset.attachments=signature;container.replaceChildren();container.hidden=!valid.length;
-      for(const record of valid)container.append(this.card(record,this.bridge.attachmentUrl(record.id),()=>this.open(record)));
+      for(const record of valid)container.append(this.card(record,this.thumbnailUrl(record),()=>this.open(record)));
     }
     open(record){
       if(!record.mimeType.startsWith('image/')&&!record.mimeType.startsWith('video/')){window.open(this.bridge.attachmentUrl(record.id,true),'_blank','noopener,noreferrer');return;}
       this.closeViewer();const previous=this.scope.activeElement;
-      const viewer=document.createElement('div');viewer.className='attachment-viewer';viewer.setAttribute('role','dialog');viewer.setAttribute('aria-modal','true');viewer.setAttribute('aria-label',record.originalName);
+      const label=this.displayName(record);
+      const viewer=document.createElement('div');viewer.className='attachment-viewer';viewer.setAttribute('role','dialog');viewer.setAttribute('aria-modal','true');viewer.setAttribute('aria-label',label);
       const close=document.createElement('button');close.type='button';close.className='attachment-viewer-close';close.setAttribute('aria-label','Close attachment preview');close.textContent='×';
       const download=document.createElement('a');download.className='attachment-viewer-download';download.textContent='Download original';download.href=this.bridge.attachmentUrl(record.id,true);download.target='_blank';download.rel='noopener noreferrer';
-      const media=document.createElement(record.mimeType.startsWith('image/')?'img':'video');media.src=this.bridge.attachmentUrl(record.id);if(media.tagName==='VIDEO'){media.controls=true;media.preload='metadata';}else media.alt=record.originalName;
-      const label=document.createElement('div');label.className='attachment-viewer-name';label.textContent=record.originalName;
-      viewer.append(close,download,media,label);this.overlayRoot.append(viewer);this.viewer=viewer;
+      const media=document.createElement(record.mimeType.startsWith('image/')?'img':'video');media.src=this.bridge.attachmentUrl(record.id);if(media.tagName==='VIDEO'){media.controls=true;media.preload='metadata';}else media.alt=label;
+      viewer.append(close,download,media);
+      if(!this.isPastedImage(record)){const name=document.createElement('div');name.className='attachment-viewer-name';name.textContent=record.originalName;viewer.append(name);}
+      this.overlayRoot.append(viewer);this.viewer=viewer;
       this.viewerCleanup=()=>{if(media.tagName==='VIDEO')media.pause();media.removeAttribute('src');document.removeEventListener('keydown',this.viewerKey);viewer.remove();if(previous?.isConnected)previous.focus();};
       close.onclick=()=>this.closeViewer();viewer.onclick=event=>{if(event.target===viewer)this.closeViewer();};
       this.viewerKey=event=>{if(event.key==='Escape'){event.preventDefault();this.closeViewer();}else if(event.key==='Tab'){const controls=[close,download,...(media.tagName==='VIDEO'?[media]:[])],current=this.scope.activeElement,index=controls.indexOf(current),next=(index+(event.shiftKey?-1:1)+controls.length)%controls.length;event.preventDefault();controls[next].focus();}};

@@ -2245,6 +2245,7 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
     for (attempt, delay) in [(0, 30_000), (1, 60_000), (2, 120_000)] {
         let failed = fixture.store.load(&fixture.task).unwrap();
         assert_eq!(failed.action.automatic_retry_attempts, attempt);
+        assert!(failed.is_automatically_retrying());
         let retry_at = failed.automatic_retry_at_ms().unwrap();
         assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + delay);
         if attempt == 1 {
@@ -2268,12 +2269,20 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
         assert_eq!(supervisor.queued_count().await, 0);
         supervisor.scan_once(retry_at).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 1);
+        assert!(
+            fixture
+                .store
+                .load(&fixture.task)
+                .unwrap()
+                .is_automatically_retrying()
+        );
         assert!(supervisor.run_next(retry_at + 1).await.is_err());
         last_retry_at = retry_at;
     }
     let exhausted = fixture.store.load(&fixture.task).unwrap();
     assert_eq!(exhausted.action.automatic_retry_attempts, 3);
     assert!(exhausted.automatic_retry_at_ms().is_none());
+    assert!(!exhausted.is_automatically_retrying());
     assert_eq!(exhausted.retry_mode(), Some("retry"));
     supervisor
         .scan_once(last_retry_at + 86_400_000)
@@ -2465,6 +2474,7 @@ async fn confirmed_stop_failures_retry_after_backoff_without_losing_or_duplicati
         let _ = supervisor.run_next(began + 1).await;
         let failed = f.store.load(&f.task).unwrap();
         assert_eq!(failed.action.status, AutomationActionStatus::Failed);
+        assert!(failed.is_automatically_retrying());
         assert_eq!(failed.action.send_accepted, Some(false));
         assert_eq!(failed.goal.as_ref().unwrap().turn_count, 1);
         let retry_at = failed.automatic_retry_at_ms().unwrap();
@@ -2473,6 +2483,7 @@ async fn confirmed_stop_failures_retry_after_backoff_without_losing_or_duplicati
         assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
         supervisor.scan_once(retry_at).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 1);
+        assert!(f.store.load(&f.task).unwrap().is_automatically_retrying());
         supervisor.run_next(retry_at + 1).await.unwrap();
         let saved = f.store.load(&f.task).unwrap();
         assert!(saved.action.messages_fenced);
@@ -2482,6 +2493,7 @@ async fn confirmed_stop_failures_retry_after_backoff_without_losing_or_duplicati
             codexify::agent_automation::GoalStatus::Active
         );
         assert!(saved.automatic_retry_at_ms().is_none());
+        assert!(!saved.is_automatically_retrying());
         supervisor.scan_once(retry_at + 2).await.unwrap();
         assert_eq!(supervisor.queued_count().await, 0);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
@@ -6352,6 +6364,7 @@ async fn abandoned_goal_actions_retry_and_skip_the_wake_if_agent_activity_return
     restarted.scan_once(2001 + 32 * 60 * 1000).await.unwrap();
     let retried = f.store.load(&f.task).unwrap();
     assert_eq!(retried.action.status, AutomationActionStatus::Queued);
+    assert!(retried.is_automatically_retrying());
     assert_ne!(retried.action.id.as_deref(), Some("orphaned-goal-action"));
     assert_eq!(
         restarted.next_queued_kind().await,
@@ -8031,4 +8044,25 @@ async fn missing_connector_keeps_goal_work_pending_until_an_exact_name_is_saved(
     let executions = f.executor.executions.lock().unwrap();
     assert_eq!(executions.len(), 1);
     assert_eq!(executions[0].request.connector_name, "Saved exact name");
+}
+
+#[tokio::test]
+async fn completing_a_goal_during_automatic_recovery_clears_its_retry_indicator() {
+    let f = orphaned_goal_fixture(false).await;
+    let (restarted, _) = restarted_goal_supervisor(&f, None).await;
+    let now = 2001 + 32 * 60 * 1000;
+    restarted.scan_once(now).await.unwrap();
+    let queued = f.store.load(&f.task).unwrap();
+    assert!(queued.is_automatically_retrying());
+    f.store
+        .finish_goal(
+            &f.task,
+            queued.goal.unwrap().revision,
+            codexify::agent_automation::GoalFinish::Completed { summary: None },
+            now + 1,
+        )
+        .unwrap();
+    let completed = f.store.load(&f.task).unwrap();
+    assert_eq!(completed.action.status, AutomationActionStatus::Idle);
+    assert!(!completed.is_automatically_retrying());
 }

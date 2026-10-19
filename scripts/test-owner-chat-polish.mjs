@@ -19,6 +19,7 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
  });
  const errors=[],operations=[],browserOperations=[];let shift=0,held=false,release;
  let browserState={authenticated:!browserOptions.unavailable,status:browserOptions.unavailable?'unavailable':'idle',manuallyStopped:false};
+ let browserCatalog=[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}];
  let holdBrowser=false,releaseBrowser,failBrowser=false,browserGate=Promise.resolve();
  let gate=Promise.resolve();
  const chats=[0,1,3,8,20,50,0,2].map((days,i)=>({
@@ -43,10 +44,13 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
   if(url.pathname==='/api/global')return route.fulfill({json:{version:'1.7.0',plan:{kind:'pro',label:'Pro 20x'},latest:{updateAvailable:false},settingsAvailable:true,restartAvailable:false}});
   if(url.pathname==='/api/analytics/extras')return route.fulfill({status:503,body:'Optional extras unavailable'});
   if(url.pathname==='/api/analytics/turn-cutoffs')return route.fulfill({json:{samples:0,models:[]}});
-  if(url.pathname==='/api/settings')return route.fulfill({json:{revision:'one',document:{},defaults:{},raw:'{}',path:'/fixture/config.json',restartRequired:false}});
+  if(url.pathname==='/api/settings')return route.fulfill({json:{revision:'one',document:{},defaults:browserOptions.noChats?{agentChat:{automation:{enabled:true,autoApproveToolCalls:true,headless:false}}}:{},raw:'{}',path:'/fixture/config.json',restartRequired:false}});
   if(url.pathname==='/api/health')return route.fulfill({json:{status:'ok'}});
   if(url.pathname==='/api/projects')return route.fulfill({json:{catalog:{projects:[],total:0},createWorktree:false}});
   if(url.pathname==='/api/new-chat')return route.fulfill({json:{models:[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}],catalogRevision:'one',multiProject:true,createWorktree:false}});
+  if(url.pathname==='/api/browser')return route.fulfill({json:{companion:{...browserState}}});
+  if(url.pathname==='/api/browser/login'){browserOperations.push('login');browserState={authenticated:!browserOptions.deferLogin,status:browserOptions.deferLogin?'authentication_required':'idle',manuallyStopped:false};return route.fulfill({json:{companion:{...browserState}}});}
+  if(url.pathname==='/api/browser/capabilities'){browserOperations.push('capabilities');assert.equal(request.postDataJSON().refresh,true);browserCatalog=[...browserCatalog,{id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:[{id:'max',label:'Pro',available:true}]}];return route.fulfill({json:{companion:{...browserState},catalogRevision:'refreshed',models:browserCatalog}});}
   if(url.pathname==='/api/browser/start'||url.pathname==='/api/browser/stop'){
    const operation=url.pathname.split('/').at(-1);browserOperations.push(operation);assert(request.postDataJSON().requestId);
    if(failBrowser){failBrowser=false;browserState.manuallyStopped=false;return route.fulfill({status:503,body:'Browser startup failed'});}
@@ -55,7 +59,7 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
    if(operation==='start'&&holdBrowser)await browserGate;
    return route.fulfill({json:result});
   }
-  if(url.pathname==='/api/chats')return route.fulfill({json:{chats,matchedChatIds:chats.map(chat=>chat.id),serverTimeMs:now+shift}});
+  if(url.pathname==='/api/chats')return route.fulfill({json:{chats:browserOptions.noChats?[]:chats,matchedChatIds:chats.map(chat=>chat.id),serverTimeMs:now+shift}});
   const id=url.pathname.split('/')[3],chat=chats.find(chat=>chat.id===id);assert(chat,'known chat request: '+url.pathname);
   if(url.pathname.endsWith('/title')){
    const body=request.postDataJSON();operations.push({kind:'title',...body});chat.title=body.title||'Latest message';chat.customTitle=body.title||null;
@@ -66,35 +70,60 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
    chat.projectPath=body.path;chat.workspace='changed';chat.isScratch=false;chat.projectId='changed';
    return route.fulfill({json:{projectPath:chat.projectPath,workspace:chat.workspace,isScratch:false,projectId:'changed'}});
   }
-  if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},selection:{model:'gpt-6-astra',effort:'max'},action:{status:'idle'},goal:null,companion:{...browserState},presence:{lastAgentCallAtMs:now+shift-1000},serverTimeMs:now+shift}});
+  if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},selection:{model:'gpt-6-astra',effort:'max'},catalog:{models:browserCatalog},action:{status:'idle'},goal:null,companion:{...browserState},presence:{lastAgentCallAtMs:now+shift-1000},serverTimeMs:now+shift}});
   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/'+id+'/CHAT.md',revision:'200-'+shift,read_through:200,delivered_through:200,messages,total_tool_calls:32,last_agent_call_at_ms:now+shift-1000,server_time_ms:now+shift,has_more:false,unchanged:false}}}});
  });
- await page.goto(origin+'/?chat='+chats[0].id+'#test-token');await page.locator('.conversation-row').first().waitFor();
- return {page,chats,errors,operations,browserOperations,holdBrowserStart(){holdBrowser=true;browserGate=new Promise(resolve=>releaseBrowser=resolve);},releaseBrowserStart(){holdBrowser=false;releaseBrowser?.();},failBrowserStart(){failBrowser=true;},hold(){held=true;gate=new Promise(resolve=>release=resolve);},release(){held=false;release?.();},advance(ms){shift+=ms;for(const chat of chats)chat.lastAgentCallAtMs=now+shift-1000;}};
+ await page.goto(origin+'/'+(browserOptions.noChats?'':'?chat='+chats[0].id)+'#test-token');if(browserOptions.noChats)await page.getByText('No persisted conversations yet.',{exact:true}).waitFor();else await page.locator('.conversation-row').first().waitFor();
+ return {page,chats,errors,operations,browserOperations,setBrowserState(value){browserState=value;},holdBrowserStart(){holdBrowser=true;browserGate=new Promise(resolve=>releaseBrowser=resolve);},releaseBrowserStart(){holdBrowser=false;releaseBrowser?.();},failBrowserStart(){failBrowser=true;},hold(){held=true;gate=new Promise(resolve=>release=resolve);},release(){held=false;release?.();},advance(ms){shift+=ms;for(const chat of chats)chat.lastAgentCallAtMs=now+shift-1000;}};
 }
 
 for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
- test(`${name}: browser controls recover, stop deliberately and ignore a stale start response`,{timeout:30000},async()=>{
+ test(`${name}: global browser controls work without chats, recover, stop deliberately and ignore a stale start response`,{timeout:30000},async()=>{
   const browser=await engine.launch();let f;
   try {
-   f=await fixture(browser,undefined,undefined,null,{unavailable:true});const {page}=f,host=page.locator('#chat-host');
-   await host.getByRole('button',{name:'Connection settings',exact:true}).click();
-   const start=host.getByRole('button',{name:'Start browser',exact:true}),stop=host.getByRole('button',{name:'Stop browser',exact:true});
+   f=await fixture(browser,undefined,undefined,null,{unavailable:true,noChats:true,deferLogin:true});const {page}=f;
+   await page.getByRole('button',{name:'Codexify settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Codexify settings',exact:true});await settings.getByRole('button',{name:'Browser',exact:true}).click();
+   const start=settings.getByRole('button',{name:'Start browser',exact:true}),stop=settings.getByRole('button',{name:'Stop browser',exact:true}),state=settings.locator('#settings-browser-state'),models=settings.getByRole('button',{name:'Refresh models',exact:true});
+   await page.waitForFunction(()=>!document.getElementById('settings-browser-start').disabled);
    assert(await start.isEnabled());assert(await stop.isEnabled());
-   await start.click();await host.locator('#companion-status').filter({hasText:'Connected'}).waitFor();
-   assert(await start.isDisabled());await stop.click();await host.locator('#companion-status').filter({hasText:'Browser stopped by you'}).waitFor();
-   assert(await start.isEnabled());assert(await stop.isDisabled());assert(await host.getByRole('button',{name:'Refresh models',exact:true}).isDisabled());
-   f.holdBrowserStart();await start.click();await host.getByRole('button',{name:'Starting…',exact:true}).waitFor();
+   await start.click();await state.filter({hasText:'Connected'}).waitFor();
+   assert(await start.isDisabled());await stop.click();await state.filter({hasText:'Browser stopped by you'}).waitFor();
+   assert(await start.isEnabled());assert(await stop.isDisabled());assert(await models.isDisabled());
+   f.holdBrowserStart();await start.click();await settings.getByRole('button',{name:'Starting…',exact:true}).waitFor();
    assert(await stop.isEnabled(),'Stop remains available during startup');await stop.click();
-   await host.locator('#companion-status').filter({hasText:'Browser stopped by you'}).waitFor();f.releaseBrowserStart();
-   await page.waitForTimeout(100);assert.equal(await host.locator('#companion-status').textContent(),'Browser stopped by you');
-   f.failBrowserStart();await start.click();await host.locator('#connection-settings-error').filter({hasText:'Browser startup failed'}).waitFor();assert(await start.isEnabled());
+   await state.filter({hasText:'Browser stopped by you'}).waitFor();f.releaseBrowserStart();
+   await page.waitForTimeout(100);assert.equal(await state.textContent(),'Browser stopped by you');
+   f.failBrowserStart();await start.click();await settings.locator('#settings-browser-feedback').filter({hasText:'Browser startup failed'}).waitFor();assert(await start.isEnabled());
    assert.deepEqual(f.browserOperations,['start','stop','start','stop','start']);assert.deepEqual(f.operations,[]);
+   await settings.getByRole('button',{name:'Sign in',exact:true}).click();await settings.getByText('Complete sign-in in the browser.',{exact:true}).waitFor();
+   f.setBrowserState({authenticated:true,status:'idle',manuallyStopped:false});await settings.getByRole('button',{name:'Browser',exact:true}).click();await state.filter({hasText:'Connected'}).waitFor();await settings.getByText('Signed in.',{exact:true}).waitFor();assert(await settings.getByRole('button',{name:'Sign in',exact:true}).isDisabled());
+   await models.click();await settings.getByText('Models refreshed.',{exact:true}).waitFor();
+   f.setBrowserState({authenticated:true,status:'busy',activeActionId:'other-action'});await settings.getByRole('button',{name:'Browser',exact:true}).click();await page.waitForFunction(()=>document.getElementById('settings-browser-models').disabled);assert(await stop.isEnabled());
+   f.setBrowserState({authenticated:true,status:'idle',activeActionId:null});await settings.getByRole('button',{name:'Browser',exact:true}).click();await page.waitForFunction(()=>!document.getElementById('settings-browser-models').disabled);
+   assert.deepEqual(f.browserOperations,['start','stop','start','stop','start','login','capabilities']);assert.equal(await page.locator('.conversation-row').count(),0);
    if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-browser-controls.png`});}
-   await page.setViewportSize({width:390,height:860});assert.equal(await host.locator('#automation-settings').evaluate(n=>n.scrollWidth>n.clientWidth),false);
+   await page.setViewportSize({width:390,height:860});assert.equal(await settings.evaluate(n=>n.scrollWidth>n.clientWidth),false);
    if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS)await page.screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-browser-controls-mobile.png`});
    assert.deepEqual(f.errors,[]);
   }finally{f?.releaseBrowserStart();await browser.close();}
+ });
+
+ test(`${name}: global model refresh updates an open conversation without moving shared controls back into it`,{timeout:20000},async()=>{
+  const browser=await engine.launch();
+  try{
+   const f=await fixture(browser),{page}=f,host=page.locator('#chat-host'),model=host.getByLabel('ChatGPT model',{exact:true});
+   await model.locator('option[value="gpt-6-astra"]').waitFor({state:'attached'});
+   await host.getByRole('button',{name:'Connection settings',exact:true}).click();
+   const conversation=host.getByRole('dialog',{name:'Conversation settings',exact:true});
+   for(const name of ['Start browser','Stop browser','Sign in','Refresh models'])assert.equal(await conversation.getByRole('button',{name,exact:true}).count(),0);
+   assert.equal(await conversation.locator('[aria-labelledby="connection-pairing-heading"]').getByRole('button',{name:'Open in ChatGPT',exact:true}).count(),1);
+   await conversation.getByRole('button',{name:'Done',exact:true}).click();
+   await page.getByRole('button',{name:'Codexify settings',exact:true}).click();const settings=page.getByRole('dialog',{name:'Codexify settings',exact:true});await settings.getByRole('button',{name:'Browser',exact:true}).click();
+   await page.waitForFunction(()=>!document.getElementById('settings-browser-models').disabled);await settings.getByRole('button',{name:'Refresh models',exact:true}).click();
+   await model.locator('option[value="gpt-5.6-sol"]').waitFor({state:'attached'});assert.equal(await model.inputValue(),'gpt-6-astra');assert.equal(await host.getByLabel('Reasoning effort',{exact:true}).inputValue(),'max');
+   await settings.getByRole('button',{name:'Close settings',exact:true}).click();assert.equal(await page.locator('.conversation-row[aria-current=true]').getAttribute('data-chat-id'),f.chats[0].id);
+   assert.deepEqual(f.browserOperations,['capabilities']);assert.deepEqual(f.operations,[]);assert.deepEqual(f.errors,[]);
+  }finally{await browser.close();}
  });
 
  test(`${name}: plain titles stay consistent while message Markdown is preserved`,{timeout:30000},async()=>{

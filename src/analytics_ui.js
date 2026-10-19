@@ -3,7 +3,7 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
  const metricNames={turns:'Turns',activeMs:'Active time',toolCalls:'Tool calls'};
  const rangeCache=new Map();
  let shareCard=null;
- let root=null,data=null,range='7',leaderMetric='turns',request=0,loading=false,hiddenModels=new Set(),mountedRange=null;
+ let root=null,data=null,range='7',leaderMetric='turns',request=0,loading=false,hiddenModels=new Set();
  const el=(tag,className,text)=>{const n=document.createElement(tag);if(className)n.className=className;if(text!=null)n.textContent=text;return n;};
  const svg=(tag,attrs={})=>{const n=document.createElementNS(svgNS,tag);for(const [key,value]of Object.entries(attrs))n.setAttribute(key,String(value));return n;};
  const count=value=>new Intl.NumberFormat(undefined,{notation:value>=10000?'compact':'standard',maximumFractionDigits:1}).format(value||0);
@@ -137,13 +137,13 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
   for(const m of rows){const row=el('div','analytics-model-row'),copy=el('div','analytics-model-copy'),name=el('span','analytics-model-name'),dot=el('i','analytics-dot');row.style.setProperty('--series',colors.get(m.id));name.append(dot,document.createTextNode(fullModel(m)));copy.append(name,el('strong','',duration(m.activeMs)));const track=el('div','analytics-model-track'),bar=el('span','');bar.style.width=`${m.activeMs/max*100}%`;track.append(bar);row.append(copy,track,el('p','analytics-model-caption',`${count(m.turns)} turns · ${count(m.toolCalls)} tools`));modelRows.append(row);}if(!rows.length)card.append(el('div','analytics-empty','Your model mix will appear with new activity.'));return card;}
  function render(){
   if(!root?.isConnected)return;const focused=document.activeElement?.dataset?.analyticsFocus;root.replaceChildren();root.classList.toggle('analytics-loading',loading&&!data);const d=data||sanitize(null);
-  const hero=el('section','analytics-hero'),copy=el('div','');copy.append(el('p','analytics-eyebrow','Codexify analytics'),el('h4','',range==='all'?'The bigger picture':`The last ${range} days`),el('p','',d.since?`Collecting since ${new Date(d.since).toLocaleDateString()} · ${d.timezone}`:'A fresh start. New activity only.'));
-  const controls=el('div','analytics-controls'),select=el('select','analytics-select');select.setAttribute('aria-label','Analytics date range');select.dataset.analyticsFocus='range';for(const [value,label]of [['7','7 days'],['30','30 days'],['90','90 days'],['all','Lifetime']]){const option=el('option','',label);option.value=value;select.append(option);}select.value=range;select.addEventListener('change',()=>{range=select.value;data=rangeCache.get(range)||null;void load();});
+  const hero=el('section','analytics-hero'),copy=el('div','');copy.append(el('p','analytics-eyebrow','Codexify analytics'),el('h4','',range==='all'?'The bigger picture':range==='1'?'Today':`The last ${range} days`),el('p','',d.since?`Collecting since ${new Date(d.since).toLocaleDateString()} · ${d.timezone}`:'A fresh start. New activity only.'));
+  const controls=el('div','analytics-controls'),select=el('select','analytics-select');select.setAttribute('aria-label','Analytics date range');select.dataset.analyticsFocus='range';for(const [value,label]of [['1','1 day'],['7','7 days'],['30','30 days'],['90','90 days'],['all','Lifetime']]){const option=el('option','',label);option.value=value;select.append(option);}select.value=range;select.addEventListener('change',()=>{range=select.value;data=rangeCache.get(range)||null;void load();});
   const refresh=el('button','','↻');refresh.type='button';refresh.setAttribute('aria-label','Refresh analytics');refresh.disabled=loading;refresh.addEventListener('click',()=>void load());const share=el('button','analytics-share-button','Share your stats');share.type='button';share.setAttribute('aria-label','Share analytics');share.disabled=!data||loading;share.addEventListener('click',()=>{
     if(!data||loading)return;
     const bins=dayBins(),values=bins.map(bin=>[...bin.models.values()].reduce((sum,t)=>sum+t.turns,0));
     shareCard??=createAnalyticsShareCard({bindBackdrop});
-    shareCard.open({period:range,today:data.today,start:bins[0]?.start||data.today,totals:{...data.totals},activity:values});
+    shareCard.open({period:range,today:data.today,start:bins[0]?.start||data.today,totals:{...data.totals},topModel:analyticsShareTopModel(data.models),activity:values});
   });controls.append(select,share,refresh);hero.append(copy,controls);root.append(hero);
   const kpis=el('div','analytics-kpis');for(const [key,title]of [['turns','Confirmed turns'],['activeMs','Active time · estimated'],['toolCalls','Tool calls'],['goals','Goals completed']]){const card=el('div','analytics-kpi');card.dataset.metric=key;const value=el('strong','analytics-kpi-value',valueText(key,d.totals[key]));value.title=key==='activeMs'?`${Math.round(d.totals[key]/1000)} seconds`:`${d.totals[key]}`;card.append(el('p','analytics-kpi-label',title),value,el('span','analytics-kpi-foot',`${valueText(key,d.lifetime[key])} lifetime`));const values=dayBins().map(bin=>[...bin.models.values()].reduce((sum,t)=>sum+t[key],0));
    const points=values.slice(-30),max=Math.max(1,...points),spark=svg('svg',{viewBox:'0 0 96 34','aria-hidden':'true',class:'analytics-spark'}),path=points.map((v,i)=>`${i?'L':'M'}${points.length===1?48:i/(points.length-1)*96} ${30-v/max*26}`).join(' ');spark.append(svg('path',{d:path,fill:'none',stroke:'currentColor','stroke-width':2.5,'stroke-linecap':'round','stroke-linejoin':'round'}));card.append(spark);kpis.append(card);}root.append(kpis);const highlights=getHighlights?.('summary');if(highlights)root.append(highlights);
@@ -154,11 +154,12 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
   if(cutoffCard)root.append(cutoffCard());
   if(focused)for(const node of root.querySelectorAll('[data-analytics-focus]'))if(node.dataset.analyticsFocus===focused){node.focus({preventScroll:true});break;}
  }
- async function load(){const epoch=++request;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${range}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);mountedRange=range;rangeCache.set(range,data);}catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
+ async function load(){const epoch=++request;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${range}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);rangeCache.set(range,data);}catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
  window.addEventListener('statistics-extras-change',()=>{if(isVisible())render();});
  const timer=setInterval(()=>{if(isVisible()&&!document.hidden&&!loading&&!shareCard?.isOpen())void load();},30000);
  window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});
- return {mount(parent){root=el('div','analytics');root.id=rootId;parent.append(root);render();if(!data||mountedRange!==range)void load();}};
+ // Cached figures are a placeholder, never a reason to skip fetching on open.
+ return {mount(parent){root=el('div','analytics');root.id=rootId;parent.append(root);void load();}};
 }
 
 
@@ -203,7 +204,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
  const formatButtons=new Map();for(const [key,label]of [['png','Static PNG'],['svg','Animated SVG']]){const b=make('button','',label);b.type='button';b.setAttribute('aria-pressed',String(key==='png'));b.addEventListener('click',()=>{format=key;paused=false;show();});formatButtons.set(key,b);formats.append(b);}
  const motion=make('button','','Pause preview');motion.id='stats-share-motion';motion.type='button';motion.hidden=true;motion.addEventListener('click',()=>{paused=!paused;show();});formats.append(motion);
  const hint=make('p','stats-share-privacy');hint.id='stats-share-hint';
- const privacy=make('p','stats-share-privacy','Only aggregate totals appear on the card. Generated on this device, with no upload or public link.');
+ const privacy=make('p','stats-share-privacy','Only aggregate usage and the top model appear on the card. Generated on this device, with no upload or public link.');
  const footer=make('div','stats-share-footer'),message=make('p','stats-share-status');message.id='stats-share-status';message.setAttribute('role','status');message.setAttribute('aria-live','polite');
  const download=make('a','','Download PNG');download.id='stats-share-download';download.setAttribute('aria-disabled','true');
  const copyButton=make('button','','Copy image');copyButton.id='stats-share-copy';copyButton.type='button';copyButton.disabled=true;copyButton.setAttribute('aria-describedby',message.id);footer.append(message,download,copyButton);dialog.append(header,formats,preview,hint,privacy,footer);document.body.append(dialog);bindBackdrop(dialog,()=>dialog.close());
@@ -214,7 +215,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
  function show(){
   if(!snapshot)return;const asset=assets[format],animated=format==='svg',still=paused||reducedMotion.matches;
   for(const [key,b]of formatButtons)b.setAttribute('aria-pressed',String(key===format));
-  description.textContent=`${snapshot.periodLabel|| (snapshot.period==='all'?'Lifetime':`Last ${snapshot.period} days`)} · ${animated?'Animated SVG':'PNG image'}`;
+  description.textContent=`${snapshot.periodLabel||analyticsPeriodLabel(snapshot.period)} · ${animated?'Animated SVG':'PNG image'}`;
   hint.textContent=animated?(reducedMotion.matches?'Reduced motion: showing the final totals. The SVG respects the viewer’s motion preference.':'A 6-second loop: count up, celebrate, hold. Add the downloaded SVG to your GitHub README as an image.'):'A still image for chats, posts and anywhere you share images.';
   motion.hidden=!animated;motion.disabled=reducedMotion.matches||!assets.still?.url;motion.textContent=reducedMotion.matches?'Motion reduced':paused?'Play preview':'Pause preview';motion.setAttribute('aria-pressed',String(!still));
   // Some image engines do not propagate a page's emulated motion preference
@@ -222,7 +223,7 @@ function createAnalyticsShareCard({bindBackdrop}) {
   const shown=animated&&still?(assets.png?.url?assets.png:assets.still):asset;image.hidden=!shown?.url;placeholder.hidden=!!shown?.url;placeholder.textContent=asset?.error?'The image could not be created.':'Creating your card…';
   if(shown?.url&&image.getAttribute('src')!==shown.url)image.src=shown.url;
   download.textContent=animated?'Download SVG':'Download PNG';download.setAttribute('aria-disabled',String(!asset?.url));
-  if(asset?.url){download.href=asset.url;download.download=`codexify-stats-${snapshot.periodLabel?'week-in-review':snapshot.period==='all'?'lifetime':snapshot.period+'-days'}-${snapshot.today}.${format}`;}else download.removeAttribute('href');
+  if(asset?.url){download.href=asset.url;download.download=`codexify-stats-${snapshot.periodLabel?'week-in-review':snapshot.period==='all'?'lifetime':snapshot.period+(snapshot.period==='1'?'-day':'-days')}-${snapshot.today}.${format}`;}else download.removeAttribute('href');
   copyButton.textContent=animated?'Copy PNG':'Copy image';copyButton.disabled=!assets.png?.blob||copying||!canCopy();
   message.textContent=asset?.error?'Close this preview and try again.':!asset?.url?'':canCopy()?'Ready to share.':'Copy isn’t available in this browser. Download the PNG instead.';
  }
@@ -245,12 +246,42 @@ function createAnalyticsShareCard({bindBackdrop}) {
   open(value){
    if(dialog.open)return;
    release();snapshot=value;format='png';paused=false;const current=++epoch;copying=false;
-   image.alt=`Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed.`;show();dialog.showModal();
+   image.alt=analyticsShareDescription(snapshot);show();dialog.showModal();
    for(const [key,render]of [['png',()=>renderAnalyticsSharePNG(value)],['svg',()=>new Blob([renderAnalyticsShareSVG(value)],{type:'image/svg+xml'})],['still',()=>new Blob([renderAnalyticsShareSVG(value,true)],{type:'image/svg+xml'})]]){
     Promise.resolve().then(render).then(blob=>{if(current!==epoch||!dialog.open)return;assets[key]={blob,url:URL.createObjectURL(blob)};show();}).catch(()=>{if(current===epoch&&dialog.open){assets[key]={error:true};show();}});
    }
   }
  };
+}
+
+function analyticsPeriodLabel(period) {
+ return period==='all'?'Lifetime':period==='1'?'Today':`Last ${period} days`;
+}
+// Export only the winning public model/effort and its aggregate count, never IDs
+// or conversation metadata. Turns define usage; ties use active time, then name.
+function analyticsShareTopModel(models=[]) {
+ const row=[...models].filter(m=>m&&typeof m.model==='string'&&typeof m.effort==='string'&&Number.isFinite(m.turns)&&m.turns>0).sort((a,b)=>b.turns-a.turns||(b.activeMs||0)-(a.activeMs||0)||a.model.localeCompare(b.model)||a.effort.localeCompare(b.effort))[0];
+ return row?{model:row.model,effort:row.effort,turns:row.turns}:null;
+}
+function analyticsShareNumber(key,value) {
+ const n=Math.max(0,Number.isFinite(value)?value:0)/(key==='activeMs'?3600000:1);
+ return key==='activeMs'&&n>0&&n<.05?'<0.1':new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:key==='activeMs'||n>=10000?1:0}).format(n);
+}
+function analyticsShareTiles(snapshot) {
+ const top=snapshot.topModel,known=top&&top.model!=='unattributed';
+ const model=known?top.model.replace(/^gpt-/,'GPT-').replace(/-sol$/,' Sol').replace(/-astra$/,' Astra'):top?'Not recorded':'No turns yet';
+ const effort=known&&top.effort!=='unknown'?({max:'Pro',xhigh:'Extra High',low:'Instant'}[top.effort]||top.effort.replace(/^./,c=>c.toUpperCase())):'';
+ return [
+  {key:'turns',label:'Turns',x:66,y:180,width:330,angle:-.025,color:'#dfff75'},
+  {key:'toolCalls',label:'Tool calls',x:435,y:187,width:330,angle:.02,color:'#ff91c8'},
+  {key:'goals',label:'Goals completed',x:804,y:179,width:330,angle:-.018,color:'#80eadb'},
+  {key:'activeMs',label:'Hours · estimated',x:66,y:387,width:330,angle:.018,color:'#ffd28b'},
+  {key:'topModel',label:`Top model${effort?' · '+effort:''}${known?' · '+analyticsShareNumber('turns',top.turns)+' turns':''}`,value:model,x:435,y:387,width:699,angle:-.008,color:'#fff9ea'}
+ ].map(card=>({...card,height:174,value:card.value??analyticsShareNumber(card.key,snapshot.totals[card.key])}));
+}
+function analyticsShareDescription(snapshot) {
+ const model=analyticsShareTiles(snapshot).find(card=>card.key==='topModel');
+ return `Codexify stats: ${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed, ${analyticsShareNumber('activeMs',snapshot.totals.activeMs)} estimated agent-hours. ${model.label}: ${model.value}.`;
 }
 
 function renderAnalyticsSharePNG(snapshot) {
@@ -261,30 +292,29 @@ function renderAnalyticsSharePNG(snapshot) {
  const star=(x,y,r,color)=>{context.beginPath();for(let i=0;i<16;i++){const angle=i*Math.PI/8-Math.PI/2,rad=i%2?r*.52:r;const px=x+Math.cos(angle)*rad,py=y+Math.sin(angle)*rad;if(i)context.lineTo(px,py);else context.moveTo(px,py);}context.closePath();context.fillStyle=color;context.fill();};
  rounded(0,0,W,H,30);context.clip();context.fillStyle='#7651ed';context.fillRect(0,0,W,H);
  // Flat, saturated sticker colors keep the PNG small and the numbers legible.
- star(1129,461,38,'#dfff75');star(407,160,23,'#ff91c8');
- context.fillStyle='#ff91c8';context.beginPath();context.arc(39,495,13,0,Math.PI*2);context.fill();
- context.fillStyle='#dfff75';context.save();context.translate(1099,157);context.rotate(-.3);context.fillRect(-5,-17,10,34);context.fillRect(-17,-5,34,10);context.restore();
+ star(1158,558,26,'#dfff75');star(407,143,18,'#ff91c8');
+ context.fillStyle='#ff91c8';context.beginPath();context.arc(31,375,10,0,Math.PI*2);context.fill();
+ context.fillStyle='#dfff75';context.save();context.translate(1099,143);context.rotate(-.3);context.fillRect(-4,-14,8,28);context.fillRect(-14,-4,28,8);context.restore();
  context.textBaseline='alphabetic';context.fillStyle='#fff9ea';context.font='800 48px system-ui, -apple-system, sans-serif';context.fillText(snapshot.title||'Codexify stats',68,113);
- const period=snapshot.periodLabel||(snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`);context.font='750 23px system-ui, -apple-system, sans-serif';const pillWidth=context.measureText(period).width+42;
+ const period=(snapshot.periodLabel||analyticsPeriodLabel(snapshot.period)).toUpperCase();context.font='750 23px system-ui, -apple-system, sans-serif';const pillWidth=context.measureText(period).width+42;
  context.save();context.translate(W-72-pillWidth/2,85);context.rotate(.045);rounded(-pillWidth/2+5,-27+5,pillWidth,54,14);context.fillStyle=ink;context.fill();rounded(-pillWidth/2,-27,pillWidth,54,14);context.fillStyle='#fff9ea';context.fill();context.strokeStyle=ink;context.lineWidth=3;context.stroke();context.fillStyle=ink;context.textAlign='center';context.fillText(period,0,8);context.restore();
- const format=n=>new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:n>=10000?1:0}).format(n||0);
- const cards=[{key:'turns',label:'Turns',x:66,y:200,angle:-.025,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:.02,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-.018,color:'#80eadb'}];
- for(const card of cards){
-  const width=330,height=249;context.save();context.translate(card.x+width/2,card.y+height/2);context.rotate(card.angle);
+ for(const card of analyticsShareTiles(snapshot)){
+  const {width,height}=card;context.save();context.translate(card.x+width/2,card.y+height/2);context.rotate(card.angle);
   rounded(-width/2+8,-height/2+9,width,height,22);context.fillStyle=ink;context.fill();rounded(-width/2,-height/2,width,height,22);context.fillStyle=card.color;context.fill();context.strokeStyle=ink;context.lineWidth=4;context.stroke();
-  const text=format(snapshot.totals[card.key]);let size=100;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;while(context.measureText(text).width>278&&size>34){size-=2;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;}
-  context.fillStyle=ink;context.fillText(text,-width/2+25,19);context.font='650 31px system-ui, -apple-system, sans-serif';context.fillText(card.label,-width/2+27,79);context.restore();
+  let value=card.value,size=card.key==='topModel'?50:80;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;while(context.measureText(value).width>width-52&&size>36){size-=2;context.font=`850 ${size}px system-ui, -apple-system, sans-serif`;}
+  while(context.measureText(value).width>width-52&&value.length>1)value=value.slice(0,-2)+'…';
+  context.fillStyle=ink;context.fillText(value,-width/2+25,7);context.font=`650 ${card.key==='topModel'?26:29}px system-ui, -apple-system, sans-serif`;context.fillText(card.label,-width/2+27,54);context.restore();
  }
- // One aggregate activity strip, with no model labels or private details.
+ // One aggregate activity strip, without conversation details.
  const raw=snapshot.activity.length?snapshot.activity:[0,0,0,0,0,0,0],stride=Math.max(1,Math.ceil(raw.length/30)),bars=[];
  for(let i=0;i<raw.length;i+=stride)bars.push(raw.slice(i,i+stride).reduce((a,b)=>a+b,0));
  const max=Math.max(1,...bars),plotWidth=600,gap=bars.length<=7?12:5,barW=(plotWidth-gap*(bars.length-1))/bars.length;
- for(const [index,value]of bars.entries()){const height=value?Math.max(4,value/max*43):3;context.fillStyle=value?(index===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50';rounded(72+index*(barW+gap),554-height,barW,height,Math.min(4,height/2));context.fill();}
+ for(const [index,value]of bars.entries()){const height=value?Math.max(4,value/max*23):3;context.fillStyle=value?(index===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50';rounded(72+index*(barW+gap),607-height,barW,height,Math.min(4,height/2));context.fill();}
  const date=iso=>{const value=new Date(iso+'T12:00:00Z');return Number.isFinite(value.getTime())?value:null;};
  const first=date(snapshot.start),last=date(snapshot.today),pretty=(d,year)=>new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',...(year?{year:'numeric'}:{}),timeZone:'UTC'}).format(d);
  const dates=first&&last?(snapshot.start===snapshot.today?pretty(last,true):`${pretty(first,first.getUTCFullYear()!==last.getUTCFullYear())} – ${pretty(last,true)}`):'Your agent activity';
- context.font='550 23px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText(dates,72,605);
- context.save();context.translate(1002,579);context.rotate(-.035);rounded(-142,-35,284,70,17);context.fillStyle=ink;context.fill();context.textAlign='center';context.font='750 35px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText('codexify.dev',0,12);context.restore();
+ context.font='550 23px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText(dates,72,645);
+ context.save();context.translate(1002,617);context.rotate(-.035);rounded(-142,-30,284,60,17);context.fillStyle=ink;context.fill();context.textAlign='center';context.font='750 35px system-ui, -apple-system, sans-serif';context.fillStyle='#fff9ea';context.fillText('codexify.dev',0,12);context.restore();
  return new Promise((resolve,reject)=>{canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('PNG unavailable')),'image/png');});
 }
 
@@ -292,51 +322,52 @@ function renderAnalyticsSharePNG(snapshot) {
 // do not. Final totals are the base drawing, so a still renderer stays useful.
 function renderAnalyticsShareSVG(snapshot,still=false) {
  const escape=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
- const format=n=>new Intl.NumberFormat('en-US',{notation:n>=10000?'compact':'standard',maximumFractionDigits:n>=10000?1:0}).format(n||0);
  const text=(x,y,value,size=23,weight=650,extra='')=>`<text x="${x}" y="${y}" font-size="${size}" font-weight="${weight}" ${extra}>${escape(value)}</text>`;
  const rect=(x,y,w,h,r,fill,extra='')=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" fill="${fill}" ${extra}/>`;
  const anim=(attr,values,times)=>`<animate attributeName="${attr}" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>`;
  const star=(x,y,r,color,rotate=false)=>{const points=Array.from({length:16},(_,i)=>{const a=i*Math.PI/8-Math.PI/2,s=i%2?r*.52:r;return `${(Math.cos(a)*s).toFixed(2)},${(Math.sin(a)*s).toFixed(2)}`;}).join(' ');return `<g transform="translate(${x} ${y})"><polygon points="${points}" fill="${color}"/>${rotate?`<g class="motion" visibility="hidden"><set attributeName="visibility" to="visible" begin="0s"/><circle r="${r+2}" fill="#7651ed"/><polygon points="${points}" fill="${color}"><animateTransform attributeName="transform" type="rotate" values="0;0;90;90" keyTimes="0;.24;.4;1" dur="6s" repeatCount="indefinite"/></polygon></g>`:''}</g>`;};
- const period=snapshot.periodLabel||(snapshot.period==='all'?'LIFETIME':`LAST ${snapshot.period} DAYS`),pillWidth=period.length*15+42;
+ const period=(snapshot.periodLabel||analyticsPeriodLabel(snapshot.period)).toUpperCase(),pillWidth=period.length*15+42;
  let defs='<clipPath id="edge"><rect width="1200" height="675" rx="30"/></clipPath>',cards='';
- for(const [i,card]of [{key:'turns',label:'Turns',x:66,y:200,angle:-1.43,color:'#dfff75'},{key:'toolCalls',label:'Tool calls',x:435,y:211,angle:1.15,color:'#ff91c8'},{key:'goals',label:'Goals completed',x:804,y:196,angle:-1.03,color:'#80eadb'}].entries()){
+ for(const [i,card]of analyticsShareTiles(snapshot).entries()){
+  const {width,height}=card,isModel=card.key==='topModel';
   const value=snapshot.totals[card.key]||0;
   // Bounded text frames keep the SVG compact even for lifetime totals. Ease out
   // over 1.7s, then hold the exact final value for the rest of the six-second loop.
-  const frames=Array.from({length:33},(_,n)=>format(Math.round(value*(1-Math.pow(1-n/32,2)))));
-  const size=Math.min(100,Math.floor(278/(Math.max(...frames.map(v=>v.length))*.66)));
+  const frames=isModel?[]:Array.from({length:33},(_,n)=>analyticsShareNumber(card.key,card.key==='activeMs'?value*(1-Math.pow(1-n/32,2)):Math.round(value*(1-Math.pow(1-n/32,2)))));
+  const size=Math.max(36,Math.min(isModel?50:80,Math.floor((width-52)/(Math.max(card.value.length,...frames.map(v=>v.length))*.66))));
+  const fit=value=>{const limit=Math.floor((width-52)/(size*.66));return value.length>limit?value.slice(0,limit-1)+'…':value;};
   const times=frames.map((_,n)=>(n/32*.28).toFixed(5)).concat('1').join(';');
-  const values=frames.map((_,n)=>`0 ${-n*126}`).concat(`0 ${-32*126}`).join(';');
-  defs+=`<clipPath id="digits-${i}"><rect x="20" y="45" width="290" height="122"/></clipPath>`;
-  cards+=`<g transform="translate(${card.x+165} ${card.y+124.5}) rotate(${card.angle}) translate(-165 -124.5)">
-   ${rect(8,9,330,249,22,'#241739')}${rect(0,0,330,249,22,card.color,'stroke="#241739" stroke-width="4"')}
-   ${text(25,144,format(value),size,850,'data-final="'+card.key+'"')}
-   <g class="motion" visibility="hidden" clip-path="url(#digits-${i})"><set attributeName="visibility" to="visible" begin="0s"/>
-    ${rect(20,45,290,122,0,card.color)}<g><animateTransform attributeName="transform" type="translate" calcMode="discrete" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>
-    ${frames.map((v,n)=>text(25,144+n*126,v,size,850)).join('')}</g>
-   </g>${text(27,204,card.label,31)}
+  const values=frames.map((_,n)=>`0 ${-n*100}`).concat(`0 ${-32*100}`).join(';');
+  if(!isModel)defs+=`<clipPath id="digits-${i}"><rect x="20" y="15" width="290" height="95"/></clipPath>`;
+  cards+=`<g transform="translate(${card.x+width/2} ${card.y+height/2}) rotate(${card.angle*180/Math.PI}) translate(${-width/2} ${-height/2})">
+   ${rect(8,9,width,height,22,'#241739')}${rect(0,0,width,height,22,card.color,'stroke="#241739" stroke-width="4"')}
+   ${text(25,94,fit(card.value),size,850,'data-final="'+card.key+'"')}
+   ${isModel?'':`<g class="motion" visibility="hidden" clip-path="url(#digits-${i})"><set attributeName="visibility" to="visible" begin="0s"/>
+    ${rect(20,15,290,95,0,card.color)}<g><animateTransform attributeName="transform" type="translate" calcMode="discrete" values="${values}" keyTimes="${times}" dur="6s" repeatCount="indefinite"/>
+    ${frames.map((v,n)=>text(25,94+n*100,v,size,850)).join('')}</g>
+   </g>`}${text(27,141,card.label,isModel?26:29)}
   </g>`;
  }
  const raw=snapshot.activity.length?snapshot.activity:[0,0,0,0,0,0,0],stride=Math.max(1,Math.ceil(raw.length/30)),bars=[];
  for(let i=0;i<raw.length;i+=stride)bars.push(raw.slice(i,i+stride).reduce((a,b)=>a+b,0));
  const max=Math.max(1,...bars),gap=bars.length<=7?12:5,w=(600-gap*(bars.length-1))/bars.length;
- const strip=bars.map((v,i)=>{const h=v?Math.max(4,v/max*43):3,start=(.02+i/bars.length*.12).toFixed(4),end=(.12+i/bars.length*.16).toFixed(4);return `<rect x="${72+i*(w+gap)}" y="${554-h}" width="${w}" height="${h}" rx="${Math.min(4,h/2)}" fill="${v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50'}">${anim('height',`${h};0;${h};${h}`,`0;${start};${end};1`)}${anim('y',`${554-h};554;${554-h};${554-h}`,`0;${start};${end};1`)}</rect>`;}).join('');
+ const strip=bars.map((v,i)=>{const h=v?Math.max(4,v/max*23):3,start=(.02+i/bars.length*.12).toFixed(4),end=(.12+i/bars.length*.16).toFixed(4);return `<rect x="${72+i*(w+gap)}" y="${607-h}" width="${w}" height="${h}" rx="${Math.min(4,h/2)}" fill="${v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50'}">${anim('height',`${h};0;${h};${h}`,`0;${start};${end};1`)}${anim('y',`${607-h};607;${607-h};${607-h}`,`0;${start};${end};1`)}</rect>`;}).join('');
  const pretty=(iso,year)=>new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',...(year?{year:'numeric'}:{}),timeZone:'UTC'}).format(new Date(iso+'T12:00:00Z'));
  const dates=snapshot.start===snapshot.today?pretty(snapshot.today,true):`${pretty(snapshot.start,snapshot.start.slice(0,4)!==snapshot.today.slice(0,4))} – ${pretty(snapshot.today,true)}`;
- const sparks=Array.from({length:12},(_,i)=>{const angle=i/12*Math.PI*2,x=Math.cos(angle)*67,y=Math.sin(angle)*44;return `<g transform="translate(${754+x} ${539+y})"><path d="M-3 0h6M0-3v6" fill="none" stroke="${i%2?'#ff91c8':'#dfff75'}" stroke-width="4" stroke-linecap="round"/>${anim('opacity','0;0;1;0;0','0;.25;.32;.52;1')}<animateTransform attributeName="transform" type="translate" additive="sum" values="0 0;0 0;${x*.5} ${y*.5};${x*.5} ${y*.5}" keyTimes="0;.25;.52;1" dur="6s" repeatCount="indefinite"/></g>`;}).join('');
+ const sparks=Array.from({length:12},(_,i)=>{const angle=i/12*Math.PI*2,x=Math.cos(angle)*36,y=Math.sin(angle)*22;return `<g transform="translate(${754+x} ${615+y})"><path d="M-3 0h6M0-3v6" fill="none" stroke="${i%2?'#ff91c8':'#dfff75'}" stroke-width="4" stroke-linecap="round"/>${anim('opacity','0;0;1;0;0','0;.25;.32;.52;1')}<animateTransform attributeName="transform" type="translate" additive="sum" values="0 0;0 0;${x*.5} ${y*.5};${x*.5} ${y*.5}" keyTimes="0;.25;.52;1" dur="6s" repeatCount="indefinite"/></g>`;}).join('');
  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
- <title id="title">Codexify stats · ${escape(period)}</title><desc id="desc">${escape(`${snapshot.totals.turns} turns, ${snapshot.totals.toolCalls} tool calls, ${snapshot.totals.goals} goals completed. ${dates}.`)}</desc>
+ <title id="title">Codexify stats · ${escape(period)}</title><desc id="desc">${escape(`${analyticsShareDescription(snapshot)} ${dates}.`)}</desc>
  <style>text{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#241739}.cream{fill:#fff9ea}@media(prefers-reduced-motion:reduce){.motion{display:none}animate,animateTransform,set{display:none}}</style>
  <defs>${defs}</defs><g clip-path="url(#edge)">${rect(0,0,1200,675,0,'#7651ed')}
- ${star(1129,461,38,'#dfff75',true)}${star(407,160,23,'#ff91c8',true)}<circle cx="39" cy="495" r="13" fill="#ff91c8"/>
- <g transform="translate(1099 157) rotate(-17)"><path d="M-17 0h34M0-17v34" stroke="#dfff75" stroke-width="10"/></g>
+ ${star(1158,558,26,'#dfff75',true)}${star(407,143,18,'#ff91c8',true)}<circle cx="31" cy="375" r="10" fill="#ff91c8"/>
+ <g transform="translate(1099 143) rotate(-17)"><path d="M-14 0h28M0-14v28" stroke="#dfff75" stroke-width="8"/></g>
  ${text(68,113,snapshot.title||'Codexify stats',48,800,'class="cream"')}
  <g transform="translate(${1128-pillWidth/2} 85) rotate(2.58)">${rect(-pillWidth/2+5,-22,pillWidth,54,14,'#241739')}${rect(-pillWidth/2,-27,pillWidth,54,14,'#fff9ea','stroke="#241739" stroke-width="3"')}${text(0,8,period,23,750,'text-anchor="middle"')}</g>
- ${cards}<g class="motion">${sparks}<g transform="translate(754 568)" opacity="0">${anim('opacity','0;0;1;1;0;0','0;.24;.28;.5;.6;1')}<g>
+ ${cards}<g class="motion">${sparks}<g transform="translate(754 645) scale(.7)" opacity="0">${anim('opacity','0;0;1;1;0;0','0;.24;.28;.5;.6;1')}<g>
  <animateTransform attributeName="transform" type="scale" values="1 1;.9 1.08;1.04 .96;1 1" dur=".6s" repeatCount="indefinite"/>
  <path d="M0 5C-39 5-38-29-19-47C-22-33-10-32-12-50C-13-64 4-70 3-84C30-64 8-48 27-39C29-48 26-52 26-52C53-24 35 5 0 5Z" fill="#ff763e" stroke="#241739" stroke-width="3" stroke-linejoin="round"/>
  <path d="M0 0C-20 0-20-19-8-29C-8-15 1-24 1-41C21-25 21 0 0 0Z" fill="#ffe875"/></g></g></g>
- <g class="motion">${strip}</g><g class="still-strip">${bars.map((v,i)=>{const h=v?Math.max(4,v/max*43):3;return rect(72+i*(w+gap),554-h,w,h,Math.min(4,h/2),v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50');}).join('')}</g>
- ${text(72,605,dates,23,550,'class="cream"')}<g transform="translate(1002 579) rotate(-2)">${rect(-142,-35,284,70,17,'#241739')}${text(0,12,'codexify.dev',35,750,'class="cream" text-anchor="middle"')}</g>
+ <g class="motion">${strip}</g><g class="still-strip">${bars.map((v,i)=>{const h=v?Math.max(4,v/max*23):3;return rect(72+i*(w+gap),607-h,w,h,Math.min(4,h/2),v?(i===bars.length-1?'#dfff75':'#fff9eaaa'):'#fff9ea50');}).join('')}</g>
+ ${text(72,645,dates,23,550,'class="cream"')}<g transform="translate(1002 617) rotate(-2)">${rect(-142,-30,284,60,17,'#241739')}${text(0,12,'codexify.dev',35,750,'class="cream" text-anchor="middle"')}</g>
  </g><style>.still-strip{display:none}@media(prefers-reduced-motion:reduce){.still-strip{display:inline}}${still?'.motion{display:none}.still-strip{display:inline}':''}</style></svg>`;
 }

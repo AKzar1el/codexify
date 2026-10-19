@@ -100,6 +100,11 @@ Prefer a manual install? Get a [prebuilt binary](https://github.com/devnoname120
 or read the [installation guide](https://github.com/devnoname120/codexify/wiki/Installation).
 The installer source is available for [macOS/Linux](https://github.com/devnoname120/codexify/blob/main/install.sh) and [Windows](https://github.com/devnoname120/codexify/blob/main/install.ps1).
 
+Run `codexify update` to download, verify and schedule the latest release for a
+standard installation. A running background service is restarted after the
+verified replacement; a stopped service stays stopped. The command reports when
+the installation is already up to date and never downgrades a newer version.
+
 ### 2. Connect to ChatGPT
 
 ```sh
@@ -275,13 +280,16 @@ goals visible when Statistics first observes them.
 with activity, when the interface is idle. You can reopen it from Statistics and
 share a static PNG or animated SVG using that week's exact dates and totals.
 Record, badge and streak celebrations use a short, click-through toast; fireworks
-last under four seconds and respect reduced motion. Durable local receipts in
+use five large, staggered bursts with glowing sparks and rising trails. They
+last under four seconds and respect reduced motion. A brief local fanfare and
+firework pops can accompany celebrations after your first interaction with the page.
+Durable local receipts in
 `statistics-extras.json` prevent repeats across reloads or simultaneous clients.
 A conversation or goal celebrates each record category only once, including after
 goal edits, pauses and resumes. Initial historical milestones are recorded quietly.
 
 In **Settings → Extras**, independently turn off achievement celebrations,
-animations, weekly recap popups, daily streak celebrations or personal record
+animations, celebration sounds, weekly recap popups, daily streak celebrations or personal record
 celebrations. These settings apply immediately and never hide Statistics, sharing,
 or collected milestones. Disabled celebrations do not accumulate a later backlog.
 
@@ -419,9 +427,10 @@ the patterns for later use.
 
 The browser companion is monitored while automation is enabled. An installed
 companion recovers automatically after its window closes or stops responding.
-**Conversation settings → Browser connection** provides **Start browser** and
-**Stop browser**. Stop deliberately keeps it off, including after restarting
-Codexify, until Start is pressed. The CLI `browser start` and `browser stop`
+**Codexify settings → Browser** provides **Start browser**, **Stop browser**,
+**Sign in**, and **Refresh models**, shared by all conversations and available
+without selecting a chat. Stop deliberately keeps it off, including after
+restarting Codexify, until Start is pressed. The CLI `browser start` and `browser stop`
 commands use the same control. Queued work, pairings and the signed-in profile
 are retained. Recovery does not submit or replay messages.
 

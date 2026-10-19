@@ -26,6 +26,15 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
         ..Default::default()
     };
     assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
+    assert!(state.is_automatically_retrying());
+    let mut legacy = serde_json::to_value(&state).unwrap();
+    legacy["action"]
+        .as_object_mut()
+        .unwrap()
+        .remove("automaticRetryInProgress");
+    let legacy: AutomationTaskState = serde_json::from_value(legacy).unwrap();
+    assert!(!legacy.action.automatic_retry_in_progress);
+    assert!(legacy.is_automatically_retrying());
     for accepted in [None, Some(true)] {
         let mut uncertain = state.clone();
         uncertain.action.send_accepted = accepted;
@@ -52,6 +61,11 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     }
     different.action.automatic_retry_attempts = 3;
     assert!(different.automatic_retry_at_ms().is_none());
+    different.action.automatic_retry_in_progress = true;
+    assert!(
+        !different.is_automatically_retrying(),
+        "exhausted failures stay terminal"
+    );
     let mut cancelled = state.clone();
     cancelled.action.last_error = Some("Browser action cancelled before Send".into());
     assert!(cancelled.automatic_retry_at_ms().is_none());

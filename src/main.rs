@@ -190,6 +190,37 @@ async fn run(mut cli: Cli) -> anyhow::Result<()> {
             CliCommand::Config(args) => {
                 return codexify::config_cli::run(&cli, args);
             }
+            CliCommand::Update => {
+                let config = load_config_quiet_read_only(cli).map_err(anyhow::Error::msg)?;
+                codexify::terminal::write_stdout("Checking for a verified Codexify update…\n")?;
+                let receipt = codexify::self_update::trigger_for_cli(config.port).await?;
+                use codexify::self_update::SelfUpdateStatus;
+                let message = match receipt.status {
+                    SelfUpdateStatus::UpToDate => format!(
+                        "Codexify {} is already up to date.\n",
+                        receipt.current_version
+                    ),
+                    SelfUpdateStatus::AheadOfLatest => format!(
+                        "Codexify {} is newer than the latest release ({}). No update scheduled.\n",
+                        receipt.current_version, receipt.target_version
+                    ),
+                    SelfUpdateStatus::Scheduled => format!(
+                        "Codexify {} has been downloaded and verified. Update {} is scheduled.\n{}\nLog: {}\n",
+                        receipt.target_version,
+                        receipt.update_id.as_deref().unwrap_or("<unknown>"),
+                        if receipt.service_restart {
+                            "The running background service will restart after the replacement."
+                        } else if cfg!(windows) {
+                            "Close any foreground Codexify server so its executable can be replaced."
+                        } else {
+                            "The installed executable will be replaced shortly. Restart any foreground Codexify process to use the new version."
+                        },
+                        receipt.log_path
+                    ),
+                };
+                codexify::terminal::write_stdout(&message)?;
+                return Ok(());
+            }
             CliCommand::Doctor(args) => {
                 let report = doctor::run(cli).await;
                 let output = if args.json {

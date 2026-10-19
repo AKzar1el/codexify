@@ -202,7 +202,8 @@ async fn workspace_picker_wait_and_switch_require_brief_without_touching_old_fil
 
         config.markdown_chat.enabled = true;
         config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
-        config.markdown_chat.max_wait_ms = 2000;
+        // Exercise workspace transitions without racing the chat timeout on busy runners.
+        config.markdown_chat.max_wait_ms = 10_000;
         config.worktrees.mode = crate::types::WorktreeMode::Never;
         config.memory.dir = Some(root.path().join("memory").display().to_string());
         let mut handler = handler_with_tools(

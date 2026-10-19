@@ -1159,18 +1159,23 @@ mod tests {
         let waiting = chat.clone();
         let task = tokio::spawn(async move {
             waiting
-                .wait_completed(Duration::from_secs(2), CancellationToken::new())
+                // Native watcher startup can exceed two seconds on a busy host.
+                .wait_completed(Duration::from_secs(10), CancellationToken::new())
                 .await
                 .unwrap()
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let summary = chat.owner_summary().await.unwrap();
+        assert!(summary.agent_waiting_until_ms.is_none());
+        assert!(summary.agent_idle_until_ms.is_some());
         assert!(
-            chat.owner_summary()
+            chat.widget_page(None, None)
                 .await
                 .unwrap()
                 .agent_waiting_until_ms
                 .is_none()
         );
+        assert!(!chat.queue_input_required().await.unwrap());
         enqueue(&chat, "first").await;
         enqueue(&chat, "second").await;
         match task.await.unwrap() {

@@ -8,13 +8,13 @@ const META='io.github.devnoname120/codexify/markdown-chat';
 const id='a'.repeat(64),base='http://127.0.0.1:43314';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(predicate){for(let i=0;i<100;i++){if(await predicate())return;await pause(40);}assert.fail('Expected state did not arrive');}
-async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[],inputRequired=false,waiting=false}={}){
+async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[],inputRequired=false,waiting=false,completedWaiting=false}={}){
  const context=await browser.newContext({viewport:{width,height:900}});
  await context.addInitScript(platform=>Object.defineProperty(navigator,'platform',{value:platform}),platform);
  const page=await context.newPage();page.setDefaultTimeout(6000);
  const errors=[],calls=[],messages=[{id:'agent-progress',role:'agent',markdown:'The current request is still running.',start:0,end:100,created_at_ms:Date.now(),tool_call_count:1}];
  page.on('pageerror',error=>errors.push(error.message));
- const backend={queue:queued.map((markdown,i)=>({id:`queue-${i}`,revision:1,markdown,attachment_ids:[],attachments:[],created_at_ms:Date.now()+i})),mode,inputRequired,waiting,readThrough:0,revision:1,settingsRevision:1,end:100,failAfterQueue:false,pollDelay:null};
+ const backend={queue:queued.map((markdown,i)=>({id:`queue-${i}`,revision:1,markdown,attachment_ids:[],attachments:[],created_at_ms:Date.now()+i})),mode,inputRequired,waiting,idleUntil:completedWaiting?Date.now()+60000:null,readThrough:0,revision:1,settingsRevision:1,end:100,failAfterQueue:false,pollDelay:null};
  const defaults=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url)));
  const document={workDir:'/fixture',agentChat:{enabled:true,defaultMessageMode:mode},codexMcp:{enabled:false}};
  const settings=()=>({path:'/fixture/settings.json',defaults,document,raw:JSON.stringify(document),revision:String(backend.settingsRevision),restartRequired:false});
@@ -32,7 +32,7 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
    for(const[key,value]of Object.entries(body.changes)){assert.equal(key,'agentChat.defaultMessageMode');document.agentChat.defaultMessageMode=value;backend.mode=value;}
    backend.settingsRevision++;return route.fulfill({json:settings()});
   }
-  if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Queued messages',workspace:'fixture',workspacePath:'/fixture',lastEntryAtMs:Date.now(),lastEntryEnd:backend.end,lastAgentCallAtMs:Date.now(),totalToolCalls:1}],serverTimeMs:Date.now()}});
+  if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Queued messages',workspace:'fixture',workspacePath:'/fixture',lastEntryAtMs:Date.now(),lastEntryEnd:backend.end,lastAgentCallAtMs:Date.now(),agentIdleUntilMs:backend.idleUntil,totalToolCalls:1}],serverTimeMs:Date.now()}});
   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:false,goal:null,pairing:{status:'unpaired'},action:{status:'idle'},selection:{},catalog:{models:[]},companion:{authenticated:false,status:'idle'},presence:{lastAgentCallAtMs:Date.now()},serverTimeMs:Date.now()}});
   if(path===`/api/chats/${id}/send`){
    const body=request.postDataJSON();calls.push({path,body});
@@ -58,6 +58,22 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
  return{page,context,host,backend,calls,errors,messages};
 }
 for(const[engineName,engine]of[['Chromium',chromium],['WebKit',webkit]]){
+ test(`${engineName}: completed waits show a static waiting sidebar icon without treating the next request as an answer`,{timeout:25000},async()=>{
+  const browser=await engine.launch();
+  try {
+   const f=await fixture(browser,{mode:'queue',completedWaiting:true}),{page,host,backend,calls,errors}=f;
+   const icon=page.locator('.conversation .presence.waiting');await icon.waitFor();
+   assert.equal(await icon.locator('.presence-spinner').count(),0);assert.equal(await icon.locator('circle').count(),3);
+   assert.equal(await host.locator('#chat').getAttribute('data-awaiting'),'false','completion waits must not show the question/answer cue');
+   const input=host.locator('#draft');await input.fill('A new queued request');await input.press('Enter');await until(()=>backend.queue.length===1);
+   assert.equal(calls.at(-1).body.message_mode,'queue');assert.equal(f.messages.length,1);await icon.waitFor();
+   backend.idleUntil=Date.now()-1;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await page.locator('.conversation .presence.online').waitFor();
+   backend.idleUntil=Date.now()+60000;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await icon.waitFor();
+   if(process.env.QUEUE_SCREENSHOTS){mkdirSync(process.env.QUEUE_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.QUEUE_SCREENSHOTS}/${engineName.toLowerCase()}-completed-wait.png`});}
+   backend.idleUntil=null;await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await page.locator('.conversation .presence.online .presence-spinner').waitFor();
+   assert.deepEqual(errors,[]);await f.context.close();
+  }finally{await browser.close();}
+ });
  test(`${engineName}: per-message keyboard override, defaults and private queue controls`,{timeout:60000},async()=>{
   const browser=await engine.launch();
   try{

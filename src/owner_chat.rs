@@ -521,20 +521,25 @@ struct ChatListing {
     custom_title: Option<String>,
     pinned_at_ms: Option<u64>,
     archived_at_ms: Option<u64>,
+    owner_read_through: u64,
     workspace: String,
     project_id: String,
     project_path: String,
     is_scratch: bool,
     last_entry_end: u64,
+    last_incoming_entry_end: u64,
     last_entry_at_ms: u64,
     last_agent_call_at_ms: Option<u64>,
     agent_waiting_until_ms: Option<u64>,
+    agent_idle_until_ms: Option<u64>,
     agent_presence_until_ms: Option<u64>,
     goal_status: Option<crate::agent_automation::GoalStatus>,
+    goal: Option<crate::agent_automation::GoalRecord>,
     goal_completion_dismissed: bool,
     goal_completed_at_ms: Option<u64>,
     goal_completed_chat_end: Option<u64>,
     automation_error: Option<String>,
+    automation_retrying: bool,
     total_tool_calls: u64,
 }
 
@@ -649,12 +654,15 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             custom_title,
             pinned_at_ms,
             archived_at_ms,
+            owner_read_through,
             last_entry_end,
+            last_incoming_entry_end,
             last_entry_at_ms,
             last_user_entry_end,
             last_user_entry_at_ms,
             last_agent_call_at_ms,
             agent_waiting_until_ms,
+            agent_idle_until_ms,
             agent_presence_until_ms,
             total_tool_calls,
             ..
@@ -668,7 +676,9 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                     custom_title: None,
                     pinned_at_ms: None,
                     archived_at_ms: None,
+                    owner_read_through: 0,
                     last_entry_end: metadata.len(),
+                    last_incoming_entry_end: 0,
                     last_entry_at_ms: metadata
                         .modified()
                         .ok()
@@ -680,6 +690,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                     last_user_entry_at_ms: None,
                     agent_stop_requested: false,
                     agent_waiting_until_ms: None,
+                    agent_idle_until_ms: None,
                     agent_presence_until_ms: None,
                     total_tool_calls: 0,
                 }
@@ -719,6 +730,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                 )
             }
         };
+        let automation_retrying = state_error.is_none() && automation.is_automatically_retrying();
         let automation_error = state_error.or_else(|| {
             automation
                 .action_needs_attention_at(crate::markdown_chat::now_ms())
@@ -752,20 +764,25 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             custom_title,
             pinned_at_ms,
             archived_at_ms,
+            owner_read_through,
             workspace: located.workspace,
             project_id,
             project_path,
             is_scratch: located.is_scratch,
             last_entry_end,
+            last_incoming_entry_end,
             last_entry_at_ms,
             last_agent_call_at_ms,
             agent_waiting_until_ms,
+            agent_idle_until_ms,
             agent_presence_until_ms,
             goal_status,
             goal_completion_dismissed,
             goal_completed_at_ms: completed_goal.and_then(|goal| goal.finished_at_ms),
             goal_completed_chat_end: completed_goal.and_then(|goal| goal.completed_chat_end),
+            goal,
             automation_error,
+            automation_retrying,
             total_tool_calls,
         });
     }
@@ -775,7 +792,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(Json(
-        json!({"chats": list, "matchedChatIds": matched, "serverTimeMs": crate::markdown_chat::now_ms()}),
+        json!({"chats": list, "matchedChatIds": matched, "automationEnabled":state.config.markdown_chat.automation.enabled, "serverTimeMs": crate::markdown_chat::now_ms()}),
     ))
 }
 
@@ -859,6 +876,29 @@ struct PageQuery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReadBody {
+    through: u64,
+}
+
+async fn mark_chat_read(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<ReadBody>,
+) -> ApiResult {
+    let located = selected(&state, &id)?;
+    let chat = state
+        .chats
+        .chat_at_path(located.path, true)
+        .map_err(internal_error)?;
+    let through = chat
+        .mark_owner_read(body.through)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({"ownerReadThrough": through})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OrganizationBody {
     pinned: Option<bool>,
     archived: Option<bool>,
@@ -931,6 +971,66 @@ async fn chat_state(
     Ok(wrap(page))
 }
 
+async fn browser_snapshot(state: &OwnerState) -> (Value, Option<Value>) {
+    let mut catalog = None;
+    let mut companion = match companion_client(state) {
+        Ok(client) => match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.health(&CancellationToken::new()),
+        )
+        .await
+        .unwrap_or_else(|_| Err("Browser companion health check timed out".into()))
+        {
+            Ok(health) => {
+                let key = catalog_context(&health);
+                if health.authenticated
+                    && let Some(cached) = cached_owner_catalog(state, &key).await
+                {
+                    catalog = Some(
+                        json!({"catalogRevision":cached.catalog_revision,"models":cached.models}),
+                    );
+                }
+                let mut public = public_companion_health(&health);
+                public["catalogContext"] = json!(key);
+                public
+            }
+            Err(_) => {
+                json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
+            }
+        },
+        Err(_) => {
+            json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
+        }
+    };
+    if companion["status"] == "unavailable"
+        && let Ok(client) = companion_client(state)
+    {
+        let responsive = matches!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.liveness(&CancellationToken::new())
+            )
+            .await,
+            Ok(Ok(Some(true)))
+        );
+        companion["responsive"] = json!(responsive);
+    }
+    if let Ok(control) = crate::agent_automation::BrowserCompanionControl::new(
+        &state.config.markdown_chat.automation,
+    ) && let (Some(public), Some(lifecycle)) = (
+        companion.as_object_mut(),
+        control.public_status().as_object(),
+    ) {
+        public.extend(lifecycle.clone());
+    }
+    (companion, catalog)
+}
+
+async fn browser_state(State(state): State<OwnerState>) -> ApiResult {
+    let (companion, _) = browser_snapshot(&state).await;
+    Ok(Json(json!({"companion": companion})))
+}
+
 async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String>) -> ApiResult {
     if !state.config.markdown_chat.automation.enabled {
         return Ok(Json(json!({
@@ -953,7 +1053,6 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             .map(|(position, total)| json!({"position": position, "total": total})),
         None => None,
     };
-    let mut catalog = None;
     let mut public_action = serde_json::to_value(&automation.action).map_err(internal_error)?;
     let retry_mode = automation.retry_mode().or_else(|| {
         (automation.action.status == crate::agent_automation::AutomationActionStatus::Interference
@@ -982,56 +1081,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
     {
         public_action["lastError"] = json!(message);
     }
-    let mut companion = match companion_client(&state) {
-        Ok(client) => match tokio::time::timeout(
-            Duration::from_secs(2),
-            client.health(&CancellationToken::new()),
-        )
-        .await
-        .unwrap_or_else(|_| Err("Browser companion health check timed out".into()))
-        {
-            Ok(health) => {
-                let key = catalog_context(&health);
-                if health.authenticated
-                    && let Some(cached) = cached_owner_catalog(&state, &key).await
-                {
-                    catalog = Some(
-                        json!({"catalogRevision":cached.catalog_revision,"models":cached.models}),
-                    );
-                }
-                let mut public = public_companion_health(&health);
-                public["catalogContext"] = json!(key);
-                public
-            }
-            Err(_) => {
-                json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
-            }
-        },
-        Err(_) => {
-            json!({"status":"unavailable","authenticated":false,"activeActionId":null,"detail":"Browser companion is unavailable"})
-        }
-    };
-    if companion["status"] == "unavailable"
-        && let Ok(client) = companion_client(&state)
-    {
-        let responsive = matches!(
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                client.liveness(&CancellationToken::new())
-            )
-            .await,
-            Ok(Ok(Some(true)))
-        );
-        companion["responsive"] = json!(responsive);
-    }
-    if let Ok(control) = crate::agent_automation::BrowserCompanionControl::new(
-        &state.config.markdown_chat.automation,
-    ) && let (Some(public), Some(lifecycle)) = (
-        companion.as_object_mut(),
-        control.public_status().as_object(),
-    ) {
-        public.extend(lifecycle.clone());
-    }
+    let (companion, catalog) = browser_snapshot(&state).await;
     Ok(Json(json!({
         "enabled": true,
         "ownerGeneration": context.owner_generation,
@@ -1050,6 +1100,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
         "presence": {
             "lastAgentCallAtMs": summary.last_agent_call_at_ms,
             "agentWaitingUntilMs": summary.agent_waiting_until_ms,
+            "agentIdleUntilMs": summary.agent_idle_until_ms,
             "agentPresenceUntilMs": summary.agent_presence_until_ms,
             "totalToolCalls": summary.total_tool_calls
         },
@@ -1064,6 +1115,13 @@ async fn automation_capabilities(
 ) -> ApiResult {
     let located = selected(&state, &id)?;
     let _ = automation_context(&state, &located).await?;
+    browser_capabilities(State(state), Json(body)).await
+}
+
+async fn browser_capabilities(
+    State(state): State<OwnerState>,
+    Json(body): Json<Value>,
+) -> ApiResult {
     let (health, catalog) = owner_catalog(
         &state,
         body.get("refresh")
@@ -1287,6 +1345,10 @@ async fn automation_login(
 ) -> ApiResult {
     let located = selected(&state, &id)?;
     let _ = automation_context(&state, &located).await?;
+    browser_login(State(state), Json(json!({}))).await
+}
+
+async fn browser_login(State(state): State<OwnerState>, Json(_): Json<Value>) -> ApiResult {
     let client = crate::agent_automation::BrowserCompanionControl::new(
         &state.config.markdown_chat.automation,
     )
@@ -1921,10 +1983,12 @@ async fn authorize(
             response.headers_mut().insert(header::SET_COOKIE, value);
         }
     }
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
+    if !content_request || !response.headers().contains_key(header::CACHE_CONTROL) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
     response.headers_mut().insert(
         header::REFERRER_POLICY,
         header::HeaderValue::from_static("no-referrer"),
@@ -2168,6 +2232,10 @@ fn router(state: OwnerState) -> Router {
         .route("/api/chats/{id}", get(chat_state))
         .route("/api/chats/{id}/title", post(rename_chat))
         .route("/api/chats/{id}/organization", post(organize_chat))
+        .route("/api/chats/{id}/read", post(mark_chat_read))
+        .route("/api/browser", get(browser_state))
+        .route("/api/browser/login", post(browser_login))
+        .route("/api/browser/capabilities", post(browser_capabilities))
         .route("/api/browser/start", post(browser_start))
         .route("/api/browser/stop", post(browser_stop))
         .route("/api/chats/{id}/automation", get(automation_state))
@@ -2923,6 +2991,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(renamed["chats"][0]["title"], "Check the build");
+        assert!(renamed["chats"][0]["lastEntryEnd"].as_u64().unwrap() > 0);
+        assert_eq!(renamed["chats"][0]["lastIncomingEntryEnd"], 0);
         for index in 0..55 {
             chat.append(format!("Agent answer {index}")).await.unwrap();
         }
@@ -3078,6 +3148,65 @@ mod tests {
         assert_eq!(malformed_organization.status(), StatusCode::BAD_REQUEST);
         let original = std::fs::read(chat.path()).unwrap();
         let unread = chat.unread_snapshot().await.unwrap();
+        let read_url = format!("{base}/api/chats/{id}/read");
+        let through = chat.owner_summary().await.unwrap().last_entry_end;
+        assert_eq!(chat.owner_summary().await.unwrap().owner_read_through, 0);
+        assert_eq!(
+            client
+                .post(&read_url)
+                .json(&json!({"through":through}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for position in [through, 0, through] {
+            let response = client
+                .post(&read_url)
+                .bearer_auth("test-token")
+                .json(&json!({"through":position}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["ownerReadThrough"],
+                through
+            );
+        }
+        assert_eq!(
+            client
+                .post(&read_url)
+                .bearer_auth("test-token")
+                .json(&json!({"through":u64::MAX}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let other_browser: Value = reqwest::Client::new()
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(other_browser["chats"][0]["ownerReadThrough"], through);
+        assert_eq!(other_browser["chats"][0]["lastEntryEnd"], through);
+        assert_eq!(other_browser["chats"][0]["lastIncomingEntryEnd"], through);
+        let reopened = MarkdownChatStore::default()
+            .chat_at_path(chat.path().into(), true)
+            .unwrap();
+        assert_eq!(
+            reopened.owner_summary().await.unwrap().owner_read_through,
+            through
+        );
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        assert_eq!(std::fs::read(chat.path()).unwrap(), original);
         let pinned: Value = client
             .post(format!("{base}/api/chats/{id}/organization"))
             .bearer_auth("test-token")
@@ -3529,6 +3658,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed["chats"][0]["goalStatus"], "active");
+        assert_eq!(listed["automationEnabled"], true);
+        assert_eq!(listed["chats"][0]["goal"], automation["goal"]);
         let serialized = automation.to_string();
         assert!(!serialized.contains("descriptorPath"));
         assert!(!serialized.contains("test-token"));
@@ -3790,6 +3921,7 @@ mod tests {
             .await
             .unwrap();
         assert!(listed["chats"][0]["goalStatus"].is_null());
+        assert!(listed["chats"][0]["goal"].is_null());
         task.abort();
     }
 
@@ -3834,7 +3966,6 @@ mod tests {
         let chat = chats
             .chat(&config, Some(&identity), &SessionState::new())
             .unwrap();
-        chat.ensure().await.unwrap();
         let artifacts = Arc::new(ArtifactEgressStore::new_at(
             config.artifact_egress.clone(),
             temp.path().join("artifacts"),
@@ -3877,6 +4008,80 @@ mod tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+        let empty: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(empty["chats"].as_array().unwrap().is_empty());
+        for route in [
+            "/api/browser",
+            "/api/browser/login",
+            "/api/browser/capabilities",
+        ] {
+            let request = if route == "/api/browser" {
+                client.get(format!("{base}{route}"))
+            } else {
+                client.post(format!("{base}{route}")).json(&json!({}))
+            };
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let browser: Value = client
+            .get(format!("{base}/api/browser"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(browser["companion"]["authenticated"], true);
+        assert!(!browser.to_string().contains(bearer));
+        let models: Value = client
+            .post(format!("{base}/api/browser/capabilities"))
+            .bearer_auth("test-token")
+            .json(&json!({"refresh":true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(models["models"][0]["id"], "gpt-6-sol");
+        assert!(models.get("accountFingerprint").is_none());
+        let login: Value = client
+            .post(format!("{base}/api/browser/login"))
+            .bearer_auth("test-token")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(login["companion"]["authenticated"], true);
+
+        let still_empty: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            still_empty["chats"].as_array().unwrap().is_empty(),
+            "global browser controls must not create a conversation"
+        );
+        chat.ensure().await.unwrap();
         let list: Value = client
             .get(format!("{base}/api/chats"))
             .bearer_auth("test-token")
@@ -3960,18 +4165,6 @@ mod tests {
             .unwrap();
         assert_eq!(cached_again["catalogRevision"], "owner_catalog_1");
         assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
-
-        let login: Value = client
-            .post(format!("{base}/api/chats/{id}/automation/login"))
-            .bearer_auth("test-token")
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(login["companion"]["authenticated"], true);
 
         let selection: Value = client
             .post(format!("{base}/api/chats/{id}/automation/selection"))
@@ -4328,6 +4521,8 @@ mod tests {
             .unwrap();
         let id = list["chats"][0]["id"].as_str().unwrap();
 
+        assert_eq!(list["chats"][0]["automationRetrying"], true);
+
         let dismissed: Value = client
             .post(format!("{base}/api/chats/{id}/automation/action/cancel"))
             .bearer_auth("test-token")
@@ -4340,6 +4535,16 @@ mod tests {
             .unwrap();
         assert_eq!(dismissed["action"]["status"], "cancelled");
         assert!(dismissed["action"]["lastError"].is_null());
+        let listing: Value = client
+            .get(format!("{base}/api/chats"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listing["chats"][0]["automationRetrying"], false);
         assert!(
             store
                 .load(&identity)

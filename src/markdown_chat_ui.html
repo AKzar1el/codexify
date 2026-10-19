@@ -739,6 +739,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     render();
     resizeInput();
     if (pendingCount !== pendingSends.size) save();
+    if (!history) bridge?.onPageRendered?.(snapshotEnd);
   }
   function currentGeneration(value) { return !tornDown && value === generation; }
   function requestDestination() {

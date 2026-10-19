@@ -28,6 +28,16 @@ test("owner presence changes at exactly three and five minutes", () => {
   assert.equal(presence(1000, 1000 + 300000, null), "offline");
 });
 
+test("idle waiting deadlines expire independently of question waits and ordinary presence", () => {
+  const source = ownerHtml.match(/function presence\([^)]*\) \{[\s\S]*?\n  \}/)?.[0];
+  const presence = Function(`return (${source})`)();
+  assert.equal(presence(1000, 5999, null, null, 6000), "waiting");
+  assert.equal(presence(1000, 6000, null, null, 6000), "online");
+  assert.equal(presence(null, 5999, null, null, 6000), "waiting");
+  assert.equal(presence(null, 6000, null, null, 6000), "offline");
+  assert.equal(presence(1000, 6000, 9000, null, 5999), "waiting");
+});
+
 test("goal elapsed time uses compact day/hour/minute/second labels", () => {
   const source = ownerHtml.match(/function goalDuration\([^)]*\) \{[\s\S]*?\n    \}/)?.[0];
   assert(source); const duration = Function(`return (${source})`)();
@@ -251,7 +261,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     await routeOwner(page, 'http://127.0.0.1:43219/**',route=>{
       const request=route.request(),url=new URL(request.url());
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
-      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:['failed','ambiguous'].includes(action.status)?action.lastError:null}],serverTimeMs:Date.now()}});
+      if(url.pathname==='/api/chats')return route.fulfill({json:{chats:[{...chat,automationError:['failed','ambiguous'].includes(action.status)?action.lastError:null,automationRetrying:Number.isSafeInteger(action.automaticRetryAtMs)}],serverTimeMs:Date.now()}});
       if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal:null,action,catalog:{models:[]},pairing:{status:'verified'},companion:{authenticated:true,status:'idle'},serverTimeMs:Date.now(),presence:{lastAgentCallAtMs:null}}});
       if(url.pathname.endsWith('/action/retry')) {
         const body=request.postDataJSON();operations.push(body);
@@ -279,6 +289,7 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     assert.equal(operations.length,1);
     action={id:'pending-retry',kind:'offline_chat',status:'failed',lastError:'Connector menu unavailable',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:Date.now()+30000,automaticRetryAttempts:0};
     await host.locator('#automation-error').getByText(/Retrying automatically in \d+s \(retry 1 of 3\)/).waitFor();
+    await page.locator('.conversation .presence.retrying .presence-spinner').waitFor();
     await inline.waitFor();
     await inline.click();await inline.waitFor({state:'hidden'});
     assert.equal(operations.length,2,'manual Retry works during automatic backoff');
@@ -423,7 +434,7 @@ test(`${engineName}: opening a goal chat stays at the bottom after controls load
       await routeOwner(page, "http://127.0.0.1:43216/**",async route=>{
         const url=new URL(route.request().url());
         if(url.pathname==="/")return route.fulfill({contentType:"text/html",body:ownerHtml});
-        if(url.pathname==="/api/chats")return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
+        if(url.pathname==="/api/chats")return route.fulfill({json:{chats:chats.map((chat,i)=>({...chat,goal:i===0?goal:null,goalStatus:i===0?goal?.status:null})),automationEnabled:true,serverTimeMs:Date.now()}});
         const isGoalChat=url.pathname.split("/")[3]===chats[0].id;
         const kind=url.pathname.endsWith("/automation") ? "automation" : "history";
         if(isGoalChat && gateKind===kind){gateKind=null;await gate;}
@@ -564,7 +575,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
         return {time:performance.now(),angle:Math.atan2(matrix.b,matrix.a)};
       };
       const before=sample();
-      window.dispatchEvent(new StorageEvent("storage",{key:"owner-chat-seen-v1"}));
+      document.getElementById("view-recent").click();
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
       const after=sample();
       const difference=after.angle-before.angle-(after.time-before.time)*2*Math.PI/2000;
@@ -640,9 +651,9 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     const rawSource = "**Rendered**  \n\n```js\nconst x = 1;\n```";
     const wholeTranscript = `## Agent\n\nOlder server-only entry\n\n## Agent\n\n${rawSource}`;
     const chats = [
-      { id:"a".repeat(64), title:"Fix tests", workspace:"project-a", lastEntryEnd:200, lastEntryAtMs:now, lastAgentCallAtMs:now, totalToolCalls:3 },
-      { id:"b".repeat(64), title:"Review files", workspace:"project-b", lastEntryEnd:100, lastEntryAtMs:now - 60000, lastAgentCallAtMs:now - 240000, totalToolCalls:1 },
-      { id:"c".repeat(64), title:"Old task", workspace:"project-c", lastEntryEnd:75, lastEntryAtMs:now - 120000, lastAgentCallAtMs:null, totalToolCalls:0 }
+      { id:"a".repeat(64), title:"Fix tests", workspace:"project-a", lastEntryEnd:200, lastIncomingEntryEnd:200, lastEntryAtMs:now, lastAgentCallAtMs:now, totalToolCalls:3 },
+      { id:"b".repeat(64), title:"Review files", workspace:"project-b", lastEntryEnd:100, lastIncomingEntryEnd:100, lastEntryAtMs:now - 60000, lastAgentCallAtMs:now - 240000, totalToolCalls:1 },
+      { id:"c".repeat(64), title:"Old task", workspace:"project-c", lastEntryEnd:75, lastIncomingEntryEnd:75, lastEntryAtMs:now - 120000, lastAgentCallAtMs:null, totalToolCalls:0 }
     ];
     const messages = new Map(chats.map(chat => [chat.id, []]));
     messages.get(chats[0].id).push({ id:"raw-one", role:"agent", markdown:rawSource, start:1, end:100, created_at_ms:now, tool_call_count:3 });
@@ -1046,7 +1057,10 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await panel.getByText("Inspecting the workspace", { exact:true }).waitFor();
     await panel.getByText("Partial browser answer", { exact:true }).waitFor();
     assert.equal(await panel.getByRole("button", { name:"Open in ChatGPT" }).isDisabled(), true);
-    await panel.getByRole("button", { name:"Refresh models" }).click();
+    assert.equal(await panel.getByRole("button", { name:"Refresh models" }).count(),0,"shared browser controls live in global settings");
+    assert.equal(await panel.getByRole("button", { name:"Start browser" }).count(),0);
+    assert.equal(await panel.getByRole("button", { name:"Stop browser" }).count(),0);
+    assert.equal(await panel.getByRole("button", { name:"Sign in" }).count(),0);
     await panel.getByLabel("ChatGPT conversation URL").fill("https://chatgpt.com/c/owner-automation");
     await panel.getByRole("button", { name:"Pair conversation" }).click();
     await panel.getByText("Pairing verification queued", { exact:true }).waitFor();
@@ -1055,7 +1069,6 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await panel.getByRole("button", { name:"Pair conversation" }).click();
     await panel.getByText("Pairing verification queued", { exact:true }).waitFor();
     automation.companion.activeActionId = "busy-action";
-    await panel.locator("#automation-capabilities:disabled").waitFor();
     await panel.getByRole("button", { name:"Open in ChatGPT" }).click();
     automation.companion.activeActionId = null;
     await panel.getByRole("button", { name:"Close connection settings" }).click();
@@ -1142,12 +1155,10 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     automation.companion.status="busy";automation.companion.activeActionId="running-action";
     await page.waitForTimeout(1600);
     assert.equal(await model.isDisabled(),false,"cached preferences do not need an idle browser");
-    assert.equal(await panel.locator("#automation-capabilities").isDisabled(),true);
     automation.companion.status="idle";automation.companion.activeActionId=null;
     automation.presence.agentWaitingUntilMs=Date.now()+30000;
     await page.waitForTimeout(1600);
     assert.equal(await model.isDisabled(),false);
-    assert.equal(await panel.locator("#automation-capabilities").isDisabled(),false,"live refresh requires an idle browser, not an offline agent");
     automation.presence.agentWaitingUntilMs=null;
     await panel.getByRole("button", { name:"Connection settings", exact:true }).click();
     automation.action = { id:"failed-action", kind:"offline_chat", status:"failed", pairingGeneration:1, goalRevision:null, lastError:"Selector verification failed before Send", lastStableAnswer:null, updatedAtMs:Date.now() };
@@ -1162,7 +1173,6 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await panel.getByRole("button", { name:"Unlink conversation" }).click();
     await panel.getByText("Not paired", { exact:true }).waitFor();
     automation.companion.activeActionId = "unrelated-action";
-    await panel.locator("#automation-capabilities:disabled").waitFor();
     assert.equal(await panel.getByRole("button", { name:"Open in ChatGPT" }).isDisabled(), true);
     automation.companion.authenticated = false;
     await model.locator("option").filter({hasText:"Saved model"}).waitFor({state:"attached"});

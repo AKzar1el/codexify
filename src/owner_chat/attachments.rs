@@ -2,6 +2,7 @@ use super::*;
 use crate::markdown_chat::attachments::{AttachmentStore, MAX_ATTACHMENT_BYTES};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 static UPLOAD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static THUMBNAIL_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -17,6 +18,74 @@ pub(super) struct UploadQuery {
 pub(super) struct ContentQuery {
     #[serde(default)]
     download: bool,
+    #[serde(default)]
+    thumbnail: bool,
+}
+
+async fn thumbnail_content(
+    chat_path: std::path::PathBuf,
+    attachment: String,
+    request_headers: &http::HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    let permit = tokio::time::timeout(Duration::from_secs(15), THUMBNAIL_SLOTS.acquire())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Image previews are busy".into(),
+            )
+        })?
+        .map_err(internal_error)?;
+    let preview = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        AttachmentStore::for_chat(&chat_path)?.thumbnail(&attachment)
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)?;
+    let not_modified = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == preview.etag)
+        });
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let len = preview.file.metadata().map_err(internal_error)?.len();
+        let body = Body::from_stream(tokio_util::io::ReaderStream::new(
+            tokio::fs::File::from_std(preview.file).take(len),
+        ));
+        let mut response = body.into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            header::HeaderValue::from_static("inline; filename=\"thumbnail.webp\""),
+        );
+        response
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("image/webp"),
+    );
+    headers.insert(header::ETAG, preview.etag.parse().map_err(internal_error)?);
+    // Revalidate before reuse: changed/deleted originals and revoked sessions
+    // must not keep serving an old preview. A 304 transfers no image bytes.
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, no-cache"),
+    );
+    headers.insert(
+        header::VARY,
+        header::HeaderValue::from_static("Cookie, Authorization"),
+    );
+    Ok(response)
 }
 
 pub(super) async fn upload(
@@ -129,6 +198,15 @@ pub(super) async fn content(
             StatusCode::NOT_FOUND,
             "Attachment payload no longer exists".into(),
         ));
+    }
+    if query.thumbnail {
+        if query.download {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "A thumbnail is not an original download".into(),
+            ));
+        }
+        return thumbnail_content(chat.path().to_owned(), record.id, request.headers()).await;
     }
     let path = std::path::PathBuf::from(&record.path);
     let opened =
@@ -402,6 +480,145 @@ mod tests {
         let replay=client.post(format!("{base}/api/chats/{id}/send")).bearer_auth("attachment-test-token").json(&json!({"request_id":"send-pdf","message":"Inspect this file","attachment_ids":[aid]})).send().await.unwrap();
         assert_eq!(replay.status(), StatusCode::OK);
         assert_eq!(chat.unread_snapshot().await.unwrap().messages.len(), 1);
+        // Previews are private, derived and reusable even for an older upload
+        // that has never had a thumbnail. Original downloads remain untouched.
+        let mut sample = 1_u32;
+        let image =
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(1200, 800, |_, _| {
+                sample = sample.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                image::Rgba([
+                    (sample >> 24) as u8,
+                    (sample >> 16) as u8,
+                    (sample >> 8) as u8,
+                    255,
+                ])
+            }));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+        let uploaded: Value = client
+            .post(format!(
+                "{base}/api/chats/{id}/attachments?requestId=preview-image&name=photo.png"
+            ))
+            .bearer_auth("attachment-test-token")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(png.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let image_id = uploaded["attachment"]["id"].as_str().unwrap();
+        let original_url = format!("{base}/api/chats/{id}/attachments/{image_id}/content");
+        let thumbnail_url = format!("{original_url}?thumbnail=true");
+        assert_eq!(
+            client.get(&thumbnail_url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let preview = client
+            .get(&thumbnail_url)
+            .header(header::COOKIE, "codexify-attachment=attachment-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert_eq!(preview.headers()[header::CONTENT_TYPE], "image/webp");
+        assert_eq!(
+            preview.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+        assert_eq!(preview.headers()[header::VARY], "Cookie, Authorization");
+        assert!(
+            preview.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .starts_with("sandbox;")
+        );
+        let etag = preview.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let preview = preview.bytes().await.unwrap();
+        assert!(preview.len() < png.len());
+        let decoded = image::load_from_memory(&preview).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (480, 320));
+        for validator in [etag.clone(), format!("\"unrelated\", W/{etag}")] {
+            let cached = client
+                .get(&thumbnail_url)
+                .bearer_auth("attachment-test-token")
+                .header(header::IF_NONE_MATCH, validator)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(cached.headers()[header::CACHE_CONTROL], "private, no-cache");
+            assert_eq!(cached.headers()[header::ETAG], etag);
+            assert!(cached.bytes().await.unwrap().is_empty());
+        }
+        assert_eq!(
+            client
+                .get(&thumbnail_url)
+                .header(header::IF_NONE_MATCH, &etag)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "cached previews still require authentication"
+        );
+        let original = client
+            .get(&original_url)
+            .bearer_auth("attachment-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(original.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(original.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(original.bytes().await.unwrap().as_ref(), png);
+        assert_eq!(
+            client
+                .get(format!("{thumbnail_url}&download=true"))
+                .bearer_auth("attachment-test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let source = uploaded["attachment"]["path"].as_str().unwrap();
+        let mut changed = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            64,
+            32,
+            image::Rgba([0, 0, 255, 255]),
+        ))
+        .write_to(&mut changed, image::ImageFormat::Png)
+        .unwrap();
+        std::fs::write(source, changed.into_inner()).unwrap();
+        let refreshed = client
+            .get(&thumbnail_url)
+            .bearer_auth("attachment-test-token")
+            .header(header::IF_NONE_MATCH, &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        assert_ne!(refreshed.headers()[header::ETAG], etag);
+        let decoded = image::load_from_memory(&refreshed.bytes().await.unwrap()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 32));
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(
+            client
+                .get(&thumbnail_url)
+                .bearer_auth("attachment-test-token")
+                .header(header::IF_NONE_MATCH, &etag)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         server.abort();
     }
 }

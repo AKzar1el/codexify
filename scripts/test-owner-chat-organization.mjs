@@ -11,7 +11,7 @@ const titles=['Bioshock optimization','WAW optimization','OrbStack investigation
 async function fixture(browser) {
  const page=await browser.newPage({viewport:{width:1280,height:900}});page.setDefaultTimeout(7000);
  const now=Date.now(),errors=[],operations=[];let clock=now,failNext=false;
- const chats=titles.map((title,i)=>({id:'abcde'[i].repeat(64),title,workspace:i===2?'orbstack':i===4?'Dopamine2-roothide':'mach-o-vita',projectId:i===2?'orb':i===4?'dopamine':'vita',projectPath:'/projects/'+i,lastEntryEnd:200,lastEntryAtMs:now-i*10000,lastAgentCallAtMs:null,totalToolCalls:12,pinnedAtMs:null,archivedAtMs:i===3?now-30000:i===4?now-20000:null}));
+ const chats=titles.map((title,i)=>({id:'abcde'[i].repeat(64),title,workspace:i===2?'orbstack':i===4?'Dopamine2-roothide':'mach-o-vita',projectId:i===2?'orb':i===4?'dopamine':'vita',projectPath:'/projects/'+i,lastEntryEnd:200,lastIncomingEntryEnd:100,lastEntryAtMs:now-i*10000,lastAgentCallAtMs:null,totalToolCalls:12,pinnedAtMs:null,archivedAtMs:i===3?now-30000:i===4?now-20000:null}));
  page.on('pageerror',error=>errors.push(error.message));
  const messages=[{id:'agent-message',role:'agent',markdown:'The latest checks passed. The conversation and its saved files are ready for the next step.',start:0,end:100,created_at_ms:now,tool_call_count:10},{id:'user-message',role:'user',markdown:'Continue from the current progress.',start:100,end:200,created_at_ms:now,tool_call_count:12}];
  await routeOwner(page, origin+'/**',route=>{

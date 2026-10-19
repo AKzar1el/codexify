@@ -9,6 +9,8 @@ use image::{AnimationDecoder, ImageDecoder, ImageEncoder, ImageFormat, ImageRead
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod thumbnail;
+
 pub const MAX_ATTACHMENT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_MESSAGE_ATTACHMENTS: usize = 20;
 const MAX_IMAGE_ALLOCATION: u64 = 256 * 1024 * 1024;

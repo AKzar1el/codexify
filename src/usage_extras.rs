@@ -2,7 +2,7 @@
 use crate::{
     markdown_chat::ExtrasConfig,
     types::AppConfig,
-    usage_analytics::{Dashboard, Totals},
+    usage_analytics::{Dashboard, Model, Totals},
 };
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,7 @@ pub(crate) struct Week {
     pub start: String,
     pub end: String,
     pub totals: Totals,
+    pub models: Vec<Model>,
     pub activity: Vec<u64>,
     pub active_days: usize,
     pub ready: bool,
@@ -641,6 +642,7 @@ fn build(
     let end = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()) + 1);
     let start = end - chrono::Duration::days(6);
     let mut week_totals = Totals::default();
+    let mut week_models: BTreeMap<String, Totals> = BTreeMap::new();
     let mut activity = vec![0; 7];
     let mut week_days = 0;
     for day in &d.daily {
@@ -653,6 +655,9 @@ fn build(
                 activity[(date - start).num_days() as usize] = total.turns;
             }
             week_totals.add(&total);
+            for (id, totals) in &day.models {
+                week_models.entry(id.clone()).or_default().add(totals);
+            }
         }
     }
     let week_id = format!("week:{end}");
@@ -685,6 +690,20 @@ fn build(
             start: start.to_string(),
             end: end.to_string(),
             totals: week_totals,
+            models: week_models
+                .into_iter()
+                .map(|(id, totals)| {
+                    let (model, effort) = id
+                        .split_once('\u{1f}')
+                        .unwrap_or(("unattributed", "unknown"));
+                    Model {
+                        model: model.into(),
+                        effort: effort.into(),
+                        id,
+                        totals,
+                    }
+                })
+                .collect(),
             activity,
             active_days: week_days,
             ready,
@@ -1001,11 +1020,28 @@ mod tests {
             day("2027-01-03", 3),
             day("2027-01-04", 1000),
         ];
+        for (i, day) in d.daily.iter_mut().enumerate() {
+            day.models.values_mut().next().unwrap().active_ms = (i as u64 + 1) * 3_600_000;
+        }
+        d.daily[0].models = BTreeMap::from([(
+            "gpt-6-astra\u{1f}pro".into(),
+            Totals {
+                turns: 999,
+                active_ms: 100 * 3_600_000,
+                ..Default::default()
+            },
+        )]);
         let mut ledger = Ledger::default();
         let s = build(&mut ledger, &d, &[], ExtrasConfig::default(), 1).unwrap();
         assert_eq!(s.week.start, "2026-12-28");
         assert_eq!(s.week.end, "2027-01-03");
         assert_eq!(s.week.totals.turns, 5);
+        assert_eq!(s.week.models.len(), 1);
+        assert_eq!(s.week.models[0].model, "gpt-5.6-sol");
+        assert_eq!(s.week.models[0].effort, "max");
+        assert_eq!(s.week.models[0].totals.turns, 5);
+        assert_eq!(s.week.models[0].totals.active_ms, 5 * 3_600_000);
+        assert_eq!(s.week.totals.active_ms, 5 * 3_600_000);
         assert_eq!(s.week.activity, vec![2, 0, 0, 0, 0, 0, 3]);
         assert_eq!(s.week.active_days, 2);
         assert!(s.week.ready);
@@ -1047,6 +1083,7 @@ mod tests {
             daily_streaks: false,
             weekly_recap: false,
             animations: false,
+            sounds: false,
         };
         d.daily = vec![day("2026-10-11", 1), day("2026-10-18", 10)];
         d.streak = 1;
@@ -1111,6 +1148,7 @@ mod tests {
             before["defaults"]["agentChat"]["extras"]["weeklyRecap"],
             true
         );
+        assert_eq!(before["defaults"]["agentChat"]["extras"]["sounds"], true);
         let after = crate::global_settings::save(
             &config,
             before["revision"].as_str().unwrap(),
@@ -1124,20 +1162,21 @@ mod tests {
                     "agentChat.extras.weeklyRecap".into(),
                     serde_json::json!(false),
                 ),
+                ("agentChat.extras.sounds".into(), serde_json::json!(false)),
             ])),
         )
         .unwrap();
         assert_eq!(after["restartRequired"], false);
         assert!(after["document"]["agentChat"]["turnRenewal"].is_null());
         let p = crate::global_settings::extras(&config).unwrap();
-        assert!(!p.animations && !p.weekly_recap);
+        assert!(!p.animations && !p.weekly_recap && !p.sounds);
         assert!(p.achievements && p.personal_records && p.daily_streaks);
         assert_eq!(
             after["document"]["agentChat"]["extras"]
                 .as_object()
                 .unwrap()
                 .len(),
-            2
+            3
         );
     }
     #[test]

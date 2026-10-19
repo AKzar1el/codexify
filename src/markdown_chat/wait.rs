@@ -94,13 +94,21 @@ impl ChatFile {
     }
 
     pub(crate) fn agent_waiting_until_ms(&self) -> Option<u64> {
+        self.waiting_until_ms(true)
+    }
+
+    pub(crate) fn agent_idle_until_ms(&self) -> Option<u64> {
+        self.waiting_until_ms(false)
+    }
+
+    fn waiting_until_ms(&self, input_required: bool) -> Option<u64> {
         let state = self
             .waiting
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state
             .until_ms
-            .filter(|_| state.input_required)
+            .filter(|_| state.input_required == input_required)
             .filter(|until| *until > super::now_ms())
     }
 
@@ -248,6 +256,26 @@ mod tests {
     }
 
     #[test]
+    fn completed_waits_have_a_separate_bounded_idle_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let chat = ChatFile::new(root.path().join("CHAT.md"), false);
+        let first = chat.begin_wait(Duration::from_secs(30), false);
+        assert!(chat.agent_idle_until_ms().is_some());
+        assert!(chat.agent_waiting_until_ms().is_none());
+        let question = chat.begin_agent_wait(Duration::from_secs(30));
+        drop(first);
+        assert!(chat.agent_idle_until_ms().is_none());
+        assert!(chat.agent_waiting_until_ms().is_some());
+        drop(question);
+        let mut timed = chat.begin_wait(Duration::ZERO, false);
+        timed.timed_out();
+        drop(timed);
+        assert!(chat.agent_idle_until_ms().is_some());
+        chat.waiting.lock().unwrap().until_ms = Some(super::super::now_ms().saturating_sub(1));
+        assert!(chat.agent_idle_until_ms().is_none());
+    }
+
+    #[test]
     fn stale_wait_completion_cannot_clear_or_revive_a_newer_state() {
         let root = tempfile::tempdir().unwrap();
         let chat = ChatFile::new(root.path().join("CHAT.md"), false);
@@ -271,74 +299,84 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_is_cleared_by_reply_cancellation_and_dropped_future() {
-        for outcome in ["reply", "cancel", "drop", "manual"] {
-            let root = tempfile::tempdir().unwrap();
-            let chat = Arc::new(ChatFile::new(root.path().join("chat/CHAT.md"), false));
-            chat.ensure().await.unwrap();
-            assert!(
-                chat.owner_summary()
-                    .await
-                    .unwrap()
-                    .agent_waiting_until_ms
-                    .is_none()
-            );
-            let cancellation = CancellationToken::new();
-            let task = tokio::spawn({
-                let chat = chat.clone();
-                let cancellation = cancellation.clone();
-                async move {
-                    chat.wait_with_watcher(Duration::from_secs(30), cancellation, false)
+        for completed in [false, true] {
+            for outcome in ["reply", "cancel", "drop", "manual"] {
+                let root = tempfile::tempdir().unwrap();
+                let chat = Arc::new(ChatFile::new(root.path().join("chat/CHAT.md"), false));
+                chat.ensure().await.unwrap();
+                assert!(
+                    chat.owner_summary()
                         .await
-                }
-            });
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while chat.agent_waiting_until_ms().is_none() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert!(
-                chat.owner_summary()
-                    .await
-                    .unwrap()
-                    .agent_waiting_until_ms
-                    .is_some()
-            );
-            match outcome {
-                "reply" => {
-                    chat.append_user("reply".into(), "Continue".into())
-                        .await
-                        .unwrap();
-                }
-                "manual" => {
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(chat.path())
                         .unwrap()
-                        .write_all(b"Editor reply\n")
-                        .unwrap();
+                        .agent_waiting_until_ms
+                        .is_none()
+                );
+                let cancellation = CancellationToken::new();
+                let task = tokio::spawn({
+                    let chat = chat.clone();
+                    let cancellation = cancellation.clone();
+                    async move {
+                        chat.wait_with_policy(
+                            Duration::from_secs(30),
+                            cancellation,
+                            false,
+                            completed,
+                        )
+                        .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while chat
+                        .agent_waiting_until_ms()
+                        .or(chat.agent_idle_until_ms())
+                        .is_none()
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let summary = chat.owner_summary().await.unwrap();
+                assert_eq!(summary.agent_waiting_until_ms.is_some(), !completed);
+                assert_eq!(summary.agent_idle_until_ms.is_some(), completed);
+                match outcome {
+                    "reply" => {
+                        chat.append_user("reply".into(), "Continue".into())
+                            .await
+                            .unwrap();
+                    }
+                    "manual" => {
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(chat.path())
+                            .unwrap()
+                            .write_all(b"Editor reply\n")
+                            .unwrap();
+                    }
+                    "cancel" => cancellation.cancel(),
+                    _ => task.abort(),
                 }
-                "cancel" => cancellation.cancel(),
-                _ => task.abort(),
-            }
-            match task.await {
-                Ok(Ok(WaitOutcome::Message(_))) => assert!(matches!(outcome, "reply" | "manual")),
-                Ok(Ok(WaitOutcome::Cancelled)) => assert_eq!(outcome, "cancel"),
-                Err(error) => {
-                    assert_eq!(outcome, "drop");
-                    assert!(error.is_cancelled());
+                match task.await {
+                    Ok(Ok(WaitOutcome::Message(_))) => {
+                        assert!(matches!(outcome, "reply" | "manual"))
+                    }
+                    Ok(Ok(WaitOutcome::Cancelled)) => assert_eq!(outcome, "cancel"),
+                    Err(error) => {
+                        assert_eq!(outcome, "drop");
+                        assert!(error.is_cancelled());
+                    }
+                    _ => panic!("unexpected await outcome"),
                 }
-                _ => panic!("unexpected await outcome"),
+                assert!(chat.agent_waiting_until_ms().is_none());
+                assert!(chat.agent_idle_until_ms().is_none());
+                assert!(
+                    chat.owner_summary()
+                        .await
+                        .unwrap()
+                        .agent_waiting_until_ms
+                        .is_none()
+                );
             }
-            assert!(chat.agent_waiting_until_ms().is_none());
-            assert!(
-                chat.owner_summary()
-                    .await
-                    .unwrap()
-                    .agent_waiting_until_ms
-                    .is_none()
-            );
         }
     }
 

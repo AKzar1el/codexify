@@ -21,6 +21,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
    if(path==='/api/settings')return route.fulfill({json:{path:'/fixture/config.json',defaults,document:{workDir:'/fixture'},raw:'{"workDir":"/fixture"}',revision:'1'}});
    if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Bioshock optimization',workspace:'mach-o-vita',lastEntryAtMs:now,lastEntryEnd:4000,lastAgentCallAtMs:now,totalToolCalls:40}],serverTimeMs:Date.now()}});
    if(path.endsWith('/automation'))return route.fulfill({json:{...state,serverTimeMs:Date.now()}});
+   if(path===`/api/chats/${id}/read`)return route.fulfill({json:{ownerReadThrough:request.postDataJSON().through}});
    if(request.method()==='POST'){
     operations.push([path,request.postDataJSON()]);
     if(path.endsWith('/action/retry')){state.action={...state.action,status:'queued',lastError:null};return route.fulfill({json:{action:state.action}});}
@@ -38,7 +39,9 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   const before=await geometry();await toggle.click();
   const dialog=host.getByRole('dialog',{name:'Conversation settings',exact:true});await dialog.waitFor();
   assert.equal(await dialog.getByText('Bioshock optimization',{exact:true}).count(),1);
-  assert.deepEqual(await dialog.getByRole('heading',{level:3}).allTextContents(),['Project','Browser connection','Paired conversation','Activity & recovery']);
+  assert.deepEqual(await dialog.getByRole('heading',{level:3}).allTextContents(),['Project','Paired conversation','Activity & recovery']);
+  for(const name of ['Start browser','Stop browser','Sign in','Refresh models'])assert.equal(await dialog.getByRole('button',{name,exact:true}).count(),0);
+  assert.equal(await dialog.locator('[aria-labelledby="connection-pairing-heading"]').getByRole('button',{name:'Open in ChatGPT',exact:true}).count(),1);
   assert.equal(await dialog.evaluate(element=>element.open&&element.matches(':modal')),true);
   const box=await dialog.boundingBox();assert(Math.abs(box.x+box.width/2-720)<1&&Math.abs(box.y+box.height/2-490)<1,'dialog is centered in the viewport rather than over the composer');
   assert.deepEqual(await geometry(),before);

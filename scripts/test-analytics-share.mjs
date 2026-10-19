@@ -8,8 +8,10 @@ import {createHash} from 'node:crypto';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const origin='http://127.0.0.1:43329',today='2026-10-17';
-const numbers={7:{turns:84,toolCalls:12480,goals:9},30:{turns:328,toolCalls:50321,goals:27},90:{turns:820,toolCalls:150000,goals:84},all:{turns:1240,toolCalls:284000,goals:119}};
-async function fixture(engine,{clipboard=true}={}){
+const numbers={1:{turns:12,toolCalls:690,goals:1},7:{turns:84,toolCalls:12480,goals:9},30:{turns:328,toolCalls:50321,goals:27},90:{turns:820,toolCalls:150000,goals:84},all:{turns:1240,toolCalls:284000,goals:119}};
+const modelCases={1:['gpt-5.6-sol','max','GPT-5.6 Sol','Pro'],7:['gpt-6-astra','pro','GPT-6 Astra','Pro'],30:['gpt-5.6-sol','max','GPT-5.6 Sol','Pro'],90:['gpt-6-sol','xhigh','GPT-6 Sol','Extra High'],all:['gpt-6-astra','pro','GPT-6 Astra','Pro']};
+const activeMs={1:3600000,7:12345678,30:36000000,90:720000000,all:72000000000};
+async function fixture(engine,{clipboard=true,usage={}}={}){
  const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1440,height:1000}});page.setDefaultTimeout(6000);const errors=[],requests=[],posts=[];page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.url().startsWith(origin))requests.push(new URL(r.url()).pathname);if(r.method()!=='GET')posts.push(new URL(r.url()).pathname);});
  await page.addInitScript(({clipboard})=>{
   // Stop unrelated sidebar polling so this fixture audits only export requests.
@@ -30,8 +32,8 @@ async function fixture(engine,{clipboard=true}={}){
   if(path==='/api/settings')return route.fulfill({json:{document:{},defaults:{agentChat:{analyticsEnabled:true}},revision:'1',path:'/private/secret-project/config.json',raw:'{}'}});
   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
   if(path==='/api/analytics/usage'){
-   const days=url.searchParams.get('days'),totals={...numbers[days],activeMs:12345678};
-   return route.fulfill({json:{today,timezone:'CEST',since:1700000000000,totals,lifetime:totals,activeDays:7,streak:4,models:[{id:'private-model\x1fhigh',model:'PRIVATE-MODEL',effort:'high',...totals}],daily:[{date:'2026-10-11',models:{model:{turns:8}}},{date:today,models:{model:{turns:21}}}],conversations:[{id:'a'.repeat(64),title:'Private project secret',path:'/Users/private/secret-project',...totals}]}});
+   const days=url.searchParams.get('days'),totals={...numbers[days],activeMs:activeMs[days]},[model,effort]=modelCases[days];
+   return route.fulfill({json:{today,timezone:'CEST',since:1700000000000,totals,lifetime:totals,activeDays:7,streak:4,models:[{id:'private-model\x1fhigh',model,effort,...totals,turns:Math.ceil(totals.turns*.6),activeMs:1000},{id:'private-runner\x1fhigh',model:'gpt-runner-up',effort:'high',...totals,turns:Math.floor(totals.turns*.4)}],daily:[{date:'2026-10-11',models:{model:{turns:8}}},{date:today,models:{model:{turns:21}}}],conversations:[{id:'a'.repeat(64),title:'Private project secret',path:'/Users/private/secret-project',...totals}],...usage}});
   }
   return route.fulfill({status:404});
  });
@@ -50,15 +52,17 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
  const f=await fixture(engine),{browser,page,settings,errors,requests,posts}=f;const output=process.env.ANALYTICS_SHARE_SCREENSHOTS||mkdtempSync(join(tmpdir(),'analytics-share-'));mkdirSync(output,{recursive:true});
  try{
   const range=settings.getByLabel('Analytics date range');
-  for(const period of ['7','30','90','all']){
+  for(const period of ['1','7','30','90','all']){
    await range.selectOption(period);await page.waitForFunction(()=>!document.querySelector('[aria-label="Share analytics"]').disabled);
    await page.evaluate(()=>{window.__drawn=[];});const before=requests.length;await settings.getByRole('button',{name:'Share analytics',exact:true}).click();const dialog=await ready(page);
-   assert.match(await dialog.locator('#stats-share-description').textContent(),period==='all'?/Lifetime/:new RegExp(`Last ${period} days`));
+   assert.match(await dialog.locator('#stats-share-description').textContent(),period==='all'?/Lifetime/:period==='1'?/Today/:new RegExp(`Last ${period} days`));
    assert.equal(await dialog.locator('img').getAttribute('src').then(v=>v.startsWith('blob:')),true);
    const text=await page.evaluate(()=>window.__drawn);assert(text.includes('Codexify stats'));assert(text.includes('codexify.dev'));assert(text.includes('Turns'));assert(text.includes('Tool calls'));assert(text.includes('Goals completed'));assert(text.some(t=>t===String(numbers[period].turns)||t===new Intl.NumberFormat('en-US').format(numbers[period].turns)));
-   assert(!text.some(t=>/secret|private|share-test-token|127\.0\.0\.1|chatgpt\.com/i.test(t)),'only aggregate totals and public branding belong on the card');
+   assert(text.includes('Hours · estimated'));assert(text.includes(new Intl.NumberFormat('en-US',{maximumFractionDigits:1,notation:activeMs[period]/3600000>=10000?'compact':'standard'}).format(activeMs[period]/3600000)));assert(text.includes(modelCases[period][2]));assert(text.includes(`Top model · ${modelCases[period][3]} · ${Math.ceil(numbers[period].turns*.6)} turns`));
+   assert(text.includes(period==='all'?'LIFETIME':period==='1'?'TODAY':`LAST ${period} DAYS`));
+   assert(!text.some(t=>/secret|private|runner-up|share-test-token|127\.0\.0\.1|chatgpt\.com/i.test(t)),'only aggregate usage, the winning model and public branding belong on the card');
    const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download PNG',exact:true}).click();const download=await pending;
-   assert.equal(download.suggestedFilename(),`codexify-stats-${period==='all'?'lifetime':period+'-days'}-${today}.png`);const path=join(output,`${name.toLowerCase()}-${period}.png`);await download.saveAs(path);const bytes=readFileSync(path);png(bytes);
+   assert.equal(download.suggestedFilename(),`codexify-stats-${period==='all'?'lifetime':period+(period==='1'?'-day':'-days')}-${today}.png`);const path=join(output,`${name.toLowerCase()}-${period}.png`);await download.saveAs(path);const bytes=readFileSync(path);png(bytes);
    await dialog.getByRole('button',{name:'Copy image',exact:true}).click();await dialog.getByText('Image copied.',{exact:true}).waitFor();
    const copied=await page.evaluate(async()=>Array.from(new Uint8Array(await(await window.__copied.getType('image/png')).arrayBuffer())));assert.equal(createHash('sha256').update(Buffer.from(copied)).digest('hex'),createHash('sha256').update(bytes).digest('hex'));assert.notEqual(await page.evaluate(()=>window.__copyActivation),false,'clipboard write must keep the click gesture');
    assert.equal(requests.length,before,'generation, copy and download must not make server requests');assert.deepEqual(posts,[]);
@@ -92,16 +96,17 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: animated SVG downloads locally, counts up in an image, and retains PNG copying`,{timeout:45000},async()=>{
  const {browser,page,settings,errors,requests,posts}=await fixture(engine),output=process.env.ANALYTICS_SHARE_SCREENSHOTS||mkdtempSync(join(tmpdir(),'analytics-motion-'));mkdirSync(output,{recursive:true});
  try{
-  for(const period of ['7','30','90','all']){
+  for(const period of ['1','7','30','90','all']){
    await settings.getByLabel('Analytics date range').selectOption(period);await page.waitForFunction(()=>!document.querySelector('[aria-label="Share analytics"]').disabled);
    const before=requests.length;await settings.getByRole('button',{name:'Share analytics',exact:true}).click();const dialog=await ready(page);
    await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();await dialog.getByRole('link',{name:'Download SVG',exact:true}).waitFor();
    const source=await dialog.locator('img').getAttribute('src');assert(source.startsWith('blob:'));
-   const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download SVG',exact:true}).click();const download=await pending;assert.equal(download.suggestedFilename(),`codexify-stats-${period==='all'?'lifetime':period+'-days'}-${today}.svg`);
+   const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download SVG',exact:true}).click();const download=await pending;assert.equal(download.suggestedFilename(),`codexify-stats-${period==='all'?'lifetime':period+(period==='1'?'-day':'-days')}-${today}.svg`);
    const path=join(output,`${name.toLowerCase()}-${period}.svg`);await download.saveAs(path);const svg=readFileSync(path,'utf8');assert.equal(await page.evaluate(async source=>(await fetch(source)).text(),source),svg,'download and live preview use identical SVG bytes');
    assert(svg.length<60000);assert(svg.includes('prefers-reduced-motion'));assert(!/secret|private|share-test-token|127\.0\.0\.1|chatgpt\.com|foreignObject|<script|<image|href=|@import|onload=/i.test(svg));
    const xml=await page.evaluate(svg=>{const d=new DOMParser().parseFromString(svg,'image/svg+xml');return {error:!!d.querySelector('parsererror'),dimensions:[d.documentElement.getAttribute('width'),d.documentElement.getAttribute('height')],final:[...d.querySelectorAll('[data-final]')].map(n=>n.textContent),animated:d.querySelectorAll('animateTransform').length,desc:d.querySelector('desc')?.textContent};},svg);
-   assert.equal(xml.error,false);assert.deepEqual(xml.dimensions,['1200','675']);assert(xml.animated>=3);assert(xml.desc.includes(`${numbers[period].toolCalls} tool calls`));
+   assert.equal(xml.error,false);assert.deepEqual(xml.dimensions,['1200','675']);assert(xml.animated>=4);assert(xml.desc.includes(`${numbers[period].toolCalls} tool calls`));assert(xml.desc.includes('estimated agent-hours'));assert(svg.includes('Hours · estimated'));assert.equal(xml.final.length,5);assert.equal(xml.final[4],modelCases[period][2]);assert(svg.includes(`Top model · ${modelCases[period][3]}`));
+   assert(svg.includes('Codexify stats · '+(period==='all'?'LIFETIME':period==='1'?'TODAY':`LAST ${period} DAYS`)));
    assert.equal(xml.final[0],new Intl.NumberFormat('en-US',{notation:numbers[period].turns>=10000?'compact':'standard'}).format(numbers[period].turns));
    await dialog.getByRole('button',{name:'Pause preview',exact:true}).click();assert.notEqual(await dialog.locator('img').getAttribute('src'),source);
    await dialog.getByRole('button',{name:'Copy PNG',exact:true}).click();await dialog.getByText('Image copied.',{exact:true}).waitFor();const copied=await page.evaluate(async()=>Array.from(new Uint8Array(await(await window.__copied.getType('image/png')).arrayBuffer())));png(Buffer.from(copied));
@@ -137,5 +142,23 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   await page.evaluate(()=>{HTMLCanvasElement.prototype.getContext=()=>null;});await settings.getByRole('button',{name:'Share analytics',exact:true}).click();await dialog.getByText('The image could not be created.',{exact:true}).waitFor();
   await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();await dialog.getByRole('link',{name:'Download SVG',exact:true}).waitFor();await page.waitForFunction(()=>document.getElementById('stats-share-image').naturalWidth===1200);assert.equal(await dialog.getByRole('button',{name:'Copy PNG',exact:true}).isDisabled(),true);
   const pending=page.waitForEvent('download');await dialog.getByRole('link',{name:'Download SVG',exact:true}).click();await pending;assert.deepEqual(errors,[]);assert.deepEqual(posts,[]);
+ }finally{await browser.close();}
+});
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: share cards handle zero hours and missing model attribution without inventing a winner`,{timeout:30000},async()=>{
+ const usage={models:[],totals:{turns:0,toolCalls:0,goals:0,activeMs:0}},f=await fixture(engine,{usage}),{browser,page,settings,errors,posts}=f;
+ try{
+  for(const [model,hours]of [['No turns yet','0'],['Not recorded','<0.1']]){
+   if(model==='Not recorded'){
+    usage.totals={turns:1,toolCalls:0,goals:0,activeMs:60000};usage.models=[{id:'private-unknown',model:'unattributed',effort:'unknown',...usage.totals}];
+    await settings.getByRole('button',{name:'Refresh analytics',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('[aria-label="Share analytics"]').disabled);
+   }
+   await page.evaluate(()=>window.__drawn=[]);await settings.getByRole('button',{name:'Share analytics',exact:true}).click();const dialog=await ready(page),drawn=await page.evaluate(()=>window.__drawn);
+   assert(drawn.includes(model));assert(drawn.includes(hours));assert(!drawn.some(t=>/NaN|undefined|private/.test(t)));
+   await dialog.getByRole('button',{name:'Animated SVG',exact:true}).click();await dialog.getByRole('link',{name:'Download SVG',exact:true}).waitFor();
+   const values=await page.evaluate(async()=>{const svg=await(await fetch(document.getElementById('stats-share-download').href)).text(),xml=new DOMParser().parseFromString(svg,'image/svg+xml');return {error:!!xml.querySelector('parsererror'),hours:xml.querySelector('[data-final="activeMs"]').textContent,model:xml.querySelector('[data-final="topModel"]').textContent};});
+   assert.deepEqual(values,{error:false,hours,model});await dialog.getByRole('button',{name:'Close share preview',exact:true}).click();
+  }
+  assert.deepEqual(errors,[]);assert.deepEqual(posts,[]);
  }finally{await browser.close();}
 });

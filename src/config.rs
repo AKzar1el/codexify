@@ -180,6 +180,9 @@ pub enum CliCommand {
     Config(ConfigArgs),
     /// Diagnose the local Codexify installation without changing it.
     Doctor(DoctorArgs),
+    /// Download and verify the latest release, then update this installation.
+    /// A running background service is restarted after the verified replacement.
+    Update,
     /// Inspect the read-only project catalogue used by multi-project mode.
     Projects {
         #[command(subcommand)]

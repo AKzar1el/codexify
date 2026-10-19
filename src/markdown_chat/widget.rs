@@ -77,7 +77,9 @@ pub struct OwnerChatSummary {
     pub custom_title: Option<String>,
     pub pinned_at_ms: Option<u64>,
     pub archived_at_ms: Option<u64>,
+    pub owner_read_through: u64,
     pub last_entry_end: u64,
+    pub last_incoming_entry_end: u64,
     pub last_entry_at_ms: u64,
     pub last_user_entry_end: u64,
     pub last_user_entry_at_ms: Option<u64>,
@@ -85,6 +87,7 @@ pub struct OwnerChatSummary {
     pub agent_presence_until_ms: Option<u64>,
     pub agent_stop_requested: bool,
     pub agent_waiting_until_ms: Option<u64>,
+    pub agent_idle_until_ms: Option<u64>,
     pub total_tool_calls: u64,
 }
 
@@ -401,7 +404,9 @@ impl ChatFile {
                         custom_title,
                         pinned_at_ms: cursor.pinned_at_ms,
                         archived_at_ms: cursor.archived_at_ms,
+                        owner_read_through: cursor.owner_read_through,
                         last_entry_end: cached.last_entry_end,
+                        last_incoming_entry_end: cached.last_incoming_entry_end,
                         last_entry_at_ms: cached.last_entry_at_ms,
                         last_user_entry_end: cached.last_user_entry_end,
                         last_user_entry_at_ms: cached.last_user_entry_at_ms,
@@ -411,6 +416,9 @@ impl ChatFile {
                         agent_stop_requested: cursor.agent_stop_requested,
                         agent_waiting_until_ms: (!cursor.agent_stop_requested)
                             .then(|| chat.agent_waiting_until_ms())
+                            .flatten(),
+                        agent_idle_until_ms: (!cursor.agent_stop_requested)
+                            .then(|| chat.agent_idle_until_ms())
                             .flatten(),
                         agent_presence_until_ms: (!cursor.agent_stop_requested)
                             .then_some(cursor.agent_presence_until_ms)
@@ -490,7 +498,13 @@ impl ChatFile {
                     custom_title,
                     pinned_at_ms: cursor.pinned_at_ms,
                     archived_at_ms: cursor.archived_at_ms,
+                    owner_read_through: cursor.owner_read_through,
                     last_entry_end: last.map_or(0, |span| span.end),
+                    last_incoming_entry_end: records
+                        .iter()
+                        .rev()
+                        .find(|span| matches!(span.role, "agent" | "warning"))
+                        .map_or(0, |span| span.end),
                     last_entry_at_ms: last
                         .and_then(|span| span.created_at_ms)
                         .unwrap_or(modified_ms),
@@ -509,6 +523,9 @@ impl ChatFile {
                     agent_waiting_until_ms: (!cursor.agent_stop_requested)
                         .then(|| chat.agent_waiting_until_ms())
                         .flatten(),
+                    agent_idle_until_ms: (!cursor.agent_stop_requested)
+                        .then(|| chat.agent_idle_until_ms())
+                        .flatten(),
                     agent_presence_until_ms: (!cursor.agent_stop_requested)
                         .then_some(cursor.agent_presence_until_ms)
                         .flatten(),
@@ -519,6 +536,7 @@ impl ChatFile {
                     modified,
                     title,
                     last_entry_end: summary.last_entry_end,
+                    last_incoming_entry_end: summary.last_incoming_entry_end,
                     last_entry_at_ms: summary.last_entry_at_ms,
                     last_user_entry_end: summary.last_user_entry_end,
                     last_user_entry_at_ms: summary.last_user_entry_at_ms,
@@ -1063,6 +1081,25 @@ impl ChatFile {
         self.run(move |chat| {
             chat.with_cursor(|_, _| {
                 super::super::attachments::AttachmentStore::for_chat(&chat.path)?.observe(&id)
+            })
+        })
+        .await
+    }
+
+    pub async fn mark_owner_read(self: &Arc<Self>, through: u64) -> Result<u64, String> {
+        self.run(move |chat| {
+            chat.with_cursor(|cursor, file| {
+                check_cursor(file, cursor)?;
+                if through > file.metadata().map_err(io_error)?.len() {
+                    return Err("Read position is beyond the current transcript.".into());
+                }
+                if through > cursor.owner_read_through {
+                    let mut next = cursor.clone();
+                    next.owner_read_through = through;
+                    chat.save_cursor(&next)?;
+                    *cursor = next;
+                }
+                Ok(cursor.owner_read_through)
             })
         })
         .await
@@ -1713,6 +1750,140 @@ mod tests {
         chat.ensure().await.unwrap();
 
         assert_eq!(chat.clean_markdown_transcript().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn owner_unread_tracks_incoming_messages_and_not_own_sends_or_agent_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append_user("own-first".into(), "My first message".into())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let summary = chat.owner_summary().await.unwrap();
+            assert!(summary.last_entry_end > 0);
+            assert_eq!(summary.last_incoming_entry_end, 0);
+        }
+        chat.append("First incoming response".into()).await.unwrap();
+        let incoming = chat.owner_summary().await.unwrap().last_incoming_entry_end;
+        assert!(incoming > 0);
+        chat.mark_owner_read(incoming).await.unwrap();
+        chat.append_user("own-reply".into(), "My own reply".into())
+            .await
+            .unwrap();
+        let outgoing = chat.owner_summary().await.unwrap().last_entry_end;
+        let transcript = std::fs::read(&path).unwrap();
+        chat.mark_delivered(outgoing).await.unwrap();
+        for consume in [false, true] {
+            chat.read(consume).await.unwrap();
+            chat.record_agent_call(super::super::super::now_ms())
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let summary = chat.owner_summary().await.unwrap();
+                assert!(summary.last_entry_end > incoming);
+                assert_eq!(summary.last_incoming_entry_end, incoming);
+                assert_eq!(summary.owner_read_through, incoming);
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        chat.append("Unread incoming response".into())
+            .await
+            .unwrap();
+        let unseen = chat.owner_summary().await.unwrap().last_incoming_entry_end;
+        chat.append_user("own-later".into(), "My later message".into())
+            .await
+            .unwrap();
+        let reopened = Arc::new(ChatFile::new(path, true));
+        for _ in 0..2 {
+            let summary = reopened.owner_summary().await.unwrap();
+            assert!(summary.last_entry_end > unseen);
+            assert_eq!(summary.last_incoming_entry_end, unseen);
+            assert!(summary.last_incoming_entry_end > summary.owner_read_through);
+        }
+        reopened.mark_owner_read(unseen).await.unwrap();
+        reopened.warn_ticket_rejection().await.unwrap();
+        let warning = reopened.owner_summary().await.unwrap();
+        assert_eq!(warning.last_incoming_entry_end, warning.last_entry_end);
+        assert!(warning.last_incoming_entry_end > warning.owner_read_through);
+    }
+
+    #[tokio::test]
+    async fn owner_read_position_is_durable_monotonic_and_independent_of_agent_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append_user("unread-input".into(), "Continue".into())
+            .await
+            .unwrap();
+        let first = chat.owner_summary().await.unwrap().last_entry_end;
+        chat.append("First response".into()).await.unwrap();
+        let second = chat.owner_summary().await.unwrap().last_entry_end;
+        chat.append_user("pending-input".into(), "New input for the agent".into())
+            .await
+            .unwrap();
+        let transcript = std::fs::read(&path).unwrap();
+        let unread = chat.unread_snapshot().await.unwrap();
+        assert!(!unread.messages.is_empty());
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_file_name("cursor.json")).unwrap())
+                .unwrap();
+        assert_eq!(chat.owner_summary().await.unwrap().owner_read_through, 0);
+        let (older, newer) =
+            tokio::join!(chat.mark_owner_read(first), chat.mark_owner_read(second));
+        assert!(older.unwrap() >= first);
+        assert_eq!(newer.unwrap(), second);
+        assert_eq!(chat.mark_owner_read(first).await.unwrap(), second);
+        assert_eq!(chat.mark_owner_read(second).await.unwrap(), second);
+        assert_eq!(
+            chat.owner_summary().await.unwrap().owner_read_through,
+            second
+        );
+        assert!(
+            chat.mark_owner_read(transcript.len() as u64 + 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_file_name("cursor.json")).unwrap())
+                .unwrap();
+        after["ownerReadThrough"] = before["ownerReadThrough"].clone();
+        assert_eq!(after, before, "only the owner's read position changes");
+
+        let reopened = Arc::new(ChatFile::new(path.clone(), true));
+        assert_eq!(
+            reopened.owner_summary().await.unwrap().owner_read_through,
+            second
+        );
+        reopened.append("New response".into()).await.unwrap();
+        let summary = reopened.owner_summary().await.unwrap();
+        assert!(summary.last_entry_end > summary.owner_read_through);
+        let other_directory = directory.path().join("other");
+        std::fs::create_dir(&other_directory).unwrap();
+        let elsewhere = Arc::new(ChatFile::new(other_directory.join("CHAT.md"), true));
+        elsewhere.ensure().await.unwrap();
+        assert_eq!(
+            elsewhere.owner_summary().await.unwrap().owner_read_through,
+            0
+        );
+
+        let cursor_path = path.with_file_name("cursor.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("ownerReadThrough");
+        std::fs::write(&cursor_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_chat = Arc::new(ChatFile::new(path, true));
+        assert_eq!(
+            legacy_chat
+                .owner_summary()
+                .await
+                .unwrap()
+                .owner_read_through,
+            0
+        );
     }
 
     #[tokio::test]

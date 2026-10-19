@@ -42,6 +42,8 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(await dashboard.getByLabel('Analytics date range').inputValue(),'7');assert.deepEqual(reads,['7']);assert.equal(await dashboard.locator('.analytics-kpi').count(),4);assert.equal(await dashboard.getByRole('img').count(),3);
   const card=dashboard.locator('.analytics-card').filter({hasText:'Conversation league'});assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'BioShock optimization');await card.getByRole('button',{name:'Active time',exact:true}).click();assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'Reader annotations');
   const legend=dashboard.locator('.analytics-legend button').first();await legend.click();assert.equal(await dashboard.locator('.analytics-legend button').first().getAttribute('aria-pressed'),'false');await dashboard.locator('.analytics-legend button').first().click();
+  await dashboard.getByLabel('Analytics date range').selectOption('1');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='Today'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.equal(reads.at(-1),'1');assert.equal(await dashboard.locator('.analytics-kpi[data-metric=turns] .analytics-kpi-value').textContent(),String(fixture('1').totals.turns));assert.equal(await dashboard.locator('.analytics-chart g[role=button]').count(),3,'each chart shows just one day');
+  if(process.env.ANALYTICS_SCREENSHOT_DIR){mkdirSync(process.env.ANALYTICS_SCREENSHOT_DIR,{recursive:true});await page.screenshot({animations:'disabled',path:`${process.env.ANALYTICS_SCREENSHOT_DIR}/${name.toLowerCase()}-one-day.png`});}
   await dashboard.getByLabel('Analytics date range').selectOption('30');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='The last 30 days'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.equal(reads.at(-1),'30');
   const out=process.env.ANALYTICS_SCREENSHOT_DIR;if(out){mkdirSync(out,{recursive:true});await dialog.locator('#settings-main').evaluate(n=>n.scrollTop=0);await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-desktop.png`});}
   if(out){await card.scrollIntoViewIfNeeded();await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-leaderboard.png`});await dashboard.getByRole('heading',{name:'Momentum',exact:true}).locator('..').scrollIntoViewIfNeeded();await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-momentum.png`});await dialog.locator('#settings-main').evaluate(n=>n.scrollTop=0);}
@@ -51,5 +53,54 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(await dashboard.getByLabel('Collect analytics',{exact:true}).count(),0);assert.equal(writes.length,0);
   const prior=await dashboard.locator('.analytics-kpi-value').allTextContents();fail=true;await dashboard.getByRole('button',{name:'Refresh analytics',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.deepEqual(await dashboard.locator('.analytics-kpi-value').allTextContents(),prior);assert.equal(await dialog.locator('#settings-save-state').getAttribute('data-error'),'false');assert.equal(await page.getByText('private disk error').count(),0);
   fail=false;malformed=true;await dashboard.getByLabel('Analytics date range').selectOption('all');await dashboard.getByText('Your next turn starts the story.',{exact:false}).waitFor();await dialog.getByRole('button',{name:'Back to settings',exact:true}).click();assert(await nav.isVisible());assert.equal(await dialog.getByLabel('agentChat.analyticsEnabled',{exact:true}).count(),0);await dialog.getByRole('button',{name:'Analytics',exact:true}).click();assert.deepEqual(errors,[]);assert.equal(writes.length,0);
+ }finally{await browser.close();}
+});
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: opening either analytics view fetches fresh figures without a manual refresh`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1440,height:1000}});page.setDefaultTimeout(5000);
+ try{
+  // No polling: opening a view itself must fetch the current snapshot.
+  await page.addInitScript(()=>{window.setInterval=()=>0;});
+  let version=0,usageReads=0,extrasReads=0,gate=null,fail=false;const errors=[],writes=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  const hold=()=>{let release;const wait=new Promise(resolve=>release=resolve);gate={wait,release};return gate;};
+  await routeOwner(page,'http://127.0.0.1:43358/**',async route=>{
+   const req=route.request(),url=new URL(req.url()),path=url.pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   assert.equal(req.headers().authorization,'Bearer fresh-stats-token');if(req.method()!=='GET')writes.push(path);
+   if(path==='/api/global')return route.fulfill({json:{version:'2.2.1',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings')return route.fulfill({json:{document:{},defaults:{agentChat:{extras:{achievements:false,animations:false,sounds:false,weeklyRecap:false,dailyStreaks:false,personalRecords:false}}},raw:'{}',revision:'1',path:'/fixture/config.json'}});
+   if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
+   if(path==='/api/analytics/extras'){
+    extrasReads++;const today=new Date().toISOString().slice(0,10);
+    return route.fulfill({json:{today,timezone:'UTC',streak:0,bestStreak:0,activeToday:false,badges:[],notices:[],records:[{metric:'conversationTurns',value:(version+1)*10}],week:{id:'week:test',start:today,end:today,totals:{turns:0,toolCalls:0,goals:0,activeMs:0},activity:[0,0,0,0,0,0,0],ready:false}}});
+   }
+   if(path==='/api/analytics/usage'){
+    usageReads++;const value=fixture(url.searchParams.get('days')),pending=gate,failed=fail;value.totals.turns=(version+1)*100;
+    if(pending)await pending.wait;
+    return failed?route.fulfill({status:503,body:'Statistics temporarily busy'}):route.fulfill({json:value});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43358/#fresh-stats-token');
+  const stats=page.getByRole('dialog',{name:'Statistics',exact:true}),settings=page.getByRole('dialog',{name:'Codexify settings',exact:true});
+  const turns=dialog=>dialog.locator('.analytics-kpi[data-metric=turns] .analytics-kpi-value');
+  const record=dialog=>dialog.locator('.extras-record').filter({hasText:'Turns · one chat'}).locator('strong');
+  const expectFigures=async(dialog,total,best)=>{await page.waitForFunction(({id,total})=>document.querySelector(`#${id} .analytics-kpi[data-metric=turns] .analytics-kpi-value`)?.textContent===String(total),{id:await dialog.getAttribute('id'),total});await record(dialog).filter({hasText:new RegExp(`^${best}$`)}).waitFor();};
+  const openStats=()=>page.getByRole('button',{name:'Statistics',exact:true}).click(),closeStats=()=>stats.getByRole('button',{name:'Close statistics',exact:true}).click();
+  await openStats();await expectFigures(stats,100,10);assert.equal(usageReads,1);assert.equal(await stats.getByLabel('Analytics date range').inputValue(),'7');
+  await stats.getByLabel('Analytics date range').selectOption('1');await page.waitForFunction(()=>!document.querySelector('#statistics-dialog [aria-label="Share analytics"]').disabled);await closeStats();
+  version=1;const reopen=hold(),reopened=page.waitForRequest(req=>new URL(req.url()).pathname==='/api/analytics/usage');await openStats();await reopened;
+  assert.equal(await turns(stats).textContent(),'100','cached figures stay visible while fresh data arrives');assert.equal(await stats.getByLabel('Analytics date range').inputValue(),'1');gate=null;reopen.release();await expectFigures(stats,200,20);await closeStats();
+  version=2;await page.getByRole('button',{name:'Codexify settings',exact:true}).click();await settings.getByRole('button',{name:'Analytics',exact:true}).click();await expectFigures(settings,300,30);
+  await settings.getByRole('button',{name:'Back to settings',exact:true}).click();version=3;await settings.getByRole('button',{name:'Analytics',exact:true}).click();await expectFigures(settings,400,40);
+  await settings.getByRole('button',{name:'Close settings',exact:true}).click();version=4;await page.getByRole('button',{name:'Codexify settings',exact:true}).click();await expectFigures(settings,500,50);await settings.getByRole('button',{name:'Close settings',exact:true}).click();
+  // An old request finishing after reopening cannot overwrite newer figures.
+  version=5;const old=hold(),oldRequest=page.waitForRequest(req=>new URL(req.url()).pathname==='/api/analytics/usage');await openStats();await oldRequest;await closeStats();gate=null;
+  version=6;await openStats();await expectFigures(stats,700,70);old.release();await page.waitForTimeout(75);assert.equal(await turns(stats).textContent(),'700');await closeStats();
+  fail=true;await openStats();await page.waitForFunction(()=>!document.querySelector('#statistics-dialog [aria-label="Share analytics"]').disabled);assert.equal(await turns(stats).textContent(),'700','a temporary read failure preserves the last successful snapshot');await closeStats();
+  fail=false;version=7;await openStats();await expectFigures(stats,800,80);
+  assert.equal(usageReads,10,'each opening and the date-range change issue one fresh read');assert(extrasReads>=8,'opening analytics also refreshes streaks and records');assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });

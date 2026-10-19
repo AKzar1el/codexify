@@ -539,6 +539,7 @@ Each release ships a compiled binary per platform — `windows-x64`, `linux-x64`
 | `config unset KEY` | Remove a dotted setting while preserving the rest of the document |
 | `config edit` | Edit a validated staging copy using `VISUAL`, `EDITOR`, `nano`/`vi`, or Notepad |
 | `doctor` | Run read-only local diagnostics for configuration, command dependencies, service/update state, local health, and native tunnel prerequisites; add `--json` for machine-readable output |
+| `update` | Download and SHA-256-verify the latest release, then schedule replacement of the standard installed executable; restart a background service only if it is running |
 | `browser install` | Download the current platform's version-matched companion release, verify its published SHA-256, and atomically install it under the private browser runtime directory |
 | `browser start` | Start the installed browser companion as an independent user-session process |
 | `browser stop` | Stop the running companion without changing the Codexify background service |
@@ -749,6 +750,17 @@ only by an interactive shell.
 
 ### Self-update
 
+`codexify update` runs the verified updater directly from the terminal. Invoking
+the command requests the update without entering quickstart. It uses the selected
+configuration (`--config` or `CODEXIFY_CONFIG`) and reports whether an update was
+scheduled, the installation is up to date, or its version is newer than the latest
+release. Scheduling returns an update ID and log path; replacement runs shortly
+after the command exits. A running background service is restarted, while a stopped
+service stays stopped. Without a background service, restart a foreground Unix
+server to use the new executable; on Windows, close foreground server processes
+so the worker can replace the executable. Source builds cannot replace a separate
+managed installation.
+
 The `self_update` MCP tool updates a standard `~/.codexify/bin` installation to
 the latest GitHub release. It requires an explicit user request and
 `{"confirm": true}`. Codexify downloads the platform archive and published
@@ -794,7 +806,7 @@ the connector tools exposed by the updated server.
 Progress and failures are appended to the normal rotating service log and can be
 followed with `codexify service logs -f`. A fixed update lock rejects concurrent
 updates. Self-update refuses source-tree or nonstandard executable locations;
-native Windows self-update also requires the background service because a running
+the Windows MCP self-update tool requires the background service because a running
 executable cannot be replaced in place. A foreground Unix update can replace the
 installed executable without restarting its already-running process; the card
 therefore reports the installed update separately from that process's
@@ -1910,8 +1922,10 @@ without a ChatGPT session request or a navigation. A bounded active UI operation
 retains its normal deadline rather than being interrupted by the watchdog.
 Failed recoveries back off for 30 seconds.
 
-Conversation settings offer **Start browser** and **Stop browser**, matching the
-CLI commands. An explicit stop is stored privately in `browser/lifecycle.json`
+Global settings under **Browser** offer **Start browser** and **Stop browser**,
+matching the CLI commands, along with **Sign in** and **Refresh models**. These
+controls are shared by all conversations. An explicit stop is stored privately
+in `browser/lifecycle.json`
 and survives a core restart. Automatic maintenance and queued actions honor it;
 Start restores automatic recovery. Startup can be interrupted by Stop. A shared
 process lock serializes lifecycle mutations across tasks, windows and the CLI.
@@ -2021,7 +2035,14 @@ pending messages, and new messages arriving during a turn wait for a later actio
 The standalone chat supports multiple file attachments from its file picker,
 composer-focused paste, and drag/drop anywhere on the page. A page-wide drop
 overlay identifies the destination; ordinary text paste is unchanged. Images
-have thumbnail cards; other file types show their original names and sizes.
+have thumbnail cards backed by lazily generated WebP previews, bounded to
+480 × 320 pixels and cached under `attachments/.thumbnails/`. Existing uploads
+gain previews on first use. JPEG, PNG, GIF and WebP are supported; animations use
+their first frame. Unsupported or invalid previews show a file icon instead of
+automatically downloading the original. Browser caching is private and uses
+ETags to reuse unchanged previews without transferring another image body.
+Changing an original invalidates its preview. Other file types show their
+original names and sizes.
 Sending an attachment-only prompt is supported. Image and video cards open a
 large overlay, and other files open a download with their original filename and
 stored media type. Video requests support byte ranges for seeking.
@@ -2332,6 +2353,16 @@ The clean transcript excludes the storage header, internal message markers,
 timestamps, receipts, and tool-call counters. It is generated by the
 authenticated owner API and fails instead of returning a partial result when it
 would exceed 64 MiB.
+
+Unread dots use a server-persisted owner read position shared by all browsers.
+Only new incoming agent messages or visible warnings can create an unread dot;
+your own messages, tool activity, and delivery or read receipt changes cannot.
+Viewing a conversation acknowledges the entries loaded into the visible chat;
+newer entries remain unread. Other open browsers receive the updated position
+through the existing two-second list polling, or immediately on returning to the
+page. Existing browser-local read positions migrate once that browser opens the
+updated page. This state survives service restarts and is separate from the
+agent's read cursor and message delivery receipts.
 
 Selecting a conversation updates the owner page's `?chat=<opaque-id>` URL.
 Reloading restores that conversation, and browser Back/Forward switches chats

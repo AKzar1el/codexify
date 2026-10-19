@@ -52,6 +52,9 @@ struct Cursor {
     pinned_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     archived_at_ms: Option<u64>,
+    // Owner UI read position, independent of the agent's input/delivery cursor.
+    #[serde(default)]
+    owner_read_through: u64,
     #[serde(default)]
     last_agent_end: Option<u64>,
     #[serde(default)]
@@ -158,6 +161,7 @@ struct OwnerSummaryCache {
     modified: std::time::SystemTime,
     title: String,
     last_entry_end: u64,
+    last_incoming_entry_end: u64,
     last_entry_at_ms: u64,
     last_user_entry_end: u64,
     last_user_entry_at_ms: Option<u64>,

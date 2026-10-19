@@ -215,6 +215,8 @@ pub struct AutomationActionState {
     pub send_accepted: Option<bool>,
     pub messages_fenced: bool,
     pub automatic_retry_attempts: u32,
+    // Presentation only: keep recovery visible while a scheduled retry runs.
+    pub automatic_retry_in_progress: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -404,6 +406,19 @@ impl AutomationTaskState {
         action
             .updated_at_ms
             .map(|finished| finished.saturating_add(*delay))
+    }
+
+    pub fn is_automatically_retrying(&self) -> bool {
+        self.automatic_retry_at_ms().is_some()
+            || self.action.automatic_retry_in_progress
+                && matches!(
+                    self.action.status,
+                    AutomationActionStatus::Idle
+                        | AutomationActionStatus::Queued
+                        | AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
     }
 
     pub fn pairing_verification_wait_until_ms(&self) -> Option<u64> {
@@ -1171,6 +1186,7 @@ impl AgentAutomationStore {
             state.goal_wake = GoalWakeState::default();
             if state.action.goal_revision == Some(expected_revision) {
                 state.action.status = AutomationActionStatus::Idle;
+                state.action.automatic_retry_in_progress = false;
                 state.action.updated_at_ms = Some(now_ms);
             }
             Ok(result)
@@ -1484,6 +1500,7 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.pairing.clone())
@@ -1544,6 +1561,7 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
             validate_state(&state)?;
@@ -1696,6 +1714,7 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(now_ms),
                 send_accepted: Some(false),
                 automatic_retry_attempts: state.action.automatic_retry_attempts,
+                automatic_retry_in_progress: state.action.automatic_retry_in_progress,
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -1730,6 +1749,7 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(failure.now_ms),
                 send_accepted: Some(false),
                 automatic_retry_attempts: state.action.automatic_retry_attempts,
+                automatic_retry_in_progress: state.action.automatic_retry_in_progress,
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -1779,6 +1799,7 @@ impl AgentAutomationStore {
             state.action.updated_at_ms = Some(now_ms);
             if state.action.status == AutomationActionStatus::Idle {
                 state.action.automatic_retry_attempts = 0;
+                state.action.automatic_retry_in_progress = false;
             }
             Ok(state.action.clone())
         })
@@ -1810,6 +1831,7 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Cancelled;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.action.clone())
         })
@@ -1888,6 +1910,7 @@ impl AgentAutomationStore {
             // ledger so continuing a goal never replays an earlier user batch.
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
+                automatic_retry_in_progress: true,
                 automatic_retry_attempts: if state.action.status == AutomationActionStatus::Failed
                     && state.action.send_accepted == Some(false)
                     && !state.action.messages_fenced
@@ -1925,6 +1948,7 @@ impl AgentAutomationStore {
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 automatic_retry_attempts: state.action.automatic_retry_attempts + 1,
+                automatic_retry_in_progress: true,
                 ..Default::default()
             };
             Ok(true)
@@ -1978,6 +2002,7 @@ impl AgentAutomationStore {
             count_accepted_goal_turn(state);
             state.action.send_accepted = Some(true);
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             state.action.status = if made_progress {
                 AutomationActionStatus::Idle
             } else {
@@ -2089,6 +2114,7 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             state.action.updated_at_ms = Some(now_ms);
             state.goal_wake = GoalWakeState::default();
             persist_state(path, &state)?;
@@ -2162,6 +2188,7 @@ impl AgentAutomationStore {
             }
             state.action.send_accepted = Some(true);
             state.action.automatic_retry_attempts = 0;
+            state.action.automatic_retry_in_progress = false;
             count_accepted_goal_turn(state);
             Ok(())
         })

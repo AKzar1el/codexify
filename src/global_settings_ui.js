@@ -61,6 +61,9 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
 #settings-content-description{margin:7px 0 24px;color:var(--muted);font-size:13px;max-width:520px}
 #settings-dialog .settings-card{border:1px solid var(--line);border-radius:12px;background:var(--panel);margin:0 0 18px;overflow:hidden}
 #settings-dialog .settings-card-heading{padding:14px 18px;background:var(--bg);border-bottom:1px solid var(--line);margin:0;font-size:13px;font-weight:600}
+#settings-dialog .settings-browser-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}#settings-dialog .settings-browser-heading h4{font:inherit;margin:0}#settings-browser-state{margin:0;font-size:12px;font-weight:400;color:var(--muted)}#settings-browser-state[data-state=connected]{color:var(--accent)}#settings-browser-state[data-state=unavailable]{color:var(--settings-error)}#settings-browser-state:before{content:'';display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;background:currentColor;vertical-align:middle}
+#settings-dialog .settings-browser-body{padding:16px 18px}#settings-dialog .settings-browser-copy{margin:0 0 12px;color:var(--muted);font-size:12px;line-height:1.5}#settings-dialog .settings-browser-actions{display:flex;flex-wrap:wrap;gap:8px}#settings-dialog .settings-browser-actions button{font-size:13px}#settings-browser-feedback{margin:12px 0 0;font-size:12px;line-height:1.5;overflow-wrap:anywhere;color:var(--muted)}#settings-browser-feedback[data-error=true]{color:var(--settings-error)}
+@media(max-width:760px){#settings-dialog .settings-browser-body{padding:10px 12px}#settings-dialog .settings-browser-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}#settings-dialog .settings-browser-actions button{font-size:12px;padding:8px}#settings-browser-state{font-size:11px}}
 #settings-dialog .setting-row{padding:16px 18px;display:grid;grid-template-columns:minmax(0,1fr) minmax(155px,230px);gap:20px;align-items:center}
 #settings-dialog .setting-row+.setting-row{border-top:1px solid var(--line)}
 #settings-dialog .setting-row.setting-wide{grid-template-columns:1fr;gap:10px}
@@ -142,6 +145,7 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     'agentChat.automation.requestBlockingEnabled':['Block matching requests before they leave the browser. Off by default. Use Restart Codexify to apply.','browser','Block matching requests'],
     'agentChat.extras.achievements':['Celebrate newly earned badges. Your badge collection stays in Statistics. Applies immediately.','extras','Achievement celebrations'],
     'agentChat.extras.animations':['Colorful bursts and motion, lasting a few seconds. Respects reduced motion. Applies immediately.','extras','Animations'],
+    'agentChat.extras.sounds':['Brief fireworks and a musical flourish for celebrations. Applies immediately.','extras','Celebration sounds'],
     'agentChat.extras.weeklyRecap':['Show your completed Monday–Sunday recap once a week. You can always open it in Statistics. Applies immediately.','extras','Weekly recap'],
     'agentChat.extras.dailyStreaks':['A small, non-blocking celebration for each active day. Streak statistics stay available. Applies immediately.','extras','Daily streak celebrations'],
     'agentChat.extras.personalRecords':['Celebrate each conversation or goal only the first time it breaks a record. Applies immediately.','extras','Personal record celebrations'],
@@ -164,6 +168,42 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
   const label=key=>names[key]||key.replace(/([a-z])([A-Z])/g,'$1 $2').replace(/Ms$/,' (ms)').replace(/^./,letter=>letter.toUpperCase());
   const RESET=Symbol('default'),invalidFields=new Map(),invalidText=new Map();
   let snapshot=null,global=null,dirty={},saving=false,savePromise=null,saveTimer,maintenance=false,statusTimer,previousInstance=null,rawEdited=false,shownRefreshState=null,category='general',rawMode=false,fields=[],saveError=null,inFlightChanges={},refreshSubmitting=false,refreshTimer=null,refreshEpoch=0;
+  let browser=null,browserOperation=null,browserRevision=0,browserReading=false,browserFeedback='',browserFeedbackError=false,browserFeedbackOperation=null;
+  const browserCard=document.createElement('section');browserCard.id='settings-browser';browserCard.className='settings-card';browserCard.setAttribute('aria-labelledby','settings-browser-heading');
+  browserCard.innerHTML='<div class="settings-card-heading settings-browser-heading"><h4 id="settings-browser-heading">Browser session</h4><p id="settings-browser-state" role="status">Checking browser…</p></div><div class="settings-browser-body"><p class="settings-browser-copy">The ChatGPT browser session is shared by all conversations.</p><div class="settings-browser-actions"><button type="button" id="settings-browser-start">Start browser</button><button type="button" id="settings-browser-stop">Stop browser</button><button type="button" id="settings-browser-login">Sign in</button><button type="button" id="settings-browser-models">Refresh models</button></div><p id="settings-browser-feedback" role="status" hidden></p></div>';
+  const browserNodes=Object.fromEntries(['state','start','stop','login','models','feedback'].map(key=>[key,browserCard.querySelector(`#settings-browser-${key}`)]));
+  function renderBrowser(){
+    const c=browser||{},stopping=browserOperation==='stop'||c.stopping,starting=browserOperation==='start'||c.recovering;
+    browserNodes.state.textContent=stopping?'Stopping browser…':starting?'Starting browser…':!browser?'Checking browser…':c.manuallyStopped?'Browser stopped by you':c.waitingForServerRestart?'Waiting for Codexify to restart':c.responsive&&c.status==='unavailable'?'Browser is running; check the ChatGPT page':c.authenticated?`Connected · ${(c.status||'idle').replace(/^./,v=>v.toUpperCase())}`:c.status==='unavailable'?(c.detail||'Browser companion is unavailable'):'ChatGPT sign-in required';
+    browserNodes.state.dataset.state=c.manuallyStopped||stopping||starting||c.waitingForServerRestart?'disconnected':c.authenticated?'connected':c.status==='unavailable'?'unavailable':'disconnected';
+    browserNodes.start.disabled=!browser||Boolean(browserOperation)||(!c.manuallyStopped&&c.status!=='unavailable'&&!c.recovering);
+    browserNodes.stop.disabled=!browser||browserOperation==='stop'||(c.manuallyStopped===true&&browserOperation!=='start');
+    browserNodes.start.textContent=browserOperation==='start'?'Starting…':'Start browser';browserNodes.stop.textContent=stopping?'Stopping…':'Stop browser';
+    browserNodes.login.disabled=!browser||c.authenticated===true||Boolean(browserOperation)||c.manuallyStopped===true;
+    browserNodes.models.disabled=!browser||c.authenticated!==true||c.status!=='idle'||Boolean(c.activeActionId)||Boolean(browserOperation)||c.manuallyStopped===true||c.recovering===true||c.stopping===true;
+    browserNodes.models.textContent=browserOperation==='capabilities'?'Refreshing…':'Refresh models';
+    browserNodes.feedback.hidden=!browserFeedback;browserNodes.feedback.textContent=browserFeedback;browserNodes.feedback.dataset.error=String(browserFeedbackError);
+  }
+  async function refreshBrowser(){
+    if(browserReading||browserOperation)return;browserReading=true;const revision=browserRevision;
+    try{const result=await(await api('/api/browser')).json();if(revision!==browserRevision)return;browser=result.companion||{};if(browserFeedbackOperation==='login'&&!browserFeedbackError&&browser.authenticated)browserFeedback='Signed in.';if(browserFeedbackError&&browserFeedbackOperation==='start'&&(browser.authenticated||browser.responsive||browser.status==='authentication_required')){browserFeedback='';browserFeedbackError=false;}}
+    catch(error){if(revision===browserRevision)browser={status:'unavailable',authenticated:false,detail:error.message||'Browser status is unavailable'};}
+    finally{browserReading=false;renderBrowser();}
+  }
+  async function controlBrowser(operation){
+    if(browserOperation==='stop'||browserOperation&&operation!=='stop')return;
+    const revision=++browserRevision;browserOperation=operation;browserFeedback='';browserFeedbackError=false;browserFeedbackOperation=operation;renderBrowser();
+    try{
+      const random=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const result=await(await api(`/api/browser/${operation}`,{method:'POST',body:JSON.stringify({requestId:`browser-${operation}-${random}`,...(operation==='capabilities'?{refresh:true}:{})})})).json();
+      if(revision!==browserRevision)return;browser={...result.companion,...result.lifecycle};
+      browserFeedback=operation==='capabilities'?'Models refreshed.':operation==='login'?(browser.authenticated?'Signed in.':'Complete sign-in in the browser.') : '';
+      window.dispatchEvent(new Event('codexify-browser-change'));
+    }catch(error){if(revision===browserRevision){browserFeedback=error.message||'Browser control failed';browserFeedbackError=true;}}
+    finally{if(revision===browserRevision){browserOperation=null;renderBrowser();void refreshBrowser();}}
+  }
+  for(const [key,operation]of [['start','start'],['stop','stop'],['login','login'],['models','capabilities']])browserNodes[key].addEventListener('click',()=>void controlBrowser(operation));
+  const browserTimer=setInterval(()=>{if(dialog.open&&!rawMode&&browserCard.isConnected&&!document.hidden)void refreshBrowser();},1500);
   const message=(text,error=false)=>{byId('settings-save-state').textContent=text;byId('settings-save-state').dataset.error=String(error);byId('settings-reload').hidden=!error;};
   const storedAt=(object,path)=>path.split('.').reduce((value,key)=>value&&Object.hasOwn(value,key)?value[key]:undefined,object);
   const draftAt=path=>{const pending=Object.hasOwn(dirty,path)?dirty:inFlightChanges;return Object.hasOwn(pending,path)?pending[path]===RESET?undefined:pending[path]:storedAt(snapshot.document,path);};
@@ -312,13 +352,15 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     byId('settings-raw-toggle').hidden=analytics;
     if(rawMode)return;
     const form=byId('settings-form');form.replaceChildren();
-    if(category==='analytics'&&!query){usageDashboard.mount(form);return;}
+    if(category==='analytics'&&!query){usageDashboard.mount(form);void extras.refresh();return;}
+    const browserVisible=!query&&category==='browser'||query&&'browser session start browser stop browser sign in refresh models'.includes(query);
+    if(browserVisible){form.append(browserCard);renderBrowser();void refreshBrowser();}
     const eventOrder=['completed','inputRequired','goalBlocked','errors','messages','offline'];
     matching.sort((a,b)=>{const aEvent=a.category==='notifications'&&a.section==='Events',bEvent=b.category==='notifications'&&b.section==='Events';return Number(bEvent)-Number(aEvent)||(aEvent&&bEvent?eventOrder.indexOf(a.path.split('.').at(-1))-eventOrder.indexOf(b.path.split('.').at(-1)):0);});
     const sections=new Map();for(const field of matching){const title=query?`${categories.find(item=>item.id===field.category).name} · ${field.section}`:field.section;if(!sections.has(title))sections.set(title,[]);sections.get(title).push(field);}
     for(const [title,items] of sections){const card=document.createElement('section');card.className='settings-card';const heading=document.createElement('h4');heading.className='settings-card-heading';heading.textContent=title;card.append(heading,...items.map(drawField));form.append(card);}
     if(category==='chats'&&!query)form.append(cutoffCard());
-    if(!matching.length){const empty=document.createElement('div');empty.className='settings-empty';empty.innerHTML='<strong>No settings found</strong><p>Try another search or choose a category.</p>';form.append(empty);}
+    if(!matching.length&&!browserVisible){const empty=document.createElement('div');empty.className='settings-empty';empty.innerHTML='<strong>No settings found</strong><p>Try another search or choose a category.</p>';form.append(empty);}
   }
   for(const item of categories){const button=document.createElement('button');button.type='button';button.dataset.category=item.id;button.innerHTML=`${icon(item.id)}<span>${item.name}</span>`;button.addEventListener('click',()=>{category=item.id;byId('settings-search').value='';renderForm();byId('settings-main').scrollTop=0;});byId('settings-nav').append(button);}
   byId('settings-analytics-back').addEventListener('click',()=>{category='general';byId('settings-search').value='';renderForm();byId('settings-main').scrollTop=0;});
@@ -413,5 +455,5 @@ function startGlobalSettings({api,onPlan,bindBackdrop=()=>{},getChats=()=>[],onO
     finally{refreshSubmitting=false;refreshButton();}
   });
   void pollStatus();statusTimer=setInterval(()=>{if(!document.hidden&&!maintenance)void pollStatus();},15000);
-  return {close(){clearInterval(statusTimer);clearInterval(refreshTimer);clearTimeout(saveTimer);}};
+  return {close(){clearInterval(statusTimer);clearInterval(refreshTimer);clearInterval(browserTimer);clearTimeout(saveTimer);}};
 }

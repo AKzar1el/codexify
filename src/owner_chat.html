@@ -56,14 +56,14 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .presence.goal-running,.presence.goal-completed { color:#159b27; }
 .presence.goal-paused { color:var(--muted); }
 .presence .presence-spinner { animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
-.presence.goal-running .goal-outer-ring { transform-box:view-box; transform-origin:center; animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
+.presence:is(.goal-running,.goal-retrying) .goal-outer-ring { transform-box:view-box; transform-origin:center; animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
 @keyframes presence-spin { to { transform:rotate(360deg); } }
 .presence.away { background:#eba916; border-color:#eba916; color:white; }
 .presence.offline,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
 .presence.offline { background:#fff; }
 #conversations .presence.offline { visibility:hidden; }
-.presence.waiting,.presence.goal-blocked,.presence.error { color:#c4313b; }
-@media(prefers-color-scheme:dark) { .presence.waiting,.presence.goal-blocked,.presence.error { color:#ff858e; } }
+.presence.waiting,.presence.goal-blocked,.presence.error,.presence.retrying,.presence.goal-retrying { color:#c4313b; }
+@media(prefers-color-scheme:dark) { .presence.waiting,.presence.goal-blocked,.presence.error,.presence.retrying,.presence.goal-retrying { color:#ff858e; } }
 .conversation-main { min-width:0; }
 .conversation-title { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:var(--chat-label-size); font-weight:600; }
 .conversation-detail { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:11px; color:var(--muted); margin-top:3px; }
@@ -319,6 +319,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   let archiveView = false, lastNormalSelection = null, normalSearch = "", archivedSearch = "";
   let waitingForPresenceRefresh = false;
   const lastPresence = new Map();
+  let automationEnabled = null;
   const organizing = new Set();
   try { if (localStorage.getItem("owner-chat-list-view-v1") === "recent") listMode = "recent"; } catch {}
   const chatIdPattern = /^[0-9a-f]{64}$/;
@@ -334,8 +335,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     return [...(model?.efforts || [])].reverse();
   }
   const chatMeta = "io.github.devnoname120/codexify/markdown-chat";
-  let seen = {};
-  try { seen = JSON.parse(localStorage.getItem("owner-chat-seen-v1") || "{}"); } catch {}
+  const readPositions = new Map(), reading = new Set();
+  let legacySeen = {};
+  try {
+    const saved = JSON.parse(localStorage.getItem("owner-chat-seen-v1") || "{}");
+    if (saved && typeof saved === "object" && !Array.isArray(saved)) legacySeen = saved;
+  } catch {}
 
   function showError(message) { errorNode.hidden = !message; errorNode.textContent = message || ""; }
   function bindBackdrop(dialog, close = () => dialog.close()) {
@@ -352,14 +357,50 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     event.preventDefault();
     if (kind === "drop" && !selected) showError("Select a conversation before attaching files.");
   });
-  function remember(id, end) {
-    if (!Number.isSafeInteger(end) || end <= (seen[id] || 0)) return;
-    seen[id] = end;
-    try { localStorage.setItem("owner-chat-seen-v1", JSON.stringify(seen)); } catch {}
-    renderList();
+  function forgetLegacyRead(id) {
+    delete legacySeen[id];
+    try {
+      if (Object.keys(legacySeen).length) localStorage.setItem("owner-chat-seen-v1", JSON.stringify(legacySeen));
+      else localStorage.removeItem("owner-chat-seen-v1");
+    } catch {}
   }
-  function presence(lastCall, now, waitingUntil = null, presenceUntil = null) {
+  function readThrough(chat) {
+    return Math.max(chat.ownerReadThrough || 0, readPositions.get(chat.id) || 0);
+  }
+  async function remember(id, end) {
+    if (!Number.isSafeInteger(end) || end <= 0) return;
+    const chat = chats.find(chat => chat.id === id);
+    if (!chat) return;
+    if (end > readThrough(chat)) {
+      readPositions.set(id, end);
+      renderList();
+    }
+    if (end <= (chat.ownerReadThrough || 0)) {
+      if (legacySeen[id] <= chat.ownerReadThrough) forgetLegacyRead(id);
+      return;
+    }
+    if (reading.has(id)) return;
+    reading.add(id);
+    const through = readThrough(chat);
+    let saved = false;
+    try {
+      const result = await (await api(`/api/chats/${id}/read`, {method:"POST", body:JSON.stringify({through})})).json();
+      if (!Number.isSafeInteger(result.ownerReadThrough) || result.ownerReadThrough < through) return;
+      const current = chats.find(chat => chat.id === id);
+      if (current) current.ownerReadThrough = Math.max(current.ownerReadThrough || 0, result.ownerReadThrough);
+      readPositions.set(id, Math.max(readPositions.get(id) || 0, result.ownerReadThrough));
+      if (legacySeen[id] <= result.ownerReadThrough) forgetLegacyRead(id);
+      saved = true;
+    } catch {
+      // Keep the viewed position and retry on the next chat poll or list refresh.
+    } finally {
+      reading.delete(id);
+      if (saved && (readPositions.get(id) || 0) > through) void remember(id, readPositions.get(id));
+    }
+  }
+  function presence(lastCall, now, waitingUntil = null, presenceUntil = null, idleUntil = null) {
     if (Number.isSafeInteger(waitingUntil) && now < waitingUntil) return "waiting";
+    if (Number.isSafeInteger(idleUntil) && now < idleUntil) return "waiting";
     if (Number.isSafeInteger(presenceUntil)) return now < presenceUntil ? "online" : "offline";
     if (!Number.isFinite(lastCall) || now - lastCall >= 300000) return "offline";
     if (now - lastCall >= 180000) return "away";
@@ -373,13 +414,13 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       for (const [key, value] of Object.entries({fill:"none",stroke:"currentColor","stroke-width":2.5,"stroke-linecap":"round"})) svg.setAttribute(key,String(value));
       return svg;
     }
-    if (state === "goal-running" || state === "goal-blocked" || state === "goal-completed") return goalIcon();
+    if (state === "goal-running" || state === "goal-retrying" || state === "goal-blocked" || state === "goal-completed") return goalIcon();
     if (state === "goal-paused") {
       svg.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="M9 8v8m6-8v8"/>';
       for (const [key, value] of Object.entries({ fill:"none", stroke:"currentColor", "stroke-width":1.6, "stroke-linecap":"round", "stroke-linejoin":"round" })) svg.setAttribute(key, String(value));
       return svg;
     }
-    if (state === "online") {
+    if (state === "online" || state === "retrying") {
       svg.classList.add("presence-spinner");
       svg.innerHTML = '<circle cx="12" cy="12" r="10.5" opacity=".2"/><path d="M12 1.5a10.5 10.5 0 0 1 10.5 10.5"/>';
       for (const [key, value] of Object.entries({ fill:"none", stroke:"currentColor", "stroke-width":2.5, "stroke-linecap":"round" })) svg.setAttribute(key, String(value));
@@ -411,8 +452,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     return svg;
   }
   function sidebarState(chat, now) {
+    if (chat.automationRetrying === true) return chat.goalStatus === "active" ? "goal-retrying" : "retrying";
     if (chat.automationError) return "error";
-    const state = presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs);
+    const state = presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, chat.agentIdleUntilMs);
     if (chat.goalStatus === "configured") return "goal-paused";
     if (chat.goalStatus === "completed" && !chat.goalCompletionDismissed) return "goal-completed";
     if (chat.goalStatus === "blocked" || chat.goalStatus === "error") return "goal-blocked";
@@ -523,13 +565,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
               <p id="conversation-project-error" role="alert" hidden></p>
             </form>
           </section>
-          <section class="connection-settings-card" aria-labelledby="connection-browser-heading">
-            <div class="connection-card-heading"><h3 id="connection-browser-heading">Browser connection</h3><p id="companion-status" class="connection-state" role="status"></p></div>
-            <div class="connection-card-content"><p class="connection-card-copy">Manage the ChatGPT browser session used to send messages.</p><div class="automation-actions"><button type="button" id="automation-browser-start">Start browser</button><button type="button" id="automation-browser-stop">Stop browser</button><button type="button" id="automation-login">Sign in</button><button type="button" id="automation-capabilities">Refresh models</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div></div>
-          </section>
           <section class="connection-settings-card" aria-labelledby="connection-pairing-heading">
             <div class="connection-card-heading"><h3 id="connection-pairing-heading">Paired conversation</h3><p id="pairing-status" class="connection-state"></p></div>
-            <div class="connection-card-content"><label class="automation-field" for="automation-url">ChatGPT conversation URL</label><input id="automation-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://chatgpt.com/c/…"><div class="automation-actions"><button type="button" id="automation-pair">Pair conversation</button><button type="button" id="automation-unlink">Unlink conversation</button></div></div>
+            <div class="connection-card-content"><label class="automation-field" for="automation-url">ChatGPT conversation URL</label><input id="automation-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://chatgpt.com/c/…"><div class="automation-actions"><button type="button" id="automation-pair">Pair conversation</button><button type="button" id="automation-unlink">Unlink conversation</button><button type="button" id="automation-reveal">Open in ChatGPT</button></div></div>
           </section>
           <section class="connection-settings-card" aria-labelledby="connection-activity-heading">
             <div class="connection-card-heading"><h3 id="connection-activity-heading">Activity &amp; recovery</h3></div>
@@ -573,15 +611,13 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     const byId = name => scope.querySelector(`#${name}`);
     const nodes = {
       presence:byId("automation-presence"), queue:byId("automation-queue"), action:byId("automation-action"),
-      browserStart:byId("automation-browser-start"),browserStop:byId("automation-browser-stop"),
-      companion:byId("companion-status"), login:byId("automation-login"), capabilities:byId("automation-capabilities"), reveal:byId("automation-reveal"),
+      reveal:byId("automation-reveal"),
       url:byId("automation-url"), pair:byId("automation-pair"), unlink:byId("automation-unlink"), pairing:byId("pairing-status"),
       model:byId("automation-model"), effort:byId("automation-effort"),
       goal:byId("automation-goal"), setGoal:byId("automation-set-goal"), toggleGoal:byId("automation-toggle-goal"), clearGoal:byId("automation-clear-goal"), goalStatus:byId("goal-status"),
       liveStatus:byId("automation-live-status"), liveCommentary:byId("automation-live-commentary"), liveAnswer:byId("automation-live-answer"), cancelAction:byId("automation-cancel-action"), retryAction:byId("automation-retry-action"), error:byId("automation-error")
     };
     let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, catalogAttempted = false, loadingModels = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
-    let browserOperation = null, browserRevision = 0, browserError = "", browserErrorOperation = null;
     let pairingSubmitting = false, pairingRevision = 0, pairingSubmissionError = "", lastSubmittedPairingUrl = "";
     let dismissedError = null, shownErrorSignature = null;
     const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
@@ -615,6 +651,24 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const elapsed = (goal?.elapsedActiveMs || 0) + (goal?.status === "active" && Number.isSafeInteger(goal.activeSinceMs) ? Math.max(0, Math.min(now, until) - goal.activeSinceMs) : 0);
       const turns = Math.max(1, goal?.turnCount || 1);
       byId("goal-metrics").textContent = goal ? `${goalDuration(elapsed)} (${turns} turn${turns === 1 ? "" : "s"})` : "";
+    }
+    function renderGoalBar(goal, {needsAttention=false,failure="",loading=false}={}) {
+      byId("goal-icon").dataset.state = goal?.status === "blocked" || goal?.status === "error" ? "blocked" : goal?.status === "active" ? "running" : "paused";
+      byId("goal-bar").hidden = !goal;
+      byId("goal-caption").textContent = needsAttention ? "Goal needs attention" : goal?.status === "active" ? "Pursuing goal" : goal?.status === "configured" ? "Goal paused" : `Goal ${goal?.status || ""}`;
+      byId("goal-caption").title = needsAttention ? failure : "";
+      byId("goal-text").textContent = goal?.markdown || "";
+      byId("goal-text").title = goal?.blockedReason || goal?.markdown || "";
+      updateGoalMetrics();
+      if (byId("goal-editor").hidden) nodes.goal.value = goal?.markdown || "";
+      nodes.goalStatus.textContent = goal ? sentenceCase(goal.status) + (goal.blockedReason ? ` · ${goal.blockedReason}` : "") : "No goal configured";
+      nodes.setGoal.disabled = loading || !nodes.goal.value.trim();
+      nodes.clearGoal.disabled = loading || goal?.status === "active";
+      nodes.toggleGoal.disabled = loading || !goal || !["active", "configured", "blocked"].includes(goal.status);
+      byId("automation-edit-goal").disabled = loading;
+      const toggleLabel = goal?.status === "active" ? "Pause goal" : "Run goal";
+      nodes.toggleGoal.setAttribute("aria-label", toggleLabel); nodes.toggleGoal.title = toggleLabel;
+      byId("goal-toggle-icon").setAttribute("d", goal?.status === "active" ? "M9 8v8m6-8v8" : "m10 8 6 4-6 4Z");
     }
     function sizePicker(node) {
       const style = getComputedStyle(node);
@@ -650,28 +704,19 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       // Goal controls can arrive after the history has already scrolled to its end.
       const atBottom = history.scrollHeight - history.scrollTop - history.clientHeight < 50;
       current = state;
-      if(browserErrorOperation==='start'&&!browserOperation&&(state.companion?.authenticated||state.companion?.responsive||state.companion?.status==='authentication_required'))browserError='';
-      const setStateError = message => setError(browserError||message,browserError?`browser:${browserRevision}:${browserError}`:errorSignature(message));
+      const chat = chats.find(chat => chat.id === id);
+      if (chat && Object.hasOwn(state, "goal")) chat.goal = state.goal;
+      const setStateError = message => setError(message,errorSignature(message));
       panel.hidden = tools.hidden = !state?.enabled;
       settingsToggle.hidden = !state?.enabled;
       if (!state?.enabled) { showSettings(false); return; }
       const automaticRetry = Number.isSafeInteger(state.action?.automaticRetryAtMs);
-      const presenceState = presence(state.presence?.lastAgentCallAtMs, Date.now() + clockOffset, state.presence?.agentWaitingUntilMs, state.presence?.agentPresenceUntilMs);
+      const presenceState = presence(state.presence?.lastAgentCallAtMs, Date.now() + clockOffset, state.presence?.agentWaitingUntilMs, state.presence?.agentPresenceUntilMs, state.presence?.agentIdleUntilMs);
       nodes.presence.textContent = sentenceCase(presenceState);
       nodes.queue.hidden = !Number.isSafeInteger(state.queue?.position);
       nodes.queue.textContent = nodes.queue.hidden ? "" : `· Queue ${state.queue.position} of ${state.queue.total}`;
       nodes.action.textContent = automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
       const companion = state.companion || {};
-      const stopping=browserOperation==='stop'||companion.stopping;
-      const starting=browserOperation==='start'||companion.recovering;
-      nodes.companion.textContent=stopping?'Stopping browser…':starting?'Starting browser…':companion.manuallyStopped?'Browser stopped by you':companion.waitingForServerRestart?'Waiting for Codexify to restart':companion.responsive&&companion.status==='unavailable'?'Browser is running; check the ChatGPT page':companion.authenticated?`Connected · ${sentenceCase(companion.status||'idle')}`:companion.status==='unavailable'?(companion.detail||'Browser companion is unavailable'):'ChatGPT sign-in required';
-      nodes.companion.dataset.state=companion.manuallyStopped||stopping||starting||companion.waitingForServerRestart?'disconnected':companion.authenticated?'connected':companion.status==='unavailable'?'unavailable':'disconnected';
-      nodes.browserStart.disabled=Boolean(browserOperation)||(!companion.manuallyStopped&&companion.status!=='unavailable'&&!companion.recovering);
-      nodes.browserStop.disabled=browserOperation==='stop'||(companion.manuallyStopped===true&&browserOperation!=='start');
-      nodes.browserStart.textContent=browserOperation==='start'?'Starting…':'Start browser';
-      nodes.browserStop.textContent=browserOperation==='stop'?'Stopping…':'Stop browser';
-      nodes.login.disabled = companion.authenticated===true||Boolean(browserOperation)||companion.manuallyStopped===true;
-      nodes.capabilities.disabled=companion.authenticated!==true||companion.status!=='idle'||loadingModels||Boolean(companion.activeActionId)||Boolean(browserOperation)||companion.manuallyStopped===true;
       const pairing = state.pairing || { status:"unpaired" };
       const verified = pairing.status === "verified";
       const currentPairingPhase = pairingPhase(state, Date.now() + clockOffset);
@@ -701,17 +746,15 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const locked = !companion.authenticated || !catalogLoaded || savingSelection || loadingModels;
       nodes.model.disabled = locked || !models.some(model => model.efforts.some(effort => effort.available));
       nodes.effort.disabled = locked || !models.some(model => model.id === nodes.model.value && model.efforts.some(effort => effort.available));
-      const explanation = !companion.authenticated ? "Sign in through connection settings to load available models." : savingSelection ? "Saving model and effort…" : loadingModels ? "Loading available models…" : "Used for the next automatic turn.";
+      const explanation = !companion.authenticated ? "Sign in through Codexify settings → Browser to load available models." : savingSelection ? "Saving model and effort…" : loadingModels ? "Loading available models…" : "Used for the next automatic turn.";
       nodes.model.title = nodes.effort.title = explanation;
       const goal = state.goal;
-      byId("goal-icon").dataset.state = goal?.status === "blocked" || goal?.status === "error" ? "blocked" : goal?.status === "active" ? "running" : "paused";
-      byId("goal-bar").hidden = !goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
       const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(state.action?.status));
       const actionNeedsAttention = !automaticRetry && actionFailed;
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
-      byId("goal-caption").textContent = goalNeedsAttention ? "Goal needs attention" : goal?.status === "active" ? "Pursuing goal" : goal?.status === "configured" ? "Goal paused" : `Goal ${goal?.status || ""}`;
       const failure = state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
+      renderGoalBar(goal, {needsAttention:goalNeedsAttention,failure});
       const retryMode = state.action && "retryMode" in state.action ? state.action.retryMode : state.action?.status === "failed" && state.action.kind !== "pair_verify" ? "retry" : null;
       const inlineRetry = byId("automation-retry-inline");
       inlineRetry.hidden = !actionFailed || Boolean(goal && goalNeedsAttention) || !retryMode;
@@ -719,24 +762,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       inlineRetry.textContent = retryMode === "continue_goal" ? "Continue" : "Retry";
       inlineRetry.setAttribute("aria-label", retryMode === "continue_goal" ? "Continue goal now" : "Retry now");
       inlineRetry.title = retryMode === "continue_goal" ? "Continue without resending previously submitted messages" : "Retry now instead of waiting";
-      byId("goal-caption").title = goalNeedsAttention ? failure : "";
       const retryLabel = retryMode === "continue_goal" ? "Continue goal" : "Retry failed action";
       byId("goal-retry").hidden = !goalNeedsAttention;
       byId("goal-retry").disabled = !retryMode && (state.action?.kind === "pair_verify" ? nodes.pair.disabled : nodes.reveal.disabled);
       byId("goal-retry").textContent = retryMode === "continue_goal" ? "Continue" : retryMode ? "Retry" : state.action?.kind === "pair_verify" ? "Pair again" : "ChatGPT";
       byId("goal-retry").setAttribute("aria-label", retryMode ? retryLabel : state.action?.kind === "pair_verify" ? "Replace pairing" : "Open in ChatGPT");
       byId("goal-retry").title = retryMode === "continue_goal" ? "Start a new goal turn without resending previous messages" : "Retry the action that failed before sending";
-      byId("goal-text").textContent = goal?.markdown || "";
-      byId("goal-text").title = goal?.blockedReason || goal?.markdown || "";
-      updateGoalMetrics();
-      if (byId("goal-editor").hidden) nodes.goal.value = goal?.markdown || "";
-      nodes.goalStatus.textContent = goal ? sentenceCase(goal.status) + (goal.blockedReason ? ` · ${goal.blockedReason}` : "") : "No goal configured";
-      nodes.setGoal.disabled = !nodes.goal.value.trim();
-      nodes.clearGoal.disabled = goal?.status === "active";
-      nodes.toggleGoal.disabled = !goal || !["active", "configured", "blocked"].includes(goal.status);
-      const toggleLabel = goal?.status === "active" ? "Pause goal" : "Run goal";
-      nodes.toggleGoal.setAttribute("aria-label", toggleLabel); nodes.toggleGoal.title = toggleLabel;
-      byId("goal-toggle-icon").setAttribute("d", goal?.status === "active" ? "M9 8v8m6-8v8" : "m10 8 6 4-6 4Z");
       const retrySeconds = automaticRetry ? Math.max(0, Math.ceil((state.action.automaticRetryAtMs - Date.now() - clockOffset) / 1000)) : null;
       const goalRetry = goal?.status === "active" && (state.action?.kind === "offline_goal" || state.action?.kind === "offline_combined" && state.action.sendAccepted && state.action.messagesFenced);
       const retryStatus = automaticRetry ? goalRetry ? `Retrying the goal automatically in ${retrySeconds}s. You can also continue now.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of 3). You can also retry now.` : "";
@@ -753,7 +784,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       else if (pairingSubmissionError) setStateError(pairingSubmissionError);
       else if (automaticRetry) setStateError(`${failure} ${retryStatus}`);
       else if (actionNeedsAttention) {
-        const preparation = state.action?.status === "authentication_required" ? "Sign in from connection settings, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
+        const preparation = state.action?.status === "authentication_required" ? "Sign in from Codexify settings → Browser, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
         const exhausted = state.action?.automaticRetryAttempts >= 3 ? "All three automatic retries failed. " : "";
         const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? "Use Continue to start another goal turn. Previously submitted messages will not be resent." : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
         setStateError(`${failure} ${nextStep}`);
@@ -913,20 +944,6 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     nodes.effort.addEventListener("change", () => { selectionDraft = { model:nodes.model.value, effort:nodes.effort.value }; void saveSelection(); });
     nodes.url.addEventListener("input", () => { nodes.pair.disabled = !nodes.url.value.trim() || !current?.companion?.authenticated; });
     nodes.goal.addEventListener("input", () => { nodes.setGoal.disabled = !nodes.goal.value.trim(); });
-    async function controlBrowser(operation) {
-      if(browserOperation===operation||browserOperation==='stop')return;
-      const revision=++browserRevision;
-      browserOperation=operation;browserError='';browserErrorOperation=operation;render(current);setError('');
-      try {
-        const result=await(await api(`/api/browser/${operation}`,{method:'POST',body:JSON.stringify({requestId:requestId(`browser-${operation}`)})})).json();
-        if(!closed&&current&&revision===browserRevision){current.companion={...result.companion,...result.lifecycle};models=[];catalogLoaded=false;catalogAttempted=false;catalogContext=null;}
-      }catch(error){if(!closed&&revision===browserRevision){browserError=error.message||'Browser control failed';setError(browserError);}}
-      finally{if(revision===browserRevision){browserOperation=null;if(!closed){render(current);await refreshState({quiet:true});}}}
-    }
-    nodes.browserStart.addEventListener('click',()=>void controlBrowser('start'));
-    nodes.browserStop.addEventListener('click',()=>void controlBrowser('stop'));
-    nodes.login.addEventListener("click", () => run(async () => { await post("login"); }));
-    nodes.capabilities.addEventListener("click", () => run(() => loadModels(true)));
     nodes.pair.addEventListener("click", () => { if (current?.pairing?.creatingChat && !current.pairing.canonicalUrl) void run(async () => { await post("create/retry", {requestId:requestId("create-retry")}); }); else void submitPairing(nodes.url.value.trim()); });
     nodes.unlink.addEventListener("click", () => run(async () => { await post("unlink", { requestId:requestId("unlink") }); nodes.url.value = ""; pairingSubmissionError = ""; lastSubmittedPairingUrl = ""; }));
     nodes.reveal.addEventListener("click", () => run(async () => { await post("reveal"); }));
@@ -937,7 +954,6 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     byId("automation-retry-inline").addEventListener("click", () => nodes.retryAction.click());
     byId("automation-dismiss-inline").addEventListener("click", () => {
-      if(browserError){browserError='';byId("connection-settings-error").hidden=true;}
       dismissedError = shownErrorSignature;
       nodes.error.hidden = true;
       byId("automation-retry-inline").hidden = true;
@@ -948,10 +964,20 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       else if (current?.action?.kind === "pair_verify") nodes.pair.click();
       else nodes.reveal.click();
     });
+    const browserChanged = () => { catalogAttempted = false; void refreshState({quiet:true}); };
+    window.addEventListener("codexify-browser-change",browserChanged);
+    // The sidebar already loaded this goal. Reserve and fill its bar before
+    // history or browser-health requests return, without enabling stale controls.
+    const cachedChat = chats.find(chat => chat.id === id);
+    if (automationEnabled !== false && cachedChat && Object.hasOwn(cachedChat, "goal")) {
+      current = {goal:cachedChat.goal};
+      panel.hidden = !current.goal;
+      renderGoalBar(current.goal, {loading:true,needsAttention:current.goal?.status === "active" && Boolean(cachedChat.automationError) && !cachedChat.automationRetrying,failure:cachedChat.automationError || ""});
+    }
     void refreshState();
     timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
     const metricsTimer = setInterval(() => { if (!document.hidden) updateGoalMetrics(); }, 1000);
-    return { close() { closed = true; showSettings(false); clearInterval(timer); clearInterval(metricsTimer); document.removeEventListener("pointerdown",dismissEditors); } };
+    return { close() { closed = true; showSettings(false); clearInterval(timer); clearInterval(metricsTimer); window.removeEventListener("codexify-browser-change",browserChanged); document.removeEventListener("pointerdown",dismissEditors); } };
   }
   function conversationDetail(chat) {
     const date = chat.lastEntryAtMs ? new Date(chat.lastEntryAtMs).toLocaleString() : "No messages";
@@ -1054,7 +1080,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     if (document.hidden) return;
     updateSelectedHeader();
     const now = Date.now() + clockOffset;
-    const next = chats.flatMap(chat => [chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, ...[180000,300000].map(age => chat.lastAgentCallAtMs + age)].map(deadline => deadline - now)).filter(delay => Number.isFinite(delay) && delay > 0);
+    const next = chats.flatMap(chat => [chat.agentWaitingUntilMs, chat.agentIdleUntilMs, chat.agentPresenceUntilMs, ...[180000,300000].map(age => chat.lastAgentCallAtMs + age)].map(deadline => deadline - now)).filter(delay => Number.isFinite(delay) && delay > 0);
     if (!document.hidden && next.length) presenceTimer = setTimeout(renderList, Math.max(1, Math.min(...next)));
     const focused = document.activeElement;
     const focusedChat = focused?.closest(".conversation-row")?.dataset.chatId;
@@ -1092,19 +1118,19 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       button.addEventListener("click", () => select(chat.id));
       const previousPresence = waitingForPresenceRefresh ? lastPresence.get(chat.id) : null;
       const state = previousPresence?.state ?? sidebarState(chat, now);
-      const agentState = previousPresence?.agentState ?? presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs);
+      const agentState = previousPresence?.agentState ?? presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, chat.agentIdleUntilMs);
       lastPresence.set(chat.id,{ state, agentState });
       const icon = textNode("span", `presence ${state}`, "");
       icon.dataset.agentState = agentState;
-      if (state === "goal-running" || state === "online") icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
+      if (["goal-running", "goal-retrying", "online", "retrying"].includes(state)) icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
       icon.append(presenceIcon(state));
-      icon.title = state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;
+      icon.title = state === "retrying" || state === "goal-retrying" ? `${state === "goal-retrying" ? "Goal" : "Chat"} retrying automatically${chat.automationError ? ": " + chat.automationError : ""}` : state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;
       icon.setAttribute("role", "img"); icon.setAttribute("aria-label", icon.title);
       const content = textNode("span", "conversation-main", "");
       content.append(textNode("span", "conversation-title", chat.title));
       content.append(textNode("span", "conversation-detail", conversationDetail(chat)));
       const dot = textNode("span", "unread", "");
-      dot.hidden = chat.id === selected || chat.lastEntryEnd <= (seen[chat.id] || 0);
+      dot.hidden = chat.id === selected || (chat.lastIncomingEntryEnd || 0) <= readThrough(chat);
       dot.setAttribute("aria-label", "New chat entry");
       button.append(icon, content, dot);
       const actions = textNode("span", "conversation-actions", "");
@@ -1200,12 +1226,16 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     });
     const key = `owner-chat-widget-v1:${id}`;
     const bridge = {
+      onPageRendered(end) {
+        if (selected === id && shell.isConnected && !document.hidden) void remember(id, end);
+      },
       composerPlaceholder() { return chats.find(chat => chat.id === id)?.archivedAtMs != null ? "Message the agent (it will unarchive this chat)…" : "Message the agent…"; },
       getState() { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } },
       setState(value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
       reportSize() {},
       fileDropTarget:document,
       attachmentUrl(attachment, download=false) { return `/api/chats/${id}/attachments/${encodeURIComponent(attachment)}/content${download ? "?download=true" : ""}`; },
+      attachmentThumbnailUrl(attachment) { return `/api/chats/${id}/attachments/${encodeURIComponent(attachment)}/content?thumbnail=true`; },
       async getAttachment(attachment) {return (await (await api(`/api/chats/${id}/attachments/${encodeURIComponent(attachment)}`)).json()).attachment;},
       async uploadAttachment(file,pasted,requestId,signal) {
         const query=new URLSearchParams({requestId,name:file.name||"Pasted image.png",pasted:String(pasted),lastModifiedAtMs:String(file.lastModified ?? Date.now())});
@@ -1241,10 +1271,6 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
             if (newer) { chat.goalCompletionDismissed = true; renderList(); }
           }
           void refresh();
-        }
-        if (name === "chat_ui_state") {
-          const end = chats.find(chat => chat.id === id)?.lastEntryEnd;
-          remember(id, end);
         }
         return payload;
       },
@@ -1299,6 +1325,16 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const payload = await (await api(`/api/chats${query ? `?${new URLSearchParams({ q:query })}` : ""}`)).json();
       if (sequence !== listRequest || query !== search.value.trim()) return;
       chats = payload.chats || [];
+      for (const chat of chats) {
+        const legacy = legacySeen[chat.id];
+        if (legacy !== undefined) {
+          if (Number.isSafeInteger(legacy) && legacy > 0 && legacy <= chat.lastEntryEnd) void remember(chat.id, legacy);
+          else forgetLegacyRead(chat.id);
+        }
+        const viewed = readPositions.get(chat.id);
+        if (viewed > (chat.ownerReadThrough || 0)) void remember(chat.id, viewed);
+      }
+      if (typeof payload.automationEnabled === "boolean") automationEnabled = payload.automationEnabled;
       matchedQuery = query; matchedIds = new Set(payload.matchedChatIds || []);
       if (Number.isSafeInteger(payload.serverTimeMs)) clockOffset = payload.serverTimeMs - Date.now();
       waitingForPresenceRefresh = false;
@@ -1431,12 +1467,6 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   window.addEventListener("popstate", selectFromUrl);
   window.addEventListener("focus", () => { void refresh(); });
   document.addEventListener("visibilitychange", () => { waitingForPresenceRefresh = true; clearTimeout(presenceTimer); if (!document.hidden) void refresh(); });
-  window.addEventListener("storage", event => {
-    if (event.key === "owner-chat-seen-v1") {
-      try { seen = JSON.parse(event.newValue || "{}"); } catch {}
-      renderList();
-    }
-  });
   if (!token) showError("Open this page using the URL printed by `codexify chat`.");
   else { void refresh(); setInterval(refresh, 2000); setInterval(renderList, 30000); }
 })();
