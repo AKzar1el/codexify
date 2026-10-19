@@ -15,6 +15,7 @@ pub fn load_tools() -> Vec<Box<dyn Tool>> {
         true,
         ArtifactEgressConfig::default().enabled,
         true,
+        true,
         DEFAULT_ARTIFACT_MAX_CONCURRENT_DOWNLOADS,
     )
 }
@@ -29,6 +30,7 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
         config.artifact_ingress.enabled,
         config.artifact_egress.enabled,
         config.markdown_chat.enabled,
+        config.ui_widgets,
         config.artifact_ingress.max_concurrent_downloads,
     );
     if config.markdown_chat.enabled && config.ui_widgets {
@@ -40,7 +42,7 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
     if config.ui_widgets {
         tools.push(Box::new(tools::continuation::PrepareContinuation));
     }
-    if config.ui_widgets && (config.markdown_chat.enabled || config.experimental.agent_tickets) {
+    if config.ui_widgets {
         tools.push(Box::new(tools::setup_ui_action::SetupUiAction::Update));
         {
             tools.push(Box::new(tools::setup_ui_action::SetupUiAction::Projects));
@@ -60,6 +62,7 @@ fn load_tools_with_options(
     artifact_ingress_enabled: bool,
     artifact_egress_enabled: bool,
     markdown_chat_enabled: bool,
+    ui_widgets: bool,
     max_concurrent_downloads: usize,
 ) -> Vec<Box<dyn Tool>> {
     let mut all: Vec<Box<dyn Tool>> = Vec::new();
@@ -81,7 +84,7 @@ fn load_tools_with_options(
     }
     if conversation_auth {
         all.push(Box::new(tools::setup::ConversationAuthorization));
-    } else if markdown_chat_enabled {
+    } else if markdown_chat_enabled || ui_widgets {
         all.push(Box::new(tools::setup::UnrestrictedSetup));
     }
     all.push(Box::new(tools::list_projects::ListProjects));
@@ -144,4 +147,66 @@ fn load_tools_with_options(
         }
     }
     all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workspace_picker_is_independent_of_agent_chat_and_preserves_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        for chat in [false, true] {
+            for widgets in [false, true] {
+                for auth in [false, true] {
+                    let mut config = crate::config::default_config(root.path().into());
+                    config.markdown_chat.enabled = chat;
+                    config.ui_widgets = widgets;
+                    config.conversation_auth_token = auth.then(|| "a".repeat(64).into());
+                    let tools = load_tools_for_config(&config);
+                    let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+                    assert_eq!(
+                        names.len(),
+                        names.iter().collect::<std::collections::HashSet<_>>().len()
+                    );
+                    let setup = tools.iter().find(|tool| tool.name() == "setup");
+                    assert_eq!(setup.is_some(), auth || chat || widgets);
+                    if let Some(setup) = setup {
+                        assert_eq!(
+                            setup.input_schema()["properties"].get("ref").is_some(),
+                            auth
+                        );
+                        assert_eq!(
+                            setup.meta().unwrap().get("ui").unwrap()["resourceUri"],
+                            json!(crate::setup_ui::SETUP_UI_URI)
+                        );
+                        if !auth && !chat {
+                            assert!(!setup.describe(&config).contains("chat_await"));
+                        }
+                    }
+                    for name in [
+                        "setup_ui_list_projects",
+                        "setup_ui_select_project",
+                        "setup_ui_update",
+                    ] {
+                        let tool = tools.iter().find(|tool| tool.name() == name);
+                        assert_eq!(tool.is_some(), widgets);
+                        if let Some(tool) = tool {
+                            assert_eq!(
+                                tool.meta().unwrap().get("ui").unwrap()["visibility"],
+                                json!(["app"])
+                            );
+                        }
+                    }
+                    if !chat {
+                        assert!(!names.iter().any(|name| name.starts_with("chat_")
+                            || name.starts_with("goal_")
+                            || name.starts_with("rollout_")
+                            || *name == "automation_verify_pairing"));
+                    }
+                }
+            }
+        }
+    }
 }

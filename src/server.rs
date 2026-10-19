@@ -574,8 +574,12 @@ impl ServerHandler for CodexHandler {
             );
             capabilities.extensions = Some(extensions);
         }
+        let mut server_info = Implementation::new("codexify", env!("CARGO_PKG_VERSION"));
+        if let Some(name) = &self.config.instance_name {
+            server_info = server_info.with_title(name);
+        }
         InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new("codexify", env!("CARGO_PKG_VERSION")))
+            .with_server_info(server_info)
             .with_instructions(build_initial_instructions(&self.config))
     }
 
@@ -3691,7 +3695,7 @@ mod tests {
     #[test]
     fn advertises_all_mcp_apps_resources_and_extension() {
         let root = tempfile::tempdir().unwrap();
-        let handler = CodexHandler {
+        let mut handler = CodexHandler {
             config: Arc::new(crate::config::default_config(root.path().to_path_buf())),
             tools: Arc::new(crate::registry::load_tools()),
             connector_schemas: Arc::new(crate::connector_schema::ConnectorSchemaStore::default()),
@@ -3719,6 +3723,16 @@ mod tests {
         };
 
         let info = handler.get_info();
+        assert_eq!(info.server_info.name, "codexify");
+        assert!(
+            serde_json::to_value(&info).unwrap()["serverInfo"]
+                .get("title")
+                .is_none()
+        );
+        Arc::make_mut(&mut handler.config).instance_name = Some("Workstation".into());
+        let named = handler.get_info();
+        assert_eq!(named.server_info.name, "codexify");
+        assert_eq!(named.server_info.title.as_deref(), Some("Workstation"));
         assert!(info.capabilities.resources.is_some());
         assert!(
             info.capabilities

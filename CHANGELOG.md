@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Optional `instanceName` installation display titles for MCP clients. Unset,
+  null, and blank names preserve the existing appearance; connector names and
+  the programmatic server identity remain unchanged.
+
 ### Changed
 
 - Updates show progress outside settings, through installation, restart, browser
@@ -19,6 +25,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   available while it is off. Explicit saved preferences are preserved.
 
 ### Fixed
+
+- Workspace-picker setup and its app-only project actions remain available with
+  embedded widgets enabled and agent chat disabled, while preserving setup
+  authorization and keeping agent-chat tools disabled.
+- Connector refresh can open settings from a failed conversation page without
+  waiting for a missing message composer or incorrectly requiring sign-in.
 
 - Auto-approval handles the current conversation's connector permission cards,
   including file materialization, by selecting conversation scope. It verifies

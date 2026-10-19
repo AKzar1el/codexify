@@ -34,6 +34,17 @@ pub const CODEXIFY_CONFIG_ENV: &str = "CODEXIFY_CONFIG";
 const CONFIG_FILE_NAME: &str = "codexify.config.json";
 const CONFIG_HOME_DIR: &str = ".codexify";
 
+fn instance_name(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else { return Ok(None) };
+    if value.chars().any(char::is_control) || value.chars().count() > 128 {
+        return Err(
+            "instanceName must contain at most 128 characters and no control characters".into(),
+        );
+    }
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "codexify",
@@ -412,7 +423,7 @@ pub(crate) fn settings_defaults(
     let mut chat = serde_json::to_value(&defaults.markdown_chat).expect("chat defaults");
     chat["notifications"] = serde_json::to_value(notifications).expect("notification defaults");
     json!({
-        "workDir":null,"debug":defaults.debug,"uiWidgets":defaults.ui_widgets,
+        "instanceName":null,"workDir":null,"debug":defaults.debug,"uiWidgets":defaults.ui_widgets,
         "experimental":{"agentTickets":defaults.experimental.agent_tickets,
             "forceReadOnlyToolAnnotations":defaults.experimental.force_read_only_tool_annotations,
             "forceDestructiveToolAnnotations":defaults.experimental.force_destructive_tool_annotations,
@@ -714,6 +725,7 @@ struct PartialExperimental {
 struct FileConfig {
     #[serde(rename = "schemaVersion")]
     _schema_version: Option<u64>,
+    instance_name: Option<String>,
     work_dir: Option<String>,
     debug: Option<bool>,
     ui_widgets: Option<bool>,
@@ -958,6 +970,7 @@ pub fn default_config(work_dir: std::path::PathBuf) -> AppConfig {
         ..Default::default()
     };
     AppConfig {
+        instance_name: None,
         loaded_config_path: None,
         task_state_root: None,
         project_clone_dir: work_dir.clone(),
@@ -1814,6 +1827,7 @@ fn load_config_with_announcements(
         return Err("diff.commandTimeoutMs must be between 1 and 120000".into());
     }
     let config = AppConfig {
+        instance_name: instance_name(file.instance_name)?,
         loaded_config_path: select_config_path(cli)?.path,
         task_state_root: None,
         work_dir,
@@ -1910,6 +1924,45 @@ pub fn load_project_catalog_for_cli(cli: &Cli) -> Result<ProjectCatalog, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installation_title_is_optional_and_validated_without_renaming_the_connector() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        assert!(default_config(root.path().into()).instance_name.is_none());
+        for (value, expected) in [
+            (json!(null), None),
+            (json!("  "), None),
+            (json!("  Home 工具  "), Some("Home 工具")),
+        ] {
+            let document = json!({"workDir":root.path(),"instanceName":value,"codexMcp":{"enabled":false},"agentChat":{"automation":{"connectorName":"Original connector"}}});
+            std::fs::write(&path, document.to_string()).unwrap();
+            let loaded = load_config_quiet_read_only(cli(root.path(), &path)).unwrap();
+            assert_eq!(loaded.instance_name.as_deref(), expected);
+            assert_eq!(
+                loaded.markdown_chat.automation.connector_name,
+                "Original connector"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                document.to_string()
+            );
+        }
+        for value in [
+            json!("Bad\nname"),
+            json!("\t"),
+            json!("x".repeat(129)),
+            json!(42),
+        ] {
+            std::fs::write(
+                &path,
+                json!({"workDir":root.path(),"instanceName":value,"codexMcp":{"enabled":false}})
+                    .to_string(),
+            )
+            .unwrap();
+            assert!(load_config_quiet_read_only(cli(root.path(), &path)).is_err());
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -2433,6 +2486,7 @@ mod tests {
             "experimental",
             "filesystem",
             "ignore",
+            "instanceName",
             "agentChat",
             "mcpServers",
             "memory",

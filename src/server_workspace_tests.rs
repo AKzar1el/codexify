@@ -568,3 +568,97 @@ async fn tunnel_routes_attribute_anonymous_discovery_without_cross_tunnel_or_cha
     b.cancel().await.unwrap();
     server.abort();
 }
+#[tokio::test]
+async fn plain_workspace_picker_lists_selects_and_switches_without_agent_chat() {
+    for stable in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        for name in ["first", "second"] {
+            std::fs::create_dir_all(projects.join(name)).unwrap();
+        }
+        let mut config = crate::config::default_config(projects);
+        config.markdown_chat.enabled = false;
+        config.project_catalog.codex_config.enabled = false;
+        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        let mut handler = handler_with_tools(
+            root.path(),
+            crate::registry::load_tools_for_config(&config),
+            crate::types::ToolLogLevel::Info,
+        );
+        handler.config = Arc::new(config);
+        let (server, transport) = tokio::io::duplex(128 * 1024);
+        let task = tokio::spawn(async move {
+            handler
+                .serve(server)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let client = ().serve(transport).await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        let setup = tools.iter().find(|tool| tool.name == "setup").unwrap();
+        assert_eq!(
+            setup.meta.as_ref().unwrap()["ui"]["resourceUri"],
+            json!(crate::setup_ui::SETUP_UI_URI)
+        );
+        assert!(!tools.iter().any(|tool| tool.name.starts_with("chat_")
+            || tool.name.starts_with("goal_")
+            || tool.name.starts_with("rollout_")));
+        client
+            .read_resource(ReadResourceRequestParams::new(
+                crate::setup_ui::SETUP_UI_URI,
+            ))
+            .await
+            .unwrap();
+        let request = |name: &str, args: Value| {
+            let mut request = CallToolRequestParams::new(name.to_owned())
+                .with_arguments(args.as_object().unwrap().clone());
+            if stable {
+                request.meta =
+                    Some(serde_json::from_value(json!({"openai/session":"plain-picker"})).unwrap());
+            }
+            request
+        };
+        let listed = client
+            .call_tool(request("setup_ui_list_projects", json!({})))
+            .await
+            .unwrap();
+        assert_ne!(listed.is_error, Some(true), "{listed:?}");
+        let mut previous = None;
+        for name in ["first", "second"] {
+            if let Some(path) = previous {
+                let switched = client
+                    .call_tool(request(
+                        "setup_ui_switch_project",
+                        json!({"expectedPath":path}),
+                    ))
+                    .await
+                    .unwrap();
+                assert_ne!(switched.is_error, Some(true), "{switched:?}");
+            }
+            let selected = client
+                .call_tool(request(
+                    "setup_ui_select_project",
+                    json!({"path":name,"createWorktree":false}),
+                ))
+                .await
+                .unwrap();
+            assert_ne!(selected.is_error, Some(true), "{selected:?}");
+            let path = selected.structured_content.unwrap()["active_root"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(path.ends_with(name));
+            let brief = client
+                .call_tool(request("get_agent_brief", json!({})))
+                .await
+                .unwrap();
+            assert_ne!(brief.is_error, Some(true), "{brief:?}");
+            previous = Some(path);
+        }
+        client.cancel().await.unwrap();
+        task.await.unwrap();
+    }
+}

@@ -448,6 +448,7 @@ fn set_path(document: &mut Value, path: &str, value: Value) -> Result<(), String
 fn validate(path: &Path, document: &Map<String, Value>) -> Result<(), String> {
     let known = [
         "schemaVersion",
+        "instanceName",
         "workDir",
         "debug",
         "uiWidgets",
@@ -601,6 +602,58 @@ pub fn write_refresh_intent(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optional_instance_name_can_be_saved_reset_and_kept_during_other_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let mut config = crate::config::default_config(root.path().into());
+        config.loaded_config_path = Some(path.clone());
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        let initial = snapshot(&config).unwrap();
+        assert_eq!(initial["defaults"]["instanceName"], Value::Null);
+        assert!(initial["fieldSchema"].get("instanceName").is_some());
+        assert!(initial["document"].get("instanceName").is_none());
+        let named = save(
+            &config,
+            initial["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([(
+                "instanceName".into(),
+                json!("Workstation"),
+            )])),
+        )
+        .unwrap();
+        let edited = save(
+            &config,
+            named["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([("debug".into(), json!(false))])),
+        )
+        .unwrap();
+        assert_eq!(edited["document"]["instanceName"], "Workstation");
+        let reset = save(
+            &config,
+            edited["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([("instanceName".into(), Value::Null)])),
+        )
+        .unwrap();
+        let cli =
+            crate::config::Cli::try_parse_from(["codexify", "--config", path.to_str().unwrap()])
+                .unwrap();
+        assert!(
+            crate::config::load_config_quiet_read_only(cli)
+                .unwrap()
+                .instance_name
+                .is_none()
+        );
+        assert!(reset["document"]["instanceName"].is_null());
+    }
+
     #[test]
     fn snapshots_show_runtime_defaults_without_materializing_overrides() {
         let root = tempfile::tempdir().unwrap();

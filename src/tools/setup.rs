@@ -594,12 +594,17 @@ impl Tool for UnrestrictedSetup {
         "Open Codexify setup".into()
     }
     fn description(&self) -> String {
-        "Call setup once to open workspace selection and this Codexify task's Markdown chat. No setup reference is required on this server. When the intended project is unclear or the user only says hello, leave the picker open and wait; do not select scratch by default. chat_await can wait for a selection without any workspace. After selection call get_agent_brief.".into()
+        "Call setup once to open workspace selection. No setup reference is required on this server. When the intended project is unclear or the user only says hello, leave the picker open and wait; do not select scratch by default. After selection call get_agent_brief.".into()
     }
     fn describe(&self, config: &AppConfig) -> String {
         format!(
-            "{} Connector version marker: `{}`; copy it into connectorVersion unchanged.",
+            "{} {}Connector version marker: `{}`; copy it into connectorVersion unchanged.",
             self.description(),
+            if config.markdown_chat.enabled {
+                "This also opens the task's Markdown chat. chat_await can wait for a selection without any workspace. "
+            } else {
+                ""
+            },
             crate::connector_schema::schema_version(config)
         )
     }

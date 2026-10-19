@@ -896,6 +896,8 @@ impl Default for ExperimentalConfig {
 /// `ignore`, `toolLogging` and `audit` carry their resolved/defaultable module settings.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    /// Optional display title for this installation; never its connector identity.
+    pub instance_name: Option<String>,
     /// The selected global configuration file; effective project configs retain it.
     pub loaded_config_path: Option<std::path::PathBuf>,
     pub work_dir: std::path::PathBuf,

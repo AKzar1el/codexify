@@ -229,6 +229,21 @@ Otherwise, the wizard first offers to install and start the background service;
 declining that retains the foreground-server option. Human-facing prompts,
 headings, paths, warnings, and completion messages use adaptive terminal colors.
 
+`instanceName` is an optional installation display title for MCP clients. It is
+unset by default: missing, null, and whitespace-only values leave `serverInfo.title`
+absent and preserve the existing client appearance. A nonblank value such as
+`"Workstation"` supplies only that title; `serverInfo.name` remains `codexify`.
+Names may contain up to 128 characters, with no control characters. Set it through
+General in global settings or `codexify config set instanceName Workstation`, then
+restart. This is separate from the ChatGPT connector name; quickstart does not
+populate or overwrite it.
+
+Workspace selection is independent of agent chat. With `uiWidgets=true`, `setup`
+and its app-only project listing, selection, and switch actions remain available
+when `agentChat.enabled=false`. This does not enable agent-chat tools, including its attachment, goal,
+and progress-journal tools. Conversation setup authorization still applies when
+`conversationAuthToken` is configured.
+
 When an existing config already contains `conversationAuthToken`, quickstart
 preserves it, restricts the config file to the current user on Unix, and prints the
 one-line instruction required to authorize a chat. It does not offer to enable or

@@ -5,6 +5,39 @@ import {createRequire} from 'node:module';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 
+for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: optional installation titles remain unset until edited and can be cleared`,{timeout:20000},async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  let document={},revision=1;const writes=[];
+  const snapshot=()=>({document,defaults:{instanceName:null},fieldSchema:{instanceName:null},raw:JSON.stringify(document),revision:String(revision),restartRequired:revision>1});
+  await routeOwner(page,'http://127.0.0.1:43267/**',route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.0',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=request.postDataJSON();writes.push(body);
+    if(body.raw!=null)document=JSON.parse(body.raw);else Object.assign(document,body.changes);
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43267/#test-token');
+  await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'}),input=dialog.getByLabel('instanceName',{exact:true});
+  assert.equal(await input.inputValue(),'');assert.equal(await input.getAttribute('placeholder'),'None (default)');
+  assert.deepEqual(writes,[]);assert.deepEqual(document,{});
+  await input.fill('Workstation');await page.clock.fastForward(700);
+  await dialog.getByText('Saved. Restart Codexify to apply changes.',{exact:true}).waitFor();
+  assert.equal(document.instanceName,'Workstation');
+  await input.fill('');await page.clock.fastForward(700);
+  await dialog.getByText('Saved. Restart Codexify to apply changes.',{exact:true}).waitFor();
+  assert.equal(document.instanceName,undefined);
+ }finally{await browser.close();}
+});
+
 for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(`${engineName}: audit log file shows its default and is optional while logging is off`,{timeout:20000},async()=>{
  const browser=await engine.launch();
  try {

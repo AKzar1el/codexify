@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "instanceName": null,
   "workDir": "/absolute/path/to/projects",
   "debug": true,
   "uiWidgets": true,

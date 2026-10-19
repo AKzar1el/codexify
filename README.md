@@ -117,6 +117,13 @@ settings to use, saves your configuration, and starts the connection.
 Keep Codexify running while you use it; the background service handles that for a
 standard installation.
 
+To distinguish multiple installations in MCP clients, optionally set `instanceName`
+under General in global settings, or run `codexify config set instanceName Workstation`.
+It adds a display title to the server; the programmatic name remains `codexify`.
+Leaving it unset, null, or blank preserves the existing client appearance. The
+setting does not change your ChatGPT connector name, and quickstart never fills it
+automatically. Restart Codexify after changing it.
+
 This setup uses an outbound OpenAI tunnel: you do not need a public server URL or
 an inbound port. For other deployments, see [connection options](docs/REFERENCE.md#connecting-to-chatgpt).
 The fully populated [configuration example](codexify.config.example.json) shows

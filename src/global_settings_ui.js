@@ -155,6 +155,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   const names={workDir:'Project access directory',projectCloneDir:'Git clone directory',uiWidgets:'Embedded chat widgets',apiKey:'API key',conversationAuthToken:'Conversation setup reference',openaiTunnel:'Primary OpenAI tunnel',openaiTunnels:'Additional OpenAI tunnels',mcpServers:'MCP servers',allowedHosts:'Allowed host names',debug:'Debug mode'};
   const annotationHintOverrides=new Set(['experimental.forceDestructiveToolAnnotations','experimental.forceIdempotentToolAnnotations','experimental.forceOpenWorldToolAnnotations']);
   const metadata={
+    instanceName:['Optional installation label shown by connected clients. Leave blank to keep the existing appearance. This does not rename your ChatGPT connector.','general','Instance name'],
     'artifactEgress.enabled':['Let ChatGPT materialize and offer downloads of project files and full attachments. ChatGPT may ask permission for each file. Off by default; inline attachment text and image previews remain available. Restart Codexify to apply.','tools','File materialization in ChatGPT'],
     'audit.enabled':['Record bounded, redacted tool activity in a private local audit log.','advanced','Audit logging'],
     'audit.logFile':['Optional JSONL destination. Leave blank to use the per-project default shown in the field. Ignored when Audit logging is off.','advanced','Log file'],
