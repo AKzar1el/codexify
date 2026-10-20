@@ -758,7 +758,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       renderGoalBar(goal, {needsAttention:goalNeedsAttention,failure});
       const retryMode = state.action && "retryMode" in state.action ? state.action.retryMode : state.action?.status === "failed" && state.action.kind !== "pair_verify" ? "retry" : null;
       const inlineRetry = byId("automation-retry-inline");
-      inlineRetry.hidden = !actionFailed || Boolean(goal && goalNeedsAttention) || !retryMode;
+      inlineRetry.hidden = Boolean(goal && goalNeedsAttention) || !retryMode;
       inlineRetry.disabled = !retryMode;
       inlineRetry.textContent = retryMode === "continue_goal" ? "Continue" : "Retry";
       inlineRetry.setAttribute("aria-label", retryMode === "continue_goal" ? "Continue goal now" : "Retry now");
@@ -772,7 +772,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const retrySeconds = automaticRetry ? Math.max(0, Math.ceil((state.action.automaticRetryAtMs - Date.now() - clockOffset) / 1000)) : null;
       const goalRetry = goal?.status === "active" && (state.action?.kind === "offline_goal" || state.action?.kind === "offline_combined" && state.action.sendAccepted && state.action.messagesFenced);
       const retryLimit = state.action?.automaticRetryLimit ?? 5;
-      const retryStatus = automaticRetry ? goalRetry ? `Retrying the goal automatically in ${retrySeconds}s. You can also continue now.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}). You can also retry now.` : "";
+      const retryNow = retryMode === "continue_goal" ? " You can also continue now." : retryMode ? " You can also retry now." : "";
+      const retryStatus = automaticRetry ? (goalRetry ? `Retrying the goal automatically in ${retrySeconds}s.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}).`) + retryNow : "";
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";

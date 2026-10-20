@@ -2351,9 +2351,9 @@ change goal state, complete turns, acknowledge chat input, or expose queued work
 in global settings and applies immediately. Return/the send button uses that
 mode; Cmd+Return on macOS and Ctrl+Return on Windows/Linux uses the other mode
 for one message. While the agent needs your answer, the composer temporarily
-uses Steer so Return and the send button deliver your reply immediately, even
-when Queue is configured. The modifier shortcut can explicitly queue a separate
-task during that wait. The saved preference is restored after the reply.
+uses Steer so Return, Cmd+Return/Ctrl+Return, and the send button deliver your
+reply immediately, even when Queue is configured. The saved preference and
+normal modifier shortcut are restored after the reply.
 Shift+Return inserts a newline.
 
 Queued messages are stored separately from CHAT.md. Their text and attachments

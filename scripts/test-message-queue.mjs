@@ -112,17 +112,21 @@ for(const[engineName,engine]of[['Chromium',chromium],['WebKit',webkit]]){
    }
   }finally{await browser.close();}
  });
- test(`${engineName}: answers bypass the queue preference while explicit queued tasks remain private`,{timeout:45000},async()=>{
+ test(`${engineName}: Enter and the primary shortcut send answers directly while queued tasks remain private`,{timeout:60000},async()=>{
   const browser=await engine.launch();try{
-   for(const platform of ['MacIntel','Win32']){
-    const f=await fixture(browser,{platform,width:390,mode:'queue',inputRequired:true,waiting:true,queued:['Separate next task']});const{host,backend,calls,errors}=f,input=host.locator('#draft'),send=host.locator('#send'),modifier=platform==='MacIntel'?'Meta':'Control';
-    await input.fill('Freezes too');assert.equal(await send.getAttribute('aria-label'),'Send message');await input.press('Enter');
-    await until(()=>f.messages.length===2);assert.equal(calls.at(-1).body.message_mode,'steer');assert.deepEqual(backend.queue.map(m=>m.markdown),['Separate next task']);assert.equal(backend.mode,'queue');
-    await until(()=>input.isEnabled());await input.fill('A future task');await until(async()=>await send.getAttribute('data-message-mode')==='queue');await input.press('Enter');await until(()=>backend.queue.length===2);
-    // The durable input request still applies between waits or when presence expires.
-    backend.inputRequired=true;await input.fill('Another future task');await until(async()=>await send.getAttribute('data-message-mode')==='steer');await input.press(`${modifier}+Enter`);await until(()=>backend.queue.length===3);assert.equal(f.messages.length,2);
-    await until(()=>input.isEnabled());await input.fill('Answer from the send button');await send.click();await until(()=>f.messages.length===3);assert.equal(calls.at(-1).body.message_mode,'steer');assert.equal(backend.queue.length,3);assert.equal(backend.mode,'queue');
-    assert.deepEqual(errors,[]);await f.context.close();
+   for(const platform of ['MacIntel','Win32'])for(const mode of ['queue','steer'])for(const waiting of [false,true])for(const shortcut of ['Enter','modified','button']){
+    const f=await fixture(browser,{platform,width:390,mode,inputRequired:!waiting,waiting,queued:['Separate next task']});const{host,backend,calls,errors}=f,input=host.locator('#draft'),send=host.locator('#send'),modifier=platform==='MacIntel'?'Meta':'Control';
+    try{
+     assert.match(await host.locator('#status-text').textContent(),/Enter or (Cmd|Ctrl)\+Enter to send your answer/);
+     const answer=`Answer using ${shortcut}`;await input.fill(answer);
+     assert.equal(await send.getAttribute('aria-label'),'Send message');assert.match(await send.getAttribute('title'),/also sends your answer/);assert.doesNotMatch(await send.getAttribute('title'),/other mode/);
+     if(shortcut==='button')await send.click();else await input.press(shortcut==='modified'?`${modifier}+Enter`:'Enter');
+     await until(()=>calls.some(call=>call.body.message===answer));assert.equal(calls.at(-1).body.message_mode,'steer',`${platform} ${mode} ${waiting?'timed wait':'input required'} ${shortcut}`);
+     await until(()=>f.messages.length===2);await until(()=>input.isEnabled());assert.equal(calls.filter(call=>call.path.endsWith('/send')).length,1);
+     assert.deepEqual(backend.queue.map(m=>m.markdown),['Separate next task']);assert.equal(backend.mode,mode);
+     await input.fill('The next request');await until(async()=>await send.getAttribute('data-message-mode')===mode);
+     assert.deepEqual(errors,[]);
+    }finally{await f.context.close();}
    }
   }finally{await browser.close();}
  });

@@ -5,6 +5,60 @@ import {createRequire} from 'node:module';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const origin='http://127.0.0.1:43357',META='io.github.devnoname120/codexify/markdown-chat';
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: goal backoff exposes the permitted manual action beside its countdown`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
+ try{
+  const now=Date.now(),id='e'.repeat(64),errors=[],retries=[],sends=[];
+  const goal={revision:4,status:'active',markdown:'Continue the current goal',elapsedActiveMs:16214000,turnCount:5};
+  let action={id:'initial',status:'idle',retryMode:null};
+  await page.clock.install({time:now});page.on('pageerror',e=>errors.push(e.message));
+  await routeOwner(page,origin+'/**',route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.0',settingsAvailable:false}});
+   if(path==='/api/settings/connector')return route.fulfill({json:{configured:true,connectorName:'Fixture connector'}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Retrying goal',workspace:'test',goal,goalStatus:'active',lastEntryEnd:0,totalToolCalls:0}],serverTimeMs:Date.now()}});
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'busy'},presence:{},serverTimeMs:Date.now()}});
+   if(path.endsWith('/action/retry')){
+    const body=request.postDataJSON();assert.equal(body.actionId,action.id);retries.push(body);
+    action={...action,status:'queued',retryMode:null,lastError:null,automaticRetryAtMs:null};
+    return route.fulfill({json:{action}});
+   }
+   if(path.endsWith('/send'))sends.push(request.postDataJSON());
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false}}}});
+  });
+  await page.goto(`${origin}/?chat=${id}#retry-test-token`);
+  const host=page.locator('#chat-host'),error=host.locator('#automation-error'),button=host.locator('#automation-retry-inline');
+  for(const width of [1280,390]){
+   await page.setViewportSize({width,height:844});
+   for(const [failure,mode,accepted]of [['conversation_unavailable','retry',false],['authentication_required','retry',false],['failed','retry',false],['ambiguous','continue_goal',true]]){
+    action={id:`${failure}-${width}`,kind:'offline_goal',status:failure,goalRevision:4,lastError:failure==='conversation_unavailable'?'ChatGPT conversation temporarily not accessible':'Browser action needs recovery',sendAccepted:accepted,messagesFenced:accepted,retryMode:mode,automaticRetryAtMs:Date.now()+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
+    await page.clock.fastForward(1600);
+    const verb=mode==='continue_goal'?'continue':'retry';
+    await error.getByText(new RegExp(`You can also ${verb} now\\.`)).waitFor();
+    await button.waitFor();assert.equal(await button.isEnabled(),true);
+    assert.equal(await button.textContent(),mode==='continue_goal'?'Continue':'Retry');
+    assert.equal(await host.locator('#goal-retry').isVisible(),false,'the countdown action is beside the error');
+    const box=await button.boundingBox();assert(box.x>=0&&box.x+box.width<=width,'the retry button stays within the viewport');
+    if(process.env.RETRY_BUTTON_SCREENSHOTS&&failure==='conversation_unavailable'){
+     mkdirSync(process.env.RETRY_BUTTON_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.RETRY_BUTTON_SCREENSHOTS}/${name.toLowerCase()}-${width}.png`});
+    }
+    const count=retries.length;await button.click();await button.waitFor({state:'hidden'});
+    assert.equal(retries.length,count+1,'one explicit click retries the current action once');
+   }
+   action={id:`cancelled-before-send-${width}`,kind:'offline_goal',status:'cancelled',lastError:'Browser action cancelled before Send',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:null};
+   await page.clock.fastForward(1600);await error.getByText(/Browser action cancelled before Send/).waitFor();
+   await button.waitFor();await button.click();await button.waitFor({state:'hidden'});
+   action={id:`no-manual-retry-${width}`,kind:'turn_renewal',status:'ambiguous',lastError:'Handoff confirmation unavailable',sendAccepted:true,retryMode:null,automaticRetryAtMs:Date.now()+60000};
+   await page.clock.fastForward(1600);await error.getByText(/Handoff confirmation unavailable/).waitFor();
+   assert.match(await error.textContent(),/Retrying automatically/);
+   assert.doesNotMatch(await error.textContent(),/You can also (continue|retry) now/,'do not advertise a manual action the server has not permitted');
+   assert.equal(await button.isVisible(),false);
+  }
+  assert.equal(retries.length,10);assert.deepEqual(sends,[],'Continue must use the retry API rather than resend a user message');assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
+});
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: sidebar recovery spins red through backoff and execution, then recovers or stops on terminal failure`,{timeout:30000},async()=>{
  const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
  try{
