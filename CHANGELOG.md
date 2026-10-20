@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-10-20
+
 ### Fixed
 
 - Reuse healthy ChatGPT conversation pages for browser sends and retries, and
