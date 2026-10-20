@@ -44,11 +44,11 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   // reported duration and longer lifetime totals, on desktop and mobile.
   for(const width of [1500,375]){
    await page.setViewportSize({width,height:1000});
-   for(const [minutes,label]of [[167*60+33,'167h 33m'],[99999*60+59,'99999h 59m'],[0,'0m']]){
+   for(const font of [null,'Arial Black'])for(const [minutes,label]of [[167*60+33,'167h 33m'],[99999*60+59,'99999h 59m'],[0,'0m']]){
     mixMinutes=minutes;await dashboard.getByRole('button',{name:'Refresh analytics',exact:true}).click();
     const value=dashboard.locator('.analytics-mix-center strong');await value.filter({hasText:new RegExp(`^${label}$`)}).waitFor();
-    const layout=await value.evaluate(node=>{const center=node.parentElement.getBoundingClientRect(),range=document.createRange();range.selectNodeContents(node);const text=range.getBoundingClientRect(),caption=node.nextElementSibling.getBoundingClientRect();return {lines:range.getClientRects().length,left:text.left-center.left,right:center.right-text.right,centerOffset:Math.abs((text.left+text.right-center.left-center.right)/2),gap:caption.top-text.bottom};});
-    assert.equal(layout.lines,1,`${label} must not wrap`);assert(layout.left>=3&&layout.right>=3,`${label} must fit inside the donut`);assert(layout.centerOffset<1,`${label} must stay centered`);assert(layout.gap>=2,'the caption must remain separate');
+    const layout=await value.evaluate((node,font)=>{node.style.fontFamily=font||'';const center=node.parentElement.getBoundingClientRect(),range=document.createRange();range.selectNodeContents(node);const text=range.getBoundingClientRect(),caption=node.nextElementSibling.getBoundingClientRect();return {lines:range.getClientRects().length,left:text.left-center.left,right:center.right-text.right,centerOffset:Math.abs((text.left+text.right-center.left-center.right)/2),gap:caption.top-text.bottom,font:getComputedStyle(node).font};},font);
+    assert.equal(layout.lines,1,`${label} must not wrap`);assert(layout.left>=3&&layout.right>=3,`${label} at ${width}px must fit inside the donut: ${JSON.stringify(layout)}`);assert(layout.centerOffset<1,`${label} must stay centered`);assert(layout.gap>=2,'the caption must remain separate');
     if(minutes===167*60+33&&process.env.ANALYTICS_SCREENSHOT_DIR){mkdirSync(process.env.ANALYTICS_SCREENSHOT_DIR,{recursive:true});await dashboard.locator('.analytics-mix-ring').locator('..').locator('..').screenshot({path:`${process.env.ANALYTICS_SCREENSHOT_DIR}/${name.toLowerCase()}-mix-${width}.png`});}
    }
   }

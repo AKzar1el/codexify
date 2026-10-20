@@ -70,8 +70,8 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
 :is(#settings-dialog,#statistics-dialog) .analytics-rank-value{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
 :is(#settings-dialog,#statistics-dialog) .analytics-mix-content{display:grid;grid-template-columns:132px minmax(0,1fr);gap:24px;align-items:center}
 :is(#settings-dialog,#statistics-dialog) .analytics-mix-ring{width:132px;height:132px;border-radius:50%;background:var(--mix);display:grid;place-items:center;margin:10px auto;box-shadow:0 0 0 7px color-mix(in srgb,var(--line) 25%,transparent)}
-:is(#settings-dialog,#statistics-dialog) .analytics-mix-center{display:flex;flex-direction:column;align-items:center;justify-content:center;width:102px;height:102px;border-radius:50%;background:var(--panel);gap:3px}
-:is(#settings-dialog,#statistics-dialog) .analytics-mix-center strong{font-size:min(23px,calc(152px / var(--duration-length,1)));font-weight:750;letter-spacing:-.6px;line-height:1.15;white-space:nowrap;text-align:center}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-center{display:flex;flex-direction:column;align-items:center;justify-content:center;width:102px;height:102px;border-radius:50%;background:var(--panel);gap:4px}
+:is(#settings-dialog,#statistics-dialog) .analytics-mix-center strong{font-size:min(23px,calc(132px / var(--duration-length,1)));font-weight:750;letter-spacing:-.6px;line-height:1.4;white-space:nowrap;text-align:center}
 :is(#settings-dialog,#statistics-dialog) .analytics-mix-center span{font-size:10px;color:var(--muted)}
 :is(#settings-dialog,#statistics-dialog) .analytics-model-row{margin:16px 0 0}:is(#settings-dialog,#statistics-dialog) .analytics-model-row:first-child{margin-top:0}
 :is(#settings-dialog,#statistics-dialog) .analytics-model-copy{display:flex;justify-content:space-between;gap:12px;font-size:11px;align-items:center}
