@@ -64,6 +64,7 @@ impl PairingCommit {
 pub struct AutomationExecutionError {
     pub message: String,
     pub send_accepted: bool,
+    pub failure_status: Option<AutomationActionStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -277,17 +278,18 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             ));
         }
         if !health.authenticated {
-            return Err(execution_error(
-                "Browser companion authentication is required".into(),
-                false,
-            ));
+            return Err(AutomationExecutionError {
+                message: "Browser companion authentication is required".into(),
+                send_accepted: false,
+                failure_status: Some(AutomationActionStatus::AuthenticationRequired),
+            });
         }
         if health.account_fingerprint.as_deref() != Some(execution.account_fingerprint.as_str()) {
-            return Err(execution_error(
-                "Browser companion account changed; refresh capabilities and verify the pairing again"
-                    .into(),
-                false,
-            ));
+            return Err(AutomationExecutionError {
+                message: "Browser companion account changed; refresh capabilities and verify the pairing again".into(),
+                send_accepted: false,
+                failure_status: Some(AutomationActionStatus::AuthenticationRequired),
+            });
         }
         if health.active_action_id.is_some() {
             return Err(execution_error(
@@ -489,6 +491,7 @@ pub struct AgentAutomationSupervisor {
     wake: Arc<Notify>,
     action_timeouts: ActionTimeouts,
     approval_next_scan_ms: AtomicU64,
+    next_retry_scan_ms: AtomicU64,
     approval_resume_until_ms: Mutex<HashMap<String, u64>>,
 }
 
@@ -537,6 +540,7 @@ impl AgentAutomationSupervisor {
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
             approval_next_scan_ms: AtomicU64::new(0),
+            next_retry_scan_ms: AtomicU64::new(0),
             approval_resume_until_ms: Mutex::new(HashMap::new()),
             action_timeouts: ActionTimeouts {
                 start,
@@ -573,7 +577,7 @@ impl AgentAutomationSupervisor {
                     }
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+                    _ = tokio::time::sleep(supervisor.retry_scan_delay(crate::markdown_chat::now_ms())) => {},
                     _ = supervisor.wake.notified() => {},
                 }
             }
@@ -979,8 +983,19 @@ impl AgentAutomationSupervisor {
         self.live.read().await.get(task.stable_key()).cloned()
     }
 
+    fn retry_scan_delay(&self, now_ms: u64) -> Duration {
+        Duration::from_millis(
+            self.next_retry_scan_ms
+                .load(Ordering::Relaxed)
+                .saturating_sub(now_ms)
+                .min(30_000),
+        )
+    }
+
     pub async fn scan_once(&self, now_ms: u64) -> Result<(), String> {
         let _scan_guard = self.scan_lock.lock().await;
+        self.next_retry_scan_ms
+            .store(now_ms.saturating_add(30_000), Ordering::Relaxed);
         let check_approvals = self.config.auto_approve_tool_calls
             && now_ms >= self.approval_next_scan_ms.load(Ordering::Relaxed);
         if check_approvals {
@@ -1008,6 +1023,15 @@ impl AgentAutomationSupervisor {
                 now_ms,
             )?;
             let mut state = task.store.load(&task.task)?;
+            // Wake at the actual jittered deadline, rather than rounding all
+            // chats into the same 30-second scan and undoing their jitter.
+            if let Some(at) = state
+                .automatic_retry_at_ms()
+                .or_else(|| state.goal_retry_at_ms())
+                .filter(|at| *at > now_ms)
+            {
+                self.next_retry_scan_ms.fetch_min(at, Ordering::Relaxed);
+            }
             if self
                 .approval_resume_until_ms
                 .lock()
@@ -1971,7 +1995,9 @@ impl AgentAutomationSupervisor {
                 let status = if send_accepted {
                     AutomationActionStatus::Ambiguous
                 } else {
-                    AutomationActionStatus::Failed
+                    error
+                        .failure_status
+                        .unwrap_or(AutomationActionStatus::Failed)
                 };
                 let terminal_at_ms = if !send_accepted {
                     now_ms
@@ -2081,9 +2107,18 @@ impl AgentAutomationSupervisor {
 
         let activity_after = task.chat.offline_activity().await?;
         let no_tool_activity = activity_after.tool_call_count == execution.tool_call_count_at_start;
-        let terminal_status = accumulator
-            .terminal_status
-            .unwrap_or_else(|| companion_status(snapshot.state));
+        let terminal_status = accumulator.terminal_status.unwrap_or_else(|| {
+            if snapshot.state == CompanionActionState::Failed
+                && snapshot
+                    .attention
+                    .as_ref()
+                    .is_some_and(|attention| attention.code == "conversation_unavailable")
+            {
+                AutomationActionStatus::ConversationUnavailable
+            } else {
+                companion_status(snapshot.state)
+            }
+        });
         let status = if pair_verification {
             let pairing = task.store.load(&task.task)?.pairing;
             if pairing.verified_owner_generation == Some(execution.owner_generation) {
@@ -2091,7 +2126,12 @@ impl AgentAutomationSupervisor {
             } else {
                 AutomationActionStatus::Unverified
             }
-        } else if accumulator.send_accepted && terminal_status == AutomationActionStatus::Failed {
+        } else if accumulator.send_accepted
+            && matches!(
+                terminal_status,
+                AutomationActionStatus::Failed | AutomationActionStatus::ConversationUnavailable
+            )
+        {
             AutomationActionStatus::Ambiguous
         } else if accumulator.send_accepted
             && !accumulator.submission_complete
@@ -2106,6 +2146,7 @@ impl AgentAutomationSupervisor {
         let failure_message = snapshot.attention.as_ref().and_then(|attention| attention.message.as_deref())
             .or(watchdog_message).or(match status {
                 AutomationActionStatus::AuthenticationRequired => Some("Sign in to ChatGPT, then retry this action."),
+                AutomationActionStatus::ConversationUnavailable => Some("ChatGPT conversation temporarily not accessible"),
                 AutomationActionStatus::Stalled => Some("The previous goal turn produced no tool activity. Continue the goal to start another turn."),
                 _ => None,
             });
@@ -2327,10 +2368,15 @@ impl AgentAutomationSupervisor {
                 accumulator.terminal_status = Some(AutomationActionStatus::Ambiguous);
                 state.phase = AutomationActionStatus::Ambiguous;
             }
-            CompanionEventKind::Failed { message, .. } => {
+            CompanionEventKind::Failed { message, code } => {
                 state.status = Some(message);
-                accumulator.terminal_status = Some(AutomationActionStatus::Failed);
-                state.phase = AutomationActionStatus::Failed;
+                let failure = if code == "conversation_unavailable" {
+                    AutomationActionStatus::ConversationUnavailable
+                } else {
+                    AutomationActionStatus::Failed
+                };
+                accumulator.terminal_status = Some(failure);
+                state.phase = failure;
             }
         }
         Ok(())
@@ -2437,6 +2483,7 @@ fn execution_error(message: String, send_accepted: bool) -> AutomationExecutionE
     AutomationExecutionError {
         message,
         send_accepted,
+        failure_status: None,
     }
 }
 
@@ -2568,6 +2615,35 @@ mod model_fallback_snapshot_tests {
     }
 }
 
+#[cfg(test)]
+mod retry_wake_tests {
+    use super::*;
+    #[test]
+    fn jittered_retry_deadlines_are_not_rounded_into_one_scan() {
+        let config = AgentAutomationConfig::default();
+        let supervisor = AgentAutomationSupervisor::new(
+            config.clone(),
+            Arc::new(BrowserAutomationExecutor::new(config)),
+        );
+        supervisor
+            .next_retry_scan_ms
+            .store(30_000, Ordering::Relaxed);
+        supervisor
+            .next_retry_scan_ms
+            .fetch_min(12_345, Ordering::Relaxed);
+        assert_eq!(
+            supervisor.retry_scan_delay(12_000),
+            Duration::from_millis(345)
+        );
+        assert_eq!(supervisor.retry_scan_delay(12_345), Duration::ZERO);
+        assert_eq!(supervisor.retry_scan_delay(13_000), Duration::ZERO);
+        supervisor
+            .next_retry_scan_ms
+            .store(100_000, Ordering::Relaxed);
+        assert_eq!(supervisor.retry_scan_delay(13_000), Duration::from_secs(30));
+    }
+}
+
 fn blocks_automatic_requeue(status: AutomationActionStatus) -> bool {
     matches!(
         status,
@@ -2576,6 +2652,7 @@ fn blocks_automatic_requeue(status: AutomationActionStatus) -> bool {
             | AutomationActionStatus::Generating
             | AutomationActionStatus::ApprovalRequired
             | AutomationActionStatus::AuthenticationRequired
+            | AutomationActionStatus::ConversationUnavailable
             | AutomationActionStatus::RateLimited
             | AutomationActionStatus::Interference
             | AutomationActionStatus::Ambiguous

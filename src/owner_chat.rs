@@ -1077,6 +1077,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
             automation.action.status,
             crate::agent_automation::AutomationActionStatus::Interference
                 | crate::agent_automation::AutomationActionStatus::Failed
+                | crate::agent_automation::AutomationActionStatus::ConversationUnavailable
                 | crate::agent_automation::AutomationActionStatus::Ambiguous
                 | crate::agent_automation::AutomationActionStatus::RateLimited
                 | crate::agent_automation::AutomationActionStatus::ApprovalRequired

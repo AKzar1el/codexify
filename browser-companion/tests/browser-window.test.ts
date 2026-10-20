@@ -8,6 +8,7 @@ import {
   type ExecuteActionRequest,
 } from "../src/protocol";
 import {
+  BROWSER_OPERATION_TIMEOUT_MS,
   MAX_RETAINED_ACTIONS,
   SingleWindowCoordinator,
   type BrowserDriver,
@@ -672,6 +673,31 @@ test("passive approval checks yield to active sends and never start another acti
 });
 
 const shortBudget = {operationMs:45,cleanupMs:40,hardStopMs:30};
+
+test('slow navigation, connector selection and Send acceptance get the 30-second budget',async()=>{
+ // Scale the production budget and browser delays together to exercise a
+ // 27-second stage without making the test wait in real time.
+ const scale=100;
+ class SlowSubmissionDriver extends DeferredDriver {
+  override async execute(execution:DriverExecution) {
+   this.runs.push(execution.request.actionId);
+   const slowStage=async()=>{await new Promise(resolve=>setTimeout(resolve,27_000/scale));execution.signal.throwIfAborted();};
+   execution.emit({type:'navigating'});await slowStage();
+   execution.emit({type:'composer_ready'});
+   execution.emit({type:'model_verified',model:execution.request.model!,effort:execution.request.effort!});await slowStage();
+   execution.emit({type:'connector_verified'});await slowStage();
+   execution.emit({type:'send_accepted'});
+   execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});
+  }
+ }
+ const driver=new SlowSubmissionDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{...shortBudget,operationMs:BROWSER_OPERATION_TIMEOUT_MS/scale});
+ await coordinator.execute(request('slow-submission'));
+ const events=await collect(coordinator,'slow-submission');
+ expect(events.at(-1)?.type).toBe('submission_complete');
+ expect((await coordinator.action('slow-submission'))?.sendAccepted).toBeTrue();
+ expect(driver.runs).toEqual(['slow-submission']);
+ await coordinator.close();
+});
 
 test('verified submission phases each receive the operation timeout budget',async()=>{
  class ProgressDriver extends DeferredDriver {

@@ -30,10 +30,6 @@ export async function conversationUnavailableVisible(page: Page): Promise<boolea
   const url = new URL(page.url());
   if (url.origin !== "https://chatgpt.com" || !/^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(url.pathname)) return false;
   return page.evaluate(() => {
-    const main = document.querySelector('[data-app-shell-focus-area="main"]');
-    // This is the full-page load failure, not text or controls inside a turn,
-    // an empty new chat, or a signed-out page. The error has no stable test ID.
-    if (!main || main.querySelector('form, [role="textbox"], textarea, [contenteditable="true"], article, [data-turn-key], [data-turn-id], [data-message-author-role]')) return false;
     const visible = (element: Element): boolean => {
       if (!element.getClientRects().length || element.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
       for (let node: Element | null = element; node; node = node.parentElement) {
@@ -42,6 +38,25 @@ export async function conversationUnavailableVisible(page: Page): Promise<boolea
       }
       return true;
     };
+    const conversationContent = 'form, [role="textbox"], textarea, [contenteditable="true"], article, [data-turn-key], [data-turn-id], [data-message-author-role]';
+    // The inline load failure replaces the transcript, with one message and
+    // one retry button. Match its app-owned structure, never translated text.
+    for (const target of document.querySelectorAll('[data-chatgpt-conversation-selection-target="true"][data-thread-find-target="conversation"]')) {
+      if (!target.closest('[data-mcp-app-portal-target="true"][data-thread-user-message-navigation-content="true"]')
+        || !target.closest('[data-request-input-activity-root="true"]')
+        || target.closest('article, [data-turn-key], [data-turn-id], [data-message-author-role]')
+        || target.querySelector(conversationContent) || !visible(target)) continue;
+      const children = [...target.children].filter(visible);
+      if (children.length !== 1) continue;
+      const panel = children[0]!;
+      const button = panel.firstElementChild;
+      if (panel.matches('.rounded-xl.border.border-default.p-4.text-sm.text-default')
+        && panel.children.length === 1 && button?.matches('button[type="button"]') && visible(button)
+        && [...panel.childNodes].some(node => node.nodeType === Node.TEXT_NODE && !!node.textContent?.trim())) return true;
+    }
+    // The original full-page layout also has no composer or conversation turns.
+    const main = document.querySelector('[data-app-shell-focus-area="main"]');
+    if (!main || main.querySelector(conversationContent)) return false;
     const panels = main.querySelectorAll(':scope > div > .flex.flex-col.items-center.justify-center > .flex.flex-col.items-center.justify-center.text-center.max-w-xl');
     return [...panels].some(panel => {
       if (panel.children.length !== 2 || !visible(panel)) return false;

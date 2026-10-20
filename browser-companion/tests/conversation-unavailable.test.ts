@@ -43,6 +43,17 @@ function errorPage(title: string, retry: string): string {
   </div>`;
 }
 
+// Captured inline transcript failure: its translated message and retry label
+// have no error test ID, heading, ARIA alert or centered full-page panel.
+function inlineErrorPage(title:string,retry:string):string {
+  return `<div data-request-input-activity-root="true"><div role="region" data-app-action-timeline-scroll="">
+    <div data-mcp-app-portal-target="true" data-thread-user-message-navigation-content="true">
+      <div data-chatgpt-conversation-selection-target="true" data-thread-find-target="conversation">
+        <span hidden></span><div class="rounded-xl border border-default bg-surface-secondary/92 p-4 text-sm text-default">${title}<button type="button">${retry}</button></div><div aria-hidden="true" style="height:0px"></div>
+      </div>
+    </div></div></div>`;
+}
+
 const healthyPage = '<form data-chatgpt-composer><div id="prompt-textarea" contenteditable="true" style="min-height:24px"></div></form>';
 let context: BrowserContext;
 let page: Page;
@@ -77,8 +88,8 @@ beforeAll(async () => {
 afterAll(async () => { await context?.close(); if (profile) await rm(profile, {recursive:true, force:true}); });
 
 test.skipIf(!native)("conversation load failures are recognized in English, Greek and Italian on both chat URL forms", async () => {
-  for (const [title, retry] of labels) {
-    currentHtml = errorPage(title, retry);
+  for (const render of [errorPage,inlineErrorPage]) for (const [title, retry] of labels) {
+    currentHtml = render(title, retry);
     for (const destination of [url, projectUrl]) {
       await surface.navigate(destination);
       const error = await throwIfSessionAttention(page).then(() => undefined, error => error);
@@ -89,7 +100,8 @@ test.skipIf(!native)("conversation load failures are recognized in English, Gree
 });
 
 test.skipIf(!native)("a failed conversation does not falsely sign out a verified account or block navigation to another chat", async () => {
-  currentHtml = errorPage("Unavailable", "Another language");
+  for (const render of [errorPage,inlineErrorPage]) {
+  currentHtml = render("Unavailable", "Another language");
   await surface.navigate(url);
   const driver = new ChatGptBrowserDriver(surface, build);
   const before = sessionRequests;
@@ -99,6 +111,7 @@ test.skipIf(!native)("a failed conversation does not falsely sign out a verified
   await surface.navigate("https://chatgpt.com/c/another-fixture");
   expect(await driver.health()).toEqual({authenticated:true, accountFingerprint:account, status:"idle", detail:null});
   expect(context.pages()).toEqual([page]);
+  }
 });
 
 test.skipIf(!native)("ordinary sends and goal retries retain the specific conversation error before Send", async () => {
@@ -106,13 +119,13 @@ test.skipIf(!native)("ordinary sends and goal retries retain the specific conver
     {kind:"offline_chat", batchId:"batch", messages:[{id:"message", markdown:"Continue"}]},
     {kind:"offline_goal", goalRevision:1},
   ];
-  for (const [index, prompt] of prompts.entries()) {
+  for (const render of [errorPage,inlineErrorPage]) for (const [index, prompt] of prompts.entries()) {
     const failedUrl = index === 0 ? url : projectUrl;
-    currentHtml = errorPage("Unavailable", "Riprova");
+    currentHtml = render("Unavailable", "Riprova");
     await surface.navigate(failedUrl);
     const coordinator = new SingleWindowCoordinator(new ChatGptBrowserDriver(surface, build), build);
     const request: ExecuteActionRequest = {
-      actionId:`unavailable-${index}`, idempotencyKey:`unavailable-${index}`, url:failedUrl, expectedUrl:failedUrl,
+      actionId:`unavailable-${render.name}-${index}`, idempotencyKey:`unavailable-${render.name}-${index}`, url:failedUrl, expectedUrl:failedUrl,
       pairingGeneration:1, connectorName:"Fixture connector", expectedAccountFingerprint:account,
       model:"gpt-6-sol", effort:"high", prompt, autoApproveToolCalls:false,
     };
@@ -155,7 +168,16 @@ test.skipIf(!native)("retry reloads the failed conversation and navigates back t
 
 test.skipIf(!native)("ordinary content, hidden panels, other routes and incomplete error structures are not conversation load failures", async () => {
   const html = errorPage(...labels[0]);
+  const inline=inlineErrorPage(...labels[0]);
   const cases = [
+    inline.replace('data-request-input-activity-root="true"','data-unrelated="true"'),
+    inline.replace('data-thread-user-message-navigation-content="true"','data-unrelated="true"'),
+    inline.replace('data-thread-find-target="conversation"','data-thread-find-target="other"'),
+    inline.replace('class="rounded-xl','hidden class="rounded-xl'),
+    inline.replace('<button type="button"','<button type="button">Other</button><button type="button"'),
+    inline.replace('<span hidden></span>','<article>Ordinary conversation content</article>'),
+    inline.replace('<span hidden></span>',healthyPage),
+    `<article data-message-author-role="assistant">${inline}</article>`,
     html.replace('data-app-shell-focus-area="main"', 'data-unrelated="main"'),
     html.replace('class="WorkspaceContent-dnr6uY', 'hidden class="WorkspaceContent-dnr6uY'),
     html.replace('<button type="button"', '<button type="button">Other action</button><button type="button"'),

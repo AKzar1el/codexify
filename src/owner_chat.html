@@ -540,7 +540,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     if (pairing.status === "verified") return "verified";
     const pairAction = action.kind === "pair_verify";
     if (pairAction && action.sendAccepted && Number.isSafeInteger(pairing.verificationWaitUntilMs)) return now < pairing.verificationWaitUntilMs ? "pairing" : "failed";
-    if (pairAction && (action.lastError || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(action.status))) return "failed";
+    if (pairAction && (action.lastError || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "rate_limited", "interference"].includes(action.status))) return "failed";
     // A queued request gets a fresh verification deadline when it starts.
     if (pairAction && action.status === "queued") return "pairing";
     if (Number.isSafeInteger(pairing.expiresAtMs)) return now < pairing.expiresAtMs ? "pairing" : "failed";
@@ -751,7 +751,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.model.title = nodes.effort.title = explanation;
       const goal = state.goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
-      const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "rate_limited", "interference"].includes(state.action?.status));
+      const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "rate_limited", "interference"].includes(state.action?.status));
       const actionNeedsAttention = !automaticRetry && actionFailed;
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
       const failure = state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");

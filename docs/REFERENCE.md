@@ -2183,8 +2183,14 @@ and mirrored messages remain unread until the normal chat cursor advances.
 
 Confirmed pre-Send failures in chats and active goals retry automatically after
 30, 60, 120, 240, and 480 seconds, then wait for manual Retry. Submitted or stalled
-goal turns recover after 60, 120, and 240 seconds, then require Continue. These
-counts survive service restarts; verified agent activity resets the goal recovery
+goal turns recover after 60, 120, and 240 seconds, then require Continue.
+Authentication-required and conversation-unavailable failures that are confirmed
+unsent share a separate six-retry
+schedule: 3, 5, 10, 20, 30, and 60 minutes, then wait for manual Retry. Each interval
+starts after the preceding failed attempt. All three schedules add 0–10% extra
+jitter to spread retries from different chats. The jitter is stable for each failed
+action and attempt, so polling and service restarts do not move its deadline.
+These counts survive service restarts; verified agent activity resets the goal recovery
 count, while Send acceptance alone does not. Pairing references remain valid for
 60 minutes; the pairing verification grace period remains 60 seconds. The failure
 banner exposes Retry even without a goal. Browser action errors appear as a red

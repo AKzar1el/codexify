@@ -155,6 +155,7 @@ impl AutomationExecutor for StopFailureThenSuccessExecutor {
             return Err(AutomationExecutionError {
                 message: message.into(),
                 send_accepted: false,
+                failure_status: None,
             });
         }
         for (index, kind) in [
@@ -202,6 +203,7 @@ impl AutomationExecutor for AmbiguousExecutor {
         Err(AutomationExecutionError {
             message: "Send may have been accepted".into(),
             send_accepted: true,
+            failure_status: None,
         })
     }
 }
@@ -218,6 +220,7 @@ impl AutomationExecutor for PreSendFailureExecutor {
         Err(AutomationExecutionError {
             message: "Selector verification failed before Send".into(),
             send_accepted: false,
+            failure_status: None,
         })
     }
 }
@@ -274,6 +277,7 @@ impl AutomationExecutor for AcceptedEventThenTransportErrorExecutor {
         Err(AutomationExecutionError {
             message: "Browser companion status reconciliation failed".into(),
             send_accepted: false,
+            failure_status: None,
         })
     }
 }
@@ -559,6 +563,7 @@ impl AutomationExecutor for PairVerifyingFailureExecutor {
         Err(AutomationExecutionError {
             message: "Browser companion returned a different conversation URL".into(),
             send_accepted: true,
+            failure_status: None,
         })
     }
 }
@@ -2472,7 +2477,11 @@ async fn pre_send_failures_retry_with_persisted_backoff_then_require_manual_retr
         assert_eq!(failed.action.automatic_retry_attempts, attempt);
         assert!(failed.is_automatically_retrying());
         let retry_at = failed.automatic_retry_at_ms().unwrap();
-        assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + delay);
+        assert!(
+            (failed.action.updated_at_ms.unwrap() + delay
+                ..=failed.action.updated_at_ms.unwrap() + delay + delay / 10)
+                .contains(&retry_at)
+        );
         if attempt == 1 {
             // Reloading the supervisor/store cannot reset the retry episode.
             let reopened = Arc::new(AgentAutomationStore::for_config(&fixture.config).unwrap());
@@ -3252,92 +3261,102 @@ async fn real_executor_defers_only_an_unowned_busy_pairing_window_to_companion_v
 }
 
 #[tokio::test]
-async fn real_executor_rejects_account_mismatch_before_execute() {
-    let execute_calls = Arc::new(AtomicUsize::new(0));
-    let execute_counter = execute_calls.clone();
-    let app = Router::new()
-        .route(
-            "/v1/health",
-            get(|headers: HeaderMap| async move {
-                if !authorized(&headers) {
-                    return StatusCode::UNAUTHORIZED.into_response();
-                }
-                axum::Json(serde_json::json!({
-                    "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
-                    "kind":"codexify-browser-companion",
-                    "build":COMPANION_BUILD,
-                    "status":"idle",
-                    "authenticated":true,
-                    "accountFingerprint":"different-account",
-                    "activeActionId":null
-                }))
-                .into_response()
-            }),
-        )
-        .route(
-            "/v1/session/capabilities",
-            post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
-        )
-        .route(
-            "/v1/actions/execute",
-            post(move || {
-                let execute_counter = execute_counter.clone();
-                async move {
-                    execute_counter.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            }),
+async fn real_executor_rejects_missing_authentication_and_account_mismatch_before_execute() {
+    for authenticated in [false, true] {
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let execute_counter = execute_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/health",
+                get(move |headers: HeaderMap| async move {
+                    if !authorized(&headers) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                        "kind":"codexify-browser-companion",
+                        "build":COMPANION_BUILD,
+                        "status":if authenticated { "idle" } else { "authentication_required" },
+                        "authenticated":authenticated,
+                        "accountFingerprint":authenticated.then_some("different-account"),
+                        "activeActionId":null
+                    }))
+                    .into_response()
+                }),
+            )
+            .route(
+                "/v1/session/capabilities",
+                post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/v1/actions/execute",
+                post(move || {
+                    let execute_counter = execute_counter.clone();
+                    async move {
+                        execute_counter.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = write_companion_descriptor(root.path(), &endpoint);
+        let config = codexify::markdown_chat::AgentAutomationConfig {
+            enabled: true,
+            descriptor_path: descriptor.display().to_string(),
+            ..Default::default()
+        };
+        let executor = BrowserAutomationExecutor::new(config);
+        let execution = AutomationExecution {
+            task_key: "a".repeat(64),
+            owner_generation: 0,
+            account_fingerprint: "expected-account".into(),
+            catalog_revision: "catalog-1".into(),
+            activity_epoch: "epoch-1".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 1,
+            unread_message_ids: Vec::new(),
+            transcript_revision: "revision-1".into(),
+            pairing_commit: None,
+            request: codexify::agent_automation::ExecuteActionRequest {
+                action_id: "action-account-check".into(),
+                idempotency_key: "execute-account-check".into(),
+                url: "https://chatgpt.com/c/example".into(),
+                pairing_generation: 1,
+                connector_name: "Codexify".into(),
+                expected_account_fingerprint: "account-1".into(),
+                model: Some("gpt-6-sol".into()),
+                effort: Some("high".into()),
+                prompt: ActionPrompt::OfflineGoal { goal_revision: 1 },
+                expected_url: "https://chatgpt.com/c/example".into(),
+                auto_approve_tool_calls: false,
+            },
+        };
+        let (events, _events_rx) = mpsc::unbounded_channel();
+
+        let error = executor
+            .execute(execution, events, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+
+        assert!(!error.send_accepted);
+        assert_eq!(
+            error.failure_status,
+            Some(AutomationActionStatus::AuthenticationRequired)
         );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let root = tempfile::tempdir().unwrap();
-    let descriptor = write_companion_descriptor(root.path(), &endpoint);
-    let config = codexify::markdown_chat::AgentAutomationConfig {
-        enabled: true,
-        descriptor_path: descriptor.display().to_string(),
-        ..Default::default()
-    };
-    let executor = BrowserAutomationExecutor::new(config);
-    let execution = AutomationExecution {
-        task_key: "a".repeat(64),
-        owner_generation: 0,
-        account_fingerprint: "expected-account".into(),
-        catalog_revision: "catalog-1".into(),
-        activity_epoch: "epoch-1".into(),
-        activity_sequence: 1,
-        tool_call_count_at_start: 1,
-        unread_message_ids: Vec::new(),
-        transcript_revision: "revision-1".into(),
-        pairing_commit: None,
-        request: codexify::agent_automation::ExecuteActionRequest {
-            action_id: "action-account-check".into(),
-            idempotency_key: "execute-account-check".into(),
-            url: "https://chatgpt.com/c/example".into(),
-            pairing_generation: 1,
-            connector_name: "Codexify".into(),
-            expected_account_fingerprint: "account-1".into(),
-            model: Some("gpt-6-sol".into()),
-            effort: Some("high".into()),
-            prompt: ActionPrompt::OfflineGoal { goal_revision: 1 },
-            expected_url: "https://chatgpt.com/c/example".into(),
-            auto_approve_tool_calls: false,
-        },
-    };
-    let (events, _events_rx) = mpsc::unbounded_channel();
-
-    let error = executor
-        .execute(execution, events, CancellationToken::new())
-        .await
-        .err()
-        .unwrap();
-
-    assert!(!error.send_accepted);
-    assert!(error.message.contains("account"));
-    assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
-    server.abort();
+        assert!(error.message.contains(if authenticated {
+            "account"
+        } else {
+            "authentication"
+        }));
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -6455,6 +6474,7 @@ impl AutomationExecutor for WatchdogExecutor {
         Err(AutomationExecutionError {
             message: message.into(),
             send_accepted: self.accepted,
+            failure_status: None,
         })
     }
 }
@@ -7249,6 +7269,7 @@ impl AutomationExecutor for CreatedPairingFailureExecutor {
         Err(AutomationExecutionError {
             message: "Model restoration failed after creation".into(),
             send_accepted: true,
+            failure_status: None,
         })
     }
 }
@@ -7575,6 +7596,7 @@ async fn agent_delivery_acknowledgment_wins_over_a_late_browser_observer_failure
             Err(AutomationExecutionError {
                 message: "Late browser observer failure".into(),
                 send_accepted: true,
+                failure_status: None,
             })
         }
     }
@@ -7777,6 +7799,7 @@ async fn native_delivery_during_browser_preparation_is_successful_without_an_err
                 message: "ChatGPT did not stop the previous response; the new message was not sent"
                     .into(),
                 send_accepted: false,
+                failure_status: None,
             })
         }
     }
@@ -7929,12 +7952,15 @@ async fn offline_goal_retries_three_times_with_backoff_without_tool_activity_acr
         let mut previous_action = f.store.load(&f.task).unwrap().action.id;
         for (retry, delay) in [60_000, 120_000, 240_000].into_iter().enumerate() {
             let state = f.store.load(&f.task).unwrap();
-            let deadline = state
+            let earliest = state
                 .goal_wake
                 .last_nudged_at_ms
                 .unwrap()
                 .max(state.action.updated_at_ms.unwrap())
                 + delay;
+            let deadline = state
+                .automatic_retry_at_ms()
+                .unwrap_or(earliest + delay / 10);
             let restarted = AgentAutomationSupervisor::new(
                 f.config.markdown_chat.automation.clone(),
                 f.executor.clone(),
@@ -7948,11 +7974,11 @@ async fn offline_goal_retries_three_times_with_backoff_without_tool_activity_acr
                 ))
                 .await
                 .unwrap();
-            restarted.scan_once(deadline - 1).await.unwrap();
+            restarted.scan_once(earliest - 1).await.unwrap();
             assert_eq!(
                 restarted.queued_count().await,
                 0,
-                "do not retry before the scheduled delay"
+                "do not retry before the base delay"
             );
             restarted.scan_once(deadline).await.unwrap();
             assert_eq!(
@@ -8019,7 +8045,7 @@ async fn offline_goal_retries_three_times_with_backoff_without_tool_activity_acr
             .last_nudged_at_ms
             .unwrap()
             .max(resumed.action.updated_at_ms.unwrap())
-            + 60_000;
+            + 66_000;
         restarted.scan_once(retry_at).await.unwrap();
         assert_eq!(restarted.queued_count().await, 1);
         restarted.run_next(retry_at + 1).await.unwrap();
@@ -8071,7 +8097,7 @@ async fn cancelled_goal_only_action_does_not_strand_an_active_objective() {
         let deadline = if later_activity {
             1010 + AUTOMATION_OFFLINE_AFTER_MS
         } else {
-            1001 + 60_000
+            1001 + 66_000
         };
         let restarted = AgentAutomationSupervisor::new(
             f.config.markdown_chat.automation.clone(),
@@ -8086,7 +8112,14 @@ async fn cancelled_goal_only_action_does_not_strand_an_active_objective() {
             ))
             .await
             .unwrap();
-        restarted.scan_once(deadline - 1).await.unwrap();
+        restarted
+            .scan_once(if later_activity {
+                deadline - 1
+            } else {
+                1001 + 60_000 - 1
+            })
+            .await
+            .unwrap();
         assert_eq!(restarted.queued_count().await, 0);
         restarted.scan_once(deadline).await.unwrap();
         assert_eq!(restarted.queued_count().await, 1);
@@ -8118,7 +8151,7 @@ async fn offline_goal_retry_respects_activity_pause_stop_and_completion() {
             .goal_wake
             .last_nudged_at_ms
             .unwrap()
-            + 60_000;
+            + 66_000;
         match change {
             "online" => {
                 f.chat.record_agent_call(deadline - 1).await.unwrap();
@@ -8174,13 +8207,16 @@ async fn offline_goal_retry_never_replays_a_previously_accepted_user_batch() {
     assert!(accepted.action.messages_fenced);
     for delay in [60_000, 120_000, 240_000] {
         let state = f.store.load(&f.task).unwrap();
-        let deadline = state
+        let earliest = state
             .goal_wake
             .last_nudged_at_ms
             .unwrap()
             .max(state.action.updated_at_ms.unwrap())
             + delay;
-        f.supervisor.scan_once(deadline - 1).await.unwrap();
+        let deadline = state
+            .automatic_retry_at_ms()
+            .unwrap_or(earliest + delay / 10);
+        f.supervisor.scan_once(earliest - 1).await.unwrap();
         assert_eq!(f.supervisor.queued_count().await, 0);
         f.supervisor.scan_once(deadline).await.unwrap();
         f.supervisor.run_next(deadline + 1).await.unwrap();
@@ -8236,7 +8272,11 @@ async fn offline_goal_pre_send_failures_stop_after_five_retries_and_allow_manual
         let failed = f.store.load(&f.task).unwrap();
         let retry_at = failed.automatic_retry_at_ms().unwrap();
         assert_eq!(failed.action.automatic_retry_attempts, attempt);
-        assert_eq!(retry_at, failed.action.updated_at_ms.unwrap() + delay);
+        assert!(
+            (failed.action.updated_at_ms.unwrap() + delay
+                ..=failed.action.updated_at_ms.unwrap() + delay + delay / 10)
+                .contains(&retry_at)
+        );
         // Reopening the store and supervisor must retain the retry stage.
         supervisor = AgentAutomationSupervisor::new(
             f.config.markdown_chat.automation.clone(),
@@ -8374,4 +8414,219 @@ async fn completing_a_goal_during_automatic_recovery_clears_its_retry_indicator(
     let completed = f.store.load(&f.task).unwrap();
     assert_eq!(completed.action.status, AutomationActionStatus::Idle);
     assert!(!completed.is_automatically_retrying());
+}
+
+struct AuthenticationRetryExecutor {
+    calls: AtomicUsize,
+    recovered: AtomicBool,
+    failure: &'static str,
+}
+#[async_trait]
+impl AutomationExecutor for AuthenticationRetryExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.recovered.load(Ordering::SeqCst) {
+            for (index, kind) in [
+                CompanionEventKind::SendAccepted,
+                CompanionEventKind::SubmissionComplete {
+                    canonical_url: execution.request.expected_url.clone(),
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                events
+                    .send(CompanionEvent {
+                        sequence: index as u64 + 1,
+                        action_id: execution.request.action_id.clone(),
+                        at_ms: index as u64 + 1,
+                        kind,
+                    })
+                    .unwrap();
+            }
+            return Ok(snapshot_for(execution));
+        }
+        if self.failure == "authentication_preflight" {
+            return Err(AutomationExecutionError {
+                message: "Authentication unavailable before browser execution".into(),
+                send_accepted: false,
+                failure_status: Some(AutomationActionStatus::AuthenticationRequired),
+            });
+        }
+        let mut snapshot = snapshot_for(execution);
+        let conversation_failure = self.failure.starts_with("conversation");
+        snapshot.state = if conversation_failure {
+            CompanionActionState::Failed
+        } else {
+            CompanionActionState::AuthenticationRequired
+        };
+        snapshot.send_accepted = false;
+        snapshot.last_event_sequence = 0;
+        snapshot.attention = Some(codexify::agent_automation::CompanionAttention {
+            code: if conversation_failure {
+                "conversation_unavailable"
+            } else {
+                "authentication_required"
+            }
+            .into(),
+            message: Some(
+                if conversation_failure {
+                    "ChatGPT conversation temporarily not accessible"
+                } else {
+                    "Sign in to ChatGPT"
+                }
+                .into(),
+            ),
+        });
+        if self.failure == "conversation_stream" {
+            events
+                .send(CompanionEvent {
+                    sequence: 1,
+                    action_id: snapshot.action_id.clone(),
+                    at_ms: 1,
+                    kind: CompanionEventKind::Failed {
+                        code: "conversation_unavailable".into(),
+                        message: "ChatGPT conversation temporarily not accessible".into(),
+                    },
+                })
+                .unwrap();
+            snapshot.last_event_sequence = 1;
+        }
+        Ok(snapshot)
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_after_recovery() {
+    for mode in ["chat", "goal", "combined"] {
+        for failure in [
+            "authentication_preflight",
+            "authentication_snapshot",
+            "conversation_snapshot",
+            "conversation_stream",
+        ] {
+            let f = fixture().await;
+            if mode != "chat" {
+                let goal = f
+                    .store
+                    .set_goal(&f.task, "Continue after authentication recovers", 100)
+                    .unwrap();
+                f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+            }
+            f.chat.record_agent_call(1_000).await.unwrap();
+            if mode != "goal" {
+                f.chat
+                    .append_user(
+                        "authentication-message".into(),
+                        "Keep this message until it can be sent".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let executor = Arc::new(AuthenticationRetryExecutor {
+                calls: AtomicUsize::new(0),
+                recovered: AtomicBool::new(false),
+                failure,
+            });
+            let mut supervisor = AgentAutomationSupervisor::new(
+                f.config.markdown_chat.automation.clone(),
+                executor.clone(),
+            );
+            supervisor
+                .register_task(AutomationTaskHandle::new(
+                    f.task.clone(),
+                    0,
+                    f.store.clone(),
+                    f.chat.clone(),
+                ))
+                .await
+                .unwrap();
+            let mut now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+            supervisor.scan_once(now).await.unwrap();
+            let _ = supervisor.run_next(now + 1).await;
+            for (attempt, minutes) in [3, 5, 10, 20, 30, 60].into_iter().enumerate() {
+                let failed = f.store.load(&f.task).unwrap();
+                assert_eq!(
+                    failed.action.status,
+                    if failure.starts_with("conversation") {
+                        AutomationActionStatus::ConversationUnavailable
+                    } else {
+                        AutomationActionStatus::AuthenticationRequired
+                    }
+                );
+                assert_eq!(failed.action.chatgpt_access_retry_attempts, attempt as u32);
+                assert_eq!(failed.automatic_retry_attempts(), attempt as u32);
+                assert_eq!(failed.automatic_retry_limit(), 6);
+                let deadline = failed.automatic_retry_at_ms().unwrap();
+                let delay = minutes * 60_000;
+                assert!(
+                    (failed.action.updated_at_ms.unwrap() + delay
+                        ..=failed.action.updated_at_ms.unwrap() + delay + delay / 10)
+                        .contains(&deadline)
+                );
+                assert_eq!(
+                    failed.action.automatic_retry_attempts, 0,
+                    "authentication must not consume the short retry budget"
+                );
+                let reopened = Arc::new(AgentAutomationStore::for_config(&f.config).unwrap());
+                assert_eq!(
+                    reopened.load(&f.task).unwrap().automatic_retry_at_ms(),
+                    Some(deadline)
+                );
+                supervisor = AgentAutomationSupervisor::new(
+                    f.config.markdown_chat.automation.clone(),
+                    executor.clone(),
+                );
+                supervisor
+                    .register_task(AutomationTaskHandle::new(
+                        f.task.clone(),
+                        0,
+                        reopened,
+                        f.chat.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                supervisor.scan_once(deadline - 1).await.unwrap();
+                assert_eq!(supervisor.queued_count().await, 0);
+                supervisor.scan_once(deadline).await.unwrap();
+                assert_eq!(supervisor.queued_count().await, 1);
+                let queued = f.store.load(&f.task).unwrap();
+                assert_eq!(queued.automatic_retry_limit(), 6);
+                assert_eq!(queued.automatic_retry_attempts(), attempt as u32 + 1);
+                assert!(queued.is_automatically_retrying());
+                let _ = supervisor.run_next(deadline + 1).await;
+                now = deadline + 1;
+            }
+            let exhausted = f.store.load(&f.task).unwrap();
+            assert_eq!(exhausted.action.chatgpt_access_retry_attempts, 6);
+            assert!(exhausted.automatic_retry_at_ms().is_none());
+            assert!(!exhausted.is_automatically_retrying());
+            supervisor.scan_once(now + 86_400_000).await.unwrap();
+            assert_eq!(supervisor.queued_count().await, 0);
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 7);
+            assert_eq!(
+                f.chat.unread_snapshot().await.unwrap().messages.len(),
+                usize::from(mode != "goal")
+            );
+            executor.recovered.store(true, Ordering::SeqCst);
+            supervisor
+                .retry_failed_action(
+                    &f.task,
+                    exhausted.action.id.as_deref().unwrap(),
+                    now + 86_400_001,
+                )
+                .await
+                .unwrap();
+            supervisor.run_next(now + 86_400_002).await.unwrap();
+            let recovered = f.store.load(&f.task).unwrap();
+            assert_eq!(recovered.action.status, AutomationActionStatus::Idle);
+            assert_eq!(recovered.action.chatgpt_access_retry_attempts, 0);
+            assert!(!recovered.action.chatgpt_access_retry_in_progress);
+        }
+    }
 }

@@ -35,6 +35,7 @@ impl AutomationExecutor for Executor {
             return Err(AutomationExecutionError {
                 message: "No send".into(),
                 send_accepted: self.ambiguous.load(Ordering::SeqCst),
+                failure_status: None,
             });
         }
         events
@@ -706,17 +707,19 @@ async fn stalled_goal_renewal_retries_after_one_minute_only_with_fresh_report_pr
     f.executor.ambiguous.store(true, Ordering::SeqCst);
     f.supervisor.scan_once(DUE + 10_000).await.unwrap();
     let _ = f.supervisor.run_next(DUE + 10_000).await;
-    let failed_at = f.store.load(&f.task).unwrap().action.updated_at_ms.unwrap();
+    let failure = f.store.load(&f.task).unwrap();
+    let failed_at = failure.action.updated_at_ms.unwrap();
+    let retry_at = failure.automatic_retry_at_ms().unwrap();
     f.supervisor
         .scan_once(failed_at + 60_000 - 1)
         .await
         .unwrap();
     assert_eq!(f.supervisor.queued_count().await, 0);
     f.executor.complete.store(false, Ordering::SeqCst);
-    f.supervisor.scan_once(failed_at + 60_000).await.unwrap();
+    f.supervisor.scan_once(retry_at).await.unwrap();
     assert_eq!(f.supervisor.queued_count().await, 0);
     f.executor.complete.store(true, Ordering::SeqCst);
-    f.supervisor.scan_once(failed_at + 60_001).await.unwrap();
+    f.supervisor.scan_once(retry_at + 1).await.unwrap();
     assert_eq!(
         f.supervisor.next_queued_kind().await,
         Some(AutomationActionKind::TurnRenewal)
@@ -749,8 +752,9 @@ async fn stalled_goal_renewal_stops_after_three_retries_across_restart() {
         let failed = f.store.load(&f.task).unwrap();
         assert_eq!(failed.automatic_retry_attempts(), attempt as u32);
         assert_eq!(failed.automatic_retry_limit(), 3);
-        let due = failed.action.updated_at_ms.unwrap() + delay;
-        assert_eq!(failed.automatic_retry_at_ms(), Some(due));
+        let due = failed.automatic_retry_at_ms().unwrap();
+        let earliest = failed.action.updated_at_ms.unwrap() + delay;
+        assert!((earliest..=earliest + delay / 10).contains(&due));
         let supervisor = AgentAutomationSupervisor::new(
             f.config.markdown_chat.automation.clone(),
             f.executor.clone(),

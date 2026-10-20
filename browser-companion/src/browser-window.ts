@@ -32,7 +32,7 @@ type WithoutEventEnvelope<T> = T extends ActionEvent
 export type DriverEvent = WithoutEventEnvelope<ActionEvent>;
 
 export const MAX_RETAINED_ACTIONS = 8;
-export const BROWSER_OPERATION_TIMEOUT_MS = 20_000;
+export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
 const BROWSER_CLEANUP_GRACE_MS = 5_000;
 const BROWSER_HARD_STOP_MS = 2_000;
 const MAX_RETIRED_ACTIONS = 1024;

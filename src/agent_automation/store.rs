@@ -27,6 +27,8 @@ pub const MAX_GOAL_BYTES: usize = 10 * 1024;
 pub const PAIRING_REFERENCE_TTL_MS: u64 = 60 * 60 * 1000;
 pub const PAIRING_VERIFICATION_GRACE_MS: u64 = 60_000;
 const AUTOMATIC_RETRY_DELAYS_MS: [u64; 5] = [30_000, 60_000, 120_000, 240_000, 480_000];
+const CHATGPT_ACCESS_RETRY_DELAYS_MS: [u64; 6] =
+    [180_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000];
 const GOAL_RECOVERY_EXHAUSTED: &str = "Automatic goal recovery stopped after three retries without agent activity. Use Continue to try again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +195,7 @@ pub enum AutomationActionStatus {
     Idle,
     ApprovalRequired,
     AuthenticationRequired,
+    ConversationUnavailable,
     RateLimited,
     Interference,
     Ambiguous,
@@ -216,6 +219,8 @@ pub struct AutomationActionState {
     pub send_accepted: Option<bool>,
     pub messages_fenced: bool,
     pub automatic_retry_attempts: u32,
+    pub chatgpt_access_retry_attempts: u32,
+    pub chatgpt_access_retry_in_progress: bool,
     // Presentation only: keep recovery visible while a scheduled retry runs.
     pub automatic_retry_in_progress: bool,
 }
@@ -369,22 +374,34 @@ impl AutomationTaskState {
         } else {
             *GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?
         };
-        self.action
+        let last = self
+            .action
             .updated_at_ms
             .into_iter()
             .chain(self.goal_wake.last_nudged_at_ms)
-            .max()
-            .map(|last| last.saturating_add(delay))
+            .max()?;
+        let attempt = if confirmed_unsent_failure(&self.action) {
+            self.action.automatic_retry_attempts
+        } else {
+            self.goal_wake.recovery_attempts
+        };
+        Some(retry_deadline(&self.action, attempt, last, delay))
     }
 
     pub(crate) fn goal_recovery_retry_at_ms(&self) -> Option<u64> {
         let delay = GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?;
-        self.action
+        let last = self
+            .action
             .updated_at_ms
             .into_iter()
             .chain(self.goal_wake.last_nudged_at_ms)
-            .max()
-            .map(|last| last.saturating_add(*delay))
+            .max()?;
+        Some(retry_deadline(
+            &self.action,
+            self.goal_wake.recovery_attempts,
+            last,
+            *delay,
+        ))
     }
 
     pub(crate) fn goal_recovery_exhausted(&self) -> bool {
@@ -394,7 +411,9 @@ impl AutomationTaskState {
     }
 
     pub fn automatic_retry_limit(&self) -> usize {
-        if self.uses_goal_recovery() {
+        if self.uses_chatgpt_access_retry() {
+            CHATGPT_ACCESS_RETRY_DELAYS_MS.len()
+        } else if self.uses_goal_recovery() {
             GOAL_RETRY_DELAYS_MS.len()
         } else {
             AUTOMATIC_RETRY_DELAYS_MS.len()
@@ -402,11 +421,58 @@ impl AutomationTaskState {
     }
 
     pub fn automatic_retry_attempts(&self) -> u32 {
-        if self.uses_goal_recovery() {
+        if self.uses_chatgpt_access_retry() {
+            self.action.chatgpt_access_retry_attempts
+        } else if self.uses_goal_recovery() {
             self.goal_wake.recovery_attempts
         } else {
             self.action.automatic_retry_attempts
         }
+    }
+
+    fn uses_chatgpt_access_retry(&self) -> bool {
+        matches!(
+            self.action.status,
+            AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::ConversationUnavailable
+        ) || self.action.chatgpt_access_retry_in_progress
+            && self.action.automatic_retry_in_progress
+            && matches!(
+                self.action.status,
+                AutomationActionStatus::Idle
+                    | AutomationActionStatus::Queued
+                    | AutomationActionStatus::Navigating
+                    | AutomationActionStatus::Sending
+                    | AutomationActionStatus::Generating
+            )
+    }
+
+    fn chatgpt_access_retry_at_ms(&self) -> Option<u64> {
+        let action = &self.action;
+        if !matches!(
+            action.status,
+            AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::ConversationUnavailable
+        ) || action_retry_mode(self) != Some("retry")
+            || action.send_accepted != Some(false)
+            || action.messages_fenced
+            || action.goal_turn_counted
+            || action.goal_revision.is_some_and(|revision| {
+                self.goal.as_ref().is_none_or(|goal| {
+                    goal.status != GoalStatus::Active || goal.revision != revision
+                })
+            })
+        {
+            return None;
+        }
+        let delay =
+            *CHATGPT_ACCESS_RETRY_DELAYS_MS.get(action.chatgpt_access_retry_attempts as usize)?;
+        Some(retry_deadline(
+            action,
+            action.chatgpt_access_retry_attempts,
+            action.updated_at_ms?,
+            delay,
+        ))
     }
 
     fn uses_goal_recovery(&self) -> bool {
@@ -425,6 +491,13 @@ impl AutomationTaskState {
     }
 
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
+        if matches!(
+            self.action.status,
+            AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::ConversationUnavailable
+        ) {
+            return self.chatgpt_access_retry_at_ms();
+        }
         if self.action.kind == Some(AutomationActionKind::TurnRenewal)
             && self.uses_goal_recovery()
             && self
@@ -470,9 +543,9 @@ impl AutomationTaskState {
             _ => return None,
         }
         let delay = AUTOMATIC_RETRY_DELAYS_MS.get(action.automatic_retry_attempts as usize)?;
-        action
-            .updated_at_ms
-            .map(|finished| finished.saturating_add(*delay))
+        action.updated_at_ms.map(|finished| {
+            retry_deadline(action, action.automatic_retry_attempts, finished, *delay)
+        })
     }
 
     pub fn is_automatically_retrying(&self) -> bool {
@@ -516,11 +589,27 @@ impl AutomationTaskState {
                 | AutomationActionStatus::Stalled
                 | AutomationActionStatus::Interference
                 | AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::ConversationUnavailable
                 | AutomationActionStatus::RateLimited
                 | AutomationActionStatus::ApprovalRequired
         ) || (self.action.status == AutomationActionStatus::Unverified
             && self.action.last_error.is_some())
     }
+}
+
+// Stable per failed action/attempt: polling and restarts must not move the
+// deadline. Different random action IDs spread chats by 0–10% after the base wait.
+fn retry_deadline(action: &AutomationActionState, attempt: u32, finished: u64, delay: u64) -> u64 {
+    let mut hash = Sha256::new();
+    hash.update(b"retry-jitter-v1\0");
+    hash.update(action.id.as_deref().unwrap_or_default().as_bytes());
+    hash.update(attempt.to_le_bytes());
+    hash.update(finished.to_le_bytes());
+    hash.update(delay.to_le_bytes());
+    let seed = u64::from_le_bytes(hash.finalize()[..8].try_into().expect("SHA-256 prefix"));
+    finished
+        .saturating_add(delay)
+        .saturating_add(seed % (delay / 10 + 1))
 }
 
 fn confirmed_unsent_failure(action: &AutomationActionState) -> bool {
@@ -548,6 +637,7 @@ fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
                 | AutomationActionStatus::Interference
                 | AutomationActionStatus::ApprovalRequired
                 | AutomationActionStatus::AuthenticationRequired
+                | AutomationActionStatus::ConversationUnavailable
                 | AutomationActionStatus::RateLimited
         )
     {
@@ -1261,6 +1351,7 @@ impl AgentAutomationStore {
             if state.action.goal_revision == Some(expected_revision) {
                 state.action.status = AutomationActionStatus::Idle;
                 state.action.automatic_retry_in_progress = false;
+                state.action.chatgpt_access_retry_in_progress = false;
                 state.action.updated_at_ms = Some(now_ms);
             }
             Ok(result)
@@ -1574,6 +1665,8 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
@@ -1635,6 +1728,8 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             state.action.send_accepted = Some(true);
             state.action.updated_at_ms = Some(now_ms);
@@ -1788,6 +1883,8 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(now_ms),
                 send_accepted: Some(false),
                 automatic_retry_attempts: state.action.automatic_retry_attempts,
+                chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts,
+                chatgpt_access_retry_in_progress: state.action.chatgpt_access_retry_in_progress,
                 automatic_retry_in_progress: state.action.automatic_retry_in_progress,
                 ..Default::default()
             };
@@ -1823,6 +1920,8 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(failure.now_ms),
                 send_accepted: Some(false),
                 automatic_retry_attempts: state.action.automatic_retry_attempts,
+                chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts,
+                chatgpt_access_retry_in_progress: state.action.chatgpt_access_retry_in_progress,
                 automatic_retry_in_progress: state.action.automatic_retry_in_progress,
                 ..Default::default()
             };
@@ -1873,6 +1972,8 @@ impl AgentAutomationStore {
             state.action.updated_at_ms = Some(now_ms);
             if state.action.status == AutomationActionStatus::Idle {
                 state.action.automatic_retry_attempts = 0;
+                state.action.chatgpt_access_retry_attempts = 0;
+                state.action.chatgpt_access_retry_in_progress = false;
                 state.action.automatic_retry_in_progress = false;
             }
             Ok(state.action.clone())
@@ -1905,6 +2006,8 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Cancelled;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             state.action.updated_at_ms = Some(now_ms);
             Ok(state.action.clone())
@@ -1989,6 +2092,7 @@ impl AgentAutomationStore {
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 automatic_retry_in_progress: true,
+                chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts,
                 automatic_retry_attempts: if unsent {
                     state.action.automatic_retry_attempts + 1
                 } else {
@@ -2058,6 +2162,7 @@ impl AgentAutomationStore {
                     .last_error
                     .get_or_insert_with(|| GOAL_RECOVERY_EXHAUSTED.into());
                 state.action.automatic_retry_in_progress = false;
+                state.action.chatgpt_access_retry_in_progress = false;
             }
             Ok(())
         })
@@ -2079,7 +2184,23 @@ impl AgentAutomationStore {
             }
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
-                automatic_retry_attempts: state.action.automatic_retry_attempts + 1,
+                automatic_retry_attempts: state.action.automatic_retry_attempts
+                    + u32::from(!matches!(
+                        state.action.status,
+                        AutomationActionStatus::AuthenticationRequired
+                            | AutomationActionStatus::ConversationUnavailable
+                    )),
+                chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts
+                    + u32::from(matches!(
+                        state.action.status,
+                        AutomationActionStatus::AuthenticationRequired
+                            | AutomationActionStatus::ConversationUnavailable
+                    )),
+                chatgpt_access_retry_in_progress: matches!(
+                    state.action.status,
+                    AutomationActionStatus::AuthenticationRequired
+                        | AutomationActionStatus::ConversationUnavailable
+                ),
                 automatic_retry_in_progress: true,
                 ..Default::default()
             };
@@ -2134,6 +2255,8 @@ impl AgentAutomationStore {
             count_accepted_goal_turn(state);
             state.action.send_accepted = Some(true);
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             state.action.status = if made_progress {
                 AutomationActionStatus::Idle
@@ -2247,6 +2370,8 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             state.action.updated_at_ms = Some(now_ms);
             state.goal_wake = GoalWakeState::default();
@@ -2321,6 +2446,8 @@ impl AgentAutomationStore {
             }
             state.action.send_accepted = Some(true);
             state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
             state.action.automatic_retry_in_progress = false;
             count_accepted_goal_turn(state);
             Ok(())
@@ -3119,6 +3246,8 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
 
 fn validate_action(action: &AutomationActionState) -> Result<(), String> {
     if action.automatic_retry_attempts as usize > AUTOMATIC_RETRY_DELAYS_MS.len()
+        || action.chatgpt_access_retry_attempts as usize > CHATGPT_ACCESS_RETRY_DELAYS_MS.len()
+        || action.chatgpt_access_retry_in_progress && !action.automatic_retry_in_progress
         || action
             .id
             .as_deref()
@@ -3142,6 +3271,7 @@ fn validate_action(action: &AutomationActionState) -> Result<(), String> {
             | AutomationActionStatus::Generating
             | AutomationActionStatus::ApprovalRequired
             | AutomationActionStatus::AuthenticationRequired
+            | AutomationActionStatus::ConversationUnavailable
             | AutomationActionStatus::RateLimited
             | AutomationActionStatus::Interference
             | AutomationActionStatus::Ambiguous

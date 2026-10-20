@@ -251,7 +251,7 @@ test(`${engineName}: pairing failures open a prefilled retry box and submit one 
   } finally {releasePost?.();releasePoll?.();await browser.close();}
 });
 
-test(`${engineName}: failed chats show an inline retry and a sidebar error without a goal`, {timeout:30000}, async () => {
+test(`${engineName}: failed chats show an inline retry and a sidebar error without a goal`, {timeout:45000}, async () => {
   const browser=await engine.launch();
   try {
     const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
@@ -294,6 +294,21 @@ test(`${engineName}: failed chats show an inline retry and a sidebar error witho
     await inline.waitFor();
     await inline.click();await inline.waitFor({state:'hidden'});
     assert.equal(operations.length,2,'manual Retry works during automatic backoff');
+    action={id:'authentication-backoff',kind:'offline_chat',status:'authentication_required',lastError:'Sign in to ChatGPT, then retry this action.',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:Date.now()+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
+    await host.locator('#automation-error').getByText(/retry 1 of 6/).waitFor();
+    action={...action,automaticRetryAtMs:Date.now()+3600000,automaticRetryAttempts:5};
+    await host.locator('#automation-error').getByText(/retry 6 of 6/).waitFor();
+    assert(!(await host.locator('#automation-error').textContent()).includes('All 6 automatic retries failed'));
+    action={...action,automaticRetryAtMs:null,automaticRetryAttempts:6};
+    await host.locator('#automation-error').getByText(/All 6 automatic retries failed/).waitFor();
+    assert(await inline.isVisible(),'exhausted authentication retries still allow a manual retry');
+    action={...action,id:'conversation-load-backoff',status:'conversation_unavailable',lastError:'ChatGPT conversation temporarily not accessible',automaticRetryAtMs:Date.now()+600000,automaticRetryAttempts:2};
+    await host.locator('#automation-error').getByText(/retry 3 of 6/).waitFor();
+    assert(!(await host.locator('#automation-error').textContent()).includes('Sign in'));
+    action={...action,automaticRetryAtMs:null,automaticRetryAttempts:6};
+    await host.locator('#automation-error').getByText(/All 6 automatic retries failed/).waitFor();
+    assert(!(await host.locator('#automation-error').textContent()).includes('Sign in'));
+    assert(await inline.isVisible());
     action={id:'uncertain-send',kind:'offline_chat',status:'ambiguous',lastError:'Send acceptance could not be confirmed',sendAccepted:true,retryMode:null,automaticRetryAtMs:null,automaticRetryAttempts:0};
     await host.locator('#automation-error').getByText(/check whether the message was sent/).waitFor();
     assert.equal(await inline.isVisible(),false,'an uncertain user message cannot be replayed');
@@ -875,7 +890,7 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
   } finally { await browser.close(); }
 });
 
-test(`${engineName}: standalone automation controls drive only authenticated owner APIs`, { timeout:30000 }, async () => {
+test(`${engineName}: standalone automation controls drive only authenticated owner APIs`, { timeout:45000 }, async () => {
   const browser = await engine.launch();
   try {
     const page = await ownerTestPage(browser,{ viewport:{ width:1280, height:900 } });
@@ -1121,6 +1136,19 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     assert((await panel.locator("#automation-error").textContent()).includes("Retrying the goal automatically in"));
     assert.equal(await panel.locator("#goal-caption").textContent(),"Pursuing goal");
     await panel.getByRole("button",{name:"Close connection settings",exact:true}).click();
+    automation.action={id:'authentication-goal-backoff',kind:'offline_goal',status:'authentication_required',goalRevision:2,lastError:'Sign in to ChatGPT, then retry this action.',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:Date.now()+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
+    await panel.locator('#automation-error').getByText(/Retrying the goal automatically/).waitFor();
+    assert.equal(await panel.locator('#goal-caption').textContent(),'Pursuing goal');
+    automation.action={...automation.action,automaticRetryAtMs:null,automaticRetryAttempts:6};
+    await panel.locator('#automation-error').getByText(/All 6 automatic retries failed/).waitFor();
+    await panel.locator('#goal-retry').getByText('Retry',{exact:true}).waitFor();
+    automation.action={...automation.action,id:'conversation-goal-backoff',status:'conversation_unavailable',lastError:'ChatGPT conversation temporarily not accessible',automaticRetryAtMs:Date.now()+300000,automaticRetryAttempts:1};
+    await panel.locator('#automation-error').getByText(/Retrying the goal automatically/).waitFor();
+    assert.equal(await panel.locator('#goal-caption').textContent(),'Pursuing goal');
+    assert(!(await panel.locator('#automation-error').textContent()).includes('Sign in'));
+    automation.action={...automation.action,automaticRetryAtMs:null,automaticRetryAttempts:6};
+    await panel.locator('#automation-error').getByText(/All 6 automatic retries failed/).waitFor();
+    assert(!(await panel.locator('#automation-error').textContent()).includes('Sign in'));
     automation.action = { id:"pre-send-attention", kind:"offline_combined", status:"interference", goalRevision:1, lastError:"Clear the draft before retrying", retryMode:"retry", sendAccepted:false };
     await panel.locator("#goal-retry").getByText("Retry", {exact:true}).waitFor();
     assert((await panel.locator("#automation-error").textContent()).includes("The message was not sent"));

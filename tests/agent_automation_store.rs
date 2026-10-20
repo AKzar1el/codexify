@@ -25,7 +25,7 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
         ),
         ..Default::default()
     };
-    assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
+    assert!((30_100..=33_100).contains(&state.automatic_retry_at_ms().unwrap()));
     assert!(state.is_automatically_retrying());
     let mut legacy = serde_json::to_value(&state).unwrap();
     legacy["action"]
@@ -54,10 +54,13 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     assert!(fenced.automatic_retry_at_ms().is_none());
     let mut different = state.clone();
     different.action.last_error = Some("Selector verification failed before Send".into());
-    assert_eq!(different.automatic_retry_at_ms(), Some(30_100));
+    assert!((30_100..=33_100).contains(&different.automatic_retry_at_ms().unwrap()));
     for (attempts, delay) in [(1, 60_000), (2, 120_000), (3, 240_000), (4, 480_000)] {
         different.action.automatic_retry_attempts = attempts;
-        assert_eq!(different.automatic_retry_at_ms(), Some(100 + delay));
+        assert!(
+            (100 + delay..=100 + delay + delay / 10)
+                .contains(&different.automatic_retry_at_ms().unwrap())
+        );
     }
     different.action.automatic_retry_attempts = 5;
     assert!(different.automatic_retry_at_ms().is_none());
@@ -80,7 +83,7 @@ fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() 
     state.goal = Some(active.clone());
     state.action.kind = Some(AutomationActionKind::OfflineGoal);
     state.action.goal_revision = Some(active.revision);
-    assert_eq!(state.automatic_retry_at_ms(), Some(30_100));
+    assert!((30_100..=33_100).contains(&state.automatic_retry_at_ms().unwrap()));
     active.status = GoalStatus::Configured;
     state.goal = Some(active.clone());
     assert!(state.automatic_retry_at_ms().is_none());
@@ -1766,4 +1769,159 @@ fn created_urls_survive_expired_verification_but_project_urls_and_superseded_req
             .canonical_url
             .is_none()
     );
+}
+
+#[test]
+fn authentication_retries_use_six_separate_intervals_and_never_replay_uncertain_messages() {
+    use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
+    let mut state = AutomationTaskState::default();
+    state.action = AutomationActionState {
+        id: Some("authentication-failure".into()),
+        kind: Some(AutomationActionKind::OfflineChat),
+        status: AutomationActionStatus::AuthenticationRequired,
+        send_accepted: Some(false),
+        updated_at_ms: Some(100),
+        automatic_retry_attempts: 4,
+        ..Default::default()
+    };
+    for (attempt, minutes) in [3, 5, 10, 20, 30, 60].into_iter().enumerate() {
+        state.action.chatgpt_access_retry_attempts = attempt as u32;
+        let delay = minutes * 60_000;
+        let deadline = state.automatic_retry_at_ms().unwrap();
+        assert!((100 + delay..=100 + delay + delay / 10).contains(&deadline));
+        assert_eq!(state.automatic_retry_limit(), 6);
+        assert_eq!(state.automatic_retry_attempts(), attempt as u32);
+        let restored: AutomationTaskState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(restored.automatic_retry_at_ms(), Some(deadline));
+        assert!(restored.is_automatically_retrying());
+        let mut conversation_failure = state.clone();
+        conversation_failure.action.status = AutomationActionStatus::ConversationUnavailable;
+        assert_eq!(conversation_failure.automatic_retry_at_ms(), Some(deadline));
+        assert_eq!(conversation_failure.automatic_retry_limit(), 6);
+        assert_eq!(
+            conversation_failure.automatic_retry_attempts(),
+            attempt as u32
+        );
+    }
+    state.action.chatgpt_access_retry_attempts = 6;
+    assert!(state.automatic_retry_at_ms().is_none());
+    assert!(!state.is_automatically_retrying());
+    assert_eq!(state.retry_mode(), Some("retry"));
+    state.action.chatgpt_access_retry_attempts = 0;
+    state.action.status = AutomationActionStatus::ConversationUnavailable;
+    for variant in [
+        "accepted",
+        "unknown",
+        "fenced",
+        "counted",
+        "pairing",
+        "cancelled",
+    ] {
+        let mut unsafe_state = state.clone();
+        match variant {
+            "accepted" => unsafe_state.action.send_accepted = Some(true),
+            "unknown" => unsafe_state.action.send_accepted = None,
+            "fenced" => unsafe_state.action.messages_fenced = true,
+            "counted" => unsafe_state.action.goal_turn_counted = true,
+            "pairing" => unsafe_state.action.kind = Some(AutomationActionKind::PairVerify),
+            "cancelled" => unsafe_state.action.status = AutomationActionStatus::Cancelled,
+            _ => unreachable!(),
+        }
+        assert!(
+            unsafe_state.automatic_retry_at_ms().is_none(),
+            "{variant} must not schedule an authentication replay"
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+    let task = task("authentication-goal");
+    let goal = store.set_goal(&task, "Continue", 1).unwrap();
+    let active = store.run_goal(&task, goal.revision, 2).unwrap();
+    for kind in [
+        AutomationActionKind::OfflineGoal,
+        AutomationActionKind::OfflineCombined,
+    ] {
+        state.action.kind = Some(kind);
+        state.action.goal_revision = Some(active.revision);
+        state.goal = Some(active.clone());
+        assert!(state.automatic_retry_at_ms().is_some());
+        for status in [
+            GoalStatus::Configured,
+            GoalStatus::Blocked,
+            GoalStatus::Completed,
+        ] {
+            state.goal.as_mut().unwrap().status = status;
+            assert!(state.automatic_retry_at_ms().is_none());
+        }
+    }
+    let mut legacy = serde_json::to_value(AutomationTaskState::default()).unwrap();
+    for key in ["chatgptAccessRetryAttempts", "chatgptAccessRetryInProgress"] {
+        legacy["action"].as_object_mut().unwrap().remove(key);
+    }
+    let restored: AutomationTaskState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.action.chatgpt_access_retry_attempts, 0);
+}
+
+#[test]
+fn retry_jitter_is_stable_bounded_and_spreads_chats_on_each_schedule() {
+    use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
+    let root = tempfile::tempdir().unwrap();
+    let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+    let task = task("jitter-goal");
+    let goal = store.set_goal(&task, "Continue", 1).unwrap();
+    let active = store.run_goal(&task, goal.revision, 2).unwrap();
+    for (status, kind, delay, accepted) in [
+        (
+            AutomationActionStatus::Failed,
+            AutomationActionKind::OfflineChat,
+            30_000,
+            false,
+        ),
+        (
+            AutomationActionStatus::AuthenticationRequired,
+            AutomationActionKind::OfflineChat,
+            180_000,
+            false,
+        ),
+        (
+            AutomationActionStatus::ConversationUnavailable,
+            AutomationActionKind::OfflineChat,
+            180_000,
+            false,
+        ),
+        (
+            AutomationActionStatus::Stalled,
+            AutomationActionKind::OfflineGoal,
+            60_000,
+            true,
+        ),
+    ] {
+        let mut deadlines = std::collections::HashSet::new();
+        for index in 0..100 {
+            let mut state = AutomationTaskState::default();
+            state.goal = Some(active.clone());
+            state.action = AutomationActionState {
+                id: Some(format!("chat-{index}")),
+                kind: Some(kind),
+                status,
+                goal_revision: (kind == AutomationActionKind::OfflineGoal)
+                    .then_some(active.revision),
+                send_accepted: Some(accepted),
+                updated_at_ms: Some(100),
+                ..Default::default()
+            };
+            let deadline = state.automatic_retry_at_ms().unwrap();
+            assert!((100 + delay..=100 + delay + delay / 10).contains(&deadline));
+            assert_eq!(state.automatic_retry_at_ms(), Some(deadline));
+            let restored: AutomationTaskState =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            assert_eq!(restored.automatic_retry_at_ms(), Some(deadline));
+            deadlines.insert(deadline);
+        }
+        assert!(
+            deadlines.len() > 90,
+            "independent chats must not share one fixed retry time"
+        );
+    }
 }
