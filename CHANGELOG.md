@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-10-20
+
 ### Added
 
 - Optional `instanceName` installation display titles for MCP clients. Unset,
@@ -23,12 +25,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under Tools & files → File exports. Opting in enables native file exports and
   full attachment resources; inline attachment text and image previews remain
   available while it is off. Explicit saved preferences are preserved.
+- ChatGPT navigation and message-submission phases allow 30 seconds before
+  timing out, preserving the safeguards against replaying an uncertain send.
+- Authentication and conversation-access failures retry after 3, 5, 10, 20, 30,
+  and 60 minutes, then stop. Retry deadlines include up to 10% additional jitter
+  to spread requests across chats and remain stable through restarts.
+- Shared statistics label active time as Thinking hours with an `h` suffix.
+  Model names include Pro inline or show thinking levels in parentheses.
 
 ### Fixed
 
 - Workspace-picker setup and its app-only project actions remain available with
   embedded widgets enabled and agent chat disabled, while preserving setup
   authorization and keeping agent-chat tools disabled.
+- Return and Cmd+Return/Ctrl+Return send answers immediately while the agent is
+  waiting for input, including when the default message mode is Queue. Shortcut
+  hints and the send-button tooltip match the available behavior.
+- Error-banner Retry and Continue controls follow the server's retry permission
+  during automatic backoff. Countdown text only advertises an available action
+  and distinguishes retrying an unsent message from continuing a goal.
+- Long active-time labels stay centered on one line inside the model-mix chart.
 - Connector refresh can open settings from a failed conversation page without
   waiting for a missing message composer or incorrectly requiring sign-in.
 
@@ -893,7 +909,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/devnoname120/codexify/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/devnoname120/codexify/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/devnoname120/codexify/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/devnoname120/codexify/compare/v2.1.0...v2.2.0
