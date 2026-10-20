@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reuse healthy ChatGPT conversation pages for browser sends and retries, and
+  reuse prepared new-chat pages. Failed conversation pages still reload once
+  for recovery. Maintenance avoids duplicate restoration loads and reads an
+  available account-menu plan before visiting billing.
+- Handoff checks leave the current conversation loaded and bound necessary
+  visits to other pending handoffs. Required conversation loads share a
+  three-second spacing; HTTP 429 responses apply a shared Retry-After cooldown.
+
 ## [2.3.2] - 2026-10-20
 
 ### Added

@@ -49,6 +49,8 @@ const stopDialogHtml = `<div class="codex-dialog-overlay" style="position:fixed;
     </form></div><button type="button">Fermer</button>
   </div>`;
 let documentLoads = 0;
+let stopReloadAt=2;
+let loadedFixtureState="";
 let sessionRequests = 0;
 let changedAccountAfterReload = false;
 let changedUrlAfterReload = false;
@@ -73,7 +75,7 @@ beforeAll(async () => {
   await context.route("https://chatgpt.com/**",async route => {
     if (new URL(route.request().url()).pathname === "/api/auth/session") {
       sessionRequests++;
-      await route.fulfill({json:{user:{id:"fixture-user"},account:{id:sessionRequests>=changeAccountAtRequest||changedAccountAfterReload&&documentLoads>=3 ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
+      await route.fulfill({json:{user:{id:"fixture-user"},account:{id:sessionRequests>=changeAccountAtRequest||changedAccountAfterReload&&documentLoads>=stopReloadAt ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
       return;
     }
     documentLoads++;
@@ -100,7 +102,7 @@ beforeAll(async () => {
       </div>
       <div data-mention-list-scroll-area hidden><button data-list-navigation-item="true" data-highlighted=""><span>${connector}</span></button></div>
       <script>
-        if (${changedUrlAfterReload&&documentLoads>=3}) history.replaceState({},'', 'https://chatgpt.com/c/changed-after-reload');
+        if (${changedUrlAfterReload&&documentLoads>=stopReloadAt}) history.replaceState({},'', 'https://chatgpt.com/c/changed-after-reload');
         const editor=document.querySelector('[contenteditable="true"]');
         const form=document.querySelector('form');const send=form.querySelector('button');
         const mentions=document.querySelector('[data-mention-list-scroll-area]');
@@ -159,7 +161,7 @@ beforeAll(async () => {
           document.body.dataset.stops=String(Number(document.body.dataset.stops)+1);
           document.body.dataset.order+='stop,';
           if(stopConfirmation)setTimeout(()=>showStopDialog(stop),stopConfirmation.delayMs??0);
-          else if (${typeof acceptsStop==="number" ? `Number(document.body.dataset.stops)>=${acceptsStop}` : acceptsStop==="reload" ? documentLoads>=3 : acceptsStop}) finishStop(stop);
+          else if (${typeof acceptsStop==="number" ? `Number(document.body.dataset.stops)>=${acceptsStop}` : acceptsStop==="reload" ? documentLoads>=stopReloadAt : acceptsStop}) finishStop(stop);
         });
         editor.addEventListener('input',()=>{
           mentions.hidden=!editor.textContent.startsWith('@');
@@ -183,11 +185,12 @@ beforeAll(async () => {
           event.preventDefault();document.body.dataset.order+='send,';document.body.dataset.sends=String(Number(document.body.dataset.sends)+1);document.body.dataset.sentText=editor.textContent;
           document.body.dataset.sentFamily=window.family;document.body.dataset.sentEffort=document.body.dataset.effort;
           editor.innerHTML='';send.disabled=true;
-          document.querySelector('#history').insertAdjacentHTML('beforeend','<section data-turn-key="new"><div data-user-message-bubble>Pair verification</div><div data-content-search-unit-key="new-answer"><div data-conversation-role="assistant"><div class="markdown"></div></div></div></section>');
+          const turnKey='new-'+document.body.dataset.sends;
+          document.querySelector('#history').insertAdjacentHTML('beforeend','<section data-turn-key="'+turnKey+'"><div data-user-message-bubble>Pair verification</div><div data-content-search-unit-key="'+turnKey+'-answer"><div data-conversation-role="assistant"><div class="markdown"></div></div></div></section>');
           if (!location.pathname.includes('/c/')) history.replaceState({},'', 'https://chatgpt.com/c/new-created-fixture');
           const finish=()=>{
             document.querySelector('[data-testid="stop-button"]')?.remove();
-            document.querySelector('[data-turn-key="new"] [data-conversation-role="assistant"]').innerHTML='<div class="markdown"><p>Verified.</p></div><button data-testid="copy-turn-action-button">Copy</button>';
+            document.querySelector('[data-turn-key="'+turnKey+'"] [data-conversation-role="assistant"]').innerHTML='<div class="markdown"><p>Verified.</p></div><button data-testid="copy-turn-action-button">Copy</button>';
           };
           if (${quietGenerationMs}>0) {
             form.insertAdjacentHTML('beforeend','<button type="button" data-testid="stop-button">Stop</button>');
@@ -205,14 +208,21 @@ afterAll(async () => {
 
 const surface: SingleBrowserSurface = {
   page:async()=>page,
-  navigate:async destination=>{await page.goto(destination);return page;},
+  navigate:async destination=>{await page.goto(destination);loadedFixtureState=fixtureState();return page;},
   reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{},
 };
+
+// Synthetic server-side changes must be installed explicitly. Browser actions
+// now reuse healthy pages, so these fixtures cannot rely on a production reload.
+function fixtureState(){return JSON.stringify([initialDraft,ready,chipName,quietGenerationMs,generatingOnLoad,acceptsStop,initialModel,shiftedEfforts,hideEffortLabels,nestedHistory,missingHistoryId,duplicateHistoryViews,destinationLocks,absentFamilies,duplicateEffortLabels,stopConfirmation,fixtureLanguage,localizedStopFallback,changedUrlAfterReload]);}
+async function syncFixture(){if(loadedFixtureState!==fixtureState()){stopReloadAt=documentLoads+2;await surface.navigate(page.url());}}
+async function executeFixture(driver:ChatGptBrowserDriver,execution:DriverExecution){await syncFixture();return driver.execute(execution);}
+async function executeCoordinatorFixture(coordinator:SingleWindowCoordinator,request:ExecuteActionRequest){await syncFixture();return coordinator.execute(request);}
 
 async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating=false,stopWorks:boolean|number|"reload"=true,model={family:"6",value:4,locked:[] as number[]}) {
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
   generatingOnLoad=generating;acceptsStop=stopWorks;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
-  documentLoads=0;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
+  documentLoads=0;stopReloadAt=2;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
   initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
   destinationLocks={};absentFamilies=[];duplicateEffortLabels=false;changeAccountAtRequest=Number.MAX_SAFE_INTEGER;
   await surface.navigate(url);
@@ -222,7 +232,7 @@ async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating
 test.skipIf(!native)("pairing waits for enabled Send and binds to the new answer after history hydration",async()=>{
   const driver=await fixture();
   const events: DriverExecution["emit"] extends (event:infer T)=>void ? T[] : never = [];
-  await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:event=>events.push(event)});
+  await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:event=>events.push(event)});
   expect(await page.evaluate(()=> Number(document.body.dataset.sends))).toBe(1);
   expect(events.some(event=>event.type==="send_accepted")).toBeTrue();
   expect(events.at(-1)).toMatchObject({type:"submission_complete",canonicalUrl:url});
@@ -231,24 +241,33 @@ test.skipIf(!native)("pairing waits for enabled Send and binds to the new answer
   expect(await page.evaluate(()=>document.body.dataset.effort)).toBe("Pro");
 },15_000);
 
+test.skipIf(!native)("successive browser sends reuse a healthy paired conversation",async()=>{
+  const driver=await fixture();
+  for(const id of ['reuse-first','reuse-second']){
+    const submitted={...offlineRequest(),actionId:id,idempotencyKey:id};
+    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  }
+  expect(documentLoads).toBe(1);expect(await page.locator('body').getAttribute('data-sends')).toBe('2');
+},15_000);
+
 test.skipIf(!native)("sending an existing conversation tolerates nested wrappers for one turn",async()=>{
   const driver=await fixture();nestedHistory=true;
   const submitted=offlineRequest('gpt-6-astra','max');
-  const error=await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const error=await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
   expect(error).toBeUndefined();expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
 },15_000);
 
 test.skipIf(!native)("sending counts duplicated history views as one logical turn",async()=>{
   const driver=await fixture();duplicateHistoryViews=true;
   const submitted=offlineRequest('gpt-6-astra','max');
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
   expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
 },15_000);
 
 test.skipIf(!native)("unsupported history markers report the cause before inserting any message",async()=>{
   const driver=await fixture();missingHistoryId=true;
   const submitted=offlineRequest('gpt-6-astra','max');
-  const error=await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const error=await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
   expect(error).toMatchObject({code:'selector_drift',message:'ChatGPT legacy turn has no stable data-turn-id'});
   expect(await composerText(await activeComposer(page))).toBe('');
   expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
@@ -282,7 +301,7 @@ test.skipIf(!native)("pairing, messages, and new chats clear pre-existing drafts
   }];
   for(const submitted of requests) {
     const driver=await fixture('Discard this existing draft');
-    await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
     expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
     expect(await page.locator('body').getAttribute('data-sent-text')).not.toContain('Discard this existing draft');
     expect(await composerText(await activeComposer(page))).toBe('');
@@ -293,7 +312,7 @@ test.skipIf(!native)("draft cleanup still requires the expected account and conv
   for(const mismatch of ['account','conversation']) {
     const driver=await fixture('Keep this draft in the wrong destination');
     const submitted={...request,...(mismatch==='account'?{expectedAccountFingerprint:'another-account'}:{expectedUrl:'https://chatgpt.com/c/another-conversation'})};
-    const error=await driver.execute({request:submitted,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const error=await executeFixture(driver,{request:submitted,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(error).toMatchObject({code:mismatch==='account'?'authentication_required':'conversation_unavailable'});
     expect(await composerText(await activeComposer(page))).toBe('Keep this draft in the wrong destination');
     expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
@@ -303,7 +322,7 @@ test.skipIf(!native)("draft cleanup still requires the expected account and conv
 test.skipIf(!native)("whitespace-only drafts are removed from the submitted text",async()=>{
   for(const draft of [' \t ','   ','\n']) {
     const driver=await fixture(draft);
-    await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
+    await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
     expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
     const sent=(await page.locator('body').getAttribute('data-sent-text'))!;
     // Chrome may insert one separator after the reselected connector chip.
@@ -333,7 +352,7 @@ test.skipIf(!native)("a cold-cache send navigates before touching models and sel
   const driver=new ChatGptBrowserDriver(targetSurface,build);
   driver.capabilities=async()=>{throw new Error("A send must not refresh the full catalog");};
   const submitted=offlineRequest();const events:Parameters<DriverExecution['emit']>[0][]=[];
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
   expect(source).toEqual({family:"6",moves:"0",families:""});
   expect(page.url()).toBe(url);
   expect(await page.evaluate(()=>document.body.dataset.familyChanges)).toBe("5.5,");
@@ -346,7 +365,7 @@ test.skipIf(!native)("an already-selected request does not cycle any effort or m
   const driver=await fixture("",true,connector,0,false,true,{family:"6",value:4,locked:[]});
   driver.capabilities=async()=>{throw new Error("Unexpected catalog refresh");};
   const submitted=offlineRequest("gpt-6-astra","max");
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
   expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe("0");
   expect(await page.evaluate(()=>document.body.dataset.familyChanges)).toBe("");
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Pro");
@@ -356,7 +375,7 @@ test.skipIf(!native)("a changed account prevents selection and Send even when fa
   const driver=await fixture("",true,connector,0,false,true,{family:"6",value:4,locked:[2]});
   const submitted={...offlineRequest("gpt-6-sol","high"),expectedAccountFingerprint:"another-account"};
   let failure:unknown;
-  try {await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
+  try {await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
   expect(failure).toBeInstanceOf(Error);
   expect(await page.evaluate(()=>document.body.dataset.sends)).toBe("0");
   expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe("0");
@@ -366,14 +385,14 @@ test.skipIf(!native)("a changed account prevents selection and Send even when fa
 test.skipIf(!native)("locked preferred models follow the fallback order and try the preference again next turn",async()=>{
   const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build);
   destinationLocks={'6':[4]};
-  const preferred=offlineRequest('gpt-6-astra','max');await coordinator.execute(preferred);
+  const preferred=offlineRequest('gpt-6-astra','max');await executeCoordinatorFixture(coordinator,preferred);
   const events=[];for await(const event of coordinator.events(preferred.actionId,0))events.push(event);
   expect(events.at(-1)?.type).toBe('submission_complete');
   expect((await coordinator.action(preferred.actionId))?.selected).toEqual({model:'gpt-5.6-sol',effort:'max'});
   expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.sends])).toEqual(['5.6','Pro','1']);
   expect(preferred.model).toBe('gpt-6-astra');expect(preferred.effort).toBe('max');
   destinationLocks={};const next={...preferred,actionId:'preferred-restored',idempotencyKey:'preferred-restored-key'};
-  await coordinator.execute(next);for await(const event of coordinator.events(next.actionId,0)){}
+  await executeCoordinatorFixture(coordinator,next);for await(const event of coordinator.events(next.actionId,0)){}
   expect((await coordinator.action(next.actionId))?.selected).toEqual({model:'gpt-6-astra',effort:'max'});
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe('Pro');await coordinator.close();
 },20_000);
@@ -385,7 +404,7 @@ test.skipIf(!native)("goal continuations advance to the next available model on 
     destinationLocks=turn===1?{'6':[4]}:{'6':[4],'5.6':[4]};
     const next:ExecuteActionRequest={...preferred,actionId:`goal-turn-${turn}`,idempotencyKey:`goal-turn-${turn}-key`,
       prompt:turn===1?{kind:'offline_goal',goalRevision:1}:{kind:'offline_combined',goalRevision:1,batchId:'goal-follow-up',messages:[{id:'follow-up',markdown:'Continue'}]}};
-    await coordinator.execute(next);
+    await executeCoordinatorFixture(coordinator,next);
     const events=[];for await(const event of coordinator.events(next.actionId,0))events.push(event);
     expect(events.at(-1)?.type).toBe('submission_complete');
     expect(events.filter(event=>event.type==='send_accepted')).toHaveLength(1);
@@ -403,7 +422,7 @@ test.skipIf(!native)("fallback skips missing families and locked efforts in the 
   for(const locked of [[4],[4,3]]) {
     const driver=await fixture();destinationLocks={'6':locked};absentFamilies=['5.6'];
     const submitted=offlineRequest('gpt-6-astra','max'),events:Parameters<DriverExecution['emit']>[0][]=[];
-    await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
     expect(events.find(event=>event.type==='model_verified')).toMatchObject({model:'gpt-6-sol',effort:locked.length===1?'xhigh':'high'});
     expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.sends])).toEqual(['6',locked.length===1?'Extra High':'High','1']);
   }
@@ -414,7 +433,7 @@ test.skipIf(!native)("exhausted fallbacks, ambiguous picker state, and changed a
     const driver=await fixture();destinationLocks=mode==='exhausted'?{'6':[0,1,2,3,4],'5.6':[0,1,2,3,4],'5.5':[0,1,2,3,4]}:mode==='account'?{'6':[4]}:{};
     duplicateEffortLabels=mode==='ambiguous';if(mode==='account')changeAccountAtRequest=2;
     const submitted=offlineRequest(mode==='ambiguous'?'gpt-6-sol':'gpt-6-astra',mode==='ambiguous'?'high':'max');
-    let failure:unknown;try{await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
+    let failure:unknown;try{await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});}catch(error){failure=error;}
     expect(failure).toBeInstanceOf(Error);expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');
     expect(await composerText(await activeComposer(page))).toBe('');
     if(mode==='exhausted')expect((failure as Error).message).toContain('all supported fallbacks');
@@ -430,7 +449,7 @@ test.skipIf(!native)("a stale catalog index does not override the destination's 
   shiftedEfforts=true;
   await page.goto("https://chatgpt.com/c/unrelated-conversation");
   const submitted=offlineRequest("gpt-5.5-sol","high");
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
   expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort])).toEqual(["5.5","High"]);
   expect(await page.locator('[role="slider"]').getAttribute('aria-valuenow')).toBe("9");
 },15_000);
@@ -442,7 +461,7 @@ test.skipIf(!native)("unlabeled destination ticks use a verified cache hint or w
     hideEffortLabels=true;
     await page.goto("https://chatgpt.com/c/unrelated-conversation");
     const submitted=offlineRequest("gpt-6-sol",warm?"high":"low");
-    await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
     expect(await page.evaluate(()=>document.body.dataset.familyChanges)).toBe("");
     expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe(warm?"2":"4");
     expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe(warm?"High":"Instant");
@@ -452,7 +471,7 @@ test.skipIf(!native)("unlabeled destination ticks use a verified cache hint or w
 test.skipIf(!native)("a destination effort locked after selection prevents Send",async()=>{
   const driver=await fixture("",false);
   const submitted=offlineRequest("gpt-6-sol","high");
-  const run=driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const run=executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
   await page.waitForFunction(()=>document.querySelector('[contenteditable="true"]')!.textContent!.includes('goal'));
   await page.locator('[data-selected="true"]').evaluate(element=>element.setAttribute('data-locked','true'));
   await page.locator('button[type="submit"]').evaluate(element=>(element as HTMLButtonElement).disabled=false);
@@ -465,7 +484,7 @@ test.skipIf(!native)("pairing uses Medium for each model family and restores the
   for(const model of [{family:"6",value:4,locked:[]},{family:"5.6",value:2,locked:[]},{family:"5.5",value:11,locked:[]}]) {
     const driver=await fixture("",true,connector,31_000,false,true,model);
     const started=Date.now();
-    await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
+    await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
     expect(Date.now()-started).toBeLessThan(10_000);
     expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Medium");
     expect(await page.evaluate(()=>document.body.dataset.sentFamily)).toBe(model.family);
@@ -479,7 +498,7 @@ test.skipIf(!native)("pairing uses Medium for each model family and restores the
 
 test.skipIf(!native)("already-Medium pairing does not move the effort slider",async()=>{
   const driver=await fixture("",true,connector,0,false,true,{family:"6",value:1,locked:[]});
-  await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Medium");
   expect(await page.evaluate(()=>document.body.dataset.effort)).toBe("Medium");
   expect(await page.evaluate(()=>document.body.dataset.effortChanges)).toBe("0");
@@ -488,7 +507,7 @@ test.skipIf(!native)("already-Medium pairing does not move the effort slider",as
 test.skipIf(!native)("unavailable Medium preserves the chosen settings without sending a pairing turn",async()=>{
   const driver=await fixture("",true,connector,0,false,true,{family:"6",value:4,locked:[1]});
   let failure:unknown;
-  try { await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}); } catch(error) {failure=error;}
+  try { await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}); } catch(error) {failure=error;}
   expect(failure).toBeInstanceOf(Error);
   expect((failure as Error).message).toContain("Medium mode is unavailable");
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(0);
@@ -499,7 +518,7 @@ test.skipIf(!native)("unavailable Medium preserves the chosen settings without s
 test.skipIf(!native)("external model or effort changes during pairing are preserved and prevent Send",async()=>{
   for(const changed of ["family","effort"]) {
     const driver=await fixture("",false);
-    const run=driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const run=executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     await page.waitForFunction(()=>document.querySelector('[contenteditable="true"]')!.textContent!.includes('automation_verify_pairing'));
     await page.locator('#effort').click();
     if(changed==='family') await page.locator('[data-family="5.6"]').click();
@@ -518,7 +537,7 @@ test.skipIf(!native)("automatic pairing uses Medium before applying the configur
   const create:ExecuteActionRequest={...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",model:"gpt-6-astra",effort:"max",prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
   const events:Parameters<DriverExecution['emit']>[0][]=[];
   const coordinator=new SingleWindowCoordinator(driver,build);
-  await coordinator.execute(create);for await(const event of coordinator.events(create.actionId,0))events.push(event);
+  await executeCoordinatorFixture(coordinator,create);for await(const event of coordinator.events(create.actionId,0))events.push(event);
   expect(await page.evaluate(()=>document.body.dataset.sentEffort)).toBe("Medium");
   expect(await page.evaluate(()=>document.body.dataset.sentFamily)).toBe("5.6");
   expect(await page.evaluate(()=>document.body.dataset.effort)).toBe("Pro");
@@ -534,7 +553,7 @@ test.skipIf(!native)("cancelled automatic pairing preserves the original compose
   const driver=await fixture("",false,connector,0,false,true,{family:"5.6",value:2,locked:[]});
   const create:ExecuteActionRequest={...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",model:"gpt-6-astra",effort:"max",prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
   const controller=new AbortController();
-  const run=driver.execute({request:create,renderedPrompt:renderActionPrompt(create.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const run=executeFixture(driver,{request:create,renderedPrompt:renderActionPrompt(create.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
   await page.waitForFunction(()=>document.querySelector('[contenteditable="true"]')!.textContent!.includes('continue_task'));
   controller.abort();expect(await run).toBeInstanceOf(Error);
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(0);
@@ -547,7 +566,7 @@ test.skipIf(!native)("cancelled automatic pairing preserves the original compose
 test.skipIf(!native)("automatic pairing cannot fall back to a configured thinking request when Medium is locked",async()=>{
   const driver=await fixture("",true,connector,0,false,true,{family:"5.6",value:2,locked:[1]});
   const create:ExecuteActionRequest={...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",model:"gpt-6-astra",effort:"max",prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
-  const failure=await driver.execute({request:create,renderedPrompt:renderActionPrompt(create.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const failure=await executeFixture(driver,{request:create,renderedPrompt:renderActionPrompt(create.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
   expect(failure).toMatchObject({code:"model_unavailable",sendAccepted:false});
   expect(await page.evaluate(()=>document.body.dataset.sends)).toBe("0");
   expect(await page.evaluate(()=>[document.body.dataset.family,document.body.dataset.effort])).toEqual(["5.6","High"]);
@@ -557,7 +576,7 @@ test.skipIf(!native)("automatic pairing cannot fall back to a configured thinkin
 test.skipIf(!native)("existing-chat pairing ignores configured model selection and restores its original choice",async()=>{
   const driver=await fixture("",true,connector,31_000,false,true,{family:"5.6",value:2,locked:[]});
   const configured={...request,model:"gpt-6-astra",effort:"max"};
-  await driver.execute({request:configured,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request:configured,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}});
   expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort])).toEqual(["5.6","Medium"]);
   expect(await page.evaluate(()=>[document.body.dataset.family,document.body.dataset.effort])).toEqual(["5.6","High"]);
   expect(configured.model).toBe("gpt-6-astra");expect(configured.effort).toBe("max");
@@ -566,7 +585,7 @@ test.skipIf(!native)("existing-chat pairing ignores configured model selection a
 test.skipIf(!native)("an aborted pre-Send wait clears only the unchanged owned prompt",async()=>{
   for (const edited of [false,true]) {
     const driver=await fixture("",false);const controller=new AbortController();
-    const run=driver.execute({request,renderedPrompt:prompt,signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const run=executeFixture(driver,{request,renderedPrompt:prompt,signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
     await page.waitForFunction(()=>document.querySelector('[contenteditable="true"]')!.textContent!.includes('automation_verify_pairing'));
     if (edited) await page.locator('[contenteditable="true"]').pressSequentially(" user edit");
     const beforeAbort=await composerText(await activeComposer(page));
@@ -584,7 +603,7 @@ test.skipIf(!native)("Replace pairing recovers an old verification draft without
   const driver=await fixture(oldPrompt);const coordinator=new SingleWindowCoordinator(driver,build);
   expect((await coordinator.health()).status).toBe("idle");
   expect((await coordinator.health()).activeActionId).toBeNull();
-  await coordinator.execute(request);
+  await executeCoordinatorFixture(coordinator,request);
   const events=[];for await (const event of coordinator.events(request.actionId,0)) events.push(event);
   expect(await page.evaluate(()=> Number(document.body.dataset.sends))).toBe(1);
   expect(await page.evaluate(()=> document.body.dataset.sentText)).toContain(newReference);
@@ -596,7 +615,7 @@ test.skipIf(!native)("Replace pairing recovers an old verification draft without
 test.skipIf(!native)("an exact connector menu choice binds an unrelated internal chip name to its app identity",async()=>{
   const driver=await fixture(oldPrompt,true,"internal-name-unrelated-to-display-label");
   const coordinator=new SingleWindowCoordinator(driver,build);
-  await coordinator.execute(request);
+  await executeCoordinatorFixture(coordinator,request);
   const events=[];for await (const event of coordinator.events(request.actionId,0)) events.push(event);
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(1);
   expect(events.at(-1)?.type).toBe("submission_complete");
@@ -604,7 +623,7 @@ test.skipIf(!native)("an exact connector menu choice binds an unrelated internal
 
 test.skipIf(!native)("a connector app identity changed after selection is rejected before Send",async()=>{
   const driver=await fixture("",false,"internal-name-unrelated-to-display-label");
-  const run=driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}})
+  const run=executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:()=>{}})
     .then(()=>undefined,error=>error);
   await page.waitForFunction(()=>document.querySelector('[contenteditable="true"]')!.textContent!.includes('automation_verify_pairing'));
   await page.locator('[app-mention-path]').evaluate(element=>element.setAttribute('app-mention-path','app://different-app'));
@@ -653,7 +672,7 @@ test.skipIf(!native)("submission releases the window while the response continue
   const driver=await fixture("",true,connector,31_000);
   const coordinator=new SingleWindowCoordinator(driver,build);
   const began=Date.now();
-  await coordinator.execute(request);
+  await executeCoordinatorFixture(coordinator,request);
   const events=[];for await(const event of coordinator.events(request.actionId,0)) events.push(event);
   expect(Date.now()-began).toBeLessThan(10_000);
   expect(events.some(event=>["status_delta","commentary_delta","answer_delta","generation_complete"].includes(event.type))).toBeFalse();
@@ -664,7 +683,7 @@ test.skipIf(!native)("submission releases the window while the response continue
   expect((await coordinator.health()).status).toBe("idle");
   const nextUrl="https://chatgpt.com/c/another-pair-fixture";
   const next={...request,actionId:"next-pair",idempotencyKey:"next-pair-key",url:nextUrl,expectedUrl:nextUrl};
-  await coordinator.execute(next);
+  await executeCoordinatorFixture(coordinator,next);
   const nextEvents=[];for await(const event of coordinator.events(next.actionId,0)) nextEvents.push(event);
   expect(nextEvents.at(-1)?.type).toBe("submission_complete");
 },15_000);
@@ -679,7 +698,7 @@ test.skipIf(!native)("offline messages and goals stop lingering generation befor
     const driver=await fixture("",true,connector,31_000,true);
     const coordinator=new SingleWindowCoordinator(driver,build);
     const offline={...request,prompt:actionPrompt};
-    await coordinator.execute(offline);
+    await executeCoordinatorFixture(coordinator,offline);
     const events=[];for await(const event of coordinator.events(offline.actionId,0)) events.push(event);
     expect(events.at(-1)).toMatchObject({type:"submission_complete"});
     expect(await page.evaluate(()=>document.body.dataset.order)).toBe("stop,stopped,send,");
@@ -701,7 +720,7 @@ test.skipIf(!native)("offline Stop confirms an optional localized dialog before 
     const driver=await fixture("",true,connector,0,true);
     stopConfirmation={delayMs:index===1?350:0};
     const offline:ExecuteActionRequest={...request,prompt:actionPrompt};
-    await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+    await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
     expect(await page.locator("body").getAttribute("data-order")).toBe("stop,confirm,stopped,send,");
     expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
@@ -715,7 +734,7 @@ test.skipIf(!native)("offline Stop never confirms a preexisting or ambiguous dia
     const driver=await fixture("",true,connector,0,true);
     stopConfirmation={[scenario]:true};
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:"external_interference"});
     expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
@@ -730,7 +749,7 @@ test.skipIf(!native)("offline Stop rechecks account and conversation before conf
     stopConfirmation={changeUrl:mismatch==="conversation"};
     if(mismatch==="account")changeAccountAtRequest=3;
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:mismatch==="account"?"authentication_required":"conversation_unavailable"});
     expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
@@ -744,7 +763,7 @@ test.skipIf(!native)("an unresponsive Stop confirmation is bounded and does not 
   const coordinator=new SingleWindowCoordinator(driver,build);
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
   const began=Date.now();
-  await coordinator.execute(offline);
+  await executeCoordinatorFixture(coordinator,offline);
   const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
   expect(Date.now()-began).toBeLessThan(10_000);
   expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
@@ -760,7 +779,7 @@ test.skipIf(!native)("a cancelled Stop confirmation never inserts or sends a pro
   stopConfirmation={persists:true};
   const controller=new AbortController();
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  const running=driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const running=executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
   await page.waitForFunction(()=>document.body.dataset.confirmations==="1");
   controller.abort();
   expect(await running).toBeDefined();
@@ -776,7 +795,7 @@ for(const locale of [
 test.skipIf(!native)(`${locale.name} pairing borrows Medium and restores the saved effort without English labels`,async()=>{
   const driver=await fixture();fixtureLanguage=locale.code;
   const events:Parameters<DriverExecution["emit"]>[0][]=[];
-  await driver.execute({request,renderedPrompt:prompt,signal:new AbortController().signal,emit:event=>events.push(event)});
+  await executeFixture(driver,{request,renderedPrompt:prompt,signal:new AbortController().signal,emit:event=>events.push(event)});
   expect(await page.locator("body").getAttribute("data-sent-effort")).toBe(locale.medium);
   expect(await page.locator("body").getAttribute("data-effort")).toBe("Pro");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
@@ -787,7 +806,7 @@ test.skipIf(!native)(`${locale.name} selection, Stop fallback and confirmation s
   const driver=await fixture("",true,connector,0,true);fixtureLanguage=locale.code;localizedStopFallback=true;stopConfirmation={delayMs:200};
   const submitted:ExecuteActionRequest={...request,model:"gpt-6-sol",effort:"xhigh",prompt:{kind:"offline_chat",batchId:`${locale.code}-message`,messages:[{id:locale.code,markdown:locale.message}]}};
   const events:Parameters<DriverExecution["emit"]>[0][]=[];
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
   expect(await page.locator("body").getAttribute("data-sent-effort")).toBe(locale.extraHigh);
   expect(await page.locator("body").getAttribute("data-order")).toBe("stop,confirm,stopped,send,");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
@@ -800,7 +819,7 @@ test.skipIf(!native)(`${locale.name} unavailable-model fallback preserves the pr
   const driver=await fixture("",true,connector,0,false,true,{family:"6",value:3,locked:[4]});fixtureLanguage=locale.code;
   const submitted=offlineRequest("gpt-6-astra","max");
   const events:Parameters<DriverExecution["emit"]>[0][]=[];
-  await driver.execute({request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+  await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
   expect(events).toContainEqual({type:"model_verified",model:"gpt-5.6-sol",effort:"max"});
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
   expect(submitted.model).toBe("gpt-6-astra");
@@ -813,7 +832,7 @@ test.skipIf(!native)("offline Stop requires the paired conversation and account 
     const driver=await fixture("",true,connector,0,true);
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1},
       ...(mismatch==="conversation"?{expectedUrl:"https://chatgpt.com/c/other"}:{expectedAccountFingerprint:"other-account"})};
-    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:mismatch==="conversation"?"conversation_unavailable":"authentication_required"});
     expect(await page.locator("body").getAttribute("data-stops")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
@@ -823,17 +842,17 @@ test.skipIf(!native)("offline Stop requires the paired conversation and account 
 test.skipIf(!native)("an ignored first Stop is retried automatically before sending once",async()=>{
   const driver=await fixture("",true,connector,0,true,2);
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
   expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stop,stopped,send,");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
-  expect(documentLoads).toBe(2);
+  expect(documentLoads).toBe(1);
 },15_000);
 
 test.skipIf(!native)("a stuck Stop is rehydrated and stopped automatically before sending once",async()=>{
   const driver=await fixture("",true,connector,0,true,"reload");
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
-  expect(documentLoads).toBe(3);
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+  expect(documentLoads).toBe(2);
   expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stopped,send,");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
 },20_000);
@@ -841,8 +860,8 @@ test.skipIf(!native)("a stuck Stop is rehydrated and stopped automatically befor
 test.skipIf(!native)("Stop recovery clears an existing draft and reloads before sending once",async()=>{
   const driver=await fixture("A draft I am writing",true,connector,0,true,"reload");
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
-  expect(documentLoads).toBe(3);
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+  expect(documentLoads).toBe(2);
   expect(await composerText(await activeComposer(page))).toBe("");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
   expect(await page.locator("body").getAttribute("data-sent-text")).not.toContain("A draft I am writing");
@@ -853,9 +872,9 @@ test.skipIf(!native)("Stop recovery revalidates the account and conversation aft
     const driver=await fixture("",true,connector,0,true,false);
     changedAccountAfterReload=mismatch==="account";changedUrlAfterReload=mismatch==="conversation";
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-    const failure=await driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:mismatch==="account" ? "authentication_required" : "conversation_unavailable"});
-    expect(documentLoads).toBe(3);
+    expect(documentLoads).toBe(mismatch==="account"?2:3);
     expect(await page.locator("body").getAttribute("data-stops")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
   }
@@ -865,7 +884,7 @@ test.skipIf(!native)("a cancelled offline Stop never inserts or sends its prompt
   const driver=await fixture("",true,connector,0,true,false);
   const controller=new AbortController();
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  const run=driver.execute({request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+  const run=executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
   await page.waitForFunction(()=>document.body.dataset.stops==="1");
   controller.abort();
   expect(await run).toBeDefined();
@@ -878,7 +897,7 @@ test.skipIf(!native)("an unresponsive Stop times out before Send and releases br
   const coordinator=new SingleWindowCoordinator(driver,build);
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
   const began=Date.now();
-  await coordinator.execute(offline);
+  await executeCoordinatorFixture(coordinator,offline);
   const events=[];for await(const event of coordinator.events(offline.actionId,0)) events.push(event);
   expect(Date.now()-began).toBeLessThan(12_000);
   expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
@@ -905,7 +924,7 @@ test.skipIf(!native)("chat ID survives project, ordinary-route, and slug rewrite
   const driver=new ChatGptBrowserDriver(rewritingSurface,build);
   const coordinator=new SingleWindowCoordinator(driver,build);
   const projected:ExecuteActionRequest={...request,url:longUrl,expectedUrl:longUrl,prompt:{kind:"offline_goal",goalRevision:1}};
-  await coordinator.execute(projected);
+  await executeCoordinatorFixture(coordinator,projected);
   const events=[];for await(const event of coordinator.events(projected.actionId,0))events.push(event);
   expect(events.at(-1)).toMatchObject({type:"submission_complete",canonicalUrl:`https://chatgpt.com/c/${conversation}`});
   expect((await coordinator.action(projected.actionId))?.canonicalUrl).toBe(`https://chatgpt.com/c/${conversation}`);
@@ -926,7 +945,7 @@ test.skipIf(!native)("a different chat ID before Send remains rejected",async()=
     const driver=new ChatGptBrowserDriver(movedSurface,build);
     const coordinator=new SingleWindowCoordinator(driver,build);
     const projected:ExecuteActionRequest={...request,url:expected,expectedUrl:expected,prompt:{kind:"offline_goal",goalRevision:1}};
-    await coordinator.execute(projected);
+    await executeCoordinatorFixture(coordinator,projected);
     const events=[];for await(const event of coordinator.events(projected.actionId,0))events.push(event);
     expect(events.at(-1)).toMatchObject({type:"failed",code:"conversation_unavailable"});
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
@@ -944,12 +963,16 @@ test.skipIf(!native)("new chats bind the created URL after sending the initializ
     }};
     class CreationDriver extends ChatGptBrowserDriver { override async capabilities(){return {protocolVersion:1 as const,build,accountFingerprint:request.expectedAccountFingerprint,catalogRevision:"fixture",models:[{id:"fixture-model",label:"Fixture model",efforts:[{id:"fixture-effort",label:"Fixture effort",available:true,reason:null}]}]};} }
     const driver=new CreationDriver(creationSurface,build);
+    await driver.prepareNewChat(destination==='https://chatgpt.com/new'?null:destination);
+    const preparedLoads=documentLoads;
+    await page.evaluate(destination=>history.replaceState({},'',destination==='https://chatgpt.com/new'?'/c/local-chatgpt:prepared':'/g/g-p-0123456789abcdef0123456789abcdef-canonical/project'),destination);
     const coordinator=new SingleWindowCoordinator(driver,build);
     const creation:ExecuteActionRequest={...request,url:destination,expectedUrl:destination,prompt:{kind:"create_chat",continuationToken:"A".repeat(43),reference:newReference,setupReference:null}};
-    await coordinator.execute(creation);const events=[];for await(const event of coordinator.events(creation.actionId,0))events.push(event);
+    await executeCoordinatorFixture(coordinator,creation);const events=[];for await(const event of coordinator.events(creation.actionId,0))events.push(event);
     expect(events.at(-1)).toMatchObject({type:"submission_complete",canonicalUrl:"https://chatgpt.com/c/new-created-chat"});
     expect(await page.evaluate(()=>document.body.dataset.sentText)).toContain("continue_task");
     expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(1);
+    expect(documentLoads).toBe(preparedLoads);
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
 },15_000);
@@ -981,7 +1004,7 @@ test.skipIf(!native)("a cached healthy identity cannot authorize a send after th
   expect((await coordinator.health()).authenticated).toBeTrue();expect(sessionRequests).toBe(1);
   changedAccountAfterReload=true;documentLoads=3;
   expect((await coordinator.health()).authenticated).toBeTrue();expect(sessionRequests).toBe(1);
-  await coordinator.execute(request);const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
+  await executeCoordinatorFixture(coordinator,request);const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
   expect(events.at(-1)?.type).toBe('authentication_required');expect((await coordinator.action(request.actionId))?.sendAccepted).toBeFalse();
   expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');expect(sessionRequests).toBe(2);
 },15_000);
@@ -991,7 +1014,7 @@ test.skipIf(!native)("a created conversation URL is retained when applying the s
  const driver=await fixture("",true,connector,0,false,true,{family:"5.6",value:2,locked:[]});
  const create:ExecuteActionRequest={...request,url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",model:"gpt-99-sol",effort:"max",prompt:{kind:"create_chat",reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
  const coordinator=new SingleWindowCoordinator(driver,build),events:Parameters<DriverExecution['emit']>[0][]=[];
- await coordinator.execute(create);for await(const event of coordinator.events(create.actionId,0))events.push(event);
+ await executeCoordinatorFixture(coordinator,create);for await(const event of coordinator.events(create.actionId,0))events.push(event);
  const created=events.findIndex(event=>event.type==='conversation_created');
  expect(created).toBeGreaterThan(events.findIndex(event=>event.type==='send_accepted'));
  expect(events[created]).toMatchObject({type:'conversation_created',canonicalUrl:'https://chatgpt.com/c/new-created-fixture'});

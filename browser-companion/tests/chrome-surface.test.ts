@@ -15,6 +15,10 @@ import { readTurnDomState } from "../src/turn-binding";
 const fakeExecutablePath = join(tmpdir(), "managed-chrome");
 
 class FakePage extends EventEmitter {
+  currentUrl="about:blank";
+  url=()=>this.currentUrl;
+  owner:FakeContext|undefined;
+  context=()=>this.owner as unknown as BrowserContext;
   isClosed = () => this.closed;
   closed = false;
   navigations: string[] = [];
@@ -23,6 +27,7 @@ class FakePage extends EventEmitter {
   async goto(url: string) {
     if (this.navigationError) throw this.navigationError;
     this.navigations.push(url);
+    this.currentUrl=url;
   }
   async waitForLoadState() {}
   async bringToFront() { this.revealed = true; }
@@ -33,10 +38,11 @@ class FakeContext extends EventEmitter {
   closed = false;
   windowState = "normal";
   createdTargets: unknown[] = [];
-  constructor(readonly tabs = [new FakePage()]) { super(); }
+  constructor(readonly tabs = [new FakePage()]) { super();for(const page of tabs)page.owner=this; }
   pages() { return this.tabs.filter(page => !page.isClosed()) as unknown as Page[]; }
   async newPage() {
     const page = new FakePage();
+    page.owner=this;
     this.tabs.push(page);
     this.emit("page", page);
     return page as unknown as Page;
@@ -118,6 +124,12 @@ test("startup creates a background page and only an explicit reveal restores foc
   await surface.reveal();
   expect(fake.windowState).toBe("normal");
   expect(fake.tabs[0]!.revealed).toBeTrue();
+});
+
+test("startup preserves a restored ChatGPT conversation without loading home",async()=>{
+  const shared=new FakePage();shared.currentUrl='https://chatgpt.com/c/restored';
+  const {surface}=await createSurface([shared]);
+  expect(shared.navigations).toEqual([]);expect(await surface.page()).toBe(shared as unknown as Page);
 });
 
 test("background launch retains Patchright's transport and private profile without a startup URL", async () => {

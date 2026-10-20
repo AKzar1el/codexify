@@ -212,6 +212,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("account-m
    const driver=new ChatGptBrowserDriver({page:async()=>page,navigate:async url=>{await page.goto(url);return page;},reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{}},protocolBuild('menu-plan-test'));
    const coordinator=new SingleWindowCoordinator(driver,protocolBuild('menu-plan-test'));
    const check=async(epoch:string,expected:string,kind:string)=>{
+    await page.evaluate(({name,label})=>{const column=document.querySelector('#account-row > div:last-child');if(column){column.replaceChildren();for(const text of [name,...(label?[label]:[])]){const span=document.createElement('span');span.textContent=text;column.append(span);}}},{name,label});
     const started=Date.now(),plan=await coordinator.accountPlan(epoch);
     expect(plan.label).toBe(expected);expect(plan.kind).toBe(kind as any);
     expect(Date.now()-started).toBeLessThan(8_000);
@@ -220,12 +221,14 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("account-m
    };
    await check('pro','Pro','pro');
    const reads={billingReads,menuReads};await check('pro','Pro','pro');expect({billingReads,menuReads}).toEqual(reads);
+   label='Pro 200';await page.locator('#prompt-textarea').fill('Keep my draft');const beforeMenuPlan=billingReads;await check('menu-tier','Pro 20x','pro');expect(billingReads).toBe(beforeMenuPlan);expect(await page.locator('#prompt-textarea').innerText()).toBe('Keep my draft');await page.locator('#prompt-textarea').fill('');
    name='Pro';label='Go';testId=false;await check('go','Go','go');
    name='Another person';label='Research membership';await check('unknown','Research membership','unknown');
    label='';await check('missing','','unknown');
    const missingReads={billingReads,menuReads};await check('missing','','unknown');expect({billingReads,menuReads}).toEqual(missingReads);
+   billing='<h2>ChatGPT Pro 200</h2>';label='Research membership';await check('unknown-menu-billing','Pro 20x','pro');
    billing='<h2>ChatGPT Pro 200</h2>';label='Pro';const before=menuReads;
-   await check('billing','Pro 20x','pro');expect(menuReads).toBe(before);
+   await check('billing','Pro 20x','pro');expect(menuReads).toBe(before+1);
    const originalGoto=page.goto.bind(page),goto=spyOn(page,'goto');
    goto.mockImplementation(async(url,options)=>{if(url.endsWith('/settings/billing'))throw Error('Billing navigation failed');return originalGoto(url,options);});
    try {await check('navigation-failed','Pro','pro');}finally{goto.mockRestore();}

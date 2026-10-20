@@ -138,7 +138,7 @@ test.skipIf(!native)("ordinary sends and goal retries retain the specific conver
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
   expect(clicks).toBe(0);
-});
+},20_000);
 
 test.skipIf(!native)("retry reloads the failed conversation and navigates back to it from another failed chat", async () => {
   currentHtml = errorPage("Unavailable", "Riprova");
@@ -164,7 +164,7 @@ test.skipIf(!native)("retry reloads the failed conversation and navigates back t
   await surface.navigate(url);
   await run({...base, actionId:"retry-from-another-conversation", idempotencyKey:"retry-from-another-conversation"});
   expect(clicks).toBe(0);
-});
+},20_000);
 
 test.skipIf(!native)("ordinary content, hidden panels, other routes and incomplete error structures are not conversation load failures", async () => {
   const html = errorPage(...labels[0]);

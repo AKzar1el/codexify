@@ -19,7 +19,23 @@ import {completedHandoff} from "../src/turn-renewal";
 import {mkdtemp,rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
+import {ChatGptBrowserDriver,type SingleBrowserSurface} from "../src/chatgpt-driver";
+import {protocolBuild} from "../src/protocol";
 const native=process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME==="1";
+test.skipIf(!native)("handoff polls reuse the current document and bound visits after another chat takes the tab",async()=>{
+ const executablePath=await privateChromeExecutable(join(import.meta.dirname,'../.browsers',`${process.platform}-${process.arch}`));
+ const browser=await chromium.launch({executablePath,headless:true});
+ try{
+  const context=await browser.newContext(),page=await context.newPage(),url='https://chatgpt.com/c/handoff-poll',account=fingerprintAccountIdentity('user','account');let running=false,loads=0;
+  await context.route('https://chatgpt.com/**',route=>new URL(route.request().url()).pathname==='/api/auth/session'?route.fulfill({json:{user:{id:'user'},account:{id:'account',structure:'personal',planType:'pro'}}}):route.fulfill({contentType:'text/html',body:`<article data-testid="conversation-turn-1" data-turn="assistant" data-turn-id="final"><div class="markdown"><p>Turn handoff ${id}</p><p>Work performed. Current state. Next steps.</p></div><button data-testid="copy-turn-action-button">Copy</button></article>${running?'<button data-testid="stop-button">Stop</button>':''}`}));
+  const surface:SingleBrowserSurface={page:async()=>page,navigate:async target=>{loads++;await page.goto(target);return page;},reveal:async()=>{},beginAction:async()=>{},endAction:async()=>{},close:async()=>{}};
+  const driver=new ChatGptBrowserDriver(surface,protocolBuild('handoff-navigation-test'));
+  await page.goto(url);expect(await driver.turnHandoffComplete(url,account,id)).toBe(true);expect(loads).toBe(0);
+  running=true;await page.goto('https://chatgpt.com/c/other');expect(await driver.turnHandoffComplete(url,account,id)).toBe(false);expect(loads).toBe(1);
+  await page.goto('https://chatgpt.com/c/other');expect(await driver.turnHandoffComplete(url,account,id)).toBe(false);expect(loads).toBe(1);
+  running=false;await page.goto(url);expect(await driver.turnHandoffComplete(url,account,id)).toBe(true);expect(loads).toBe(1);
+ }finally{await browser.close();}
+},15_000);
 for(const grouped of [false,true])test.skipIf(!native)(`real Chrome proves the exact final and rejects running, old, changing and wrong-account reports (${grouped?"grouped":"legacy"})`,async()=>{
  const profile=await mkdtemp(join(tmpdir(),"turn-renewal-fixture-"));const executablePath=await privateChromeExecutable(join(import.meta.dirname,"../.browsers",`${process.platform}-${process.arch}`));
  const context=await chromium.launchPersistentContext(profile,{channel:"chrome",executablePath,headless:true});

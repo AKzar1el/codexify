@@ -1,8 +1,10 @@
 import type {Page} from "patchright";
 import {uiLabels,escapeUiPattern,normalizeUiLabel} from "./ui-localization";
 import {readChatGptAccount} from "./account";
-import {selectConnector,SELECTED_CONNECTOR_SELECTOR} from "./connector-selection";
+import {selectConnector,SELECTED_CONNECTOR_SELECTOR,clearComposerState} from "./connector-selection";
+import {CHATGPT_COMPOSER_SELECTOR} from "./session";
 import {BrowserCompanionError,selectorDrift} from "./errors";
+import {navigatePage} from "./navigation";
 
 export type AccountPlan = {label:string; sourceLabel:string; kind:"free"|"go"|"pro"|"unknown"; accountFingerprint:string};
 function traceRefresh(phase:string):void {
@@ -53,7 +55,7 @@ async function readAccountMenuPlan(page:Page,previousUrl:string,signal?:AbortSig
   signal?.throwIfAborted();
   if(!await markAccountMenuButton(page)) {
     if(page.url()===previousUrl)return null;
-    await page.goto(previousUrl,{waitUntil:"domcontentloaded",timeout:2_000,signal});
+    await navigatePage(page,previousUrl,{timeout:2_000,signal});
     if(!await markAccountMenuButton(page))return null;
   }
   const trigger=page.locator('[data-account-plan-menu-target="true"]');
@@ -98,14 +100,22 @@ async function readAccountMenuPlan(page:Page,previousUrl:string,signal?:AbortSig
 
 export async function readBillingPlan(page:Page,signal?:AbortSignal):Promise<AccountPlan> {
   const previousUrl=page.url();
+  const menuLabel=await readAccountMenuPlan(page,previousUrl,signal);
+  if(menuLabel){
+    const plan=classifyPlan(menuLabel);
+    // A plain Pro label does not identify its billing tier. Keep the billing
+    // fallback for that case instead of silently replacing Pro 20x with Pro.
+    if(new RegExp(planLabelPattern,"iu").test(menuLabel)&&(plan.kind!=="pro"||plan.label!=="Pro"))return {...plan,accountFingerprint:(await readChatGptAccount(page)).fingerprint};
+  }
   let billingReady=false;
   try {
-    await page.goto("https://chatgpt.com/settings/billing",{waitUntil:"domcontentloaded",timeout:5_000,signal});
+    if(page.url()!=="https://chatgpt.com/settings/billing"&&await page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true}).count()===1)await clearComposerState(page,"",signal);
+    await navigatePage(page,"https://chatgpt.com/settings/billing",{timeout:5_000,signal});
     await page.locator("body").waitFor({state:"visible",timeout:1_000,signal});
     billingReady=true;
   } catch {
     signal?.throwIfAborted();
-    await page.goto(previousUrl,{waitUntil:"domcontentloaded",timeout:2_000,signal});
+    await navigatePage(page,previousUrl,{timeout:2_000,signal});
   }
   const account=await readChatGptAccount(page);
   let sourceLabel:string|null|undefined;
@@ -133,7 +143,7 @@ export async function readBillingPlan(page:Page,signal?:AbortSignal):Promise<Acc
     }while(Date.now()<deadline);
   }
   if(!sourceLabel) {
-    try {sourceLabel=await readAccountMenuPlan(page,previousUrl,signal);}
+    try {sourceLabel=menuLabel??await readAccountMenuPlan(page,previousUrl,signal);}
     catch {signal?.throwIfAborted();}
     if((await readChatGptAccount(page)).fingerprint!==account.fingerprint)throw new BrowserCompanionError("ChatGPT account changed during plan inspection","authentication_required");
   }
@@ -209,7 +219,7 @@ export async function identifyConnectorApp(page:Page,connectorName:string,expect
   const observed=await observedConnectorApp(page,connectorName);
   if(observed)return observed;
   const current=new URL(page.url());
-  if(current.origin!=="https://chatgpt.com"||current.pathname!=="/"||current.search)await page.goto("https://chatgpt.com/",{waitUntil:"domcontentloaded",timeout:30_000,signal});
+  if(current.origin!=="https://chatgpt.com"||current.pathname!=="/"||current.search)await navigatePage(page,"https://chatgpt.com/",{timeout:30_000,signal});
   if((await readChatGptAccount(page)).fingerprint!==expectedAccountFingerprint)throw new BrowserCompanionError("ChatGPT account changed before connector maintenance", "authentication_required");
   const selection=await selectConnector(page,connectorName,signal);
   const mention=selection.composer.locator(SELECTED_CONNECTOR_SELECTOR).filter({visible:true});
@@ -227,7 +237,7 @@ async function connectorPage(page:Page,appId:string,account:string,permissions:b
     if(new URL(page.url()).origin!=="https://chatgpt.com"||new URL(page.url()).pathname!==new URL(url).pathname)throw selectorDrift("ChatGPT changed the plugin page during connector maintenance");
     if((await readChatGptAccount(page)).fingerprint!==account)throw selectorDrift("ChatGPT account changed during connector maintenance");
   };
-  if(page.url()!==url)await page.goto(url,{waitUntil:"domcontentloaded",timeout:30_000,signal});
+  await navigatePage(page,url,{timeout:30_000,signal});
   await assertPage();
   return assertPage;
 }

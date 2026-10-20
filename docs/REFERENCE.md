@@ -2132,9 +2132,18 @@ schema update so existing ChatGPT clients can discover the three new tools.
 
 The standalone UI exposes model and effort choices from the companion's cached,
 account-bound capability catalog. Full discovery runs when refreshing models or
-opening the new-chat picker. A send navigates to its destination conversation
-first, then selects and verifies the preferred model and effort there. If the
-picker confirms that option is locked or missing, it tries the next available
+opening the new-chat picker. A send reuses a healthy destination conversation
+already open in the shared tab, or opens it when necessary, then selects and
+verifies the preferred model and effort there. A known conversation-load failure
+still receives a deliberate recovery reload. Required conversation loads share
+a three-second minimum spacing across chats; HTTP 429 conversation-load responses pause further
+conversation loads for Retry-After, or three minutes when none is supplied.
+Plan inspection reads the account menu first when it identifies the full plan,
+and maintenance skips restoration when the original page is already current.
+Prepared empty new chats are reused at creation. Handoff checks do not reload
+the current conversation; necessary visits to another pending handoff are
+limited to once per three minutes. These rules preserve the single shared tab.
+If the picker confirms that option is locked or missing, it tries the next available
 entry in `browser-companion/model-fallback-order.json`, starting with GPT-6 Astra
 Pro, GPT-5.6 Sol Pro, GPT-6 Sol Extra High, and GPT-6 Sol High. The selected fallback
 is verified before Send; the saved preference is preserved and retried on the

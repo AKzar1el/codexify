@@ -6,6 +6,7 @@ import {approveConversationCard} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
+import {navigatePage} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
@@ -171,7 +172,7 @@ async function stopLingeringResponse(
         await clearExistingDraft(page,boundedSignal);
       }
       try {
-        await page.reload({ waitUntil:"domcontentloaded", timeout:timeout(2_000), signal:boundedSignal });
+        await navigatePage(page,page.url(),{reload:true,timeout:timeout(2_000),signal:boundedSignal});
       } catch (error) {
         if (signal.aborted) throw error;
         lastError = error;
@@ -195,7 +196,18 @@ async function exactConversationPage(
 ): Promise<{ page:Page; canonicalUrl:string }> {
   validateChatGptConversationUrl(requestedUrl);
   validateChatGptConversationUrl(expectedUrl);
-  const page = await surface.navigate(requestedUrl, signal);
+  let page = await surface.page();
+  let sameConversation=false;
+  try {sameConversation=canonicalChatGptConversationUrl(page.url())===canonicalChatGptConversationUrl(expectedUrl);}catch{}
+  if(!sameConversation)page=await surface.navigate(requestedUrl,signal);
+  else {
+    try {await throwIfSessionAttention(page);}
+    catch(error){
+      if(!(error instanceof BrowserCompanionError&&error.code==="conversation_unavailable"))throw error;
+      // A retry of a known load-failure page needs one deliberate recovery load.
+      await navigatePage(page,requestedUrl,{signal,reload:page.url()===requestedUrl});
+    }
+  }
   await throwIfSessionAttention(page);
   try {
     await assertAuthenticatedChatGptPage(page);
@@ -220,6 +232,7 @@ async function exactConversationPage(
 
 export class ChatGptBrowserDriver implements BrowserDriver {
   private readonly healthAccount = new HealthAccountCache();
+  private readonly handoffProbes = new Map<string,number>();
   private maintenance?: {page:Page;account:ChatGptAccount};
   private pendingRefresh?: {page:Page;url:string;account:ChatGptAccount};
   private pendingSubmission?: {actionId:string;mayHaveSent:boolean};
@@ -395,7 +408,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       const plan=await readBillingPlan(page,signal);
       if(plan.accountFingerprint!==account.fingerprint)throw new Error("ChatGPT account changed during plan inspection");
       this.planCache={epoch,plan};return plan;
-    },signal);
+    },signal,{clearDraft:false});
   }
 
   async refreshConnector(name:string, signal?:AbortSignal) {
@@ -429,7 +442,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if(this.pendingRefresh&&this.pendingRefresh!==pending)throw new BrowserCompanionError("Browser companion is busy with another connector refresh");
       if(pending&&(pending.page!==page||pending.url!==page.url()))throw new BrowserCompanionError("Another browser action changed pages during connector refresh","external_interference");
       if(!pending)originalUrl=page.url();
-      const result=await this.withMaintenancePage(page,account,main=>operation(main,account,operationSignal),operationSignal,false);
+      const result=await this.withMaintenancePage(page,account,main=>operation(main,account,operationSignal),operationSignal,{restore:false});
       pending={page,url:page.url(),account};this.pendingRefresh=pending;
       return result;
     },false);
@@ -465,7 +478,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         const page=await this.surface.page();
         if(!pending||page!==pending.page||page.url()!==pending.url)return;
         await observation?.dispose();
-        if(await page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true}).count())return;
+        if(page.url()===originalUrl||await page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true}).count())return;
         await this.surface.beginAction();
         try{await this.surface.navigate(originalUrl,operationSignal);}finally{await this.surface.endAction();}
       });}catch(error){
@@ -475,7 +488,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     }
   }
 
-  private async withMaintenancePage<T>(page:Page,account:ChatGptAccount,operation:(page:Page)=>Promise<T>,signal?:AbortSignal,restore=true):Promise<T> {
+  private async withMaintenancePage<T>(page:Page,account:ChatGptAccount,operation:(page:Page)=>Promise<T>,signal?:AbortSignal,options:{restore?:boolean;clearDraft?:boolean}={}):Promise<T> {
     signal?.throwIfAborted();
     await this.surface.beginAction();
     const previousUrl=page.url();
@@ -494,11 +507,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if(await this.surface.page()!==page||page.url()!==previousUrl)throw new BrowserCompanionError("ChatGPT changed pages before account maintenance", "external_interference");
       this.maintenance={page,account};started=true;
       signal?.throwIfAborted();
-      if(count===1)await clearExistingDraft(page,signal);
+      if(count===1&&options.clearDraft!==false)await clearExistingDraft(page,signal);
       const result=await operation(page);completed=true;return result;
     } finally {
       try {
-        if(started&&(restore||!completed))await this.surface.navigate(previousUrl,AbortSignal.timeout(signal?.aborted?1_500:5_000));
+        if(started&&(options.restore!==false||!completed)&&page.url()!==previousUrl)await this.surface.navigate(previousUrl,AbortSignal.timeout(signal?.aborted?1_500:8_000));
       } finally {
         this.maintenance=undefined;
         await this.surface.endAction();
@@ -508,7 +521,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
 
   async reveal(url: string | null, signal?:AbortSignal): Promise<void> {
     signal?.throwIfAborted();
-    if (url) await this.surface.navigate(url,signal);
+    if (url) {
+      const page=await this.surface.page();let same=page.url()===url;
+      try {same ||= canonicalChatGptConversationUrl(page.url())===canonicalChatGptConversationUrl(url);}catch{}
+      if(!same)await this.surface.navigate(url,signal);
+    }
     await this.surface.reveal();
   }
 
@@ -530,8 +547,21 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   async turnHandoffComplete(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean> {
     await this.surface.beginAction();
     try {
-      const exact=await exactConversationPage(this.surface,url,url,signal);
-      return await completedHandoff(exact.page,url,account,handoffId,signal);
+      const target=canonicalChatGptConversationUrl(url),key=`${account}\u001f${target}\u001f${handoffId}`;
+      let page=await this.surface.page(),same=false;
+      try {same=canonicalChatGptConversationUrl(page.url())===target;}catch{}
+      if(!same){
+        if((await readChatGptAccount(page)).fingerprint!==account)return false;
+        if(Date.now()<(this.handoffProbes.get(key)??0))return false;
+        this.handoffProbes.delete(key);this.handoffProbes.set(key,Date.now()+180_000);
+        if(this.handoffProbes.size>256)this.handoffProbes.delete(this.handoffProbes.keys().next().value!);
+        // A bounded visit can discover a final after another chat took the tab.
+        // Repeated polls of the current conversation never reload its document.
+        page=await this.surface.navigate(url,signal);
+      }
+      const complete=await completedHandoff(page,url,account,handoffId,signal);
+      if(complete)this.handoffProbes.delete(key);
+      return complete;
     } finally {await this.surface.endAction();}
   }
 

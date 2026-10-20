@@ -1,6 +1,7 @@
 import type { Page } from "patchright";
 import {uiLabelPattern} from "./ui-localization";
-import { activeComposer } from "./composer";
+import { activeComposer, composerText } from "./composer";
+import {navigatePage} from "./navigation";
 import { BrowserCompanionError } from "./errors";
 import { assertAuthenticatedChatGptPage } from "./session";
 import type { SingleBrowserSurface } from "./chatgpt-driver";
@@ -15,7 +16,20 @@ export function validateNewChatProjectUrl(value: string | null): string | null {
 
 export async function openNewChat(surface: SingleBrowserSurface, projectUrl: string | null, signal?: AbortSignal): Promise<Page> {
   const destination = validateNewChatProjectUrl(projectUrl) || "https://chatgpt.com/";
-  const page = await surface.navigate(destination, signal);
+  let page=await surface.page();
+  const current=new URL(page.url()),target=new URL(destination);
+  const projectKey=(url:URL)=>url.pathname.split('/')[2]?.replace(/^(g-p-[0-9a-f]{32}).*$/,'$1');
+  const localDraft=/\/c\/local-chatgpt(?::|%3A)/i.test(current.pathname);
+  const sameDestination=current.origin===target.origin&&(projectUrl
+    ? projectKey(current)===projectKey(target)&&(current.pathname.replace(/\/$/,'').endsWith('/project')||localDraft)
+    : current.pathname==='/'||localDraft&&current.pathname.startsWith('/c/'));
+  if(sameDestination && !await page.locator('[data-message-author-role="user"], [data-message-author-role="assistant"], [data-user-message-bubble], [data-codex-approval-surface="true"]').count()){
+    await assertAuthenticatedChatGptPage(page);
+    const composer=await activeComposer(page,30_000,signal);
+    if(!(await composerText(composer)).trim())return page;
+  }
+  if(page.url()===destination)await navigatePage(page,destination,{reload:true,signal});
+  else page=await surface.navigate(destination,signal);
   const composer = await activeComposer(page, 30_000, signal);
   await assertAuthenticatedChatGptPage(page);
   if (projectUrl) {

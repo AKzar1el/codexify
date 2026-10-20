@@ -7,6 +7,7 @@ import type { SingleBrowserSurface } from "./chatgpt-driver";
 import { BrowserCompanionError } from "./errors";
 import { backgroundChromeArgs } from "./background-chrome";
 import {prepareRequestBlockList,requestBlockListArgs,verifyRequestBlockList} from "./request-block-list";
+import {isChatGptPage,navigatePage} from "./navigation";
 
 const CHATGPT_HOME = "https://chatgpt.com/";
 
@@ -70,7 +71,7 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
         if (restored !== page) await restored.close();
       }
       const surface = new ChromeSingleWindowSurface(context, page);
-      await surface.navigate(CHATGPT_HOME);
+      if(!isChatGptPage(page.url()))await surface.navigate(CHATGPT_HOME);
       return surface;
     } catch (error) {
       await context.close().catch(() => {});
@@ -94,7 +95,7 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     const target = new URL(url);
     if (target.protocol !== "https:") throw new Error("Browser window navigation requires HTTPS");
     const page = await this.page();
-    await page.goto(target.href, { waitUntil:"domcontentloaded", timeout:60_000,signal });
+    await navigatePage(page,target.href,{signal});
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
     await page.waitForLoadState("domcontentloaded", { timeout:30_000,signal }).catch(error => { if(signal?.aborted)throw error; });
     return page;
