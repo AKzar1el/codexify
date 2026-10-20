@@ -13,7 +13,7 @@ function fixture(range){
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: colorful analytics use the full panel, stay always on, and preserve charts and silent failures`,{timeout:45000},async()=>{
  const browser=await engine.launch();try{
   const page=await browser.newPage({viewport:{width:1500,height:1000}});page.setDefaultTimeout(7000);
-  const errors=[],writes=[],reads=[];page.on('pageerror',e=>errors.push(e.message));let fail=false,malformed=false,revision=1;
+  const errors=[],writes=[],reads=[];page.on('pageerror',e=>errors.push(e.message));let fail=false,malformed=false,revision=1,mixMinutes=null;
   const config={agentChat:{analyticsEnabled:false,turnRenewal:{enabled:false,limits:[]}}},snapshot=()=>({document:config,defaults:{agentChat:{analyticsEnabled:true}},raw:JSON.stringify(config),path:'/fixture/config.json',revision:String(revision),restartRequired:false});
   await routeOwner(page,'http://127.0.0.1:43318/**',async route=>{
    const request=route.request(),url=new URL(request.url()),path=url.pathname;
@@ -25,7 +25,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
    if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
    if(path==='/api/settings')assert.fail('Analytics must never write a collection setting');
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
-   if(path==='/api/analytics/usage'){reads.push(url.searchParams.get('days'));if(fail)return route.fulfill({status:500,body:'private disk error'});return route.fulfill({json:malformed?{models:[null,42],daily:[null,{date:'bad'}],conversations:[null],totals:{turns:-1}}:fixture(url.searchParams.get('days'))});}
+   if(path==='/api/analytics/usage'){reads.push(url.searchParams.get('days'));if(fail)return route.fulfill({status:500,body:'private disk error'});const value=fixture(url.searchParams.get('days'));if(mixMinutes!==null){value.models[0].activeMs=mixMinutes*60000;value.models[1].activeMs=0;}return route.fulfill({json:malformed?{models:[null,42],daily:[null,{date:'bad'}],conversations:[null],totals:{turns:-1}}:value});}
    if(path.endsWith('/automation'))return route.fulfill({json:{enabled:false,pairing:{status:'unpaired'},action:{status:'idle'},catalog:{models:[]},selection:{},presence:{},serverTimeMs:Date.now()}});
    if(ids.some(id=>path===`/api/chats/${id}`))return route.fulfill({json:{_meta:{[META]:{messages:[],revision:'0',chat_file:'/fixture/CHAT.md',last_agent_call_at_ms:null,server_time_ms:Date.now(),total_tool_calls:0,has_more:false}}}});
    return route.fulfill({status:404});
@@ -40,6 +40,19 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   const backgrounds=await dashboard.locator('.analytics-kpi').evaluateAll(nodes=>nodes.map(n=>getComputedStyle(n).backgroundColor));assert.equal(new Set(backgrounds).size,4,'each metric has its own color');
   const main=await dialog.locator('#settings-main').boundingBox(),bounds=await dialog.boundingBox();assert(main.width>bounds.width*.9,'the dashboard uses the full dialog width');
   assert.equal(await dashboard.getByLabel('Analytics date range').inputValue(),'7');assert.deepEqual(reads,['7']);assert.equal(await dashboard.locator('.analytics-kpi').count(),4);assert.equal(await dashboard.getByRole('img').count(),3);
+  // The total must stay on one centered line within the donut, including the
+  // reported duration and longer lifetime totals, on desktop and mobile.
+  for(const width of [1500,375]){
+   await page.setViewportSize({width,height:1000});
+   for(const [minutes,label]of [[167*60+33,'167h 33m'],[99999*60+59,'99999h 59m'],[0,'0m']]){
+    mixMinutes=minutes;await dashboard.getByRole('button',{name:'Refresh analytics',exact:true}).click();
+    const value=dashboard.locator('.analytics-mix-center strong');await value.filter({hasText:new RegExp(`^${label}$`)}).waitFor();
+    const layout=await value.evaluate(node=>{const center=node.parentElement.getBoundingClientRect(),range=document.createRange();range.selectNodeContents(node);const text=range.getBoundingClientRect(),caption=node.nextElementSibling.getBoundingClientRect();return {lines:range.getClientRects().length,left:text.left-center.left,right:center.right-text.right,centerOffset:Math.abs((text.left+text.right-center.left-center.right)/2),gap:caption.top-text.bottom};});
+    assert.equal(layout.lines,1,`${label} must not wrap`);assert(layout.left>=3&&layout.right>=3,`${label} must fit inside the donut`);assert(layout.centerOffset<1,`${label} must stay centered`);assert(layout.gap>=2,'the caption must remain separate');
+    if(minutes===167*60+33&&process.env.ANALYTICS_SCREENSHOT_DIR){mkdirSync(process.env.ANALYTICS_SCREENSHOT_DIR,{recursive:true});await dashboard.locator('.analytics-mix-ring').locator('..').locator('..').screenshot({path:`${process.env.ANALYTICS_SCREENSHOT_DIR}/${name.toLowerCase()}-mix-${width}.png`});}
+   }
+  }
+  mixMinutes=null;await page.setViewportSize({width:1500,height:1000});
   const card=dashboard.locator('.analytics-card').filter({hasText:'Conversation league'});assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'BioShock optimization');await card.getByRole('button',{name:'Active time',exact:true}).click();assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'Reader annotations');
   const legend=dashboard.locator('.analytics-legend button').first();await legend.click();assert.equal(await dashboard.locator('.analytics-legend button').first().getAttribute('aria-pressed'),'false');await dashboard.locator('.analytics-legend button').first().click();
   await dashboard.getByLabel('Analytics date range').selectOption('1');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='Today'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.equal(reads.at(-1),'1');assert.equal(await dashboard.locator('.analytics-kpi[data-metric=turns] .analytics-kpi-value').textContent(),String(fixture('1').totals.turns));assert.equal(await dashboard.locator('.analytics-chart g[role=button]').count(),3,'each chart shows just one day');
