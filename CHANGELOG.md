@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.7] - 2026-10-22
+
+### Changed
+
+- Newly unlocked achievement notifications stay visible twice as long (7.2 seconds).
+
+### Fixed
+
+- Give each ChatGPT Stop click up to 20 seconds to finish before retrying or
+  reloading the conversation, while continuing immediately once it stops.
+
 ## [2.3.6] - 2026-10-21
 
 ### Fixed
@@ -953,7 +964,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.6...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.7...HEAD
+[2.3.7]: https://github.com/devnoname120/codexify/compare/v2.3.6...v2.3.7
 [2.3.6]: https://github.com/devnoname120/codexify/compare/v2.3.5...v2.3.6
 [2.3.5]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.5
 [2.3.3]: https://github.com/devnoname120/codexify/compare/v2.3.2...v2.3.3

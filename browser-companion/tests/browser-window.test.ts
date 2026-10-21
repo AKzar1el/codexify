@@ -765,13 +765,38 @@ test('verified submission phases each receive the operation timeout budget',asyn
  await coordinator.close();
 });
 
-test('repeating one submission phase cannot keep a stalled action alive',async()=>{
+test('bounded Stop milestones renew the deadline without response output or Send acceptance',async()=>{
+ class StopProgressDriver extends DeferredDriver {
+  override async execute(execution:DriverExecution){
+   execution.emit({type:'navigating'});
+   for(const step of ['initial','retry','recovery','complete'] as const){
+    await new Promise(resolve=>setTimeout(resolve,80));
+    execution.signal.throwIfAborted();
+    execution.emit({type:'stop_progress',step});
+    execution.emit({type:'composer_ready'});
+   }
+   execution.emit({type:'model_verified',model:execution.request.model!,effort:execution.request.effort!});
+   execution.emit({type:'connector_verified'});
+   execution.emit({type:'send_accepted'});
+   execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});
+  }
+ }
+ const coordinator=new SingleWindowCoordinator(new StopProgressDriver(),TEST_BUILD,{...shortBudget,operationMs:200});
+ await coordinator.execute(request('stop-progress'));
+ const events=await collect(coordinator,'stop-progress');
+ expect(events.at(-1)?.type).toBe('submission_complete');
+ expect(events.some(event=>(event.type as string)==='stop_progress')).toBeFalse();
+ expect(events.filter(event=>event.type==='send_accepted')).toHaveLength(1);
+ await coordinator.close();
+});
+
+for(const phase of ['composer_ready','stop_progress'] as const)test(`repeating ${phase} cannot keep a stalled action alive`,async()=>{
  class RepeatingDriver extends DeferredDriver {
   override async execute(execution:DriverExecution) {
    execution.emit({type:'navigating'});
    for(let attempt=0;attempt<30;attempt++) {
     execution.signal.throwIfAborted();
-    execution.emit({type:'composer_ready'});
+    execution.emit(phase==='stop_progress'?{type:'stop_progress',step:'initial'}:{type:'composer_ready'});
     await new Promise(resolve=>setTimeout(resolve,10));
    }
   }

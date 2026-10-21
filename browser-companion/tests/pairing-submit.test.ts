@@ -32,6 +32,7 @@ let chipName = connector;
 let quietGenerationMs = 0;
 let generatingOnLoad = false;
 let acceptsStop:boolean|number|"reload" = true;
+let stopFinishDelayMs=200;
 let fixtureLanguage:"en"|"el"|"it"="en";
 const fixtureUi={
   en:{send:"Send",stop:"Stop",counter:"of",efforts:["Instant","Medium","High","Extra High","Pro"]},
@@ -142,7 +143,7 @@ beforeAll(async () => {
         window.getSelection().removeAllRanges();window.getSelection().addRange(initialCaret);
         document.body.dataset.sends="0";document.body.dataset.stops="0";document.body.dataset.order="";document.body.dataset.confirmations="0";window.enableSend=${ready};
         const stopConfirmation=${JSON.stringify(stopConfirmation??null)};
-        const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';},200);
+        const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';},${stopFinishDelayMs});
         const showStopDialog=stop=>{
           if(document.querySelector('[role="dialog"]'))return;
           document.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
@@ -214,14 +215,14 @@ const surface: SingleBrowserSurface = {
 
 // Synthetic server-side changes must be installed explicitly. Browser actions
 // now reuse healthy pages, so these fixtures cannot rely on a production reload.
-function fixtureState(){return JSON.stringify([initialDraft,ready,chipName,quietGenerationMs,generatingOnLoad,acceptsStop,initialModel,shiftedEfforts,hideEffortLabels,nestedHistory,missingHistoryId,duplicateHistoryViews,destinationLocks,absentFamilies,duplicateEffortLabels,stopConfirmation,fixtureLanguage,localizedStopFallback,changedUrlAfterReload]);}
+function fixtureState(){return JSON.stringify([initialDraft,ready,chipName,quietGenerationMs,generatingOnLoad,acceptsStop,stopFinishDelayMs,initialModel,shiftedEfforts,hideEffortLabels,nestedHistory,missingHistoryId,duplicateHistoryViews,destinationLocks,absentFamilies,duplicateEffortLabels,stopConfirmation,fixtureLanguage,localizedStopFallback,changedUrlAfterReload]);}
 async function syncFixture(){if(loadedFixtureState!==fixtureState()){stopReloadAt=documentLoads+2;await surface.navigate(page.url());}}
 async function executeFixture(driver:ChatGptBrowserDriver,execution:DriverExecution){await syncFixture();return driver.execute(execution);}
 async function executeCoordinatorFixture(coordinator:SingleWindowCoordinator,request:ExecuteActionRequest){await syncFixture();return coordinator.execute(request);}
 
 async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating=false,stopWorks:boolean|number|"reload"=true,model={family:"6",value:4,locked:[] as number[]}) {
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
-  generatingOnLoad=generating;acceptsStop=stopWorks;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
+  generatingOnLoad=generating;acceptsStop=stopWorks;stopFinishDelayMs=200;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
   documentLoads=0;stopReloadAt=2;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
   initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
   destinationLocks={};absentFamilies=[];duplicateEffortLabels=false;changeAccountAtRequest=Number.MAX_SAFE_INTEGER;
@@ -850,14 +851,14 @@ test.skipIf(!native)("an unresponsive Stop confirmation is bounded and does not 
   const began=Date.now();
   await executeCoordinatorFixture(coordinator,offline);
   const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
-  expect(Date.now()-began).toBeLessThan(10_000);
+  expect(Date.now()-began).toBeGreaterThanOrEqual(20_000);expect(Date.now()-began).toBeLessThan(28_000);
   expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
   expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
   expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
   expect((await coordinator.health()).activeActionId).toBeNull();
   expect(documentLoads).toBe(2);
-},15_000);
+},30_000);
 
 test.skipIf(!native)("a cancelled Stop confirmation never inserts or sends a prompt",async()=>{
   const driver=await fixture("",true,connector,0,true);
@@ -924,6 +925,25 @@ test.skipIf(!native)("offline Stop requires the paired conversation and account 
   }
 },10_000);
 
+test.skipIf(!native)("slow Stop completion, with or without confirmation, sends once without retrying or reloading",async()=>{
+  for(const confirmation of [false,true]){
+    const driver=await fixture("",true,connector,0,true);
+    stopFinishDelayMs=15_000;
+    if(confirmation)stopConfirmation={delayMs:200};
+    await syncFixture();const loads=documentLoads,began=Date.now();
+    const coordinator=new SingleWindowCoordinator(driver,build);
+    const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
+    await executeCoordinatorFixture(coordinator,offline);
+    const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+    expect(events.at(-1)).toMatchObject({type:'submission_complete'});
+    expect(Date.now()-began).toBeLessThan(20_000);
+    expect(documentLoads).toBe(loads);
+    expect(await page.locator('body').getAttribute('data-stops')).toBe('1');
+    expect(await page.locator('body').getAttribute('data-confirmations')).toBe(confirmation?'1':'0');
+    expect(await page.locator('body').getAttribute('data-order')).toBe(confirmation?'stop,confirm,stopped,send,':'stop,stopped,send,');
+  }
+},45_000);
+
 test.skipIf(!native)("an ignored first Stop is retried automatically before sending once",async()=>{
   const driver=await fixture("",true,connector,0,true,2);
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
@@ -931,16 +951,20 @@ test.skipIf(!native)("an ignored first Stop is retried automatically before send
   expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stop,stopped,send,");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
   expect(documentLoads).toBe(1);
-},15_000);
+},30_000);
 
 test.skipIf(!native)("a stuck Stop is rehydrated and stopped automatically before sending once",async()=>{
   const driver=await fixture("",true,connector,0,true,"reload");
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
-  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}});
+  const coordinator=new SingleWindowCoordinator(driver,build),began=Date.now();
+  await executeCoordinatorFixture(coordinator,offline);
+  const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+  expect(events.at(-1)).toMatchObject({type:'submission_complete'});
+  expect(Date.now()-began).toBeGreaterThanOrEqual(40_000);
   expect(documentLoads).toBe(2);
   expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stopped,send,");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
-},20_000);
+},55_000);
 
 test.skipIf(!native)("Stop recovery clears an existing draft and reloads before sending once",async()=>{
   const driver=await fixture("A draft I am writing",true,connector,0,true,"reload");
@@ -950,7 +974,7 @@ test.skipIf(!native)("Stop recovery clears an existing draft and reloads before 
   expect(await composerText(await activeComposer(page))).toBe("");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
   expect(await page.locator("body").getAttribute("data-sent-text")).not.toContain("A draft I am writing");
-},20_000);
+},55_000);
 
 test.skipIf(!native)("Stop recovery revalidates the account and conversation after reload",async()=>{
   for(const mismatch of ["account","conversation"]){
@@ -963,7 +987,7 @@ test.skipIf(!native)("Stop recovery revalidates the account and conversation aft
     expect(await page.locator("body").getAttribute("data-stops")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
   }
-},35_000);
+},100_000);
 
 test.skipIf(!native)("a cancelled offline Stop never inserts or sends its prompt",async()=>{
   const driver=await fixture("",true,connector,0,true,false);
@@ -984,12 +1008,12 @@ test.skipIf(!native)("an unresponsive Stop times out before Send and releases br
   const began=Date.now();
   await executeCoordinatorFixture(coordinator,offline);
   const events=[];for await(const event of coordinator.events(offline.actionId,0)) events.push(event);
-  expect(Date.now()-began).toBeLessThan(12_000);
+  expect(Date.now()-began).toBeGreaterThanOrEqual(60_000);expect(Date.now()-began).toBeLessThan(75_000);
   expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(0);
   expect((await coordinator.action(offline.actionId))?.sendAccepted).toBeFalse();
   expect((await coordinator.health()).activeActionId).toBeNull();
-},15_000);
+},80_000);
 
 test.skipIf(!native)("chat ID survives project, ordinary-route, and slug rewrites during submission",async()=>{
   const project="g-p-0123456789abcdef0123456789abcdef";

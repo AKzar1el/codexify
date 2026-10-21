@@ -7,7 +7,7 @@ import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
 import {navigatePage} from "./navigation";
-import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browser-window";
+import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
 import { asCompanionError, BrowserCompanionError } from "./errors";
@@ -72,12 +72,30 @@ async function stopLingeringResponse(
   page: Page,
   signal: AbortSignal,
   expected: { canonicalUrl:string; accountFingerprint:string },
+  emit: DriverExecution["emit"],
 ): Promise<void> {
   if (signal.aborted) throw new DOMException("Browser action aborted", "AbortError");
   if (!await generationRunning(page)) return;
-  const deadline = Date.now() + 7_500;
-  const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(7_500)]);
+  const settleMs = 20_000;
+  // Three bounded Stop attempts, one optional confirmation, and recovery work.
+  const recoveryMs = settleMs * 4 + 10_000;
+  const deadline = Date.now() + recoveryMs;
+  const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(recoveryMs)]);
   const timeout = (limit:number) => Math.max(1, Math.min(limit, deadline - Date.now()));
+  let lastStopRequestedAt = 0;
+  const requested = async (step:Exclude<StopProgressStep,"complete">) => {
+    lastStopRequestedAt = Date.now();
+    emit({type:"stop_progress",step});
+    // A verified editable composer is real pre-Send progress. Keep the existing
+    // event stream alive during long Stop waits without inventing response output.
+    try {
+      await activeComposer(page,timeout(1_000),boundedSignal);
+    } catch {
+      boundedSignal.throwIfAborted();
+      return;
+    }
+    emit({type:"composer_ready"});
+  };
   const assertTarget = async () => {
     await throwIfSessionAttention(page);
     await throwIfConversationApproval(page);
@@ -93,7 +111,7 @@ async function stopLingeringResponse(
   let stopRequested = false;
   let confirmationSubmitted = false;
   const waitForStopped = async (stop:Locator) => {
-    let settleDeadline = Date.now() + timeout(1_000);
+    let settleDeadline = Math.min(deadline,(lastStopRequestedAt||Date.now())+settleMs);
     while (!boundedSignal.aborted) {
       const count = await dialogs.count();
       if (count) {
@@ -122,9 +140,10 @@ async function stopLingeringResponse(
           // Do not use localized labels or generated Radix IDs to choose Stop.
           await dialog.locator('form button[type="submit"].bg-primary-solid').click({timeout:timeout(750),signal:boundedSignal});
           confirmationSubmitted = true;
+          await requested("confirmation");
+          settleDeadline = Math.min(deadline,lastStopRequestedAt+settleMs);
         }
-        await dialog.waitFor({state:"hidden",timeout:timeout(1_000),signal:boundedSignal});
-        settleDeadline = Date.now() + timeout(1_000);
+        await dialog.waitFor({state:"hidden",timeout:Math.max(1,Math.min(timeout(settleMs),settleDeadline-Date.now())),signal:boundedSignal});
       }
       if (!await stop.isVisible()) return;
       if (Date.now() >= settleDeadline) throw new Error("ChatGPT Stop has not completed");
@@ -142,7 +161,7 @@ async function stopLingeringResponse(
     if (dialogCount && !stopRequested) {
       throw new BrowserCompanionError("ChatGPT has an open dialog before stopping the response", "external_interference");
     }
-    if (count === 0 && dialogCount === 0) return;
+    if (count === 0 && dialogCount === 0) {emit({type:"stop_progress",step:"complete"});return;}
     if (count !== 1 && dialogCount === 0) {
       throw new BrowserCompanionError("ChatGPT does not have one visible Stop control", "selector_drift");
     }
@@ -150,13 +169,16 @@ async function stopLingeringResponse(
       if (dialogCount === 0 && await stop.isEnabled()) {
         await stop.click({ timeout:timeout(750), signal:boundedSignal });
         stopRequested = true;
+        await requested((["initial","retry","recovery"] as const)[attempt]!);
       }
       await waitForStopped(stop);
+      emit({type:"stop_progress",step:"complete"});
       return;
     } catch (error) {
       if (signal.aborted || error instanceof BrowserCompanionError) throw error;
       lastError = error;
     }
+    if (confirmationSubmitted && await dialogs.count()) break;
     if (attempt === 1 && !boundedSignal.aborted) {
       if (await dialogs.count()) break;
       // Rehydrate a stuck Stop control only before inserting our prompt.
@@ -624,7 +646,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if (execution.request.prompt.kind !== "pair_verify" && !creating && !renewal) {
         // Offline actions are dispatched after tool-call inactivity. Stop only
         // while preparing this send; ongoing conversations need no observation.
-        await stopLingeringResponse(page, execution.signal, { canonicalUrl, accountFingerprint:account.fingerprint });
+        await stopLingeringResponse(page, execution.signal, { canonicalUrl, accountFingerprint:account.fingerprint }, execution.emit);
         if (canonicalChatGptConversationUrl(page.url()) !== canonicalUrl) {
           throw new BrowserCompanionError("ChatGPT changed conversations while stopping the previous response", "conversation_unavailable");
         }

@@ -31,7 +31,10 @@ type WithoutEventEnvelope<T> = T extends ActionEvent
   : never;
 // An omitted connector is a driver-only milestone, never connector verification
 // on the wire. It renews the next submission phase's existing timeout budget.
-export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_omitted"};
+const STOP_PROGRESS_STEPS = ["initial", "retry", "recovery", "confirmation", "complete"] as const;
+export type StopProgressStep = typeof STOP_PROGRESS_STEPS[number];
+export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_omitted"}
+  | {type:"stop_progress";step:StopProgressStep};
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
@@ -587,9 +590,10 @@ export class SingleWindowCoordinator {
           this.emit(record,event);
           // Only a newly verified stage renews the stall deadline. Repeated
           // events and response output cannot keep browser ownership alive.
-          if (!record.terminal && !completedSteps.has(event.type)
-            && ["navigating","composer_ready","model_verified","connector_verified","connector_omitted","send_accepted","conversation_created"].includes(event.type)) {
-            completedSteps.add(event.type);
+          const progressKey=event.type==='stop_progress'?`stop:${event.step}`:event.type;
+          if (!record.terminal && !completedSteps.has(progressKey)
+            && ["navigating","composer_ready","model_verified","connector_verified","connector_omitted","stop_progress","send_accepted","conversation_created"].includes(event.type)) {
+            completedSteps.add(progressKey);
             progress();
           }
         },
@@ -641,6 +645,10 @@ export class SingleWindowCoordinator {
 
   private emit(record: ActionRecord, raw: DriverEvent): void {
     if (record.terminal) return;
+    if (raw.type === "stop_progress") {
+      if (!STOP_PROGRESS_STEPS.includes(raw.step)) throw new BrowserCompanionError("Browser driver reported invalid Stop progress", "selector_drift");
+      return;
+    }
     if (raw.type === "connector_omitted") return;
     if (raw.type === "model_verified"
       && !modelSelectionAllowed(record.request.model,record.request.effort,raw)) {

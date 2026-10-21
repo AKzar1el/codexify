@@ -2010,7 +2010,13 @@ lifetime do not hold the browser queue. Account and connector maintenance reuse
 the existing tab and restore its original URL, even while ChatGPT is responding.
 User drafts remain protected.
 
-Every browser UI operation has a **20-second deadline**. Timeout or cancellation
+During offline-send preparation, each Stop click gets up to **20 seconds** to
+settle, including an optional Stop confirmation. Preparation continues as soon as
+the response stops; retries and reload recovery wait for that settling window.
+
+Every browser UI operation has a **30-second inactivity deadline**. Verified
+preparation and Stop milestones renew it; repeating the same milestone does not.
+Timeout or cancellation
 aborts the operation, allows at most **5 seconds** for cleanup, and releases
 ownership. A driver that ignores cancellation is retired and its browser is
 closed, with a further **2-second** bound on shutdown, so late work cannot mutate
