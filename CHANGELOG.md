@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.8] - 2026-10-22
+
+### Fixed
+
+- Keep the ChatGPT browser on the submitted conversation for at least five seconds
+  after Send, including cancellation and failure cleanup, so the next action
+  cannot interrupt its pending network request.
+
 ## [2.3.7] - 2026-10-22
 
 ### Changed
@@ -964,7 +972,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.7...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.8...HEAD
+[2.3.8]: https://github.com/devnoname120/codexify/compare/v2.3.7...v2.3.8
 [2.3.7]: https://github.com/devnoname120/codexify/compare/v2.3.6...v2.3.7
 [2.3.6]: https://github.com/devnoname120/codexify/compare/v2.3.5...v2.3.6
 [2.3.5]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.5

@@ -2004,15 +2004,18 @@ Unless `CODEXIFY_BROWSER_HOME` overrides it, a custom descriptor directory is
 also that instance's browser home. This keeps automatic startup scoped to the
 configured private instance rather than borrowing the default profile.
 
-Browser ownership covers actual UI work and ends after semantic Send acceptance
-and any required preference restoration. ChatGPT's Stop button and response
-lifetime do not hold the browser queue. Account and connector maintenance reuse
+Browser ownership covers actual UI work and a **five-second hold after Send**,
+ending after semantic acceptance and any required preference restoration. The
+hold also applies when cancellation or an error follows a possibly accepted Send,
+so another action cannot interrupt its pending network request. ChatGPT's Stop
+button and response lifetime do not hold the browser queue. Account and connector maintenance reuse
 the existing tab and restore its original URL, even while ChatGPT is responding.
 User drafts remain protected.
 
 During offline-send preparation, each Stop click gets up to **20 seconds** to
-settle, including an optional Stop confirmation. Preparation continues as soon as
-the response stops; retries and reload recovery wait for that settling window.
+settle. An optional Stop confirmation starts its own full 20-second window.
+Preparation continues as soon as the response stops; retries and reload recovery
+wait for that settling window.
 
 Every browser UI operation has a **30-second inactivity deadline**. Verified
 preparation and Stop milestones renew it; repeating the same milestone does not.

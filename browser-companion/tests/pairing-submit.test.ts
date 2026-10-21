@@ -143,7 +143,7 @@ beforeAll(async () => {
         window.getSelection().removeAllRanges();window.getSelection().addRange(initialCaret);
         document.body.dataset.sends="0";document.body.dataset.stops="0";document.body.dataset.order="";document.body.dataset.confirmations="0";window.enableSend=${ready};
         const stopConfirmation=${JSON.stringify(stopConfirmation??null)};
-        const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';},${stopFinishDelayMs});
+        const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';document.body.dataset.stoppedAt=String(Date.now());},${stopFinishDelayMs});
         const showStopDialog=stop=>{
           if(document.querySelector('[role="dialog"]'))return;
           document.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
@@ -151,7 +151,7 @@ beforeAll(async () => {
           if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
           if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
           dialogForm.addEventListener('submit',event=>{
-            event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';
+            event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());
             if(!stopConfirmation.persists){dialog.remove();document.querySelector('.codex-dialog-overlay').remove();finishStop(stop);}
           });
         };
@@ -183,7 +183,7 @@ beforeAll(async () => {
           }
         });
         form.addEventListener('submit',event=>{
-          event.preventDefault();document.body.dataset.order+='send,';document.body.dataset.sends=String(Number(document.body.dataset.sends)+1);document.body.dataset.sentText=editor.textContent;
+          event.preventDefault();document.body.dataset.order+='send,';document.body.dataset.sends=String(Number(document.body.dataset.sends)+1);document.body.dataset.sentText=editor.textContent;document.body.dataset.sentAt=String(Date.now());
           document.body.dataset.sentFamily=window.family;document.body.dataset.sentEffort=document.body.dataset.effort;
           editor.innerHTML='';send.disabled=true;
           const turnKey='new-'+document.body.dataset.sends;
@@ -253,7 +253,7 @@ test.skipIf(!native)("successive browser sends reuse a healthy paired conversati
     expect(documentLoads).toBe(1);
   }
   expect(documentLoads).toBe(1);expect(await page.locator('body').getAttribute('data-sends')).toBe('2');
-},15_000);
+},20_000);
 
 test.skipIf(!native)("editor rejection is a confirmed-unsent availability failure while edited drafts remain interference",async()=>{
   for(const mode of ["rejected","exception","edited"] as const){
@@ -348,7 +348,7 @@ test.skipIf(!native)("pairing, messages, and new chats clear pre-existing drafts
     expect(await page.locator('body').getAttribute('data-sent-text')).not.toContain('Discard this existing draft');
     expect(await composerText(await activeComposer(page))).toBe('');
   }
-},25_000);
+},35_000);
 
 test.skipIf(!native)("draft cleanup still requires the expected account and conversation",async()=>{
   for(const mismatch of ['account','conversation']) {
@@ -370,7 +370,7 @@ test.skipIf(!native)("whitespace-only drafts are removed from the submitted text
     // Chrome may insert one separator after the reselected connector chip.
     expect(sent.slice(connector.length).replace(/^ /,'')).toBe(prompt.replace(/\n/g,''));
   }
-},15_000);
+},25_000);
 
 test.skipIf(!native)("model discovery and new-chat preparation clear existing drafts",async()=>{
   for(const creating of [false,true]) {
@@ -754,24 +754,57 @@ test.skipIf(!native)("composer text preserves native paragraph, hard-break and b
   }
 },5_000);
 
-test.skipIf(!native)("submission releases the window while the response continues without observation",async()=>{
+test.skipIf(!native)("submission holds the window for five seconds so a slow request finishes before the next navigation",async()=>{
   const driver=await fixture("",true,connector,31_000);
+  const nextUrl="https://chatgpt.com/c/another-pair-fixture";
+  const delayedSubmit="https://chatgpt.com/fixture-delayed-submit";
+  await page.route(delayedSubmit,async route=>{
+    await new Promise(resolve=>setTimeout(resolve,4_000));
+    await route.fulfill({json:{accepted:true}});
+  });
+  await page.evaluate(()=>document.querySelector('form')!.addEventListener('submit',()=>{
+    void fetch('/fixture-delayed-submit').then(()=>{document.body.dataset.requestFinished='true';});
+  }));
   const coordinator=new SingleWindowCoordinator(driver,build);
   const began=Date.now();
   await executeCoordinatorFixture(coordinator,request);
+  await page.waitForFunction(()=>document.body.dataset.sends==='1');
+  const sentAt=await page.evaluate(()=>Number(document.body.dataset.sentAt));
+  expect((await coordinator.health()).activeActionId).toBe(request.actionId);
+  expect((await coordinator.health()).status).toBe('busy');
+  await coordinator.reveal(nextUrl);
+  expect(page.url()).toBe(url);
   const events=[];for await(const event of coordinator.events(request.actionId,0)) events.push(event);
+  expect(Date.now()-sentAt).toBeGreaterThanOrEqual(5_000);
   expect(Date.now()-began).toBeLessThan(10_000);
+  expect(await page.locator('body').getAttribute('data-request-finished')).toBe('true');
   expect(events.some(event=>["status_delta","commentary_delta","answer_delta","generation_complete"].includes(event.type))).toBeFalse();
   expect(events.at(-1)?.type).toBe("submission_complete");
   expect(await page.locator('[data-testid="stop-button"]').count()).toBe(1);
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(1);
   expect((await coordinator.health()).activeActionId).toBeNull();
   expect((await coordinator.health()).status).toBe("idle");
-  const nextUrl="https://chatgpt.com/c/another-pair-fixture";
   const next={...request,actionId:"next-pair",idempotencyKey:"next-pair-key",url:nextUrl,expectedUrl:nextUrl};
   await executeCoordinatorFixture(coordinator,next);
   const nextEvents=[];for await(const event of coordinator.events(next.actionId,0)) nextEvents.push(event);
   expect(nextEvents.at(-1)?.type).toBe("submission_complete");
+  expect(page.url()).toBe(nextUrl);
+  await page.unroute(delayedSubmit);
+},20_000);
+
+test.skipIf(!native)("cancellation after Send keeps browser ownership through the five-second request settling window",async()=>{
+  const driver=await fixture();
+  const coordinator=new SingleWindowCoordinator(driver,build),submitted=offlineRequest('gpt-6-astra','max');
+  await executeCoordinatorFixture(coordinator,submitted);
+  for await(const event of coordinator.events(submitted.actionId,0))if(event.type==='send_accepted')break;
+  const sentAt=await page.evaluate(()=>Number(document.body.dataset.sentAt));
+  expect((await coordinator.health()).activeActionId).toBe(submitted.actionId);
+  await coordinator.cancel({actionId:submitted.actionId,idempotencyKey:'cancel-after-submit'});
+  expect(Date.now()-sentAt).toBeGreaterThanOrEqual(5_000);
+  expect((await coordinator.action(submitted.actionId))?.sendAccepted).toBeTrue();
+  expect((await coordinator.health()).activeActionId).toBeNull();
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+  expect(page.url()).toBe(url);expect(documentLoads).toBe(1);
 },15_000);
 
 test.skipIf(!native)("offline messages and goals stop lingering generation before Send and then release the queue",async()=>{
@@ -794,7 +827,7 @@ test.skipIf(!native)("offline messages and goals stop lingering generation befor
     expect(events.at(-1)?.type).toBe("submission_complete");
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
-},15_000);
+},25_000);
 
 test.skipIf(!native)("offline Stop confirms an optional localized dialog before sending once",async()=>{
   const prompts:ExecuteActionRequest["prompt"][]=[
@@ -813,7 +846,7 @@ test.skipIf(!native)("offline Stop confirms an optional localized dialog before 
     expect(await page.locator('[role="dialog"]').count()).toBe(0);
     expect(documentLoads).toBe(2);
   }
-},20_000);
+},30_000);
 
 test.skipIf(!native)("offline Stop never confirms a preexisting or ambiguous dialog",async()=>{
   for(const scenario of ["preexisting","duplicateSubmit"] as const) {
@@ -936,13 +969,30 @@ test.skipIf(!native)("slow Stop completion, with or without confirmation, sends 
     await executeCoordinatorFixture(coordinator,offline);
     const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
     expect(events.at(-1)).toMatchObject({type:'submission_complete'});
-    expect(Date.now()-began).toBeLessThan(20_000);
+    expect(Date.now()-began).toBeLessThan(26_000);
     expect(documentLoads).toBe(loads);
     expect(await page.locator('body').getAttribute('data-stops')).toBe('1');
     expect(await page.locator('body').getAttribute('data-confirmations')).toBe(confirmation?'1':'0');
     expect(await page.locator('body').getAttribute('data-order')).toBe(confirmation?'stop,confirm,stopped,send,':'stop,stopped,send,');
   }
-},45_000);
+},55_000);
+
+test.skipIf(!native)("a late Stop confirmation gets its own settling window before any retry or reload",async()=>{
+  const driver=await fixture("",true,connector,0,true);
+  stopConfirmation={delayMs:18_000};stopFinishDelayMs=5_000;
+  await syncFixture();const loads=documentLoads;
+  const coordinator=new SingleWindowCoordinator(driver,build),offline:ExecuteActionRequest={...request,prompt:{kind:'offline_goal',goalRevision:1}};
+  await executeCoordinatorFixture(coordinator,offline);
+  const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+  expect(events.at(-1)).toMatchObject({type:'submission_complete'});
+  const times=await page.evaluate(()=>({confirmed:Number(document.body.dataset.confirmedAt),stopped:Number(document.body.dataset.stoppedAt),sent:Number(document.body.dataset.sentAt)}));
+  expect(times.stopped-times.confirmed).toBeGreaterThanOrEqual(5_000);
+  expect(times.sent-times.confirmed).toBeLessThan(20_000);
+  expect(await page.locator('body').getAttribute('data-stops')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-confirmations')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-order')).toBe('stop,confirm,stopped,send,');
+  expect(documentLoads).toBe(loads);
+},40_000);
 
 test.skipIf(!native)("an ignored first Stop is retried automatically before sending once",async()=>{
   const driver=await fixture("",true,connector,0,true,2);
@@ -1040,7 +1090,7 @@ test.skipIf(!native)("chat ID survives project, ordinary-route, and slug rewrite
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(1);
   expect((await coordinator.health()).activeActionId).toBeNull();
   }
-},10_000);
+},25_000);
 
 test.skipIf(!native)("a different chat ID before Send remains rejected",async()=>{
   const expected="https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-original-project/c/12345678-1234-4321-8765-123456789abc";
@@ -1084,7 +1134,7 @@ test.skipIf(!native)("new chats bind the created URL after sending the initializ
     expect(documentLoads).toBe(preparedLoads);
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
-},15_000);
+},25_000);
 
 
 test.skipIf(!native)("new chat creation waits for the persistent URL instead of retaining the local draft ID",async()=>{

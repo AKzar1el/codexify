@@ -141,6 +141,8 @@ async function stopLingeringResponse(
           await dialog.locator('form button[type="submit"].bg-primary-solid').click({timeout:timeout(750),signal:boundedSignal});
           confirmationSubmitted = true;
           await requested("confirmation");
+          // Confirmation is a fresh Stop request. Its full settling window starts
+          // here, even when the dialog appeared near the first click's deadline.
           settleDeadline = Math.min(deadline,lastStopRequestedAt+settleMs);
         }
         await dialog.waitFor({state:"hidden",timeout:Math.max(1,Math.min(timeout(settleMs),settleDeadline-Date.now())),signal:boundedSignal});
@@ -594,6 +596,13 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     await this.surface.beginAction();
     let sendActivated = false;
     let sendAccepted = false;
+    let submissionSettlesAt = 0;
+    const settleSubmission = async () => {
+      const remaining = submissionSettlesAt - Date.now();
+      // Keep ownership even if cancelled after Send: navigating away can abort
+      // ChatGPT's request after its UI already reported acceptance.
+      if (remaining > 0) await new Promise(resolve => setTimeout(resolve,remaining));
+    };
     let ownedPage: Page | undefined;
     let insertionAttempted = false;
     let selectedConnector: SelectedConnector | undefined;
@@ -731,7 +740,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       sendActivated = true;
       if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
       step("clicking Send");
+      submissionSettlesAt = Date.now() + 5_000;
       await send.click({ timeout:10_000, signal:execution.signal });
+      submissionSettlesAt = Date.now() + 5_000;
       step("confirming Send acceptance");
       try {
         await waitForSubmissionAcceptance(page, baseline, Date.now() + 30_000, execution.signal);
@@ -766,6 +777,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         await assertSelectedModelAndEffort(page, selected, execution.signal);
         execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
       }
+      step("letting submission requests settle");
+      await settleSubmission();
+      execution.signal.throwIfAborted();
       execution.emit({ type:"submission_complete", canonicalUrl });
     } catch (error) {
       if (process.env.CODEXIFY_BROWSER_TRACE_SUBMISSION === "1") console.error(`[submission-step] ${execution.request.actionId} failed at ${submissionStep}; sendActivated=${sendActivated}; sendAccepted=${sendAccepted}`);
@@ -804,6 +818,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       throw error;
     } finally {
       try {
+        await settleSubmission();
         if (pairingSelection && ownedPage && restoreUrl) {
           try { await this.restorePairingSelection(ownedPage, pairingSelection, restoreUrl, execution.request.expectedAccountFingerprint); }
           catch (error) {
