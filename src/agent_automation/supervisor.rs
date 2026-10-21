@@ -2217,13 +2217,14 @@ impl AgentAutomationSupervisor {
         let activity_after = task.chat.offline_activity().await?;
         let no_tool_activity = activity_after.tool_call_count == execution.tool_call_count_at_start;
         let terminal_status = accumulator.terminal_status.unwrap_or_else(|| {
-            if snapshot.state == CompanionActionState::Failed
-                && snapshot
-                    .attention
-                    .as_ref()
-                    .is_some_and(|attention| attention.code == "conversation_unavailable")
-            {
-                AutomationActionStatus::ConversationUnavailable
+            if snapshot.state == CompanionActionState::Failed {
+                failed_companion_status(
+                    snapshot
+                        .attention
+                        .as_ref()
+                        .map(|a| a.code.as_str())
+                        .unwrap_or_default(),
+                )
             } else {
                 companion_status(snapshot.state)
             }
@@ -2535,11 +2536,7 @@ impl AgentAutomationSupervisor {
             }
             CompanionEventKind::Failed { message, code } => {
                 state.status = Some(message);
-                let failure = if code == "conversation_unavailable" {
-                    AutomationActionStatus::ConversationUnavailable
-                } else {
-                    AutomationActionStatus::Failed
-                };
+                let failure = failed_companion_status(&code);
                 accumulator.terminal_status = Some(failure);
                 state.phase = failure;
             }
@@ -2806,6 +2803,17 @@ mod retry_wake_tests {
             .next_retry_scan_ms
             .store(100_000, Ordering::Relaxed);
         assert_eq!(supervisor.retry_scan_delay(13_000), Duration::from_secs(30));
+    }
+}
+
+fn failed_companion_status(code: &str) -> AutomationActionStatus {
+    // These pre-Send availability failures share the long retry schedule while
+    // keeping the companion's original error message for the owner interface.
+    match code {
+        "conversation_unavailable" | "editor_unavailable" => {
+            AutomationActionStatus::ConversationUnavailable
+        }
+        _ => AutomationActionStatus::Failed,
     }
 }
 

@@ -6,6 +6,7 @@ export type BrowserFailureCode =
   | "ambiguous_send"
   | "selector_drift"
   | "conversation_unavailable"
+  | "editor_unavailable"
   | "model_unavailable"
   | "connector_unavailable"
   | "cancelled"

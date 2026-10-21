@@ -680,9 +680,10 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       step("inserting prompt");
       try {await insertExactPrompt(selectedConnector?.composer ?? await activeComposer(page,30_000,execution.signal), execution.renderedPrompt);}
       catch(error){
+        execution.signal.throwIfAborted();
         await throwIfConversationApproval(page);
         if(error instanceof BrowserCompanionError)throw error;
-        throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent","external_interference",{cause:error});
+        throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent","editor_unavailable",{cause:error});
       }
       step("waiting for Send control");
       const send = await uniqueSendButton(await activeComposer(page, 30_000, execution.signal), 30_000, execution.signal,

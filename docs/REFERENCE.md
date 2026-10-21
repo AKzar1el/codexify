@@ -2203,8 +2203,8 @@ and mirrored messages remain unread until the normal chat cursor advances.
 Confirmed pre-Send failures in chats and active goals retry automatically after
 30, 60, 120, 240, and 480 seconds, then wait for manual Retry. Submitted or stalled
 goal turns recover after 60, 120, and 240 seconds, then require Continue.
-Authentication-required and conversation-unavailable failures that are confirmed
-unsent share a separate six-retry
+Authentication-required, conversation-unavailable, and editor-insertion failures
+that are confirmed unsent share a separate six-retry
 schedule: 3, 5, 10, 20, 30, and 60 minutes, then wait for manual Retry. Each interval
 starts after the preceding failed attempt. All three schedules add 0–10% extra
 jitter to spread retries from different chats. The jitter is stable for each failed

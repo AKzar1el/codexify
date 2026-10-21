@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.6] - 2026-10-21
+
+### Fixed
+
+- Confirmed-unsent ChatGPT editor insertion failures use the same jittered
+  3, 5, 10, 20, 30, and 60-minute retry schedule as conversation-load failures.
+  Existing or edited drafts still require manual attention.
+
 ## [2.3.5] - 2026-10-21
 
 ### Added
@@ -945,7 +953,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.5...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.6...HEAD
+[2.3.6]: https://github.com/devnoname120/codexify/compare/v2.3.5...v2.3.6
 [2.3.5]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.5
 [2.3.3]: https://github.com/devnoname120/codexify/compare/v2.3.2...v2.3.3
 [2.3.2]: https://github.com/devnoname120/codexify/compare/v2.3.0...v2.3.2

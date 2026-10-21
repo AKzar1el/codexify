@@ -8749,23 +8749,28 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
             });
         }
         let mut snapshot = snapshot_for(execution);
-        let conversation_failure = self.failure.starts_with("conversation");
-        snapshot.state = if conversation_failure {
+        let editor_failure = self.failure.starts_with("editor");
+        let access_failure = self.failure.starts_with("conversation") || editor_failure;
+        snapshot.state = if access_failure {
             CompanionActionState::Failed
         } else {
             CompanionActionState::AuthenticationRequired
         };
-        snapshot.send_accepted = false;
+        snapshot.send_accepted = self.failure == "editor_accepted";
         snapshot.last_event_sequence = 0;
         snapshot.attention = Some(codexify::agent_automation::CompanionAttention {
-            code: if conversation_failure {
+            code: if editor_failure {
+                "editor_unavailable"
+            } else if access_failure {
                 "conversation_unavailable"
             } else {
                 "authentication_required"
             }
             .into(),
             message: Some(
-                if conversation_failure {
+                if editor_failure {
+                    "ChatGPT did not accept the message in its editor; nothing was sent"
+                } else if access_failure {
                     "ChatGPT conversation temporarily not accessible"
                 } else {
                     "Sign in to ChatGPT"
@@ -8773,15 +8778,21 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
                 .into(),
             ),
         });
-        if self.failure == "conversation_stream" {
+        if matches!(self.failure, "conversation_stream" | "editor_stream") {
             events
                 .send(CompanionEvent {
                     sequence: 1,
                     action_id: snapshot.action_id.clone(),
                     at_ms: 1,
                     kind: CompanionEventKind::Failed {
-                        code: "conversation_unavailable".into(),
-                        message: "ChatGPT conversation temporarily not accessible".into(),
+                        code: snapshot.attention.as_ref().unwrap().code.clone(),
+                        message: snapshot
+                            .attention
+                            .as_ref()
+                            .unwrap()
+                            .message
+                            .clone()
+                            .unwrap(),
                     },
                 })
                 .unwrap();
@@ -8799,6 +8810,8 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
             "authentication_snapshot",
             "conversation_snapshot",
             "conversation_stream",
+            "editor_snapshot",
+            "editor_stream",
         ] {
             let f = fixture().await;
             if mode != "chat" {
@@ -8843,12 +8856,18 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
                 let failed = f.store.load(&f.task).unwrap();
                 assert_eq!(
                     failed.action.status,
-                    if failure.starts_with("conversation") {
+                    if failure.starts_with("conversation") || failure.starts_with("editor") {
                         AutomationActionStatus::ConversationUnavailable
                     } else {
                         AutomationActionStatus::AuthenticationRequired
                     }
                 );
+                if failure.starts_with("editor") {
+                    assert_eq!(
+                        failed.action.last_error.as_deref(),
+                        Some("ChatGPT did not accept the message in its editor; nothing was sent")
+                    );
+                }
                 assert_eq!(failed.action.chatgpt_access_retry_attempts, attempt as u32);
                 assert_eq!(failed.automatic_retry_attempts(), attempt as u32);
                 assert_eq!(failed.automatic_retry_limit(), 6);
@@ -8861,7 +8880,7 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
                 );
                 assert_eq!(
                     failed.action.automatic_retry_attempts, 0,
-                    "authentication must not consume the short retry budget"
+                    "access failures must not consume the short retry budget"
                 );
                 let reopened = Arc::new(AgentAutomationStore::for_config(&f.config).unwrap());
                 assert_eq!(
@@ -8922,10 +8941,45 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
 }
 
 #[tokio::test]
+async fn editor_failure_with_send_acceptance_is_ambiguous_and_never_replays_user_messages() {
+    let f = fixture().await;
+    f.chat
+        .append_user("editor-message".into(), "Keep this message".into())
+        .await
+        .unwrap();
+    let executor = Arc::new(AuthenticationRetryExecutor {
+        calls: AtomicUsize::new(0),
+        recovered: AtomicBool::new(false),
+        failure: "editor_accepted",
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor.scan_once(1_000).await.unwrap();
+    supervisor.run_next(1_001).await.unwrap();
+    let failed = f.store.load(&f.task).unwrap();
+    assert_eq!(failed.action.status, AutomationActionStatus::Ambiguous);
+    assert_eq!(failed.action.send_accepted, Some(true));
+    assert!(failed.automatic_retry_at_ms().is_none());
+    supervisor.scan_once(86_400_000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn exhausted_unsent_goal_failure_clears_only_after_fresh_agent_activity() {
     for failure in [
         "authentication_preflight",
         "conversation_snapshot",
+        "editor_snapshot",
         "failed",
     ] {
         let f = fixture().await;

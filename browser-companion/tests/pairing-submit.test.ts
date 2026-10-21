@@ -7,7 +7,7 @@ import { fingerprintAccountIdentity } from "../src/account";
 import { SingleWindowCoordinator, type DriverExecution } from "../src/browser-window";
 import { ChatGptBrowserDriver, type SingleBrowserSurface } from "../src/chatgpt-driver";
 import { privateChromeExecutable } from "../src/chrome-executable";
-import { activeComposer, composerText, uniqueSendButton } from "../src/composer";
+import { activeComposer, composerText, insertExactPrompt, uniqueSendButton } from "../src/composer";
 import { protocolBuild, renderActionPrompt, type ExecuteActionRequest } from "../src/protocol";
 
 const native = process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME === "1";
@@ -253,6 +253,43 @@ test.skipIf(!native)("successive browser sends reuse a healthy paired conversati
   }
   expect(documentLoads).toBe(1);expect(await page.locator('body').getAttribute('data-sends')).toBe('2');
 },15_000);
+
+test.skipIf(!native)("editor rejection is a confirmed-unsent availability failure while edited drafts remain interference",async()=>{
+  for(const mode of ["rejected","exception","edited"] as const){
+    const driver=await fixture();
+    const submitted=offlineRequest('gpt-6-astra','max'),text=renderActionPrompt(submitted.prompt);
+    await page.evaluate(({mode,text})=>{
+      const original=document.execCommand.bind(document);
+      document.execCommand=(command,showUi,value)=>{
+        if(command==='insertText'&&value===text){
+          if(mode==='rejected')return false;
+          if(mode==='exception')throw new Error('Editor detached during insertion');
+          const accepted=original(command,showUi,value);
+          document.querySelector('[contenteditable="true"]')!.lastElementChild!.append(' edited');
+          return accepted;
+        }
+        return original(command,showUi,value);
+      };
+    },{mode,text});
+    const coordinator=new SingleWindowCoordinator(driver,build);
+    await executeCoordinatorFixture(coordinator,submitted);
+    const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+    expect(events.at(-1)).toMatchObject(mode==='edited'
+      ? {type:'external_interference'}
+      : {type:'failed',code:'editor_unavailable',message:'ChatGPT did not accept the message in its editor; nothing was sent'});
+    expect((await coordinator.action(submitted.actionId))?.sendAccepted).toBeFalse();
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+    if(mode==='edited')expect(await composerText(await activeComposer(page))).toBe(text+' edited');
+  }
+},15_000);
+
+test.skipIf(!native)("a nonempty draft is interference rather than a retryable insertion failure",async()=>{
+  await fixture('User draft');
+  const composer=await activeComposer(page);
+  await expect(insertExactPrompt(composer,'Automation message')).rejects.toMatchObject({code:'external_interference'});
+  expect(await composerText(composer)).toBe('User draft');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+});
 
 test.skipIf(!native)("sending an existing conversation tolerates nested wrappers for one turn",async()=>{
   const driver=await fixture();nestedHistory=true;

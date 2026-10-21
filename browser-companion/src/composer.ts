@@ -102,14 +102,14 @@ export async function composerText(composer: Locator): Promise<string> {
 export async function ensureEmptyOwnedComposer(composer: Locator): Promise<void> {
   const text = await composerText(composer);
   if (text.trim().length !== 0) {
-    throw new Error("ChatGPT composer contains an existing draft; automation will not overwrite it");
+    throw new BrowserCompanionError("ChatGPT composer contains an existing draft; automation will not overwrite it", "external_interference");
   }
 }
 
 export async function insertExactPrompt(composer: Locator, prompt: string): Promise<void> {
   await ensureEmptyOwnedComposer(composer);
   const inserted = await composer.evaluate(insertPlainTextIntoComposer, prompt);
-  if (!inserted) throw new Error("ChatGPT rejected exact plaintext composer insertion");
+  if (!inserted) throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent", "editor_unavailable");
   const actual = await composerText(composer);
   if (!verifyOwnedComposerText(actual, prompt)) {
     throw new BrowserCompanionError("ChatGPT composer text changed during insertion; the message was not sent", "external_interference");
