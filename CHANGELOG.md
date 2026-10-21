@@ -6,7 +6,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [2.3.4] - 2026-10-21
+## [2.3.5] - 2026-10-21
 
 ### Added
 
@@ -945,8 +945,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.4...HEAD
-[2.3.4]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.4
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.5...HEAD
+[2.3.5]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.5
 [2.3.3]: https://github.com/devnoname120/codexify/compare/v2.3.2...v2.3.3
 [2.3.2]: https://github.com/devnoname120/codexify/compare/v2.3.0...v2.3.2
 [2.3.0]: https://github.com/devnoname120/codexify/compare/v2.2.1...v2.3.0

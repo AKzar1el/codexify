@@ -2636,6 +2636,7 @@ mod tests {
             "agentChat.automation",
             &[
                 "autoApproveToolCalls",
+                "automaticRetries",
                 "connectorName",
                 "descriptorPath",
                 "enabled",
