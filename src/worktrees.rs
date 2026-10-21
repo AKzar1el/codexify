@@ -22,6 +22,7 @@ pub use existing::{
     ExistingWorktree, existing_worktree_choice, last_used_at_ms, list_existing_worktrees,
     touch_workspace, validate_registered_worktree,
 };
+pub(crate) use existing::{worktree_base_commit, worktree_source_project};
 const METADATA_FILENAME: &str = ".codexify-worktree.json";
 const LEGACY_METADATA_FILENAME: &str = ".codex-free-worktree.json";
 const LOCAL_ENVIRONMENT_CONFIG_KEY: &str = "codex.localEnvironmentConfigPath";

@@ -391,7 +391,43 @@ impl ProjectBindingStore {
         identity: &ConversationIdentity,
         input: &str,
     ) -> Result<ProjectRootSelection, String> {
-        let reference = ProjectReference::parse(input)?;
+        self.select_project_root_with_base(config, identity, input, None)
+            .await
+    }
+
+    pub async fn select_project_root_from_worktree(
+        &self,
+        config: &AppConfig,
+        identity: &ConversationIdentity,
+        project: &str,
+        base: &Path,
+    ) -> Result<ProjectRootSelection, String> {
+        self.select_project_root_with_base(config, identity, project, Some(base))
+            .await
+    }
+
+    async fn select_project_root_with_base(
+        &self,
+        config: &AppConfig,
+        identity: &ConversationIdentity,
+        input: &str,
+        base: Option<&Path>,
+    ) -> Result<ProjectRootSelection, String> {
+        let mut reference = ProjectReference::parse(input)?;
+        let mut base = base.map(Path::to_owned);
+        if base.is_none()
+            && config.worktrees.mode == WorktreeMode::Always
+            && let ProjectReference::Path(path) = &reference
+            && let Some(source) = crate::worktrees::worktree_source_project(config, path)?
+        {
+            let path = Path::new(path);
+            base = Some(if path.is_absolute() {
+                path.to_owned()
+            } else {
+                config.work_dir.join(path)
+            });
+            reference = ProjectReference::Path(source.to_string_lossy().into_owned());
+        }
         let access_root = canonical_access_root(config)?;
         let binding_path = self.binding_path(&access_root, identity);
         let binding_lock = acquire_lock(&binding_path).await?;
@@ -438,7 +474,27 @@ impl ProjectBindingStore {
             None => {}
         }
 
-        let prepared = prepare_project_root(config, &reference).await?;
+        let prepared = if let Some(base) = &base {
+            let ProjectReference::Path(project) = &reference else {
+                return Err("A worktree base requires an authorized local source project".into());
+            };
+            let (access_root, source_project_root) = resolve_project_root(config, project)?;
+            let commit =
+                crate::worktrees::worktree_base_commit(config, &source_project_root, base).await?;
+            PreparedProjectRoot {
+                access_root,
+                source_project_root,
+                checkout_commit: Some(commit),
+                // Explicit base selection always requires a fresh worktree,
+                // even when the source checkout happens to have the same HEAD.
+                source_matches_checkout: false,
+                repository_url: None,
+                cloned: false,
+                warnings: Vec::new(),
+            }
+        } else {
+            prepare_project_root(config, &reference).await?
+        };
         if prepared.access_root != access_root {
             return Err(
                 "The configured project access root changed while resolving the project; retry the selection"

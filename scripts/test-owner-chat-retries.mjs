@@ -5,6 +5,63 @@ import {createRequire} from 'node:module';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const origin='http://127.0.0.1:43357',META='io.github.devnoname120/codexify/markdown-chat';
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: chat switches use cached models and never request browser discovery`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
+ const now=Date.now(),a='d'.repeat(64),b='f'.repeat(64),errors=[],operations=[];
+ const busy='Browser companion rejected the operation because its state changed';
+ const goal={revision:1,status:'active',markdown:'Continue the current goal',elapsedActiveMs:60000,turnCount:1};
+ const models=[{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}];
+ let actionFailed=false,cached=true,context='fixture-account-build';
+ try{
+  await page.addInitScript(()=>{window.setInterval=()=>0;});page.on('pageerror',error=>errors.push(error.message));
+  await routeOwner(page,origin+'/**',route=>{
+   const request=route.request(),path=new URL(request.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(request.method()!=='GET')operations.push(path);
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.3',settingsAvailable:false}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[a,b].map((id,i)=>({id,title:'Conversation '+i,workspace:'model-errors',goal,goalStatus:'active',lastEntryAtMs:now-i,lastEntryEnd:0,totalToolCalls:0})),serverTimeMs:Date.now()}});
+   if(path.endsWith('/automation/capabilities'))return route.fulfill({status:500,contentType:'text/plain',body:busy});
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action:actionFailed?{id:'genuine-failure',kind:'offline_goal',status:'failed',lastError:busy,retryMode:'retry'}:{status:'idle'},pairing:{status:'verified'},selection:{model:'gpt-6-astra',effort:'max'},catalog:cached?{models}:null,companion:{authenticated:true,status:'idle',activeActionId:null,catalogContext:context},presence:{},serverTimeMs:Date.now()}});
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false}}}});
+  });
+  await page.goto(origin+'/#model-error-token');await page.locator('.conversation').last().waitFor();
+  const host=page.locator('#chat-host');
+  for(const id of [a,b,a]){
+   await page.locator(`[data-chat-id="${id}"] .conversation`).click();await host.locator('#automation-model:enabled').waitFor();
+   assert.equal(await host.locator('#automation-error').isVisible(),false);
+   assert.equal(await host.locator('#goal-caption').textContent(),'Pursuing goal');
+   assert.equal(await host.locator('#automation-model').inputValue(),'gpt-6-astra');
+   assert.equal(await host.locator('#automation-effort').inputValue(),'max');
+   assert.equal(await host.locator('#automation-model option:checked').textContent(),'GPT-6 Astra');
+  }
+  // A different account with no cache keeps saved IDs, without reusing the
+  // previous account's labels or attempting discovery merely to render a chat.
+  cached=false;context='other-account-build';
+  await page.evaluate(()=>window.dispatchEvent(new Event('codexify-browser-change')));
+  await host.locator('#automation-model option:checked').filter({hasText:/^Saved model$/}).waitFor({state:'attached'});
+  assert.equal(await host.locator('#automation-model').isDisabled(),true);
+  assert.equal(await host.locator('#automation-model').inputValue(),'gpt-6-astra');
+  assert.match(await host.locator('#automation-model').getAttribute('title'),/Model list unavailable/);
+  assert.equal(await host.locator('#automation-error').isVisible(),false);
+  await page.locator(`[data-chat-id="${b}"] .conversation`).click();
+  await host.locator('#automation-model option:checked').filter({hasText:/^Saved model$/}).waitFor({state:'attached'});
+  assert.equal(await host.locator('#automation-error').isVisible(),false);
+  actionFailed=true;
+  const refresh=page.waitForResponse(response=>new URL(response.url()).pathname===`/api/chats/${b}/automation`);
+  await page.evaluate(()=>window.dispatchEvent(new Event('codexify-browser-change')));await refresh;
+  await host.locator('#automation-error').getByText(new RegExp(busy)).waitFor();
+  assert.equal(await host.locator('#automation-error').isVisible(),true,'a genuine action failure with the same message stays visible');
+  actionFailed=false;cached=true;
+  await page.evaluate(()=>window.dispatchEvent(new Event('codexify-browser-change')));
+  await host.locator('#automation-model:enabled').waitFor();
+  assert.equal(await host.locator('#automation-error').isVisible(),false);
+  assert.doesNotMatch(await host.locator('#automation-model').getAttribute('title'),/unavailable/);
+  assert.equal(await host.locator('#automation-model').inputValue(),'gpt-6-astra');
+  assert.deepEqual(operations,[],'switches, polls and catalog recovery use cached state without invoking browser operations');
+  assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
+});
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: goal backoff exposes the permitted manual action beside its countdown`,{timeout:30000},async()=>{
  const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
  try{
@@ -114,5 +171,46 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(await page.locator('#layout').evaluate(n=>n.scrollWidth>n.clientWidth),false);
   if(out)await page.screenshot({path:`${out}/${name.toLowerCase()}-retrying-mobile.png`,animations:'disabled'});
   assert.deepEqual(errors,[]);assert.deepEqual(writes,[]);
+ }finally{await browser.close();}
+});
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: pausing a retry retains its error and dismiss clears it across reopening`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:390,height:844}});page.setDefaultTimeout(5000);
+ try{
+  const id='c'.repeat(64),now=Date.now(),operations=[],errors=[];
+  const goal={revision:1,status:'active',markdown:'Keep this goal',turnCount:1};
+  let action={id:'failure',kind:'offline_goal',status:'authentication_required',lastError:'Sign in to ChatGPT',sendAccepted:false,retryMode:'retry',automaticRetriesEnabled:true,canPauseRetries:true,automaticRetryAtMs:now+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
+  await page.clock.install({time:now});page.on('pageerror',e=>errors.push(e.message));
+  await routeOwner(page,origin+'/**',route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.3',settingsAvailable:false}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Paused retries',workspace:'test',goal,lastEntryAtMs:now,lastEntryEnd:0,totalToolCalls:0,automationError:action.lastError}],serverTimeMs:Date.now()}});
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'idle'},presence:{},serverTimeMs:Date.now()}});
+   if(path.endsWith('/action/pause-retries')||path.endsWith('/action/cancel')){
+    const body=req.postDataJSON();assert.equal(body.actionId,action.id);operations.push(path);
+    action={...action,automaticRetryPaused:true,canPauseRetries:false,automaticRetryAtMs:null};
+    if(path.endsWith('/cancel'))action={...action,status:'cancelled',lastError:null,retryMode:null};
+    return route.fulfill({json:{action}});
+   }
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false}}}});
+  });
+  const url=`${origin}/?chat=${id}#retry-test-token`;
+  await page.goto(url);
+  let host=page.locator('#chat-host'),error=host.locator('#automation-error'),pause=host.locator('#automation-pause-retries');
+  await pause.waitFor();await error.getByText(/Retrying the goal automatically/).waitFor();
+  for(const button of [pause,host.locator('#automation-retry-inline'),host.locator('#automation-dismiss-inline')]){
+   const box=await button.boundingBox();assert(box.x>=0&&box.x+box.width<=390,'retry controls stay in the mobile viewport');
+  }
+  await pause.click();await error.getByText(/Automatic retries paused/).waitFor();assert.equal(await pause.isVisible(),false);
+  assert.equal(await host.locator('#goal-retry').isVisible(),true);
+  if(process.env.RETRY_BUTTON_SCREENSHOTS){mkdirSync(process.env.RETRY_BUTTON_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.RETRY_BUTTON_SCREENSHOTS}/${name.toLowerCase()}-paused.png`});}
+  await page.reload();host=page.locator('#chat-host');error=host.locator('#automation-error');
+  await error.getByText(/Automatic retries paused/).waitFor();
+  await host.locator('#automation-dismiss-inline').click();await error.waitFor({state:'hidden'});
+  await page.reload();host=page.locator('#chat-host');await host.locator('#goal-text').getByText(goal.markdown).waitFor();
+  await page.clock.fastForward(2000);assert.equal(await host.locator('#automation-error').isVisible(),false);
+  assert.equal(goal.status,'active');assert.equal(action.sendAccepted,false);assert.equal(operations.length,2);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });

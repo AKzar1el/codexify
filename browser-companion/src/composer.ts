@@ -120,6 +120,7 @@ export async function uniqueSendButton(
   composer: Locator,
   timeoutMs = COMPOSER_READY_TIMEOUT_MS,
   signal?: AbortSignal,
+  checkBlocker?: () => Promise<void>,
 ): Promise<Locator> {
   const form = composer.locator("xpath=ancestor::form[1]");
   if (await form.count() !== 1) throw new BrowserCompanionError("ChatGPT composer does not have one owned form", "selector_drift");
@@ -127,6 +128,7 @@ export async function uniqueSendButton(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
+    await checkBlocker?.();
     const count = await send.count();
     if (count > 1) throw new BrowserCompanionError("ChatGPT composer does not have one visible Send control", "selector_drift");
     if (count === 1 && await send.first().isEnabled().catch(() => false)) return send.first();

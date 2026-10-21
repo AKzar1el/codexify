@@ -757,6 +757,17 @@ async fn conversation_approval_resumes_the_existing_turn_without_sending_or_cons
             .contains("Keep my message unread")
     );
     supervisor.scan_once(6001).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    let until = f
+        .store
+        .load(&f.task)
+        .unwrap()
+        .approval_resume_until_ms()
+        .unwrap();
+    assert!(until >= 181_000);
+    supervisor.scan_once(until - 1).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 0);
+    supervisor.scan_once(until).await.unwrap();
     assert_eq!(supervisor.queued_count().await, 1);
 }
 
@@ -811,6 +822,11 @@ async fn fixture_with_queue_limit(max_queued_actions: usize) -> Fixture {
     config.markdown_chat.automation.enabled = true;
     config.markdown_chat.automation.connector_name = "Codexify".into();
     config.markdown_chat.automation.max_queued_actions = max_queued_actions;
+    config.markdown_chat.automation.descriptor_path = root
+        .path()
+        .join("browser/descriptor.json")
+        .display()
+        .to_string();
 
     let task = ConversationIdentity::from_openai_session("supervisor-online").unwrap();
     let chat = MarkdownChatStore::default()
@@ -8239,6 +8255,280 @@ async fn offline_goal_retry_never_replays_a_previously_accepted_user_batch() {
 }
 
 #[tokio::test]
+async fn resumed_goal_activity_clears_retry_cooldowns_across_restart() {
+    for failure in [
+        "failed",
+        "authentication_preflight",
+        "conversation_snapshot",
+        "ambiguous",
+    ] {
+        let f = fixture().await;
+        let goal = f.store.set_goal(&f.task, "Resume this goal", 100).unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        f.chat.record_agent_call(1_000).await.unwrap();
+        let executor: Arc<dyn AutomationExecutor> = match failure {
+            "failed" => Arc::new(PreSendFailureExecutor::default()),
+            "ambiguous" => Arc::new(AmbiguousExecutor),
+            _ => Arc::new(AuthenticationRetryExecutor {
+                calls: AtomicUsize::new(0),
+                recovered: AtomicBool::new(false),
+                failure,
+            }),
+        };
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        let first = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+        supervisor.scan_once(first).await.unwrap();
+        let _ = supervisor.run_next(first + 1).await;
+        let failed = f.store.load(&f.task).unwrap();
+        assert!(failed.action.last_error.is_some(), "{failure}");
+        let retry_at = failed.automatic_retry_at_ms().unwrap();
+        let resumed_at = failed.action.updated_at_ms.unwrap() + 10;
+        assert!(resumed_at < retry_at);
+        f.chat.record_agent_call(resumed_at).await.unwrap();
+
+        let restarted =
+            AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor);
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        restarted.scan_once(resumed_at + 1).await.unwrap();
+        let recovered = f.store.load(&f.task).unwrap();
+        assert_eq!(
+            recovered.action.status,
+            AutomationActionStatus::Idle,
+            "{failure}"
+        );
+        assert!(recovered.action.last_error.is_none());
+        assert!(recovered.automatic_retry_at_ms().is_none());
+        assert!(!recovered.is_automatically_retrying());
+        assert_eq!(recovered.action.automatic_retry_attempts, 0);
+        assert_eq!(recovered.action.chatgpt_access_retry_attempts, 0);
+        assert_eq!(
+            recovered.action.send_accepted,
+            if failure == "ambiguous" {
+                Some(true)
+            } else {
+                failed.action.send_accepted
+            }
+        );
+        assert_eq!(
+            recovered.action.messages_fenced,
+            failed.action.messages_fenced
+        );
+        assert_eq!(recovered.chat_mirror, failed.chat_mirror);
+        assert_eq!(recovered.goal.as_ref().unwrap().revision, goal.revision);
+        assert_eq!(recovered.goal.as_ref().unwrap().markdown, goal.markdown);
+        assert_eq!(
+            recovered.goal.as_ref().unwrap().turn_count,
+            failed.goal.as_ref().unwrap().turn_count
+                + u64::from(failure == "ambiguous" && !failed.action.goal_turn_counted)
+        );
+        assert!(restarted.live_state(&f.task).await.is_none());
+        restarted.scan_once(retry_at).await.unwrap();
+        assert_eq!(restarted.queued_count().await, 0);
+        assert!(restarted.run_next(retry_at + 1).await.unwrap().is_none());
+        let reopened = AgentAutomationStore::for_config(&f.config)
+            .unwrap()
+            .load(&f.task)
+            .unwrap();
+        assert!(reopened.action.last_error.is_none());
+        assert!(reopened.automatic_retry_at_ms().is_none());
+
+        // The active goal can still receive a normal wake after later inactivity.
+        restarted
+            .scan_once(resumed_at + AUTOMATION_OFFLINE_AFTER_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.next_queued_kind().await,
+            Some(codexify::agent_automation::AutomationActionKind::OfflineGoal)
+        );
+        assert!(!f.store.load(&f.task).unwrap().is_automatically_retrying());
+    }
+}
+
+#[tokio::test]
+async fn resumed_goal_activity_retires_an_already_queued_retry_before_scan_or_dispatch() {
+    for reconcile_by_scan in [true, false] {
+        let f = fixture().await;
+        let goal = f.store.set_goal(&f.task, "Resume this goal", 100).unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        let executor = Arc::new(PreSendFailureExecutor::default());
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        supervisor.scan_once(1_000).await.unwrap();
+        assert!(supervisor.run_next(1_001).await.is_err());
+        let retry_at = f
+            .store
+            .load(&f.task)
+            .unwrap()
+            .automatic_retry_at_ms()
+            .unwrap();
+        supervisor.scan_once(retry_at).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        assert!(f.store.load(&f.task).unwrap().is_automatically_retrying());
+        f.chat.record_agent_call(retry_at + 1).await.unwrap();
+        if reconcile_by_scan {
+            supervisor.scan_once(retry_at + 2).await.unwrap();
+        }
+        assert!(supervisor.run_next(retry_at + 3).await.unwrap().is_none());
+        let recovered = f.store.load(&f.task).unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "the queued continuation must never execute"
+        );
+        assert_eq!(recovered.action.status, AutomationActionStatus::Idle);
+        assert!(recovered.action.last_error.is_none());
+        assert!(!recovered.is_automatically_retrying());
+        assert!(supervisor.live_state(&f.task).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn resumed_goal_activity_requires_fresh_agent_activity_and_preserves_new_user_messages() {
+    let f = fixture().await;
+    let goal = f.store.set_goal(&f.task, "Resume this goal", 100).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    f.chat.record_agent_call(1_000).await.unwrap();
+    let supervisor = AgentAutomationSupervisor::new(
+        f.config.markdown_chat.automation.clone(),
+        Arc::new(PreSendFailureExecutor::default()),
+    );
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    let first = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+    supervisor.scan_once(first).await.unwrap();
+    assert!(supervisor.run_next(first + 1).await.is_err());
+    let failed = f.store.load(&f.task).unwrap();
+    let failed_at = failed.action.updated_at_ms.unwrap();
+    f.chat
+        .append_user(
+            "new-pending-message".into(),
+            "Keep this message for delivery".into(),
+        )
+        .await
+        .unwrap();
+    supervisor.scan_once(failed_at + 2).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action,
+        failed.action,
+        "outgoing messages are not recovery proof"
+    );
+    f.chat.record_agent_call(failed_at - 1).await.unwrap();
+    supervisor.scan_once(failed_at + 3).await.unwrap();
+    assert_eq!(
+        f.store.load(&f.task).unwrap().action,
+        failed.action,
+        "activity older than the failure is not recovery proof"
+    );
+    f.chat.record_agent_call(failed_at + 4).await.unwrap();
+    supervisor.scan_once(failed_at + 5).await.unwrap();
+    let recovered = f.store.load(&f.task).unwrap();
+    assert!(recovered.action.last_error.is_none());
+    assert!(!recovered.is_automatically_retrying());
+    assert_eq!(recovered.chat_mirror, failed.chat_mirror);
+    assert!(
+        f.chat
+            .unread_snapshot()
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.id == "new-pending-message")
+    );
+}
+
+#[tokio::test]
+async fn resumed_goal_activity_never_treats_an_unsent_user_batch_as_delivered() {
+    for with_goal in [false, true] {
+        let f = fixture().await;
+        if with_goal {
+            let goal = f
+                .store
+                .set_goal(&f.task, "Keep the pending instruction", 100)
+                .unwrap();
+            f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        }
+        f.chat
+            .append_user(
+                "pending-instruction".into(),
+                "Keep this unsent message".into(),
+            )
+            .await
+            .unwrap();
+        let executor = Arc::new(PreSendFailureExecutor::default());
+        let supervisor =
+            AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor);
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        supervisor.scan_once(1_000).await.unwrap();
+        assert!(supervisor.run_next(1_001).await.is_err());
+        let failed = f.store.load(&f.task).unwrap();
+        let resumed_at = failed.action.updated_at_ms.unwrap() + 10;
+        f.chat.record_agent_call(resumed_at).await.unwrap();
+        supervisor.scan_once(resumed_at + 1).await.unwrap();
+        let after = f.store.load(&f.task).unwrap();
+        assert_eq!(after.action, failed.action);
+        assert_eq!(after.chat_mirror, failed.chat_mirror);
+        assert!(after.automatic_retry_at_ms().is_some());
+        assert!(
+            f.chat
+                .unread_snapshot()
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == "pending-instruction")
+        );
+    }
+}
+
+#[tokio::test]
 async fn offline_goal_pre_send_failures_stop_after_five_retries_and_allow_manual_retry() {
     let f = fixture().await;
     let goal = f
@@ -8628,5 +8918,454 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
             assert_eq!(recovered.action.chatgpt_access_retry_attempts, 0);
             assert!(!recovered.action.chatgpt_access_retry_in_progress);
         }
+    }
+}
+
+#[tokio::test]
+async fn exhausted_unsent_goal_failure_clears_only_after_fresh_agent_activity() {
+    for failure in [
+        "authentication_preflight",
+        "conversation_snapshot",
+        "failed",
+    ] {
+        let f = fixture().await;
+        let goal = f
+            .store
+            .set_goal(&f.task, "Recover after exhausted retries", 100)
+            .unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        let executor: Arc<dyn AutomationExecutor> = if failure == "failed" {
+            Arc::new(PreSendFailureExecutor::default())
+        } else {
+            Arc::new(AuthenticationRetryExecutor {
+                calls: AtomicUsize::new(0),
+                recovered: AtomicBool::new(false),
+                failure,
+            })
+        };
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut at = 1_000;
+        supervisor.scan_once(at).await.unwrap();
+        let _ = supervisor.run_next(at + 1).await;
+        while let Some(retry_at) = f.store.load(&f.task).unwrap().automatic_retry_at_ms() {
+            at = retry_at;
+            supervisor.scan_once(at).await.unwrap();
+            let _ = supervisor.run_next(at + 1).await;
+        }
+        let exhausted = f.store.load(&f.task).unwrap();
+        assert!(exhausted.action.last_error.is_some());
+        assert_eq!(
+            exhausted.automatic_retry_attempts() as usize,
+            exhausted.automatic_retry_limit()
+        );
+        let failed_at = exhausted.action.updated_at_ms.unwrap();
+        f.chat.record_agent_call(failed_at - 1).await.unwrap();
+        supervisor.scan_once(failed_at + 2).await.unwrap();
+        assert_eq!(
+            f.store.load(&f.task).unwrap().action,
+            exhausted.action,
+            "an old online timestamp must not clear exhaustion"
+        );
+        f.chat.record_agent_call(failed_at + 3).await.unwrap();
+        let restarted =
+            AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor);
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        restarted.scan_once(failed_at + 4).await.unwrap();
+        let recovered = f.store.load(&f.task).unwrap();
+        assert_eq!(recovered.action.status, AutomationActionStatus::Idle);
+        assert!(recovered.action.last_error.is_none());
+        assert!(!recovered.action_needs_attention());
+        assert!(!recovered.is_automatically_retrying());
+        assert_eq!(recovered.action.send_accepted, Some(false));
+        assert_eq!(
+            recovered.action.messages_fenced,
+            exhausted.action.messages_fenced
+        );
+        assert_eq!(recovered.chat_mirror, exhausted.chat_mirror);
+        assert_eq!(
+            recovered.goal.unwrap().turn_count,
+            exhausted.goal.unwrap().turn_count
+        );
+        assert_eq!(restarted.queued_count().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn pausing_or_dismissing_a_failure_stops_retries_persistently_and_preserves_user_messages() {
+    for queued in [false, true] {
+        for dismiss in [false, true] {
+            for with_goal in [false, true] {
+                let f = fixture().await;
+                if with_goal {
+                    let goal = f.store.set_goal(&f.task, "Keep this goal", 100).unwrap();
+                    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+                } else {
+                    f.chat
+                        .append_user("pending".into(), "Preserve this message".into())
+                        .await
+                        .unwrap();
+                }
+                let executor = Arc::new(PreSendFailureExecutor::default());
+                let supervisor = AgentAutomationSupervisor::new(
+                    f.config.markdown_chat.automation.clone(),
+                    executor.clone(),
+                );
+                supervisor
+                    .register_task(AutomationTaskHandle::new(
+                        f.task.clone(),
+                        0,
+                        f.store.clone(),
+                        f.chat.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                supervisor.scan_once(1_000).await.unwrap();
+                assert!(supervisor.run_next(1_001).await.is_err());
+                let failed = f.store.load(&f.task).unwrap();
+                let deadline = failed.automatic_retry_at_ms().unwrap();
+                if queued {
+                    supervisor.scan_once(deadline).await.unwrap();
+                }
+                let action_id = f.store.load(&f.task).unwrap().action.id.unwrap();
+                if dismiss {
+                    supervisor
+                        .cancel_action(&f.task, &action_id, deadline + 1)
+                        .await
+                        .unwrap();
+                } else {
+                    supervisor
+                        .pause_action_retries(&f.task, &action_id)
+                        .await
+                        .unwrap();
+                }
+                let saved = f.store.load(&f.task).unwrap();
+                assert!(saved.action.automatic_retry_paused);
+                assert_eq!(saved.action.last_error.is_none(), dismiss);
+                assert_eq!(saved.action_needs_attention(), !dismiss);
+                assert!(saved.automatic_retry_at_ms().is_none());
+                assert_eq!(saved.chat_mirror, failed.chat_mirror);
+                assert_eq!(saved.action.send_accepted, Some(false));
+                assert_eq!(saved.goal, failed.goal);
+                assert!(supervisor.run_next(deadline + 2).await.unwrap().is_none());
+                let restarted = AgentAutomationSupervisor::new(
+                    f.config.markdown_chat.automation.clone(),
+                    executor.clone(),
+                );
+                restarted
+                    .register_task(AutomationTaskHandle::new(
+                        f.task.clone(),
+                        0,
+                        Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                        f.chat.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                restarted.scan_once(deadline + 86_400_000).await.unwrap();
+                assert_eq!(restarted.queued_count().await, 0);
+                assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+                if !with_goal {
+                    assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
+                }
+                // Retry is explicit new intent even when automatic retries were paused.
+                restarted
+                    .retry_failed_action(
+                        &f.task,
+                        saved.action.id.as_deref().unwrap(),
+                        deadline + 86_400_001,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(restarted.queued_count().await, 1);
+                assert!(!f.store.load(&f.task).unwrap().action.automatic_retry_paused);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn global_auto_retry_policy_is_hot_and_stops_queued_work_but_allows_manual_retry() {
+    for checkpoint in ["scan", "dispatch", "restart"] {
+        let f = fixture().await;
+        let path = f._root.path().join("retry-settings.json");
+        let write_policy = |enabled| {
+            std::fs::write(&path, serde_json::json!({"agentChat":{"automation":{"connectorName":"Fixture connector","automaticRetries":enabled}}}).to_string()).unwrap()
+        };
+        write_policy(true);
+        let mut config = f.config.clone();
+        config.loaded_config_path = Some(path.clone());
+        let store = Arc::new(AgentAutomationStore::for_config(&config).unwrap());
+        let goal = store.set_goal(&f.task, "Keep this goal", 100).unwrap();
+        store.run_goal(&f.task, goal.revision, 101).unwrap();
+        let executor = Arc::new(AuthenticationRetryExecutor {
+            calls: AtomicUsize::new(0),
+            recovered: AtomicBool::new(false),
+            failure: "authentication_preflight",
+        });
+        let mut supervisor = AgentAutomationSupervisor::new(
+            config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        supervisor.scan_once(1_000).await.unwrap();
+        let _ = supervisor.run_next(1_001).await;
+        let failed = store.load(&f.task).unwrap();
+        let deadline = failed.automatic_retry_at_ms().unwrap();
+        supervisor.scan_once(deadline).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        write_policy(false);
+        if checkpoint == "scan" {
+            supervisor.scan_once(deadline + 1).await.unwrap();
+        } else if checkpoint == "restart" {
+            supervisor = AgentAutomationSupervisor::new(
+                config.markdown_chat.automation.clone(),
+                executor.clone(),
+            );
+            supervisor
+                .register_task(AutomationTaskHandle::new(
+                    f.task.clone(),
+                    0,
+                    Arc::new(AgentAutomationStore::for_config(&config).unwrap()),
+                    f.chat.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(supervisor.run_next(deadline + 2).await.unwrap().is_none());
+        let stopped = store.load(&f.task).unwrap();
+        assert_eq!(
+            stopped.action, failed.action,
+            "restore the original failure without consuming a retry or losing its error type"
+        );
+        assert_eq!(stopped.goal_wake, failed.goal_wake);
+        assert!(!stopped.automatic_retries_enabled);
+        assert!(stopped.automatic_retry_at_ms().is_none());
+        supervisor.scan_once(deadline + 86_400_000).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 0);
+        // Explicit retry is still authorized with the global policy off.
+        supervisor
+            .retry_failed_action(
+                &f.task,
+                stopped.action.id.as_deref().unwrap(),
+                deadline + 86_400_001,
+            )
+            .await
+            .unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        let _ = supervisor.run_next(deadline + 86_400_002).await;
+        let failed_again = store.load(&f.task).unwrap();
+        assert!(failed_again.automatic_retry_at_ms().is_none());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
+        write_policy(true);
+        assert!(
+            store
+                .load(&f.task)
+                .unwrap()
+                .automatic_retry_at_ms()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn disabling_retries_keeps_normal_goal_wakes_working() {
+    let f = fixture().await;
+    let mut config = f.config.clone();
+    config.markdown_chat.automation.automatic_retries = false;
+    let store = Arc::new(AgentAutomationStore::for_config(&config).unwrap());
+    let goal = store.set_goal(&f.task, "Normal goal wakes", 100).unwrap();
+    store.run_goal(&f.task, goal.revision, 101).unwrap();
+    let supervisor =
+        AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), f.executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    supervisor.scan_once(1_000).await.unwrap();
+    assert_eq!(supervisor.queued_count().await, 1);
+    supervisor.run_next(1_001).await.unwrap();
+    let sent = store.load(&f.task).unwrap();
+    assert!(sent.goal_wake.last_nudged_at_ms.is_some());
+    assert!(sent.automatic_retry_at_ms().is_none());
+    supervisor.scan_once(86_400_000).await.unwrap();
+    assert_eq!(
+        supervisor.queued_count().await,
+        0,
+        "do not retry an accepted goal wake that has no agent response"
+    );
+    f.chat.record_agent_call(86_400_001).await.unwrap();
+    supervisor.scan_once(86_400_002).await.unwrap();
+    supervisor
+        .scan_once(86_400_001 + AUTOMATION_OFFLINE_AFTER_MS)
+        .await
+        .unwrap();
+    assert_eq!(
+        supervisor.queued_count().await,
+        1,
+        "fresh activity permits the next normal goal wake"
+    );
+}
+
+struct ApprovalOnOpenExecutor {
+    opened: AtomicBool,
+    approvals: AtomicUsize,
+    visits: AtomicUsize,
+}
+#[async_trait]
+impl AutomationExecutor for ApprovalOnOpenExecutor {
+    async fn approve_pending_conversation(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<bool, String> {
+        if self.opened.swap(false, Ordering::SeqCst) {
+            self.approvals.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        _: mpsc::UnboundedSender<CompanionEvent>,
+        _: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.visits.fetch_add(1, Ordering::SeqCst);
+        self.opened.store(true, Ordering::SeqCst);
+        let mut snapshot = snapshot_for(execution);
+        snapshot.state = CompanionActionState::ApprovalRequired;
+        snapshot.send_accepted = false;
+        snapshot.selected = None;
+        snapshot.attention = Some(codexify::agent_automation::CompanionAttention {
+            code: "approval_required".into(),
+            message: Some("Materialization needs approval".into()),
+        });
+        Ok(snapshot)
+    }
+}
+
+#[tokio::test]
+async fn approval_found_on_open_resumes_existing_turn_and_waits_across_restart_for_first_tool_call()
+{
+    for with_message in [false, true] {
+        let f = fixture().await;
+        let goal = f
+            .store
+            .set_goal(&f.task, "Continue after materialization", 100)
+            .unwrap();
+        f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+        if with_message {
+            f.chat
+                .append_user(
+                    "unread-during-approval".into(),
+                    "Keep this unread until the agent reads it".into(),
+                )
+                .await
+                .unwrap();
+        }
+        let executor = Arc::new(ApprovalOnOpenExecutor {
+            opened: AtomicBool::new(false),
+            approvals: AtomicUsize::new(0),
+            visits: AtomicUsize::new(0),
+        });
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        let initial_turns = f.store.load(&f.task).unwrap().goal.unwrap().turn_count;
+        supervisor.scan_once(1_000).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        supervisor.run_next(1_001).await.unwrap();
+        let resumed = f.store.load(&f.task).unwrap();
+        assert_eq!(executor.approvals.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.visits.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed.action.status, AutomationActionStatus::Idle);
+        assert_eq!(resumed.action.send_accepted, Some(false));
+        assert!(!resumed.action.messages_fenced);
+        assert!(!resumed.action.goal_turn_counted);
+        assert_eq!(resumed.goal.as_ref().unwrap().turn_count, initial_turns);
+        assert!(resumed.chat_mirror.message_ids.is_empty());
+        assert!(resumed.action.last_error.is_none());
+        let until = resumed.approval_resume_until_ms().unwrap();
+        assert!(until >= 181_001);
+        let restarted = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        restarted
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                Arc::new(AgentAutomationStore::for_config(&f.config).unwrap()),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        for now in [6_001, 61_001, 121_001] {
+            restarted.scan_once(now).await.unwrap();
+            assert_eq!(
+                restarted.queued_count().await,
+                0,
+                "approval must get the full first-tool-call grace period"
+            );
+            assert!(restarted.run_next(now + 1).await.unwrap().is_none());
+        }
+        if with_message {
+            assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
+        }
+        // Fresh agent tool activity ends the wait. It is not evidence that the
+        // unsubmitted pending user batch was accepted by a browser Send.
+        f.chat.record_agent_call(121_002).await.unwrap();
+        restarted.scan_once(121_003).await.unwrap();
+        let after = f.store.load(&f.task).unwrap();
+        assert!(after.approval_resume.is_none());
+        assert_eq!(after.action.send_accepted, Some(false));
+        assert!(!after.action.messages_fenced);
+        assert_eq!(after.goal.unwrap().turn_count, initial_turns);
+        assert_eq!(restarted.queued_count().await, 0);
+        assert_eq!(executor.visits.load(Ordering::SeqCst), 1);
     }
 }

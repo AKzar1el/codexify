@@ -131,6 +131,7 @@
       ],
       "maxQueuedActions": 64,
       "autoApproveToolCalls": true,
+      "automaticRetries": true,
       "requestBlockingEnabled": false
     },
     "notifications": {

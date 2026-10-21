@@ -104,6 +104,65 @@ pub fn validate_registered_worktree(
     Ok(())
 }
 
+/// Discover the authorized source of a pasted linked-worktree path without
+/// treating its location (or optional application metadata) as authorization.
+pub(crate) fn worktree_source_project(
+    config: &AppConfig,
+    input: &str,
+) -> Result<Option<PathBuf>, String> {
+    let input = Path::new(input);
+    let candidate = if input.is_absolute() {
+        input.to_owned()
+    } else {
+        config.work_dir.join(input)
+    };
+    let project = fs::canonicalize(&candidate)
+        .map_err(|e| format!("Cannot resolve worktree path {}: {e}", candidate.display()))?;
+    let Some(root) = project.ancestors().find(|p| p.join(".git").exists()) else {
+        return Ok(None);
+    };
+    // Ordinary source checkouts still use normal project selection.
+    if !root.join(".git").is_file() {
+        return Ok(None);
+    }
+    let directory = git_dir(root)?;
+    let common = common_dir(&directory)?;
+    if directory == common {
+        return Ok(None);
+    }
+    // A standard linked worktree points back to the source checkout's .git.
+    // Other layouts can still be selected explicitly through the project picker.
+    if common.file_name() != Some(OsStr::new(".git")) {
+        return Ok(None);
+    }
+    let source_git = common.parent().ok_or("Worktree has no source repository")?;
+    let relative = project.strip_prefix(root).map_err(|e| e.to_string())?;
+    let source = source_git.join(relative);
+    let (_, source) =
+        crate::project_bindings::resolve_project_root(config, &source.to_string_lossy())?;
+    validate_registered_worktree(&source, &project, root)?;
+    Ok(Some(source))
+}
+
+pub(crate) async fn worktree_base_commit(
+    config: &AppConfig,
+    source: &Path,
+    base: &Path,
+) -> Result<String, String> {
+    let choice = existing_worktree_choice(config, source, base).await?;
+    required_git_text(
+        config,
+        &choice.git_root,
+        &[
+            "rev-parse".into(),
+            "--verify".into(),
+            "HEAD^{commit}".into(),
+        ],
+        "resolve the selected worktree commit",
+    )
+    .await
+}
+
 pub async fn list_existing_worktrees(
     config: &AppConfig,
     source_project: &Path,

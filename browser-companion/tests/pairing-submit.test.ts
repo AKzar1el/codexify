@@ -243,9 +243,13 @@ test.skipIf(!native)("pairing waits for enabled Send and binds to the new answer
 
 test.skipIf(!native)("successive browser sends reuse a healthy paired conversation",async()=>{
   const driver=await fixture();
-  for(const id of ['reuse-first','reuse-second']){
-    const submitted={...offlineRequest(),actionId:id,idempotencyKey:id};
-    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:()=>{}});
+  for(const [id,model,family] of [['reuse-first','gpt-6-astra','6'],['reuse-second','gpt-5.6-sol','5.6']] as const){
+    const submitted={...offlineRequest(model,'max'),actionId:id,idempotencyKey:id};
+    const events:Parameters<DriverExecution['emit']>[0][]=[];
+    await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+    expect(events).toContainEqual({type:'model_verified',model,effort:'max'});
+    expect(await page.evaluate(()=>[document.body.dataset.sentFamily,document.body.dataset.sentEffort])).toEqual([family,'Pro']);
+    expect(documentLoads).toBe(1);
   }
   expect(documentLoads).toBe(1);expect(await page.locator('body').getAttribute('data-sends')).toBe('2');
 },15_000);
@@ -620,6 +624,50 @@ test.skipIf(!native)("an exact connector menu choice binds an unrelated internal
   expect(await page.evaluate(()=>Number(document.body.dataset.sends))).toBe(1);
   expect(events.at(-1)?.type).toBe("submission_complete");
 },15_000);
+
+test.skipIf(!native)("a slow connector menu loads without clearing and retriggering the mention",async()=>{
+  const driver=await fixture("Discard this existing draft");
+  await page.evaluate(()=>{
+    const editor=document.querySelector('[contenteditable="true"]')!;
+    const mentions=document.querySelector('[data-mention-list-scroll-area]') as HTMLElement;
+    let timer:ReturnType<typeof setTimeout>;
+    let typingMention=false;
+    document.body.dataset.connectorAttempts="0";
+    editor.addEventListener('input',event=>{
+      clearTimeout(timer);
+      const querying=editor.textContent!.startsWith('@');
+      if(querying&&!typingMention)document.body.dataset.connectorAttempts=String(Number(document.body.dataset.connectorAttempts)+1);
+      typingMention=querying;
+      if(!querying)return;
+      event.stopImmediatePropagation();
+      mentions.hidden=true;
+      timer=setTimeout(()=>{mentions.hidden=false;},4_000);
+    },true);
+  });
+  const coordinator=new SingleWindowCoordinator(driver,build);
+  await executeCoordinatorFixture(coordinator,offlineRequest('gpt-6-astra','max'));
+  const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe('submission_complete');
+  expect(await page.locator('body').getAttribute('data-connector-attempts')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+},15_000);
+
+test.skipIf(!native)("a missing connector sends the message once without a mention or a page reload",async()=>{
+  const driver=await fixture("Discard this existing draft");
+  await page.locator('[data-mention-list-scroll-area]').evaluate(element=>element.remove());
+  const loads=documentLoads;
+  const coordinator=new SingleWindowCoordinator(driver,build);
+  const submitted={...offlineRequest('gpt-6-astra','max'),prompt:{kind:'offline_chat' as const,batchId:'missing-connector',messages:[{id:'message-without-mention',markdown:'Proceed without a mention.'}]}};
+  await executeCoordinatorFixture(coordinator,submitted);
+  const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
+  expect(events.at(-1)).toMatchObject({type:'submission_complete'});
+  expect(events.some(event=>event.type==='connector_verified')).toBeFalse();
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-sent-text')).toContain('Proceed without a mention.');
+  expect(await page.locator('body').getAttribute('data-sent-text')).not.toContain(`@${connector}`);
+  expect(await page.locator('[app-mention-path]').count()).toBe(0);
+  expect(documentLoads).toBe(loads);
+},35_000);
 
 test.skipIf(!native)("a connector app identity changed after selection is rejected before Send",async()=>{
   const driver=await fixture("",false,"internal-name-unrelated-to-display-label");

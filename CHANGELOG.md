@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-10-21
+
+### Added
+
+- Create a fresh worktree from a selected registered worktree’s current commit,
+  including pasted worktree paths outside the project access root.
+- Persistent Pause retries and Dismiss controls for failed actions, plus an
+  immediate global Automatic retries setting under Chats & goals.
+
+### Fixed
+
+- Resolve file-materialization approvals in the latest ChatGPT turn before
+  continuing a conversation, including prompts that appear during preparation.
+  Persist the wait for resumed agent activity across restarts without sending
+  another continuation or marking unsent messages delivered.
+- Fresh agent activity clears a failed goal-only continuation and its pending
+  retries, including exhausted retries and a retry queued before the agent resumed.
+- Switching conversations uses cached models without probing the browser.
+  Model lists survive compatible local updates for the same ChatGPT account;
+  sending still verifies the requested model on the target page.
+- Wait three times longer for the configured @ connector to appear before
+  clearing and retrying the mention search. If it stays unavailable, send the
+  message without the mention instead of failing or reloading the conversation.
+
 ## [2.3.3] - 2026-10-20
 
 ### Fixed
@@ -921,7 +945,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.2...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.4...HEAD
+[2.3.4]: https://github.com/devnoname120/codexify/compare/v2.3.3...v2.3.4
+[2.3.3]: https://github.com/devnoname120/codexify/compare/v2.3.2...v2.3.3
 [2.3.2]: https://github.com/devnoname120/codexify/compare/v2.3.0...v2.3.2
 [2.3.0]: https://github.com/devnoname120/codexify/compare/v2.2.1...v2.3.0
 [2.2.1]: https://github.com/devnoname120/codexify/compare/v2.2.0...v2.2.1

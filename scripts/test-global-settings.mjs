@@ -592,3 +592,34 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
   assert.equal(await dialog.locator('#settings-save-state').getAttribute('data-error'),'false');assert.deepEqual(errors,[]);assert.deepEqual(writes,[]);
  }finally{await browser.close();}
 });
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: automatic retries is an immediate Chats and goals setting`,{timeout:20000},async()=>{
+ const browser=await engine.launch();
+ try{
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  let enabled,revision=1;const writes=[];
+  const snapshot=()=>({document:enabled===undefined?{}:{agentChat:{automation:{automaticRetries:enabled}}},defaults:{agentChat:{automation:{automaticRetries:true}}},fieldSchema:{agentChat:{automation:{automaticRetries:true}}},raw:'{}',revision:String(revision),restartRequired:false,schemaRefreshRequired:false});
+  await routeOwner(page,'http://127.0.0.1:43277/**',route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.3',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&req.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=req.postDataJSON();writes.push(body);enabled=body.changes['agentChat.automation.automaticRetries'];revision++;
+    return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43277/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  const toggle=dialog.locator('[data-setting="agentChat.automation.automaticRetries"]');
+  await toggle.waitFor();assert.equal(await toggle.getByRole('button',{name:'On (default)',exact:true}).getAttribute('aria-pressed'),'true');
+  const disabled=page.waitForResponse(response=>response.url().endsWith('/api/settings')&&response.request().method()==='POST');
+  await toggle.getByRole('button',{name:'Off',exact:true}).click();await page.clock.fastForward(700);await disabled;
+  assert.equal(enabled,false);await dialog.getByText('All changes saved.',{exact:true}).waitFor();
+  const saved=page.waitForResponse(response=>response.url().endsWith('/api/settings')&&response.request().method()==='POST');
+  await toggle.getByRole('button',{name:'On',exact:true}).click();await page.clock.fastForward(700);await saved;
+  assert.equal(enabled,true);assert.equal(writes.length,2);
+ }finally{await browser.close();}
+});

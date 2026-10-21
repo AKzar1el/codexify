@@ -117,8 +117,17 @@ fn catalog_context(health: &crate::agent_automation::CompanionHealth) -> String 
 }
 
 fn catalog_key(build: &str, account: Option<&str>) -> String {
+    // Model choices belong to the ChatGPT account, not the companion release.
+    // Keep protocol isolation while reusing the same list across local updates.
+    let schema = build
+        .split_once("+protocol.")
+        .map_or(build, |(_, schema)| schema);
+    hashed_catalog_key(schema, account)
+}
+
+fn hashed_catalog_key(context: &str, account: Option<&str>) -> String {
     let mut digest = Sha256::new();
-    digest.update(build);
+    digest.update(context);
     digest.update([0]);
     digest.update(account.unwrap_or(""));
     format!("{:x}", digest.finalize())
@@ -146,16 +155,17 @@ fn read_catalog_cache(state: &OwnerState, key: &str) -> Option<OwnerCatalogCache
             return None;
         }
     }
-    let entry: OwnerCatalogCache = serde_json::from_reader(file.take(1024 * 1024 + 1)).ok()?;
-    if entry.key != key
-        || catalog_key(
-            &entry.catalog.build,
-            Some(&entry.catalog.account_fingerprint),
-        ) != key
+    let mut entry: OwnerCatalogCache = serde_json::from_reader(file.take(1024 * 1024 + 1)).ok()?;
+    let account = Some(entry.catalog.account_fingerprint.as_str());
+    let current_key = catalog_key(&entry.catalog.build, account);
+    let legacy_key = hashed_catalog_key(&entry.catalog.build, account);
+    if current_key != key
+        || (entry.key != current_key && entry.key != legacy_key)
         || BrowserCompanionClient::validate_cached_catalog(&entry.catalog).is_err()
     {
         return None;
     }
+    entry.key = current_key;
     Some(entry)
 }
 
@@ -1068,6 +1078,14 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
         .then_some("retry")
     });
     public_action["retryMode"] = json!(retry_mode);
+    public_action["automaticRetriesEnabled"] = json!(automation.automatic_retries_enabled);
+    public_action["canPauseRetries"] = json!(
+        !automation.action.automatic_retry_paused
+            && (automation.automatic_retry_at_ms().is_some()
+                || automation.action.status
+                    == crate::agent_automation::AutomationActionStatus::Queued
+                    && automation.action.automatic_retry_in_progress)
+    );
     public_action["automaticRetryAtMs"] = json!(automation.automatic_retry_at_ms());
     public_action["automaticRetryAttempts"] = json!(automation.automatic_retry_attempts());
     public_action["automaticRetryLimit"] = json!(automation.automatic_retry_limit());
@@ -1451,6 +1469,25 @@ async fn automation_action_cancel(
         .await
         .map(|(position, total)| json!({"position": position, "total": total}));
     Ok(Json(json!({"action": action, "queue": queue})))
+}
+
+async fn automation_action_pause_retries(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<ActionMutationBody>,
+) -> ApiResult {
+    validate_owner_request_id(&body.request_id)?;
+    let located = selected(&state, &id)?;
+    let context = automation_context(&state, &located).await?;
+    let supervisor = state
+        .automation
+        .as_ref()
+        .ok_or_else(|| internal_error("Browser automation supervisor is unavailable"))?;
+    let action = supervisor
+        .pause_action_retries(&context.task, &body.action_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({"action": action})))
 }
 
 async fn automation_action_retry(
@@ -2265,6 +2302,10 @@ fn router(state: OwnerState) -> Router {
             post(automation_action_cancel),
         )
         .route(
+            "/api/chats/{id}/automation/action/pause-retries",
+            post(automation_action_pause_retries),
+        )
+        .route(
             "/api/chats/{id}/automation/action/retry",
             post(automation_action_retry),
         )
@@ -2340,6 +2381,24 @@ mod tests {
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
     const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+
+    #[test]
+    fn model_catalog_cache_is_account_and_protocol_scoped_across_local_updates() {
+        let first = format!("2.3.0{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
+        let updated = format!("2.3.3{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
+        assert_eq!(
+            catalog_key(&first, Some("same-account")),
+            catalog_key(&updated, Some("same-account"))
+        );
+        assert_ne!(
+            catalog_key(&first, Some("same-account")),
+            catalog_key(&updated, Some("different-account"))
+        );
+        assert_ne!(
+            catalog_key(&first, Some("same-account")),
+            catalog_key("2.3.3+protocol.other-schema", Some("same-account"))
+        );
+    }
 
     #[derive(Clone, Default)]
     struct OwnerCompanionState {
@@ -4391,6 +4450,32 @@ mod tests {
         let (health, restored) = owner_catalog(&restarted, false).await.unwrap();
         assert_eq!(restored.catalog_revision, "owner_catalog_1");
         assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
+        let mut legacy_catalog = restored.clone();
+        legacy_catalog.build = format!("2.3.0{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
+        let legacy = OwnerCatalogCache {
+            key: hashed_catalog_key(
+                &legacy_catalog.build,
+                Some(&legacy_catalog.account_fingerprint),
+            ),
+            catalog: legacy_catalog,
+        };
+        write_catalog_cache(&restarted, &legacy).unwrap();
+        restarted.catalog_cache = Arc::default();
+        let (_, migrated) = owner_catalog(&restarted, false).await.unwrap();
+        assert_ne!(migrated.build, health.build);
+        assert_eq!(migrated.models, restored.models);
+        assert_eq!(
+            companion_state.capabilities_calls.load(Ordering::SeqCst),
+            1,
+            "a compatible update restores the legacy disk cache without browser discovery"
+        );
+        let invalid = OwnerCatalogCache {
+            key: "unrelated-cache-key".into(),
+            catalog: migrated,
+        };
+        write_catalog_cache(&restarted, &invalid).unwrap();
+        assert!(read_catalog_cache(&restarted, &catalog_context(&health)).is_none());
+        write_catalog_cache(&restarted, &legacy).unwrap();
         assert!(
             cached_owner_catalog(
                 &restarted,

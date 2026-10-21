@@ -316,6 +316,9 @@ pub(super) async fn save(State(state): State<OwnerState>, Json(body): Json<SaveB
             error,
         )
     })?;
+    if let Some(supervisor) = &state.automation {
+        supervisor.notify();
+    }
     if value["schemaRefreshRequired"] == true
         && let Err(error) = super::schema_refresh::queue(state.config.clone(), &value).await
     {

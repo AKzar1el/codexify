@@ -474,3 +474,249 @@ async fn concurrent_auto_bindings_claim_one_source_checkout_and_one_worktree() {
         fs::canonicalize(project_root).unwrap()
     );
 }
+
+#[tokio::test]
+async fn new_worktrees_use_the_selected_base_commit_and_keep_authorized_source_metadata() {
+    for nested in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (access, source) = repository(&root);
+        if nested {
+            fs::create_dir_all(source.join("subproject")).unwrap();
+            fs::write(source.join("subproject/file.txt"), "nested").unwrap();
+            git(&source, &["add", "subproject"]);
+            git(
+                &source,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "subproject",
+                ],
+            );
+        }
+        let base = root.path().join("base worktree");
+        git(
+            &source,
+            &["worktree", "add", "-b", "base", base.to_str().unwrap()],
+        );
+        fs::write(base.join("base-only.txt"), "from base commit").unwrap();
+        git(&base, &["add", "base-only.txt"]);
+        git(
+            &base,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "base commit",
+            ],
+        );
+        let head = git(&base, &["rev-parse", "HEAD"]);
+        // An ahead upstream must never override an explicitly selected base.
+        git(&source, &["branch", "base-upstream", &head]);
+        git(&base, &["branch", "--set-upstream-to=base-upstream"]);
+        git(&source, &["checkout", "-q", "base-upstream"]);
+        fs::write(source.join("upstream-only.txt"), "later upstream").unwrap();
+        git(&source, &["add", "upstream-only.txt"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "upstream advanced",
+            ],
+        );
+        fs::write(base.join("tracked.txt"), "staged local work").unwrap();
+        git(&base, &["add", "tracked.txt"]);
+        fs::write(base.join("tracked.txt"), "unstaged local work").unwrap();
+        fs::write(base.join("untracked.txt"), "untracked local work").unwrap();
+        let before = git(&base, &["status", "--porcelain=v1"]);
+        let index = fs::read({
+            let p = PathBuf::from(git(&base, &["rev-parse", "--git-path", "index"]));
+            if p.is_absolute() { p } else { base.join(p) }
+        })
+        .unwrap();
+        let config = config(&root, access, WorktreeMode::Always);
+        let store = ProjectBindingStore::new(root.path().join("bindings"));
+        let source_project = if nested {
+            source.join("subproject")
+        } else {
+            source.clone()
+        };
+        let base_project = if nested {
+            base.join("subproject")
+        } else {
+            base.clone()
+        };
+        for explicit in [false, true] {
+            let task = identity(if explicit {
+                "explicit-base"
+            } else {
+                "pasted-base"
+            });
+            let selected = if explicit {
+                store
+                    .select_project_root_from_worktree(
+                        &config,
+                        &task,
+                        source_project.to_str().unwrap(),
+                        &base_project,
+                    )
+                    .await
+            } else {
+                store
+                    .select_project_root(&config, &task, base_project.to_str().unwrap())
+                    .await
+            }
+            .unwrap();
+            assert!(selected.managed_worktree);
+            assert_ne!(selected.project_root, base_project);
+            assert_eq!(
+                selected.source_project_root,
+                fs::canonicalize(&source_project).unwrap()
+            );
+            assert_eq!(git(&selected.project_root, &["rev-parse", "HEAD"]), head);
+            let new_git = selected.worktree_git_root.as_ref().unwrap();
+            assert!(new_git.join("base-only.txt").is_file());
+            assert!(!new_git.join("upstream-only.txt").exists());
+            assert_eq!(
+                fs::read_to_string(new_git.join("tracked.txt")).unwrap(),
+                "tracked\n"
+            );
+            assert!(!new_git.join("untracked.txt").exists());
+            let reopened = ProjectBindingStore::new(root.path().join("bindings"));
+            assert_eq!(
+                reopened.effective_config(&config, &task).unwrap().work_dir,
+                selected.project_root
+            );
+            let retry = if explicit {
+                reopened
+                    .select_project_root_from_worktree(
+                        &config,
+                        &task,
+                        source_project.to_str().unwrap(),
+                        &base_project,
+                    )
+                    .await
+            } else {
+                reopened
+                    .select_project_root(&config, &task, base_project.to_str().unwrap())
+                    .await
+            }
+            .unwrap();
+            assert_eq!(
+                retry.project_root, selected.project_root,
+                "retrying creation must reuse its saved workspace"
+            );
+        }
+        assert_eq!(git(&base, &["status", "--porcelain=v1"]), before);
+        assert_eq!(
+            fs::read_to_string(base.join("tracked.txt")).unwrap(),
+            "unstaged local work"
+        );
+        let git_index = PathBuf::from(git(&base, &["rev-parse", "--git-path", "index"]));
+        assert_eq!(
+            fs::read(if git_index.is_absolute() {
+                git_index
+            } else {
+                base.join(git_index)
+            })
+            .unwrap(),
+            index
+        );
+        assert_eq!(git(&base, &["symbolic-ref", "--short", "HEAD"]), "base");
+    }
+}
+
+#[tokio::test]
+async fn worktree_bases_reject_unauthorized_or_forged_registrations_and_disabled_isolation() {
+    let root = TempDir::new().unwrap();
+    let (access, source) = repository(&root);
+    let config = config(&root, access, WorktreeMode::Always);
+    let store = ProjectBindingStore::new(root.path().join("bindings"));
+    let other = TempDir::new().unwrap();
+    let (_, foreign) = repository(&other);
+    let foreign_base = root.path().join("foreign-base");
+    git(
+        &foreign,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            foreign_base.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        store
+            .select_project_root(
+                &config,
+                &identity("foreign-paste"),
+                foreign_base.to_str().unwrap()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .select_project_root_from_worktree(
+                &config,
+                &identity("foreign-explicit"),
+                source.to_str().unwrap(),
+                &foreign_base
+            )
+            .await
+            .is_err()
+    );
+    let base = root.path().join("registered-base");
+    git(
+        &source,
+        &["worktree", "add", "--detach", base.to_str().unwrap()],
+    );
+    let forged = root.path().join("forged-base");
+    fs::create_dir_all(&forged).unwrap();
+    fs::copy(base.join(".git"), forged.join(".git")).unwrap();
+    assert!(
+        store
+            .select_project_root(&config, &identity("forged"), forged.to_str().unwrap())
+            .await
+            .is_err()
+    );
+    assert!(
+        !config.worktrees.root.exists(),
+        "rejected bases must not allocate a worktree"
+    );
+    let mut disabled = config.clone();
+    disabled.worktrees.mode = WorktreeMode::Never;
+    assert!(
+        store
+            .select_project_root_from_worktree(
+                &disabled,
+                &identity("disabled"),
+                source.to_str().unwrap(),
+                &base
+            )
+            .await
+            .is_err()
+    );
+    // Explicitly choosing even the source checkout as a base always creates fresh isolation.
+    let selected = store
+        .select_project_root_from_worktree(
+            &config,
+            &identity("source-as-base"),
+            source.to_str().unwrap(),
+            &source,
+        )
+        .await
+        .unwrap();
+    assert!(selected.managed_worktree);
+    assert_ne!(selected.project_root, source);
+}

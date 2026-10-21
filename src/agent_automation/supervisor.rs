@@ -492,7 +492,6 @@ pub struct AgentAutomationSupervisor {
     action_timeouts: ActionTimeouts,
     approval_next_scan_ms: AtomicU64,
     next_retry_scan_ms: AtomicU64,
-    approval_resume_until_ms: Mutex<HashMap<String, u64>>,
 }
 
 struct ActionTimeouts {
@@ -541,7 +540,6 @@ impl AgentAutomationSupervisor {
             wake: Arc::new(Notify::new()),
             approval_next_scan_ms: AtomicU64::new(0),
             next_retry_scan_ms: AtomicU64::new(0),
-            approval_resume_until_ms: Mutex::new(HashMap::new()),
             action_timeouts: ActionTimeouts {
                 start,
                 progress,
@@ -636,11 +634,16 @@ impl AgentAutomationSupervisor {
                 .retain(|queued| queued.task_key != task.task.stable_key());
             self.live.write().await.remove(task.task.stable_key());
         } else if let Some(action_id) = orphaned_action {
-            task.store.clear_persisted_queued_action(
-                &task.task,
-                &action_id,
-                crate::markdown_chat::now_ms(),
-            )?;
+            if !task
+                .store
+                .restore_disabled_queued_retry(&task.task, &action_id)?
+            {
+                task.store.clear_persisted_queued_action(
+                    &task.task,
+                    &action_id,
+                    crate::markdown_chat::now_ms(),
+                )?;
+            }
             self.queue
                 .lock()
                 .await
@@ -775,6 +778,40 @@ impl AgentAutomationSupervisor {
         };
         drop(queue);
         self.live.write().await.remove(handle.task.stable_key());
+        self.notify();
+        Ok(action)
+    }
+
+    pub async fn pause_action_retries(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+    ) -> Result<super::AutomationActionState, String> {
+        let _scan_guard = self.scan_lock.lock().await;
+        let handle = self
+            .tasks
+            .read()
+            .await
+            .get(task.stable_key())
+            .cloned()
+            .ok_or("Browser automation task is not registered")?;
+        let mut queue = self.queue.lock().await;
+        let state = handle.store.load(&handle.task)?;
+        if state.action.status == AutomationActionStatus::Queued
+            && !queue.iter().any(|q| {
+                q.request.action_id == expected_action_id && q.task_key == task.stable_key()
+            })
+        {
+            return Err("The browser action already started or left the queue".into());
+        }
+        let action = handle
+            .store
+            .pause_action_retries(&handle.task, expected_action_id)?;
+        queue.retain(|q| {
+            q.request.action_id != expected_action_id || q.task_key != task.stable_key()
+        });
+        drop(queue);
+        self.live.write().await.remove(task.stable_key());
         self.notify();
         Ok(action)
     }
@@ -1002,10 +1039,6 @@ impl AgentAutomationSupervisor {
             self.approval_next_scan_ms
                 .store(now_ms.saturating_add(5_000), Ordering::Relaxed);
         }
-        self.approval_resume_until_ms
-            .lock()
-            .await
-            .retain(|_, until| now_ms < *until);
         let tasks = self
             .tasks
             .read()
@@ -1023,6 +1056,22 @@ impl AgentAutomationSupervisor {
                 now_ms,
             )?;
             let mut state = task.store.load(&task.task)?;
+            if !state.automatic_retries_enabled
+                && state.action.status == AutomationActionStatus::Queued
+                && state.action.automatic_retry_in_progress
+                && let Some(action_id) = state.action.id.as_deref()
+                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && task
+                    .store
+                    .restore_disabled_queued_retry(&task.task, action_id)?
+            {
+                self.queue.lock().await.retain(|q| {
+                    q.request.action_id != action_id || q.task_key != task.task.stable_key()
+                });
+                self.clear_live_action(task.task.stable_key(), action_id)
+                    .await;
+                state = task.store.load(&task.task)?;
+            }
             // Wake at the actual jittered deadline, rather than rounding all
             // chats into the same 30-second scan and undoing their jitter.
             if let Some(at) = state
@@ -1032,13 +1081,27 @@ impl AgentAutomationSupervisor {
             {
                 self.next_retry_scan_ms.fetch_min(at, Ordering::Relaxed);
             }
-            if self
-                .approval_resume_until_ms
-                .lock()
-                .await
-                .contains_key(task.task.stable_key())
-            {
-                continue;
+            if let Some(resume) = state.approval_resume.as_ref() {
+                let made_progress = activity
+                    .last_call_at_ms
+                    .is_some_and(|last| last > resume.resumed_at_ms);
+                let current = resume.owner_generation == task.owner_generation
+                    && resume.pairing_generation == state.pairing.generation
+                    && state.pairing.verified_owner_generation == Some(task.owner_generation)
+                    && resume.goal_revision == state.goal.as_ref().map(|g| g.revision);
+                if current
+                    && !activity.agent_stop_requested
+                    && !made_progress
+                    && let Some(until) = state
+                        .approval_resume_until_ms()
+                        .filter(|until| now_ms < *until)
+                {
+                    self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
+                    continue;
+                }
+                task.store
+                    .clear_approval_resume(&task.task, &state, made_progress && current)?;
+                state = task.store.load(&task.task)?;
             }
             if check_approvals
                 && !activity.agent_stop_requested
@@ -1054,38 +1117,17 @@ impl AgentAutomationSupervisor {
                     .approve_pending_conversation(url, account, &connector)
                     .await
             {
-                // Granting this approval resumes the existing turn. It does not
-                // acknowledge queued messages or justify another browser Send.
-                if let Some(id) = state.action.id.as_deref() {
-                    if state.action.status == AutomationActionStatus::Queued
-                        && state.action.kind != Some(AutomationActionKind::PairVerify)
-                        && state.action.send_accepted != Some(true)
-                    {
-                        self.queue
-                            .lock()
-                            .await
-                            .retain(|queued| queued.request.action_id != id);
-                        task.store
-                            .clear_persisted_queued_action(&task.task, id, now_ms)?;
-                        self.live.write().await.remove(task.task.stable_key());
-                    } else if state.action.status == AutomationActionStatus::ApprovalRequired
-                        && state.action.send_accepted == Some(false)
-                    {
-                        task.store.update_action_status(
-                            &task.task,
-                            id,
-                            AutomationActionStatus::Idle,
-                            None,
-                            None,
-                            now_ms,
-                        )?;
-                        self.live.write().await.remove(task.task.stable_key());
-                    }
-                }
-                self.approval_resume_until_ms.lock().await.insert(
-                    task.task.stable_key().to_string(),
-                    now_ms.saturating_add(5_000),
-                );
+                let epoch = activity
+                    .activity_epoch
+                    .as_deref()
+                    .unwrap_or("legacy-activity");
+                let sequence = if activity.activity_sequence == 0 {
+                    activity.tool_call_count
+                } else {
+                    activity.activity_sequence
+                };
+                self.record_approved_resume(&task, &state, epoch, sequence, now_ms)
+                    .await?;
                 continue;
             }
             let activity_epoch = activity
@@ -1203,11 +1245,6 @@ impl AgentAutomationSupervisor {
                     }
                 }
             }
-            if state.action.status == AutomationActionStatus::Cancelled
-                && state.goal_retry_at_ms().is_none()
-            {
-                continue;
-            }
             if !activity.agent_stop_requested
                 && self.reconcile_chat_delivery(&task, &state, now_ms).await?
             {
@@ -1259,6 +1296,44 @@ impl AgentAutomationSupervisor {
                     }
                     state = task.store.load(&task.task)?;
                 }
+            }
+            if !activity.agent_stop_requested
+                && state.action.kind == Some(AutomationActionKind::OfflineGoal)
+                && activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+            {
+                // Preserve the proven-delivery reconciliation above. A queued
+                // retry is retired only while the worker cannot start its Send.
+                let queued = state.action.status == AutomationActionStatus::Queued;
+                let run_guard = if queued {
+                    self.run_lock.try_lock().ok()
+                } else {
+                    None
+                };
+                if (!queued || run_guard.is_some())
+                    && task.store.reconcile_resumed_goal_retry(
+                        &task.task,
+                        &state,
+                        task.owner_generation,
+                        activity.last_call_at_ms,
+                        now_ms,
+                    )?
+                {
+                    if let Some(action_id) = state.action.id.as_deref() {
+                        self.queue
+                            .lock()
+                            .await
+                            .retain(|queued| queued.request.action_id != action_id);
+                        self.clear_live_action(task.task.stable_key(), action_id)
+                            .await;
+                    }
+                    state = task.store.load(&task.task)?;
+                    task.store.notify_state(&task.chat, &state).await;
+                }
+            }
+            if state.action.status == AutomationActionStatus::Cancelled
+                && state.goal_retry_at_ms().is_none()
+            {
+                continue;
             }
             let renewing = state
                 .turn_renewal
@@ -1362,6 +1437,12 @@ impl AgentAutomationSupervisor {
                     .expire_unobserved_action(&task.task, &state.action)?
             {
                 state = task.store.load(&task.task)?;
+            }
+            if !obsolete_action
+                && (state.action.automatic_retry_paused
+                    || !state.automatic_retries_enabled && state.action_needs_attention_at(now_ms))
+            {
+                continue;
             }
             if !obsolete_action && state.goal_recovery_exhausted() {
                 task.store
@@ -1702,6 +1783,13 @@ impl AgentAutomationSupervisor {
             let Some(task) = self.tasks.read().await.get(&execution.task_key).cloned() else {
                 continue;
             };
+            if task
+                .store
+                .restore_disabled_queued_retry(&task.task, &execution.request.action_id)?
+            {
+                self.clear_live_if_action(&execution).await;
+                continue;
+            }
             if let Some(batch_id) = execution_batch_id(&execution) {
                 if !task.store.record_chat_submission(
                     &task.task,
@@ -1724,6 +1812,27 @@ impl AgentAutomationSupervisor {
                 }
             }
             if !execution_matches(&task, &execution, now_ms).await? {
+                if execution_kind(&execution) == AutomationActionKind::OfflineGoal {
+                    let state = task.store.load(&task.task)?;
+                    let activity = task.chat.offline_activity().await?;
+                    if state.action.id.as_deref() == Some(execution.request.action_id.as_str())
+                        && !activity.agent_stop_requested
+                        && activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS)
+                        && task.store.reconcile_resumed_goal_retry(
+                            &task.task,
+                            &state,
+                            task.owner_generation,
+                            activity.last_call_at_ms,
+                            now_ms,
+                        )?
+                    {
+                        self.clear_live_if_action(&execution).await;
+                        task.store
+                            .notify_state(&task.chat, &task.store.load(&task.task)?)
+                            .await;
+                        continue;
+                    }
+                }
                 let _ = task.store.update_action_status(
                     &task.task,
                     &execution.request.action_id,
@@ -2179,6 +2288,33 @@ impl AgentAutomationSupervisor {
         if status == AutomationActionStatus::ApprovalRequired && self.config.auto_approve_tool_calls
         {
             self.approval_next_scan_ms.store(0, Ordering::Relaxed);
+            // The action has opened its target and found an approval. Resolve it
+            // before any new continuation, including when the passive scan had
+            // been looking at a different conversation.
+            let pending = task.store.load(&task.task)?;
+            if pending.action.id.as_deref() == Some(execution.request.action_id.as_str())
+                && pending.pairing.verified_owner_generation == Some(task.owner_generation)
+                && let Some(connector) = task.store.connector_name(&self.config.connector_name)?
+                && let Ok(true) = self
+                    .executor
+                    .approve_pending_conversation(
+                        &execution.request.expected_url,
+                        &execution.account_fingerprint,
+                        &connector,
+                    )
+                    .await
+                && self
+                    .record_approved_resume(
+                        &task,
+                        &pending,
+                        &execution.activity_epoch,
+                        execution.activity_sequence,
+                        terminal_at_ms,
+                    )
+                    .await?
+            {
+                return Ok(Some(snapshot));
+            }
             self.notify();
         }
         self.update_live_terminal(
@@ -2192,6 +2328,35 @@ impl AgentAutomationSupervisor {
             task.store.notify_state(&task.chat, &state).await;
         }
         Ok(Some(snapshot))
+    }
+
+    async fn record_approved_resume(
+        &self,
+        task: &AutomationTaskHandle,
+        expected: &super::AutomationTaskState,
+        activity_epoch: &str,
+        activity_sequence: u64,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if !task.store.record_approval_resume(
+            &task.task,
+            expected,
+            task.owner_generation,
+            activity_epoch,
+            activity_sequence,
+            now_ms,
+        )? {
+            return Ok(false);
+        }
+        if let Some(id) = expected.action.id.as_deref() {
+            self.queue.lock().await.retain(|queued| {
+                queued.task_key != task.task.stable_key() || queued.request.action_id != id
+            });
+            self.clear_live_action(task.task.stable_key(), id).await;
+        }
+        let state = task.store.load(&task.task)?;
+        task.store.notify_state(&task.chat, &state).await;
+        Ok(true)
     }
 
     async fn reconcile_chat_delivery(

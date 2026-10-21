@@ -1896,8 +1896,14 @@ The account, verified pairing, connector chip and menu structure must match;
 localized button labels are not used to identify the controls. Unknown or ambiguous
 cards remain for manual approval. Disabling auto-approval leaves them untouched.
 These bounded checks yield to active browser actions and never navigate, press Stop,
-or submit a prompt. Granting permission resumes the existing turn and preserves
-queued messages and accepted-message records. It does not enable file materialization
+or submit a prompt. Continuation actions also check their destination's latest turn
+for approvals after opening it and again during preparation, before Send. An approval
+found there is resolved on that same page before another continuation can be sent.
+Granting permission resumes the existing turn and preserves queued messages and
+accepted-message records. A persisted three-minute grace period (plus up to ten
+percent jitter) allows the first tool call to arrive; fresh agent activity ends this
+wait immediately. Browser restart does not reset the wait. Approval alone does not
+mark pending user messages delivered or count a new goal turn. It does not enable file materialization
 in Codexify when that feature is disabled.
 The first release reuses agent chat's existing five-minute offline threshold and
 always uses one shared window rather than a configurable tab count.
@@ -2131,8 +2137,12 @@ the user asks to follow them. Refresh the connector's tools after deploying this
 schema update so existing ChatGPT clients can discover the three new tools.
 
 The standalone UI exposes model and effort choices from the companion's cached,
-account-bound capability catalog. Full discovery runs when refreshing models or
-opening the new-chat picker. A send reuses a healthy destination conversation
+account-bound capability catalog. The persisted list survives restarts and
+companion updates with the same protocol, and is never shared across accounts.
+Opening or switching conversations only reads this cache, including when it is
+empty; saved model and effort selections remain visible without browser discovery.
+Full discovery runs when explicitly refreshing models or opening the new-chat
+picker. A send reuses a healthy destination conversation
 already open in the shared tab, or opens it when necessary, then selects and
 verifies the preferred model and effort there. A known conversation-load failure
 still receives a deliberate recovery reload. Required conversation loads share
@@ -2200,7 +2210,12 @@ starts after the preceding failed attempt. All three schedules add 0–10% extra
 jitter to spread retries from different chats. The jitter is stable for each failed
 action and attempt, so polling and service restarts do not move its deadline.
 These counts survive service restarts; verified agent activity resets the goal recovery
-count, while Send acceptance alone does not. Pairing references remain valid for
+count, while Send acceptance alone does not. If fresh agent activity resumes
+during a failed goal-only continuation's cooldown, Codexify clears that error and
+cancels its retry, including an automatic retry still waiting in the browser queue.
+The goal remains active and can continue normally after later inactivity. This
+does not acknowledge or discard pending user messages, or count another accepted Send.
+Pairing references remain valid for
 60 minutes; the pairing verification grace period remains 60 seconds. The failure
 banner exposes Retry even without a goal. Browser action errors appear as a red
 exclamation icon beside the sidebar title. Pending automatic retries stay quiet;
@@ -3336,3 +3351,33 @@ when the widget host exposes the connector slug, otherwise a Plugins-settings
 link. Opening that link is not treated as proof of refresh. ChatGPT controls
 these settings URLs, so manual instructions remain available when navigation
 is unsupported.
+
+### Automatic error retries
+
+`agentChat.automation.automaticRetries` defaults to `true`. Change **Settings →
+Chats & goals → Automatic retries** to apply the policy immediately, including
+retries already queued. With it off, initial sends and normal goal continuations
+still work, and failed actions can be retried manually. Error retry backoff is not
+scheduled until the option is enabled again.
+
+**Pause retries** keeps the saved error but stops automatic retries for that
+failure across browsers and restarts. **Retry** (or **Continue**) starts a manual
+attempt and clears that pause. **Dismiss** clears the saved error and cancels its
+retries without clearing the goal or marking unsent user messages as delivered.
+New user intent can resume work. Fresh agent activity also clears stale goal-only
+continuation failures, including failures that exhausted their retry budget;
+accepted-message records remain intact.
+
+### Creating a new chat from an existing worktree
+
+In **New chat → Worktrees**, selecting the worktree name reuses its checkout.
+**New from here** creates a fresh managed worktree at that checkout's current
+commit. The Create a worktree checkbox can switch between these choices.
+Uncommitted changes in the base checkout remain there and are not copied.
+
+An explicit worktree-list selection is checked against the selected authorized
+source project. A standard linked-worktree path can also be pasted into Project
+path or Git URL with Create a worktree enabled. Its Git registration and backlink
+must validate against a source project under the configured access root. The
+new worktree retains that source project in its saved binding; its base commit
+is pinned without refreshing or substituting an upstream commit.

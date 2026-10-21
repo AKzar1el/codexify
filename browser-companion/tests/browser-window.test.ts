@@ -595,12 +595,12 @@ test("post-Send attention snapshots retain the verified conversation URL", async
   expect(snapshot?.canonicalUrl).toBe(submitted.expectedUrl);
 });
 
-test("pairing and default conversation actions need no model verification but still require connector and account proof", async () => {
+test("pairing and default conversation actions allow an omitted connector and still require account proof", async () => {
   class ConversationDriver extends DeferredDriver {
     override async execute(execution: DriverExecution) {
       this.runs.push(execution.request.actionId);
       execution.emit({type:"navigating"});execution.emit({type:"composer_ready"});
-      execution.emit({type:"connector_verified"});execution.emit({type:"send_accepted"});
+      execution.emit({type:"send_accepted"});
       execution.emit({type:"generation_complete",finalMarkdown:"Verified.",canonicalUrl:execution.request.expectedUrl});
     }
   }
@@ -635,6 +635,45 @@ test("automatic pairing verifies conversation preferences after acceptance and b
     if(restore){expect(events.at(-1)?.type).toBe("submission_complete");expect((await coordinator.action(automatic.actionId))?.selected).toEqual({model:automatic.model!,effort:automatic.effort!});}
     else{expect(events.at(-1)?.type).toBe("ambiguous_send");const last=events.at(-1);expect(last&&"message" in last?last.message:"").toContain("before restoring its requested model and effort");}
   }
+});
+
+test("ordinary sends without a connector still require model verification",async()=>{
+  for(const verified of [true,false]) {
+    class OptionalConnectorDriver extends DeferredDriver {
+      override async execute(execution:DriverExecution):Promise<void>{
+        if(verified)execution.emit({type:"model_verified",model:execution.request.model!,effort:execution.request.effort!});
+        execution.emit({type:"send_accepted"});
+        execution.emit({type:"submission_complete",canonicalUrl:execution.request.expectedUrl});
+      }
+    }
+    const coordinator=new SingleWindowCoordinator(new OptionalConnectorDriver(),TEST_BUILD),ordinary=request(`optional-connector-${verified}`);
+    await coordinator.execute(ordinary);const events=await collect(coordinator,ordinary.actionId);
+    expect(events.at(-1)?.type).toBe(verified?"submission_complete":"failed");
+    expect((await coordinator.action(ordinary.actionId))?.sendAccepted).toBe(verified);
+    expect(events.some(event=>event.type==="connector_verified")).toBeFalse();
+    await coordinator.close();
+  }
+});
+
+test("omitting an unavailable connector renews the next submission phase without claiming verification",async()=>{
+  class OptionalConnectorDriver extends DeferredDriver {
+    override async execute(execution:DriverExecution):Promise<void>{
+      execution.emit({type:"model_verified",model:execution.request.model!,effort:execution.request.effort!});
+      await Bun.sleep(100);
+      execution.signal.throwIfAborted();
+      execution.emit({type:"connector_omitted"});
+      await Bun.sleep(100);
+      execution.signal.throwIfAborted();
+      execution.emit({type:"send_accepted"});
+      execution.emit({type:"submission_complete",canonicalUrl:execution.request.expectedUrl});
+    }
+  }
+  const coordinator=new SingleWindowCoordinator(new OptionalConnectorDriver(),TEST_BUILD,{operationMs:150,cleanupMs:40,hardStopMs:30});
+  const ordinary=request('omitted-connector-progress');
+  await coordinator.execute(ordinary);const events=await collect(coordinator,ordinary.actionId);
+  expect(events.at(-1)?.type).toBe('submission_complete');
+  expect(events.some(event=>event.type==='connector_verified')).toBeFalse();
+  await coordinator.close();
 });
 
 test("ordinary sends still require model verification before connector verification",async()=>{

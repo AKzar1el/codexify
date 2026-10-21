@@ -906,6 +906,21 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       agentWaitingUntilMs:null, totalToolCalls:4
     };
     const messages = [];
+    const catalog = {
+      catalogRevision:"catalog-live",
+      models:[
+        { id:"gpt-6-astra", label:"GPT-6 Astra", efforts:[{ id:"max", label:"Pro", available:true, reason:null }] },
+        { id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[
+          { id:"low", label:"Instant", available:true, reason:null },
+          { id:"medium", label:"Medium", available:true, reason:null },
+          { id:"high", label:"High", available:true, reason:null },
+          { id:"max", label:"Max", available:false, reason:"Not available for this account" }
+        ] },
+        { id:"gpt-5.6-sol", label:"GPT-5.6 Sol", efforts:[
+          { id:"medium", label:"Medium", available:true, reason:null }
+        ] }
+      ]
+    };
     const automation = {
       enabled:true,
       ownerGeneration:0,
@@ -936,6 +951,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       }) });
       if (url.pathname === `/api/chats/${chat.id}/automation` && request.method() === "GET") {
         const snapshot = structuredClone(automation);
+        snapshot.catalog = automation.companion.authenticated ? catalog : null;
         if (holdNextState) {
           holdNextState = false;
           snapshot.live.status = "Stale selection poll received";
@@ -946,22 +962,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
       }
       if (url.pathname === `/api/chats/${chat.id}/automation/capabilities`) {
         operations.push("capabilities");
-        return route.fulfill({ json:{
-          companion:automation.companion,
-          catalogRevision:"catalog-live",
-          models:[
-            { id:"gpt-6-astra", label:"GPT-6 Astra", efforts:[{ id:"max", label:"Pro", available:true, reason:null }] },
-            { id:"gpt-6-sol", label:"GPT-6 Sol", efforts:[
-              { id:"low", label:"Instant", available:true, reason:null },
-              { id:"medium", label:"Medium", available:true, reason:null },
-              { id:"high", label:"High", available:true, reason:null },
-              { id:"max", label:"Max", available:false, reason:"Not available for this account" }
-            ] },
-            { id:"gpt-5.6-sol", label:"GPT-5.6 Sol", efforts:[
-              { id:"medium", label:"Medium", available:true, reason:null }
-            ] }
-          ]
-        } });
+        return route.fulfill({ json:{companion:automation.companion,...catalog} });
       }
       if (url.pathname === `/api/chats/${chat.id}/automation/selection`) {
         const body = request.postDataJSON(); operations.push(["selection", body]);
@@ -1208,7 +1209,7 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     await model.locator("option").filter({hasText:"Saved model"}).waitFor({state:"attached"});
     assert.equal(await model.locator("option:checked").textContent(), "Saved model");
     assert.equal(await effort.locator("option:checked").textContent(), "Saved effort");
-    assert(operations.includes("capabilities"));
+    assert(!operations.includes("capabilities"),"browsing and preference changes use the cached model list");
     assert(operations.includes("reveal"));
     assert(operations.some(entry => Array.isArray(entry) && entry[0] === "selection"));
     assert(operations.some(entry => Array.isArray(entry) && entry[0] === "pair"));
@@ -1331,6 +1332,8 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
       await page.goto('http://127.0.0.1:43215/#test-token');
       const dialog=page.getByRole('dialog',{name:'New chat'});
       const open=async()=>{
+        const back=page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true});
+        if(await back.isVisible())await back.click();
         await page.getByRole('button',{name:'New chat',exact:true}).click();
         await dialog.getByRole('button',{name:'Existing repo',exact:true}).waitFor();
         await dialog.locator('#new-chat-model:enabled').waitFor();
@@ -1382,14 +1385,29 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
       assert.equal(submitted[5].path,'/workspace/local-project','filesystem paths also submit directly');
       assert.equal(submitted[5].createWorktree,false);
       await open();await dialog.getByRole('button',{name:'Existing worktrees for Existing repo',exact:true}).click();await dialog.getByRole('button',{name:'Saved worktree',exact:true}).click();
-      assert.equal(await checkbox.isDisabled(),true);
+      assert.equal(await checkbox.isEnabled(),true);assert.equal(await checkbox.isChecked(),false);
       await url.fill('/workspace/confirmed');await dialog.getByRole('button',{name:'Confirm',exact:true}).click();
       assert.equal(await checkbox.isEnabled(),true,'Confirm releases the selected existing worktree');
       await url.fill('/workspace/latest');
       await create.click();await dialog.waitFor({state:'hidden'});
       assert.equal(submitted[6].path,'/workspace/latest','the path field stays current after confirmation');
-      assert(!Object.hasOwn(submitted[6],'worktreePath'));assert.equal(submitted[6].createWorktree,true);
-      assert.equal(preparations,7,'every New chat must freshly discover its destination-specific models');
+      assert(!Object.hasOwn(submitted[6],'worktreePath'));assert.equal(submitted[6].createWorktree,false,'Confirm preserves the current checkbox choice');
+      await page.setViewportSize({width:390,height:844});
+      await open();await dialog.getByRole('button',{name:'Existing worktrees for Existing repo',exact:true}).click();
+      const from=dialog.getByRole('button',{name:'Create a new worktree from Saved worktree',exact:true});
+      await from.waitFor();const fromBox=await from.boundingBox();assert(fromBox.x>=0&&fromBox.x+fromBox.width<=390);
+      await from.click();assert.equal(await checkbox.isChecked(),true);assert.equal(await checkbox.isEnabled(),true);
+      if(process.env.WORKTREE_BASE_SCREENSHOTS){mkdirSync(process.env.WORKTREE_BASE_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.WORKTREE_BASE_SCREENSHOTS}/${engineName.toLowerCase()}-base.png`});}
+      await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[7].path,'repo');assert.equal(submitted[7].worktreePath,'/workspace/saved');assert.equal(submitted[7].createWorktree,true);
+      await open();await dialog.getByRole('button',{name:'Existing worktrees for Existing repo',exact:true}).click();await dialog.getByRole('button',{name:'Saved worktree',exact:true}).click();
+      await checkbox.check();await dialog.locator('#new-chat-selection').getByText('New worktree from /workspace/saved',{exact:true}).waitFor();
+      await checkbox.uncheck();await dialog.locator('#new-chat-selection').getByText('/workspace/saved',{exact:true}).waitFor();
+      await checkbox.check();await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[8].path,'repo');assert.equal(submitted[8].worktreePath,'/workspace/saved');assert.equal(submitted[8].createWorktree,true);
+      await open();await url.fill('/workspace/saved');await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[9].path,'/workspace/saved');assert.equal(submitted[9].createWorktree,true);
+      assert.equal(preparations,10,'every New chat must freshly discover its destination-specific models');
       assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });
@@ -1428,7 +1446,7 @@ for(const [engineName,engine] of [['Chromium',chromium],['WebKit',webkit]])test(
 
 
 for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]]) {
-  test(`${engineName}: Dismissing errors preserves the goal and retries across polling`, {timeout:30000}, async()=>{
+  test(`${engineName}: Dismissing errors clears the saved failure and cancels retries across polling`, {timeout:30000}, async()=>{
     const browser=await engine.launch();
     try {
       const page=await ownerTestPage(browser,{viewport:{width:1280,height:900}});page.setDefaultTimeout(5000);
@@ -1468,15 +1486,16 @@ for (const [engineName, engine] of [["Chromium", chromium], ["WebKit", webkit]])
         await dismiss.click();await error.waitFor({state:'hidden'});await dismiss.waitFor({state:'hidden'});
         await page.waitForTimeout(1700);
         assert.equal(await error.isVisible(),false,'polling and countdown changes do not restore a dismissed error');
-        assert.deepEqual(action,before,'dismissing must not change the saved action or retry deadline');
+        assert.equal(action.status,'cancelled');assert.equal(action.lastError,null);assert.equal(action.automaticRetryAtMs,null);
+        assert.equal(action.sendAccepted,before.sendAccepted,'dismiss preserves delivery evidence');
         assert.equal(goal.status,'active');
         await host.getByRole('button',{name:'Connection settings',exact:true}).click();
-        assert.equal(await host.locator('#connection-settings-error').isVisible(),true,'diagnostics remain available in settings');
+        assert.equal(await host.locator('#connection-settings-error').isVisible(),false,'dismiss clears the stored error everywhere');
         await host.getByRole('button',{name:'Close connection settings',exact:true}).click();
         assert.equal(await host.locator('#goal-text').textContent(),goal.markdown);
         if(failure.id==='backoff')await page.screenshot({path:`/tmp/chat-error-cancel-ui/${engineName.toLowerCase()}-after.png`});
       }
-      assert.equal(cancellations.length,0);assert.equal(action.sendAccepted,true);assert.deepEqual(errors,[]);
+      assert.equal(cancellations.length,3);assert.equal(action.sendAccepted,true);assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });
 }

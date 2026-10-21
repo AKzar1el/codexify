@@ -49,6 +49,7 @@ pub struct AgentAutomationConfig {
     pub connector_name: String,
     pub max_queued_actions: usize,
     pub auto_approve_tool_calls: bool,
+    pub automatic_retries: bool,
     pub chatgpt_project_url: Option<String>,
     #[serde(deserialize_with = "deserialize_request_block_list")]
     pub request_block_list: Vec<String>,
@@ -63,6 +64,7 @@ impl Default for AgentAutomationConfig {
             connector_name: DEFAULT_AUTOMATION_CONNECTOR_NAME.into(),
             max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
             auto_approve_tool_calls: true,
+            automatic_retries: true,
             chatgpt_project_url: None,
             request_block_list: vec![
                 r"^https?://(www\.)?chatgpt\.com/.*/rgstr".into(),

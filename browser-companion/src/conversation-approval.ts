@@ -3,6 +3,23 @@ import { readChatGptAccount } from "./account";
 import { BrowserCompanionError } from "./errors";
 import { canonicalChatGptConversationUrl, type ConversationApprovalRequest } from "./protocol";
 
+const APPROVAL_SELECTOR = '[data-codex-approval-surface="true"], [data-testid="tool-approval-card"]';
+
+/** Old unanswered cards must not mask the blocker in the current turn. */
+export async function latestConversationApprovalCards(page:Page) {
+  const groups = page.locator('[data-turn-key]').filter({visible:true});
+  if (await groups.count()) return groups.last().locator(APPROVAL_SELECTOR).filter({visible:true});
+  const legacy = page.locator('article[data-testid^="conversation-turn-"], [data-turn-id-container]').filter({visible:true});
+  if (await legacy.count()) return legacy.last().locator(APPROVAL_SELECTOR).filter({visible:true});
+  return page.locator(APPROVAL_SELECTOR).filter({visible:true});
+}
+
+export async function throwIfConversationApproval(page:Page):Promise<void> {
+  if (await (await latestConversationApprovalCards(page)).count()) {
+    throw new BrowserCompanionError("ChatGPT is waiting for a connector approval before this conversation can continue", "approval_required");
+  }
+}
+
 /** Only the connector card in the verified conversation may grant conversation scope. */
 export async function approveConversationCard(page:Page, request:ConversationApprovalRequest, expectedAppId:string|undefined, signal:AbortSignal):Promise<boolean> {
   const sameConversation = () => {
@@ -10,7 +27,7 @@ export async function approveConversationCard(page:Page, request:ConversationApp
     catch { return false; }
   };
   if (!sameConversation()) return false;
-  const cards = page.locator('[data-codex-approval-surface="true"]').filter({visible:true});
+  const cards = (await latestConversationApprovalCards(page)).and(page.locator('[data-codex-approval-surface="true"]'));
   if (await cards.count() !== 1) return false;
   const card = cards.first();
   const trusted = () => card.evaluate((element,{name,appId}) => {
@@ -34,7 +51,17 @@ export async function approveConversationCard(page:Page, request:ConversationApp
   if (!await trusted()) return false;
   const trigger = card.locator('form button[type="button"][aria-haspopup="menu"].bg-primary-solid');
   const menus = page.locator('[role="menu"]').filter({visible:true});
-  if (await menus.count() || !await trigger.isEnabled()) return false;
+  const existingMenus = await menus.count();
+  if (existingMenus > 1 || !await trigger.isEnabled()) return false;
+  if (existingMenus) {
+    // A previous attempt or the user may already have opened this card's
+    // options. Only reuse an explicitly associated approval menu.
+    const menu = menus.first(), id = await trigger.getAttribute('id');
+    const controls = await trigger.getAttribute('aria-controls'), labelledBy = await menu.getAttribute('aria-labelledby');
+    if (await trigger.getAttribute('aria-expanded') !== 'true'
+      || !(controls && controls === await menu.getAttribute('id')
+        || id && labelledBy?.split(/\s+/).includes(id))) return false;
+  }
   const verify = async () => {
     signal.throwIfAborted();
     if (!sameConversation() || (await readChatGptAccount(page)).fingerprint !== request.expectedAccountFingerprint || !await trusted()) {
@@ -44,7 +71,7 @@ export async function approveConversationCard(page:Page, request:ConversationApp
   await verify();
   let opened = false;
   try {
-    await trigger.click({timeout:750,signal});
+    if (!existingMenus) await trigger.click({timeout:750,signal});
     opened = true;
     await menus.first().waitFor({state:"visible",timeout:750,signal});
     if (await menus.count() !== 1 || await trigger.getAttribute('aria-expanded') !== 'true') return false;

@@ -29,7 +29,9 @@ import {
 type WithoutEventEnvelope<T> = T extends ActionEvent
   ? Omit<T, "sequence" | "actionId" | "atMs">
   : never;
-export type DriverEvent = WithoutEventEnvelope<ActionEvent>;
+// An omitted connector is a driver-only milestone, never connector verification
+// on the wire. It renews the next submission phase's existing timeout budget.
+export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_omitted"};
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
@@ -81,7 +83,6 @@ interface ActionRecord {
   snapshot: ActionSnapshot;
   events: ActionEvent[];
   eventBytes: number;
-  connectorVerified: boolean;
   listeners: Set<(event: ActionEvent) => void>;
   abort: AbortController;
   terminal: boolean;
@@ -390,7 +391,6 @@ export class SingleWindowCoordinator {
         },
         events:[],
         eventBytes:0,
-        connectorVerified:false,
         listeners:new Set(),
         abort:new AbortController(),
         terminal:false,
@@ -588,7 +588,7 @@ export class SingleWindowCoordinator {
           // Only a newly verified stage renews the stall deadline. Repeated
           // events and response output cannot keep browser ownership alive.
           if (!record.terminal && !completedSteps.has(event.type)
-            && ["navigating","composer_ready","model_verified","connector_verified","send_accepted","conversation_created"].includes(event.type)) {
+            && ["navigating","composer_ready","model_verified","connector_verified","connector_omitted","send_accepted","conversation_created"].includes(event.type)) {
             completedSteps.add(event.type);
             progress();
           }
@@ -641,6 +641,7 @@ export class SingleWindowCoordinator {
 
   private emit(record: ActionRecord, raw: DriverEvent): void {
     if (record.terminal) return;
+    if (raw.type === "connector_omitted") return;
     if (raw.type === "model_verified"
       && !modelSelectionAllowed(record.request.model,record.request.effort,raw)) {
       throw new BrowserCompanionError(
@@ -661,9 +662,9 @@ export class SingleWindowCoordinator {
       );
     }
     if (raw.type === "send_accepted"
-      && ((!pairing && record.request.model !== null && !record.snapshot.selected) || !record.connectorVerified)) {
+      && !pairing && record.request.model !== null && !record.snapshot.selected) {
       throw new BrowserCompanionError(
-        "Browser driver accepted Send before completing model and connector verification",
+        "Browser driver accepted Send before completing model verification",
         "failed",
       );
     }
@@ -731,7 +732,6 @@ export class SingleWindowCoordinator {
     record.snapshot.state = stateForEvent(event.type, record.snapshot.state);
     record.snapshot.attention = attentionFor(event);
     if (event.type === "model_verified") record.snapshot.selected = { model:event.model, effort:event.effort };
-    if (event.type === "connector_verified") record.connectorVerified = true;
     if (event.type === "send_accepted") {
       record.snapshot.sendAccepted = true;
       if(record.request.prompt.kind !== "create_chat")record.snapshot.canonicalUrl = record.request.expectedUrl;

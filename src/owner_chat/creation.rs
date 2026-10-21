@@ -226,26 +226,28 @@ pub(super) async fn create_chat(
     }
     let config = selection_config(&state.config, body.create_worktree);
     let root = if let Some(worktree) = &body.worktree_path {
-        if body.without_project.is_some()
-            || body.resume_path.is_some()
-            || body.create_worktree.is_some()
-        {
+        if body.without_project.is_some() || body.resume_path.is_some() {
             return Err(internal_error(
                 "Worktree reuse cannot be combined with another workspace choice",
             ));
         }
-        bindings
-            .reuse_worktree(
-                &state.config,
-                &task,
-                body.path
-                    .as_deref()
-                    .ok_or_else(|| internal_error("Choose the worktree source project"))?,
-                FilePath::new(worktree),
-            )
-            .await
-            .map_err(internal_error)?
-            .project_root
+        let project = body
+            .path
+            .as_deref()
+            .ok_or_else(|| internal_error("Choose the worktree source project"))?;
+        if body.create_worktree == Some(true) {
+            bindings
+                .select_project_root_from_worktree(&config, &task, project, FilePath::new(worktree))
+                .await
+                .map_err(internal_error)?
+                .project_root
+        } else {
+            bindings
+                .reuse_worktree(&state.config, &task, project, FilePath::new(worktree))
+                .await
+                .map_err(internal_error)?
+                .project_root
+        }
     } else {
         match (&body.path, body.without_project, &body.resume_path) {
             (Some(path), None, None) if !path.trim().is_empty() => {
@@ -708,6 +710,124 @@ mod tests {
                     )
                     .is_err()
             );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_accepts_pasted_and_explicit_worktree_bases_without_reusing_or_replaying_them()
+    {
+        fn git(root: &FilePath, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        }
+        for pasted in [false, true] {
+            let (temp, mut state, _executor, server) = fixture().await;
+            let config = Arc::make_mut(&mut state.config);
+            config.worktrees.root = temp.path().join("managed");
+            config.worktrees.auto_cleanup_enabled = false;
+            let source = config.work_dir.join("repo");
+            git(&source, &["init", "-qb", "main"]);
+            git(
+                &source,
+                &[
+                    "-c",
+                    "user.name=Tests",
+                    "-c",
+                    "user.email=tests@example.invalid",
+                    "commit",
+                    "-qm",
+                    "initial",
+                    "--allow-empty",
+                ],
+            );
+            let base = temp.path().join("base");
+            git(
+                &source,
+                &["worktree", "add", "-b", "base", base.to_str().unwrap()],
+            );
+            std::fs::write(base.join("base.txt"), "committed base content").unwrap();
+            git(&base, &["add", "base.txt"]);
+            git(
+                &base,
+                &[
+                    "-c",
+                    "user.name=Tests",
+                    "-c",
+                    "user.email=tests@example.invalid",
+                    "commit",
+                    "-qm",
+                    "base commit",
+                ],
+            );
+            let head = git(&base, &["rev-parse", "HEAD"]);
+            std::fs::write(base.join("base.txt"), "uncommitted base content").unwrap();
+            let _ = prepare_chat(State(state.clone()), Json(Default::default()))
+                .await
+                .unwrap();
+            let request = || {
+                let mut request = body("from-base", false);
+                request.create_worktree = Some(true);
+                if pasted {
+                    request.path = Some(base.to_string_lossy().into_owned());
+                } else {
+                    request.worktree_path = Some(base.to_string_lossy().into_owned());
+                }
+                request
+            };
+            let created = create_chat(State(state.clone()), Json(request()))
+                .await
+                .unwrap()
+                .0;
+            let repeated = create_chat(State(state.clone()), Json(request()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(created["id"], repeated["id"]);
+            assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 1);
+            let task = creation_identity(&state.config, "from-base").unwrap();
+            let workspace = state
+                .project_bindings
+                .selected_project_root(&state.config, &task)
+                .unwrap()
+                .unwrap();
+            assert_ne!(workspace, base);
+            assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("base.txt")).unwrap(),
+                "committed base content"
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("base.txt")).unwrap(),
+                "uncommitted base content"
+            );
+            // The existing reuse API still selects the base without creating another checkout.
+            let before = git(&source, &["worktree", "list", "--porcelain"]);
+            let mut reuse = body("reuse-base", false);
+            reuse.create_worktree = None;
+            reuse.worktree_path = Some(base.to_string_lossy().into_owned());
+            let _ = create_chat(State(state.clone()), Json(reuse))
+                .await
+                .unwrap();
+            let task = creation_identity(&state.config, "reuse-base").unwrap();
+            assert_eq!(
+                state
+                    .project_bindings
+                    .selected_project_root(&state.config, &task)
+                    .unwrap()
+                    .unwrap(),
+                std::fs::canonicalize(&base).unwrap()
+            );
+            assert_eq!(git(&source, &["worktree", "list", "--porcelain"]), before);
             server.abort();
         }
     }

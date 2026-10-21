@@ -185,6 +185,23 @@ pub fn turn_renewal_settings(
     config.validate()?;
     Ok(config)
 }
+pub(crate) fn automatic_retries(path: Option<&Path>, fallback: bool) -> Result<bool, String> {
+    let Some(path) = path else {
+        return Ok(fallback);
+    };
+    let document: Value = serde_json::from_str(&read_raw(path)?)
+        .map_err(|_| "Cannot read automatic retry settings")?;
+    match document
+        .pointer("/agentChat/automation/automaticRetries")
+        .filter(|v| !v.is_null())
+    {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "Automatic retries must be a boolean".into()),
+        None => Ok(true),
+    }
+}
+
 pub fn rollout_enabled(config: &AppConfig) -> Result<bool, String> {
     let Some(path) = &config.loaded_config_path else {
         return Ok(config.markdown_chat.rollout_enabled);
@@ -367,6 +384,7 @@ pub fn save(
             chat.remove("extras");
             if let Some(automation) = chat.get_mut("automation").and_then(Value::as_object_mut) {
                 automation.remove("connectorName");
+                automation.remove("automaticRetries");
                 if automation.is_empty() {
                     chat.remove("automation");
                 }
@@ -983,6 +1001,42 @@ mod tests {
         assert_eq!(reset["restartRequired"], false);
         assert_eq!(rollout_reminder_interval(&config).unwrap(), 25);
     }
+    #[test]
+    fn automatic_retries_default_on_and_hot_reload_without_restart_or_schema_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false},"multiProject":false})
+                .to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path.clone());
+        assert!(automatic_retries(Some(&path), false).unwrap());
+        let mut shown = snapshot(&config).unwrap();
+        assert_eq!(
+            shown["defaults"]["agentChat"]["automation"]["automaticRetries"],
+            true
+        );
+        for enabled in [false, true] {
+            shown = save(
+                &config,
+                shown["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "agentChat.automation.automaticRetries".into(),
+                    json!(enabled),
+                )])),
+            )
+            .unwrap();
+            assert!(!shown["restartRequired"].as_bool().unwrap());
+            assert!(!shown["schemaRefreshRequired"].as_bool().unwrap());
+            assert_eq!(automatic_retries(Some(&path), true).unwrap(), enabled);
+        }
+        assert!(automatic_retries(None, false).is_ok_and(|v| !v));
+    }
+
     #[test]
     fn new_defaults_and_schema_refresh_projection_are_consistent() {
         let root = tempfile::tempdir().unwrap();

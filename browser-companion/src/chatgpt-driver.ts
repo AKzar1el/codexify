@@ -2,14 +2,14 @@ import type { Locator, Page } from "patchright";
 import {completedHandoff} from "./turn-renewal";
 import {classifyPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
-import {approveConversationCard} from "./conversation-approval";
+import {approveConversationCard,throwIfConversationApproval} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
 import {navigatePage} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
-import { clearComposerState, connectorIsSelected, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
+import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
 import { asCompanionError, BrowserCompanionError } from "./errors";
 import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
@@ -80,6 +80,7 @@ async function stopLingeringResponse(
   const timeout = (limit:number) => Math.max(1, Math.min(limit, deadline - Date.now()));
   const assertTarget = async () => {
     await throwIfSessionAttention(page);
+    await throwIfConversationApproval(page);
     await assertAuthenticatedChatGptPage(page);
     if (canonicalChatGptConversationUrl(page.url()) !== expected.canonicalUrl) {
       throw new BrowserCompanionError("ChatGPT changed conversations while stopping the previous response", "conversation_unavailable");
@@ -574,6 +575,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     let ownedPage: Page | undefined;
     let insertionAttempted = false;
     let selectedConnector: SelectedConnector | undefined;
+    const connectorMatches = async (composer:Locator):Promise<boolean> => selectedConnector
+      ? connectorIsSelected(composer,execution.request.connectorName,selectedConnector.identity)
+      : await composer.locator(SELECTED_CONNECTOR_SELECTOR).filter({visible:true}).count()===0;
     let pairingSelection: PairingMediumSelection | undefined;
     let restoreUrl: string | undefined;
     let submissionStep = "opening conversation";
@@ -589,11 +593,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         try { sameConversation = canonicalChatGptConversationUrl(current.url()) === canonicalChatGptConversationUrl(execution.request.expectedUrl); } catch {}
         // Reloading can discard an in-memory approval card. Preserve it for the
         // conversation approval handler instead of restarting the blocked turn.
-        if (sameConversation && await current.locator('[data-codex-approval-surface="true"], [data-testid="tool-approval-card"]').filter({visible:true}).count()) {
+        if (sameConversation) {
           if ((await readChatGptAccount(current)).fingerprint !== execution.request.expectedAccountFingerprint) {
             throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
           }
-          throw new BrowserCompanionError("ChatGPT is waiting for a connector approval before this conversation can continue", "approval_required");
+          await throwIfConversationApproval(current);
         }
       }
       execution.emit({ type:"navigating" });
@@ -607,9 +611,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         throw new BrowserCompanionError("ChatGPT account changed before the action could start", "authentication_required");
       }
       ownedPage = page;
-      if (await page.locator('[data-codex-approval-surface="true"], [data-testid="tool-approval-card"]').filter({visible:true}).count()) {
-        throw new BrowserCompanionError("ChatGPT is waiting for a connector approval before this conversation can continue", "approval_required");
-      }
+      await throwIfConversationApproval(page);
       const renewal=execution.request.prompt.kind === "turn_renewal" ? execution.request.prompt : null;
       const verifyHandoff=async()=>{
         if(renewal && !await completedHandoff(page,canonicalUrl,account.fingerprint,renewal.handoffId,execution.signal)) {
@@ -655,27 +657,41 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if (creating || execution.request.prompt.kind === "pair_verify") {
         pairingSelection = await selectPairingMedium(page, execution.signal);
       }
-      selectedConnector = await selectConnector(page, execution.request.connectorName, execution.signal);
-      this.connectorApps.remember(account.fingerprint,execution.request.connectorName,selectedConnector.identity);
-      execution.emit({ type:"connector_verified" });
+      try {
+        selectedConnector = await selectConnector(page, execution.request.connectorName, execution.signal);
+      } catch(error) {
+        // selectConnector has cleared the unsuccessful mention search. A missing
+        // menu row does not require another page load or another submission.
+        if (!(error instanceof ConnectorMenuUnavailableError)) throw error;
+        execution.signal.throwIfAborted();
+        execution.emit({type:"connector_omitted"});
+      }
+      if(selectedConnector) {
+        this.connectorApps.remember(account.fingerprint,execution.request.connectorName,selectedConnector.identity);
+        execution.emit({ type:"connector_verified" });
+      }
       // Read history before inserting a prompt: unsupported markers must not
       // make a newly filled composer flash and disappear during failure cleanup.
       step("reading submission baseline");
       await verifyHandoff();
+      await throwIfConversationApproval(page);
       const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       insertionAttempted = true;
       step("inserting prompt");
-      try {await insertExactPrompt(selectedConnector.composer, execution.renderedPrompt);}
+      try {await insertExactPrompt(selectedConnector?.composer ?? await activeComposer(page,30_000,execution.signal), execution.renderedPrompt);}
       catch(error){
+        await throwIfConversationApproval(page);
         if(error instanceof BrowserCompanionError)throw error;
         throw new BrowserCompanionError("ChatGPT did not accept the message in its editor; nothing was sent","external_interference",{cause:error});
       }
       step("waiting for Send control");
-      const send = await uniqueSendButton(await activeComposer(page, 30_000, execution.signal), 30_000, execution.signal);
+      const send = await uniqueSendButton(await activeComposer(page, 30_000, execution.signal), 30_000, execution.signal,
+        () => throwIfConversationApproval(page));
+      await throwIfConversationApproval(page);
       step("checking model and connector");
       if (pairingSelection) await pairingSelection.verify(execution.signal);
       else if (selected) await assertSelectedModelAndEffort(page, selected, execution.signal, creating);
-      if (!await connectorIsSelected(await activeComposer(page, 30_000, execution.signal), execution.request.connectorName, selectedConnector.identity)) {
+      if (!await connectorMatches(await activeComposer(page, 30_000, execution.signal))) {
         throw new BrowserCompanionError("ChatGPT changed the selected connector before Send", "external_interference");
       }
       step("checking prompt and conversation");
@@ -686,6 +702,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       else if (canonicalChatGptConversationUrl(page.url()) !== canonicalUrl) {
         throw new BrowserCompanionError("ChatGPT changed the verified conversation before Send", "conversation_unavailable");
       }
+      await throwIfConversationApproval(page);
       execution.signal.throwIfAborted();
       await verifyHandoff();
       sendActivated = true;
@@ -737,11 +754,19 @@ export class ChatGptBrowserDriver implements BrowserDriver {
             && !await generationRunning(ownedPage)) {
             const composer = await activeComposer(ownedPage, 2_000);
             if (await composerText(composer) === execution.renderedPrompt
-              && await connectorIsSelected(composer, execution.request.connectorName, selectedConnector?.identity)) {
+              && await connectorMatches(composer)) {
               await clearComposerState(ownedPage, execution.request.connectorName);
             }
           }
         } catch { /* Preserve the original failure when safe cleanup is unavailable. */ }
+      }
+      if (!sendActivated && execution.request.prompt.kind !== "create_chat" && ownedPage
+        && !(error instanceof BrowserCompanionError && error.code === "authentication_required")) {
+        let sameTarget = false;
+        try {sameTarget = canonicalChatGptConversationUrl(ownedPage.url()) === canonicalChatGptConversationUrl(execution.request.expectedUrl);} catch {}
+        // A card can appear while a model/connector operation is awaiting UI.
+        // Report that blocker so the supervisor resolves it on this page.
+        if (sameTarget) await throwIfConversationApproval(ownedPage);
       }
       if (sendActivated && !sendAccepted && !(error instanceof BrowserCompanionError && error.code === "ambiguous_send")) {
         throw new BrowserCompanionError(

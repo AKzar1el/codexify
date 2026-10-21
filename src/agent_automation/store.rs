@@ -29,6 +29,7 @@ pub const PAIRING_VERIFICATION_GRACE_MS: u64 = 60_000;
 const AUTOMATIC_RETRY_DELAYS_MS: [u64; 5] = [30_000, 60_000, 120_000, 240_000, 480_000];
 const CHATGPT_ACCESS_RETRY_DELAYS_MS: [u64; 6] =
     [180_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000];
+pub(crate) const APPROVAL_RESUME_GRACE_MS: u64 = 180_000;
 const GOAL_RECOVERY_EXHAUSTED: &str = "Automatic goal recovery stopped after three retries without agent activity. Use Continue to try again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +224,7 @@ pub struct AutomationActionState {
     pub chatgpt_access_retry_in_progress: bool,
     // Presentation only: keep recovery visible while a scheduled retry runs.
     pub automatic_retry_in_progress: bool,
+    pub automatic_retry_paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -276,6 +278,22 @@ pub struct GoalWakeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ApprovalResumeState {
+    pub resumed_at_ms: u64,
+    pub owner_generation: u64,
+    pub pairing_generation: u64,
+    pub goal_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SuspendedRetryState {
+    pub action: AutomationActionState,
+    pub goal_wake: GoalWakeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AutomationTaskState {
     pub creation_request_digest: Option<String>,
@@ -286,6 +304,14 @@ pub struct AutomationTaskState {
     pub chat_mirror: ChatMirrorState,
     pub action: AutomationActionState,
     pub goal_wake: GoalWakeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_resume: Option<ApprovalResumeState>,
+    // Restore the exact failure if an automatic retry is stopped while queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_retry: Option<SuspendedRetryState>,
+    // Runtime policy, read from global settings on each load; never persisted per chat.
+    #[serde(skip, default = "retries_enabled_by_default")]
+    pub automatic_retries_enabled: bool,
     #[serde(skip_serializing_if = "super::turn_renewal::TurnRenewalState::is_empty")]
     pub turn_renewal: super::turn_renewal::TurnRenewalState,
     #[serde(default)]
@@ -303,10 +329,17 @@ impl Default for AutomationTaskState {
             chat_mirror: ChatMirrorState::default(),
             action: AutomationActionState::default(),
             goal_wake: GoalWakeState::default(),
+            approval_resume: None,
+            suspended_retry: None,
+            automatic_retries_enabled: true,
             turn_renewal: Default::default(),
             owner_goal_requests: Vec::new(),
         }
     }
+}
+
+fn retries_enabled_by_default() -> bool {
+    true
 }
 
 impl AutomationTaskState {
@@ -366,7 +399,10 @@ impl AutomationTaskState {
     }
 
     pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
-        if !self.offline_goal_retry_eligible() {
+        if !self.automatic_retries_enabled
+            || self.action.automatic_retry_paused
+            || !self.offline_goal_retry_eligible()
+        {
             return None;
         }
         let delay = if confirmed_unsent_failure(&self.action) {
@@ -389,6 +425,9 @@ impl AutomationTaskState {
     }
 
     pub(crate) fn goal_recovery_retry_at_ms(&self) -> Option<u64> {
+        if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
+            return None;
+        }
         let delay = GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?;
         let last = self
             .action
@@ -490,7 +529,21 @@ impl AutomationTaskState {
             )
     }
 
+    pub fn approval_resume_until_ms(&self) -> Option<u64> {
+        self.approval_resume.as_ref().map(|resume| {
+            retry_deadline(
+                &self.action,
+                0,
+                resume.resumed_at_ms,
+                APPROVAL_RESUME_GRACE_MS,
+            )
+        })
+    }
+
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
+        if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
+            return None;
+        }
         if matches!(
             self.action.status,
             AutomationActionStatus::AuthenticationRequired
@@ -550,7 +603,9 @@ impl AutomationTaskState {
 
     pub fn is_automatically_retrying(&self) -> bool {
         self.automatic_retry_at_ms().is_some()
-            || self.action.automatic_retry_in_progress
+            || self.automatic_retries_enabled
+                && !self.action.automatic_retry_paused
+                && self.action.automatic_retry_in_progress
                 && matches!(
                     self.action.status,
                     AutomationActionStatus::Idle
@@ -676,6 +731,7 @@ pub struct AgentAutomationStore {
     notification_workspace: String,
     pub(super) renewal_config: super::turn_renewal::TurnRenewalConfig,
     pub(super) settings_path: Option<PathBuf>,
+    automatic_retries: bool,
     pub(super) usage_options: crate::usage_analytics::Options,
 }
 
@@ -734,6 +790,7 @@ impl AgentAutomationStore {
             notification_workspace: "Agent chat".into(),
             renewal_config: Default::default(),
             settings_path: None,
+            automatic_retries: true,
             usage_options: Default::default(),
         })
     }
@@ -742,6 +799,7 @@ impl AgentAutomationStore {
         self.notifications = config.markdown_chat.notifications.clone();
         self.renewal_config = config.markdown_chat.turn_renewal.clone();
         self.settings_path = config.loaded_config_path.clone();
+        self.automatic_retries = config.markdown_chat.automation.automatic_retries;
         self.usage_options = crate::usage_analytics::Options::from_config(config);
         self.notification_workspace = config
             .work_dir
@@ -780,13 +838,24 @@ impl AgentAutomationStore {
         crate::global_settings::connector_name(self.settings_path.as_deref(), fallback)
     }
 
+    pub(crate) fn automatic_retries_enabled(&self) -> Result<bool, String> {
+        crate::global_settings::automatic_retries(
+            self.settings_path.as_deref(),
+            self.automatic_retries,
+        )
+    }
+
     pub fn task_directory(&self, task: &ConversationIdentity) -> Result<PathBuf, String> {
         validate_task_key(task.stable_key())?;
         Ok(self.root.join(task.stable_key()))
     }
 
     pub fn load(&self, task: &ConversationIdentity) -> Result<AutomationTaskState, String> {
-        self.with_locked_task(task, load_state)
+        self.with_locked_task(task, |path| {
+            let mut state = load_state(path)?;
+            state.automatic_retries_enabled = self.automatic_retries_enabled()?;
+            Ok(state)
+        })
     }
 
     pub fn sync_goal_presence(
@@ -915,6 +984,7 @@ impl AgentAutomationStore {
                 && state.action.kind != Some(AutomationActionKind::PairVerify)
             {
                 state.action = AutomationActionState::default();
+                state.suspended_retry = None;
             }
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -1948,6 +2018,12 @@ impl AgentAutomationStore {
             if state.action.id.as_deref() != Some(action_id) {
                 return Err("Agent automation action changed before its status update".into());
             }
+            if matches!(
+                status,
+                AutomationActionStatus::Navigating | AutomationActionStatus::Idle
+            ) {
+                state.suspended_retry = None;
+            }
             let verified_pairing = state.action.kind == Some(AutomationActionKind::PairVerify)
                 && state.action.pairing_generation == Some(state.pairing.generation)
                 && state.pairing.verified_owner_generation.is_some();
@@ -1980,6 +2056,64 @@ impl AgentAutomationStore {
         })
     }
 
+    pub(crate) fn pause_action_retries(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+    ) -> Result<AutomationActionState, String> {
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(expected_action_id) {
+                return Err("The browser action changed before retries could be paused".into());
+            }
+            if state.action.status == AutomationActionStatus::Queued
+                && state.action.automatic_retry_in_progress
+            {
+                if let Some(previous) = state.suspended_retry.take() {
+                    state.action = previous.action;
+                    state.goal_wake = previous.goal_wake;
+                } else {
+                    // Older queued retries have no saved failure. No Send has started.
+                    state.action.status = AutomationActionStatus::Failed;
+                    state.action.last_error = Some("Automatic retry stopped before Send".into());
+                }
+            } else if !state.raw_action_needs_attention() {
+                return Err(
+                    "Only retries for a failed or queued retry action can be paused".into(),
+                );
+            }
+            state.action.automatic_retry_paused = true;
+            state.action.automatic_retry_in_progress = false;
+            state.action.chatgpt_access_retry_in_progress = false;
+            Ok(state.action.clone())
+        })
+    }
+
+    pub(crate) fn restore_disabled_queued_retry(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.automatic_retries_enabled
+                || state.action.id.as_deref() != Some(expected_action_id)
+                || state.action.status != AutomationActionStatus::Queued
+                || !state.action.automatic_retry_in_progress
+            {
+                return Ok(false);
+            }
+            if let Some(previous) = state.suspended_retry.take() {
+                state.action = previous.action;
+                state.goal_wake = previous.goal_wake;
+            } else {
+                state.action.status = AutomationActionStatus::Failed;
+                state.action.last_error = Some("Automatic retry stopped before Send".into());
+                state.action.automatic_retry_in_progress = false;
+                state.action.chatgpt_access_retry_in_progress = false;
+            }
+            Ok(true)
+        })
+    }
+
     pub fn cancel_action(
         &self,
         task: &ConversationIdentity,
@@ -1993,17 +2127,27 @@ impl AgentAutomationStore {
             if state.action.id.as_deref() != Some(expected_action_id) {
                 return Err("The browser action changed before it could be cancelled".into());
             }
-            if state.action.status == AutomationActionStatus::Cancelled {
+            if state.action.status == AutomationActionStatus::Cancelled
+                && state.action.last_error.is_none()
+            {
                 return Ok(state.action.clone());
             }
-            if state.action.status != AutomationActionStatus::Queued
+            if state.action.status != AutomationActionStatus::Cancelled
+                && state.action.status != AutomationActionStatus::Queued
                 && !state.raw_action_needs_attention()
                 && !(state.action.kind == Some(AutomationActionKind::PairVerify)
                     && state.pairing.pending.is_some())
             {
                 return Err("Only a queued or failed browser action can be cancelled here".into());
             }
+            // Dismissing a failure or cancelling its queued retry ends that
+            // error episode. Cancelling an initial queued goal wake keeps the
+            // existing goal scheduling behavior.
+            state.action.automatic_retry_paused |= state.raw_action_needs_attention()
+                || state.action.automatic_retry_in_progress
+                || state.action.last_error.is_some();
             state.action.status = AutomationActionStatus::Cancelled;
+            state.suspended_retry = None;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
             state.action.chatgpt_access_retry_attempts = 0;
@@ -2055,6 +2199,7 @@ impl AgentAutomationStore {
                     "Pairing verification cannot be replayed; start a new pairing request".into(),
                 );
             }
+            state.suspended_retry = None;
             if action_retry_mode(state) == Some("continue_goal") {
                 state.goal_wake = GoalWakeState::default();
             }
@@ -2083,6 +2228,10 @@ impl AgentAutomationStore {
             {
                 return Ok(false);
             }
+            state.suspended_retry = Some(SuspendedRetryState {
+                action: state.action.clone(),
+                goal_wake: state.goal_wake.clone(),
+            });
             // The active goal authorizes another turn. Keep the accepted-message
             // ledger so continuing a goal never replays an earlier user batch.
             let unsent = confirmed_unsent_failure(&state.action);
@@ -2182,6 +2331,10 @@ impl AgentAutomationStore {
             {
                 return Ok(false);
             }
+            state.suspended_retry = Some(SuspendedRetryState {
+                action: state.action.clone(),
+                goal_wake: state.goal_wake.clone(),
+            });
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 automatic_retry_attempts: state.action.automatic_retry_attempts
@@ -2220,6 +2373,140 @@ impl AgentAutomationStore {
             state.action.status = AutomationActionStatus::Ambiguous;
             state.action.last_error = Some("Saved browser action exceeded its time limit; completion could not be confirmed. Check ChatGPT before restarting it.".into());
             // Preserve the original start time for a later retained-receipt reconciliation.
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn record_approval_resume(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        owner_generation: u64,
+        activity_epoch: &str,
+        activity_sequence: u64,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if !valid_opaque(activity_epoch) {
+            return Err("Approval activity baseline is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.goal.as_ref().map(|g| (g.revision, g.status))
+                    != expected.goal.as_ref().map(|g| (g.revision, g.status))
+                || state.pairing.verified_owner_generation != Some(owner_generation)
+            {
+                return Ok(false);
+            }
+            // Approval resumes the existing turn. Preserve actual Send evidence,
+            // goal counts and every pending/accepted message delivery record.
+            if state.action.kind != Some(AutomationActionKind::PairVerify) {
+                state.action.status = AutomationActionStatus::Idle;
+                state.action.last_error = None;
+                state.action.automatic_retry_attempts = 0;
+                state.action.chatgpt_access_retry_attempts = 0;
+                state.action.chatgpt_access_retry_in_progress = false;
+                state.action.automatic_retry_in_progress = false;
+                state.action.automatic_retry_paused = false;
+                state.suspended_retry = None;
+            }
+            state.approval_resume = Some(ApprovalResumeState {
+                resumed_at_ms: now_ms,
+                owner_generation,
+                pairing_generation: state.pairing.generation,
+                goal_revision: state.goal.as_ref().map(|g| g.revision),
+            });
+            if state
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.status == GoalStatus::Active)
+            {
+                state.goal_wake = GoalWakeState {
+                    activity_epoch: Some(activity_epoch.into()),
+                    activity_sequence: Some(activity_sequence),
+                    nudged_epoch: Some(activity_epoch.into()),
+                    nudged_sequence: Some(activity_sequence),
+                    last_nudged_at_ms: Some(now_ms),
+                    recovery_attempts: 0,
+                };
+            }
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn clear_approval_resume(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        made_progress: bool,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.approval_resume != expected.approval_resume
+                || state.pairing != expected.pairing
+                || state.goal.as_ref().map(|g| (g.revision, g.status))
+                    != expected.goal.as_ref().map(|g| (g.revision, g.status))
+            {
+                return Ok(false);
+            }
+            if made_progress {
+                state.goal_wake = GoalWakeState::default();
+            }
+            state.approval_resume = None;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn reconcile_resumed_goal_retry(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationTaskState,
+        owner_generation: u64,
+        last_agent_call_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if expected.action.kind != Some(AutomationActionKind::OfflineGoal)
+            || !(expected.raw_action_needs_attention()
+                || expected.action.status == AutomationActionStatus::Cancelled
+                    && expected.action.automatic_retry_paused
+                || expected.action.status == AutomationActionStatus::Queued
+                    && expected.action.automatic_retry_in_progress)
+        {
+            return Ok(false);
+        }
+        self.mutate(task, |state| {
+            let queued_retry = state.action.status == AutomationActionStatus::Queued
+                && state.action.automatic_retry_in_progress;
+            if state.action != expected.action
+                || state.pairing != expected.pairing
+                || state.goal != expected.goal
+                || state.goal_wake != expected.goal_wake
+                || state.action.kind != Some(AutomationActionKind::OfflineGoal)
+                || state.action.pairing_generation != Some(state.pairing.generation)
+                || state.pairing.verified_owner_generation != Some(owner_generation)
+                || state.goal.as_ref().is_none_or(|goal| {
+                    goal.status != GoalStatus::Active
+                        || Some(goal.revision) != state.action.goal_revision
+                })
+                || (!queued_retry
+                    && state.action.updated_at_ms.is_none_or(|failed_at| {
+                        last_agent_call_at_ms.is_none_or(|last| last <= failed_at)
+                    }))
+            {
+                return Ok(false);
+            }
+            state.action.automatic_retry_paused = false;
+            state.suspended_retry = None;
+            // The caller observed the agent online again. Retire the failed
+            // goal-only wake without claiming our Send succeeded or touching
+            // user-message delivery, which might have resumed on another device.
+            state.action.status = AutomationActionStatus::Idle;
+            state.action.last_error = None;
+            state.action.updated_at_ms = Some(now_ms);
+            state.action.automatic_retry_attempts = 0;
+            state.action.chatgpt_access_retry_attempts = 0;
+            state.action.chatgpt_access_retry_in_progress = false;
+            state.action.automatic_retry_in_progress = false;
+            state.goal_wake = GoalWakeState::default();
             Ok(true)
         })
     }
@@ -2543,6 +2830,7 @@ impl AgentAutomationStore {
     ) -> Result<R, String> {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
+            state.automatic_retries_enabled = self.automatic_retries_enabled()?;
             let result = mutation(&mut state)?;
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -2557,6 +2845,7 @@ impl AgentAutomationStore {
     ) -> Result<R, String> {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
+            state.automatic_retries_enabled = self.automatic_retries_enabled()?;
             let result = mutation(&mut state);
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -3216,6 +3505,10 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     }
     validate_action(&state.action)?;
     validate_goal_wake(&state.goal_wake)?;
+    if let Some(previous) = &state.suspended_retry {
+        validate_action(&previous.action)?;
+        validate_goal_wake(&previous.goal_wake)?;
+    }
     if state.owner_goal_requests.len() > MAX_OWNER_GOAL_REQUESTS {
         return Err("Agent automation owner goal request history is too large".into());
     }

@@ -5,12 +5,20 @@ import { activeComposer, composerText } from "./composer";
 import { BrowserCompanionError } from "./errors";
 
 const CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
+const CONNECTOR_MENU_TIMEOUT_MS = 7_500;
 const MAX_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 export const SELECTED_CONNECTOR_SELECTOR = '[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][contenteditable="false"]';
 
 export interface SelectedConnector {
   composer: Locator;
   identity: string;
+}
+
+/** The configured row never appeared; no connector was selected. */
+export class ConnectorMenuUnavailableError extends BrowserCompanionError {
+  constructor(message:string,cause:unknown) {
+    super(message,"connector_unavailable",{cause});
+  }
 }
 
 export function connectorSelectionSelector(name: string): string {
@@ -112,7 +120,7 @@ export async function selectConnector(
         signal,
       });
       try {
-        await exactRow.waitFor({ state:"visible", timeout:2_500, signal });
+        await exactRow.waitFor({ state:"visible", timeout:CONNECTOR_MENU_TIMEOUT_MS, signal });
         break;
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -121,10 +129,9 @@ export async function selectConnector(
           const detail = titles.length
             ? `ChatGPT connector menu exposed ${titles.map(title => JSON.stringify(title)).join(", ")}`
             : "ChatGPT connector menu did not open";
-          throw new BrowserCompanionError(
+          throw new ConnectorMenuUnavailableError(
             `${detail}, but no exact row named ${JSON.stringify(connectorName)} was available`,
-            "connector_unavailable",
-            { cause:error },
+            error,
           );
         }
       }

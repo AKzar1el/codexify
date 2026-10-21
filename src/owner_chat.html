@@ -110,7 +110,7 @@ input,select,textarea { font:inherit; }
 #new-chat-dialog .new-chat-row { display:flex; gap:8px; align-items:center; margin:7px 0; }
 #new-chat-dialog .new-chat-row>* { min-width:0; }
 #new-chat-projects { max-height:220px; overflow:auto; margin:8px 0; }
-#new-chat-projects .new-chat-row button:first-child { flex:1; text-align:left; overflow-wrap:anywhere; }
+#new-chat-projects .new-chat-row button:first-child,#new-chat-worktrees .new-chat-row button:first-child { flex:1; text-align:left; overflow-wrap:anywhere; }
 #new-chat-selection { padding:9px; border-radius:8px; background:var(--selected); overflow-wrap:anywhere; }
 #new-chat-error { color:#ad2d30; }
 #new-chat-dialog .muted { color:var(--muted); font-size:12px; }
@@ -250,7 +250,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
 #automation-url,#automation-goal,#pairing-editor-url,#chat-name { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
 #automation-goal { min-height:90px; resize:vertical; }
 #automation-error { color:var(--error); margin:8px 4px; font-size:12px; }
-#automation-error-row { display:flex; align-items:center; gap:8px; }
+#automation-error-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+@media(max-width:600px) { #automation-error-row #automation-error { flex-basis:100%; } }
 #automation-error { flex:1; min-width:0; overflow-wrap:anywhere; }
 #automation-retry-inline { flex:none; margin:8px 4px; }
 #rename-form { padding:12px 18px; border-bottom:1px solid var(--border); }
@@ -589,7 +590,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
         <div class="automation-actions"><button type="button" id="automation-set-goal">Set goal</button></div>
         <p id="goal-status" class="automation-detail"></p>
       </div>
-      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button><button type="button" class="composer-button" id="automation-dismiss-inline" aria-label="Dismiss error" title="Hide this error; the goal and automatic retries keep running" hidden>Dismiss</button></div>
+      <div id="automation-error-row"><div id="automation-error" role="alert" hidden></div><button type="button" class="composer-button" id="automation-retry-inline" hidden>Retry</button><button type="button" class="composer-button" id="automation-pause-retries" title="Keep this error and stop its automatic retries" hidden>Pause retries</button><button type="button" class="composer-button" id="automation-dismiss-inline" aria-label="Dismiss error" title="Clear this error and stop its automatic retries" hidden>Dismiss</button></div>
       <div id="goal-bar" hidden>
         <span id="goal-icon" aria-hidden="true"></span><span id="goal-caption"></span><span id="goal-text"></span><span id="goal-metrics" aria-label="Goal active time and turns" title="Counts while this goal is enabled and the agent is online, away, or waiting. Pauses when the agent is offline."></span>
         <button type="button" class="composer-button" id="goal-retry" hidden>Retry</button>
@@ -618,7 +619,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       goal:byId("automation-goal"), setGoal:byId("automation-set-goal"), toggleGoal:byId("automation-toggle-goal"), clearGoal:byId("automation-clear-goal"), goalStatus:byId("goal-status"),
       liveStatus:byId("automation-live-status"), liveCommentary:byId("automation-live-commentary"), liveAnswer:byId("automation-live-answer"), cancelAction:byId("automation-cancel-action"), retryAction:byId("automation-retry-action"), error:byId("automation-error")
     };
-    let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, catalogAttempted = false, loadingModels = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
+    let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
     let pairingSubmitting = false, pairingRevision = 0, pairingSubmissionError = "", lastSubmittedPairingUrl = "";
     let dismissedError = null, shownErrorSignature = null;
     const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
@@ -695,7 +696,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const selected = (selectionDraft || current?.selection)?.model;
       nodes.model.replaceChildren();
       for (const model of models) if (model.efforts.some(effort => effort.available)) nodes.model.append(new Option(displayModelLabel(model), model.id));
-      if (!selected) { const prompt = new Option(catalogLoaded ? "Select model" : "Loading models…", ""); prompt.disabled = true; prompt.hidden = true; nodes.model.prepend(prompt); nodes.model.value = ""; }
+      if (!selected) { const prompt = new Option(catalogLoaded ? "Select model" : "Models unavailable", ""); prompt.disabled = true; prompt.hidden = true; nodes.model.prepend(prompt); nodes.model.value = ""; }
       if (!catalogLoaded && selected && !models.length) nodes.model.append(new Option("Saved model", selected));
       if (selected && [...nodes.model.options].some(option => option.value === selected)) nodes.model.value = selected;
       renderEfforts();
@@ -744,10 +745,10 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.unlink.disabled = pairing.status === "unpaired";
       nodes.reveal.disabled = !pairedUrl;
       if (!savingSelection && scope.activeElement !== nodes.model && scope.activeElement !== nodes.effort) renderModels();
-      const locked = !companion.authenticated || !catalogLoaded || savingSelection || loadingModels;
+      const locked = !companion.authenticated || !catalogLoaded || savingSelection;
       nodes.model.disabled = locked || !models.some(model => model.efforts.some(effort => effort.available));
       nodes.effort.disabled = locked || !models.some(model => model.id === nodes.model.value && model.efforts.some(effort => effort.available));
-      const explanation = !companion.authenticated ? "Sign in through Codexify settings → Browser to load available models." : savingSelection ? "Saving model and effort…" : loadingModels ? "Loading available models…" : "Used for the next automatic turn.";
+      const explanation = !companion.authenticated ? "Sign in through Codexify settings → Browser to load available models." : savingSelection ? "Saving model and effort…" : !catalogLoaded ? "Model list unavailable. Refresh models in Codexify settings → Browser." : "Used for the next automatic turn.";
       nodes.model.title = nodes.effort.title = explanation;
       const goal = state.goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
@@ -788,22 +789,16 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       else if (automaticRetry) setStateError(`${failure} ${retryStatus}`);
       else if (actionNeedsAttention) {
         const preparation = state.action?.status === "authentication_required" ? "Sign in from Codexify settings → Browser, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
-        const exhausted = state.action?.automaticRetryAttempts >= retryLimit ? `All ${retryLimit} automatic retries failed. ` : "";
+        const retryPolicy = state.action?.automaticRetryPaused ? "Automatic retries paused. " : state.action?.automaticRetriesEnabled === false ? "Automatic retries disabled in settings. " : "";
+        const exhausted = retryPolicy || (state.action?.automaticRetryAttempts >= retryLimit ? `All ${retryLimit} automatic retries failed. ` : "");
         const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? `${exhausted}Use Continue to start another goal turn. Previously submitted messages will not be resent.` : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
         setStateError(`${failure} ${nextStep}`);
       } else if (state.action?.lastError) setStateError(state.action.lastError);
       else setStateError("");
       if (nodes.error.hidden) inlineRetry.hidden = true;
       byId("automation-dismiss-inline").hidden = nodes.error.hidden;
+      byId("automation-pause-retries").hidden = !state.action?.canPauseRetries;
       if (atBottom) history.scrollTop = history.scrollHeight;
-    }
-    async function loadModels(refresh = false) {
-      if (closed || loadingModels || !current?.companion?.authenticated || current.companion.status !== "idle" || current.companion.activeActionId) return;
-      loadingModels = true; catalogAttempted = true; render(current);
-      try {
-        const catalog = await post("capabilities", {refresh});
-        if (!closed) { models = catalog.models || []; catalogLoaded = true; renderModels(); }
-      } finally { loadingModels = false; if (!closed) render(current); }
     }
     async function refreshState({ quiet = false } = {}) {
       if (closed || requestInFlight || savingSelection || pairingSubmitting) return;
@@ -818,10 +813,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
           if (Number.isSafeInteger(state.serverTimeMs)) clockOffset = state.serverTimeMs - Date.now();
           if (!quiet) setError("");
           const context = state.companion?.catalogContext || null;
-          if (context !== catalogContext || !state.companion?.authenticated) { models = []; catalogLoaded = false; catalogAttempted = false; catalogContext = context; }
-          if (state.catalog) { models = state.catalog.models || []; catalogLoaded = true; catalogAttempted = true; }
+          if (context !== catalogContext || !state.companion?.authenticated) { models = []; catalogLoaded = false; catalogContext = context; }
+          if (state.catalog) { models = state.catalog.models || []; catalogLoaded = true; }
           render(state);
-          if (state.enabled && state.pairing?.status === "verified" && !catalogAttempted && state.companion?.authenticated && state.companion.status==='idle' && !state.companion.manuallyStopped && !state.companion.recovering && !state.companion.stopping) await loadModels();
         }
       } catch (error) { if (!closed && !runtimeLoading?.loading) setError(error.message || "Chat automation state unavailable"); }
       finally { requestInFlight = false; }
@@ -956,18 +950,26 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     nodes.cancelAction.addEventListener("click", () => run(async () => { await post("action/cancel", { requestId:requestId("cancel"), actionId:current.action.id }); pairingSubmissionError = ""; }));
     nodes.retryAction.addEventListener("click", () => run(async () => { await post("action/retry", { requestId:requestId("retry"), actionId:current.action.id }); }));
     byId("automation-retry-inline").addEventListener("click", () => nodes.retryAction.click());
-    byId("automation-dismiss-inline").addEventListener("click", () => {
-      dismissedError = shownErrorSignature;
-      nodes.error.hidden = true;
-      byId("automation-retry-inline").hidden = true;
-      byId("automation-dismiss-inline").hidden = true;
-    });
+    byId("automation-pause-retries").addEventListener("click", () => run(async () => {
+      await post("action/pause-retries", {requestId:requestId("pause-retries"), actionId:current.action.id});
+    }));
+    byId("automation-dismiss-inline").addEventListener("click", () => run(async () => {
+      if (current?.action?.id && !nodes.cancelAction.disabled && !pairingSubmissionError) {
+        await post("action/cancel", {requestId:requestId("dismiss"), actionId:current.action.id});
+      } else {
+        dismissedError = shownErrorSignature;
+        pairingSubmissionError = "";
+        nodes.error.hidden = true;
+        byId("automation-retry-inline").hidden = true;
+        byId("automation-dismiss-inline").hidden = true;
+      }
+    }));
     byId("goal-retry").addEventListener("click", () => {
       if (!nodes.retryAction.disabled) nodes.retryAction.click();
       else if (current?.action?.kind === "pair_verify") nodes.pair.click();
       else nodes.reveal.click();
     });
-    const browserChanged = () => { catalogAttempted = false; void refreshState({quiet:true}); };
+    const browserChanged = () => { void refreshState({quiet:true}); };
     window.addEventListener("codexify-browser-change",browserChanged);
     // The sidebar already loaded this goal. Reserve and fill its bar before
     // history or browser-health requests return, without enabling stale controls.
@@ -1360,9 +1362,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     const choice = newWorkspaceChoice();
     newNode("submit").disabled = newBusy || newPreparing || !newCatalog || !choice || !newNode("model").value || !newNode("effort").value;
     newNode("close").disabled = newBusy; newNode("refresh").disabled = newBusy || newPreparing; newNode("login").disabled = newBusy || newPreparing || Boolean(newCatalog);
-    newNode("worktree").disabled = newBusy || Boolean(choice && (!choice.path || choice.worktreePath));
+    newNode("worktree").disabled = newBusy || Boolean(choice && (!choice.path));
     for (const button of newDialog.querySelectorAll("#new-chat-projects button,#new-chat-worktrees button,#new-chat-scratch,#new-chat-use-url")) button.disabled = newBusy;
     newNode("use-url").disabled = newBusy || !newNode("url").value.trim();
+    if (newChoice?.worktreePath) {
+      newNode("selection").textContent = newNode("worktree").checked ? `New worktree from ${newChoice.worktreePath}` : newChoice.worktreePath;
+    }
     if (!newChoice) {
       newNode("selection").textContent = choice?.path || "";
       newNode("selection").hidden = !choice;
@@ -1402,7 +1407,16 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
             if (!result.worktrees.length) container.append(textNode("p","muted","No available worktrees."));
             for (const entry of result.worktrees) {
               const button = textNode("button","",entry.name);button.type="button";button.title=entry.path;
-              button.addEventListener("click", () => chooseNew({path:project.selector,worktreePath:entry.path},entry.path));container.append(button);
+              const chooseWorktree = create => {
+                newWorktreeEdited = true;newNode("worktree").checked = create;
+                chooseNew({path:project.selector,worktreePath:entry.path},create ? `New worktree from ${entry.path}` : entry.path);
+              };
+              button.addEventListener("click", () => chooseWorktree(false));
+              const create = textNode("button","","New from here");create.type="button";
+              create.setAttribute("aria-label",`Create a new worktree from ${entry.name}`);
+              create.title="Start a new worktree at this worktree's current commit";
+              create.addEventListener("click", () => chooseWorktree(true));
+              const row=textNode("div","new-chat-row","");row.append(button,create);container.append(row);
             }
           } catch(error) {newError(error.message);}
         });
@@ -1435,7 +1449,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   });
   newNode("close").addEventListener("click",()=>{++newEpoch;++newSearchEpoch;newDialog.close();});
   newDialog.addEventListener("cancel",event=>{if(newBusy)event.preventDefault();else {++newEpoch;++newSearchEpoch;}});
-  newNode("worktree").addEventListener("change",()=>{newWorktreeEdited=true;});
+  newNode("worktree").addEventListener("change",()=>{newWorktreeEdited=true;newReady();});
   newNode("model").addEventListener("change",newEfforts);newNode("effort").addEventListener("change",newReady);
   newNode("login").addEventListener("click",async()=>{try{await api("/api/new-chat/login",{method:"POST",body:"{}"});newNode("loading").textContent="Sign in in Chrome, then refresh models.";}catch(error){newError(error.message);}});
   newNode("refresh").addEventListener("click",()=>{newError("");void prepareNewModels(newEpoch);});
@@ -1448,7 +1462,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     if(newNode("submit").disabled || !choice)return;newBusy=true;newReady();newError("");
     try {
       const body={requestId:newRequest,...choice,model:newNode("model").value,effort:newNode("effort").value,catalogRevision:newCatalog.catalogRevision};
-      if(choice.path && !choice.worktreePath)body.createWorktree=newNode("worktree").checked;
+      if(choice.path && (!choice.worktreePath || newNode("worktree").checked))body.createWorktree=newNode("worktree").checked;
       const result=await(await api("/api/chats",{method:"POST",body:JSON.stringify(body)})).json();
       newDialog.close();search.value="";++listRequest;pendingList=null;await refresh();select(result.id);
     }catch(error){newError(error.message);}

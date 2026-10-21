@@ -311,6 +311,10 @@ impl AgentAutomationStore {
             {
                 return Ok(false);
             }
+            state.suspended_retry = Some(super::store::SuspendedRetryState {
+                action: state.action.clone(),
+                goal_wake: state.goal_wake.clone(),
+            });
             if state.action.send_accepted == Some(false) {
                 state.action = super::AutomationActionState {
                     automatic_retry_attempts: state.action.automatic_retry_attempts + 1,
