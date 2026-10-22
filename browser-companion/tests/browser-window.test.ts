@@ -15,7 +15,7 @@ import {
   type DriverExecution,
 } from "../src/browser-window";
 import { protocolBuild } from "../src/protocol";
-import { BrowserCompanionError } from "../src/errors";
+import { BrowserCompanionError, ConversationCooldownError } from "../src/errors";
 import {navigatePage} from "../src/navigation";
 import type {BrowserContext,Page} from "patchright";
 
@@ -275,14 +275,19 @@ test("only an explicitly manual action bypasses navigation cooldown and still re
   }
   const coordinator=new SingleWindowCoordinator(new NavigationDriver(),TEST_BUILD);
   const automatic=request("cooldown-automatic");await coordinator.execute(automatic);
-  expect((await collect(coordinator,automatic.actionId)).some(event=>event.type==="rate_limited")).toBe(true);
+  const waitingEvents=await collect(coordinator,automatic.actionId);
+  const waitingEvent=waitingEvents.at(-1);
+  expect(waitingEvent).toMatchObject({type:"waiting",availableAtMs:expect.any(Number)});
+  expect(waitingEvents.some(event=>["failed","rate_limited","send_accepted"].includes(event.type))).toBe(false);
+  expect(await coordinator.action(automatic.actionId)).toMatchObject({state:"waiting",sendAccepted:false,attention:null,cooldownUntilMs:waitingEvent?.type==="waiting"?waitingEvent.availableAtMs:0});
+  expect((await coordinator.health()).activeActionId).toBeNull();
   await coordinator.execute({...automatic,bypassConversationCooldown:false});
   await expect(coordinator.execute({...automatic,bypassConversationCooldown:true})).rejects.toThrow("different request");
   const manual={...request("cooldown-manual"),bypassConversationCooldown:true};await coordinator.execute(manual);
   expect((await collect(coordinator,manual.actionId)).some(event=>event.type==="send_accepted")).toBe(true);
   expect(loads).toEqual(["https://chatgpt.com/c/existing",manual.url]);
   const after=request("cooldown-after");await coordinator.execute(after);
-  expect((await collect(coordinator,after.actionId)).some(event=>event.type==="rate_limited")).toBe(true);
+  expect((await collect(coordinator,after.actionId)).some(event=>event.type==="waiting")).toBe(true);
   await expect(coordinator.execute({...request("cooldown-wrong-account"),expectedAccountFingerprint:"other",bypassConversationCooldown:true})).rejects.toThrow("account changed");
   expect(loads).toHaveLength(2);
 });
@@ -974,4 +979,25 @@ test("liveness leaves a bounded active operation to its normal deadline", async 
   await new Promise(resolve=>setTimeout(resolve,0));
   expect((await coordinator.liveness()).available).toBe(false);
   expect(driver.probes).toBe(1);
+});
+
+for(const sent of [false,true])test(`cooldown deferral preserves ${sent?'accepted Send uncertainty':'the pending unsent action'}`,async()=>{
+ class WaitingDriver extends DeferredDriver {
+  override async execute(execution:DriverExecution){
+   execution.emit({type:'navigating'});
+   if(sent){
+    execution.emit({type:'model_verified',model:'gpt-6-sol',effort:'high'});
+    execution.emit({type:'connector_verified'});execution.emit({type:'send_accepted'});
+   }
+   throw new ConversationCooldownError(Date.now()+180000);
+  }
+ }
+ const coordinator=new SingleWindowCoordinator(new WaitingDriver(),TEST_BUILD);
+ await coordinator.execute(request('waiting-send'));
+ expect((await collect(coordinator,'waiting-send')).at(-1)?.type).toBe(sent?'ambiguous_send':'waiting');
+ const snapshot=await coordinator.action('waiting-send');
+ expect(snapshot?.sendAccepted).toBe(sent);
+ expect(snapshot?.cooldownUntilMs!==undefined).toBe(!sent);
+ expect((await coordinator.health()).activeActionId).toBeNull();
+ await coordinator.close();
 });

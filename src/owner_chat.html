@@ -253,6 +253,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
 #automation-error-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 @media(max-width:600px) { #automation-error-row #automation-error { flex-basis:100%; } }
 #automation-error { flex:1; min-width:0; overflow-wrap:anywhere; }
+#automation-error.waiting-for-browser { color:var(--muted); }
 #automation-retry-inline { flex:none; margin:8px 4px; }
 #rename-form { padding:12px 18px; border-bottom:1px solid var(--border); }
 #rename-form.inline-rename { display:inline-flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:0; max-width:100%; padding:0; border:0; font-size:13px; }
@@ -637,9 +638,11 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       return {until, summary, message:remaining ? `${match[1]}${remaining}s` : summary};
     }
     const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
-    const setError = (message, signature = message) => {
+    const setError = (message, signature = message, waiting = false) => {
       if (!message) dismissedError = null;
       nodes.error.textContent = message || "";
+      nodes.error.classList.toggle("waiting-for-browser", waiting);
+      nodes.error.setAttribute("role", waiting ? "status" : "alert");
       shownErrorSignature = signature;
       nodes.error.hidden = !message || dismissedError === signature;
       byId("automation-dismiss-inline").hidden = nodes.error.hidden;
@@ -722,16 +725,17 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       current = state;
       const chat = chats.find(chat => chat.id === id);
       if (chat && Object.hasOwn(state, "goal")) chat.goal = state.goal;
-      const setStateError = message => setError(message,errorSignature(message));
+      const setStateError = (message, waiting = false) => setError(message,errorSignature(message),waiting);
       panel.hidden = tools.hidden = !state?.enabled;
       settingsToggle.hidden = !state?.enabled;
       if (!state?.enabled) { showSettings(false); return; }
-      const automaticRetry = Number.isSafeInteger(state.action?.automaticRetryAtMs);
+      const waitingForBrowser = Number.isSafeInteger(state.action?.cooldownUntilMs);
+      const automaticRetry = !waitingForBrowser && Number.isSafeInteger(state.action?.automaticRetryAtMs);
       const presenceState = presence(state.presence?.lastAgentCallAtMs, Date.now() + clockOffset, state.presence?.agentWaitingUntilMs, state.presence?.agentPresenceUntilMs, state.presence?.agentIdleUntilMs);
       nodes.presence.textContent = sentenceCase(presenceState);
       nodes.queue.hidden = !Number.isSafeInteger(state.queue?.position);
       nodes.queue.textContent = nodes.queue.hidden ? "" : `· Queue ${state.queue.position} of ${state.queue.total}`;
-      nodes.action.textContent = automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
+      nodes.action.textContent = waitingForBrowser ? "Waiting for browser" : automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
       const companion = state.companion || {};
       const pairing = state.pairing || { status:"unpaired" };
       const verified = pairing.status === "verified";
@@ -766,7 +770,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.model.title = nodes.effort.title = explanation;
       const goal = state.goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
-      const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "rate_limited", "interference"].includes(state.action?.status));
+      const actionFailed = !waitingForBrowser && !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "rate_limited", "interference"].includes(state.action?.status));
       const actionNeedsAttention = !automaticRetry && actionFailed;
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
       const cooldown = conversationCooldown(state.action, Date.now() + clockOffset);
@@ -790,6 +794,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const retryLimit = state.action?.automaticRetryLimit ?? 5;
       const retryNow = retryMode === "continue_goal" ? " You can also continue now." : retryMode ? " You can also retry now." : "";
       const retryStatus = automaticRetry ? (goalRetry ? `Retrying the goal automatically in ${retrySeconds}s.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}).`) + retryNow : "";
+      const cooldownSeconds = waitingForBrowser ? Math.max(0,Math.ceil((state.action.cooldownUntilMs-Date.now()-clockOffset)/1000)) : 0;
+      const waitingStatus = cooldownSeconds ? `Waiting for the shared browser. Conversation loading is available in ${cooldownSeconds}s.` : "Waiting for the shared browser…";
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
@@ -799,7 +805,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.cancelAction.textContent = actionFailed ? "Cancel failed action" : "Cancel queued action";
       nodes.retryAction.disabled = !retryMode;
       nodes.retryAction.textContent = retryLabel;
-      if (pairingWaiting || verified && state.action?.kind === "pair_verify") setStateError("");
+      if (waitingForBrowser) setStateError(waitingStatus,true);
+      else if (pairingWaiting || verified && state.action?.kind === "pair_verify") setStateError("");
       else if (pairingSubmissionError) setStateError(pairingSubmissionError);
       else if (automaticRetry) setStateError(`${failure ? failure + " " : ""}${retryStatus}`);
       else if (actionNeedsAttention) {
@@ -998,7 +1005,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
     const metricsTimer = setInterval(() => {
       if (!document.hidden) {
-        if (current && conversationCooldown(current.action, Date.now() + clockOffset)) render(current);
+        if (current && (Number.isSafeInteger(current.action?.cooldownUntilMs) || conversationCooldown(current.action, Date.now() + clockOffset))) render(current);
         else updateGoalMetrics();
       }
     }, 1000);

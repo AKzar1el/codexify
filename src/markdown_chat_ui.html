@@ -134,7 +134,8 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 .attachment-drop-overlay { position:fixed; inset:0; z-index:20000; display:grid; place-items:center; padding:24px; background:#102822df; color:#fff; outline:3px dashed #8ce4b4; outline-offset:-20px; pointer-events:none; font-size:24px; font-weight:600; text-align:center; }
 .attachment-viewer { position:fixed; inset:0; z-index:10001; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:65px 24px 24px; background:#000e; color:#fff; }
 .attachment-viewer img,.attachment-viewer video { flex:1; min-height:0; width:95vw; height:calc(100dvh - 140px); max-width:95vw; max-height:calc(100dvh - 140px); object-fit:contain; }
-.attachment-viewer-close { position:absolute; top:15px; right:20px; width:38px; height:38px; border:0; border-radius:50%; color:#fff; background:#ffffff20; font-size:28px; cursor:pointer; }
+.attachment-viewer-close { position:absolute; top:15px; right:20px; width:38px; height:38px; display:grid; place-items:center; padding:0; border:0; border-radius:50%; color:#fff; background:#ffffff20; cursor:pointer; }
+.attachment-viewer-close svg { width:24px; height:24px; stroke-width:2.5; }
 .attachment-viewer-download { position:absolute; top:25px; left:24px; color:#fff; font-size:14px; }
 .attachment-viewer-name { max-width:90vw; overflow-wrap:anywhere; text-align:center; font-size:13px; }
 #send .stop-spinner { animation:stop-spin .8s linear infinite; }

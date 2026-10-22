@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067" as const;
+export const PROTOCOL_SCHEMA_HASH = "83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -247,7 +247,7 @@ export type SessionStatus = z.infer<typeof sessionStatusSchema>;
 
 export const actionStateSchema = z.enum([
   "unpaired", "unverified", "queued", "navigating", "sending", "generating", "idle",
-  "approval_required", "authentication_required", "rate_limited", "external_interference",
+  "waiting", "approval_required", "authentication_required", "rate_limited", "external_interference",
   "ambiguous", "stalled", "failed",
 ]);
 export type ActionState = z.infer<typeof actionStateSchema>;
@@ -296,12 +296,13 @@ export const actionSnapshotSchema = z.strictObject({
   canonicalUrl: chatGptUrlSchema.nullable(),
   selected: z.strictObject({ model: opaqueIdSchema, effort: opaqueIdSchema }).nullable(),
   lastEventSequence: z.number().int().nonnegative(),
+  cooldownUntilMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   attention: z.strictObject({ code: opaqueIdSchema, message: boundedTextSchema(MAX_DELTA_BYTES).nullable() }).nullable(),
 });
 export type ActionSnapshot = z.infer<typeof actionSnapshotSchema>;
 
 export const ACTION_EVENT_TYPES = [
-  "queued", "navigating", "composer_ready", "model_verified", "connector_verified",
+  "queued", "waiting", "navigating", "composer_ready", "model_verified", "connector_verified",
   "send_accepted", "conversation_created", "status_delta", "commentary_delta", "answer_delta", "submission_complete", "generation_complete",
   "approval_required", "authentication_required", "rate_limited", "external_interference",
   "ambiguous_send", "failed",
@@ -315,6 +316,7 @@ const eventBase = {
 
 export const actionEventSchema = z.discriminatedUnion("type", [
   z.strictObject({ ...eventBase, type:z.literal("queued") }),
+  z.strictObject({ ...eventBase, type:z.literal("waiting"), availableAtMs:z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }),
   z.strictObject({ ...eventBase, type:z.literal("navigating") }),
   z.strictObject({ ...eventBase, type:z.literal("composer_ready") }),
   z.strictObject({ ...eventBase, type:z.literal("model_verified"), model:opaqueIdSchema, effort:opaqueIdSchema }),

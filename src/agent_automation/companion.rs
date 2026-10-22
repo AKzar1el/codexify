@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
+    "83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
+    "+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -191,6 +191,7 @@ pub enum CompanionActionState {
     Unpaired,
     Unverified,
     Queued,
+    Waiting,
     Navigating,
     Sending,
     Generating,
@@ -229,6 +230,8 @@ pub struct CompanionActionSnapshot {
     pub canonical_url: Option<String>,
     pub selected: Option<CompanionSelection>,
     pub last_event_sequence: u64,
+    #[serde(default)]
+    pub cooldown_until_ms: Option<u64>,
     pub attention: Option<CompanionAttention>,
 }
 
@@ -268,6 +271,9 @@ pub struct CompanionEvent {
 )]
 pub enum CompanionEventKind {
     Queued,
+    Waiting {
+        available_at_ms: u64,
+    },
     Navigating,
     ComposerReady,
     ModelVerified {
@@ -341,6 +347,7 @@ impl CompanionEventKind {
         matches!(
             self,
             Self::SubmissionComplete { .. }
+                | Self::Waiting { .. }
                 | Self::GenerationComplete { .. }
                 | Self::ApprovalRequired { .. }
                 | Self::AuthenticationRequired
@@ -1524,6 +1531,11 @@ fn validate_event(
         return Err("Browser companion event belongs to the wrong action".into());
     }
     match &event.kind {
+        CompanionEventKind::Waiting { available_at_ms } => {
+            if *available_at_ms == 0 || *available_at_ms > 9_007_199_254_740_991 {
+                return Err("Browser cooldown deadline is invalid".into());
+            }
+        }
         CompanionEventKind::ModelVerified { model, effort } => {
             validate_opaque(model, "browser model ID")?;
             validate_opaque(effort, "browser effort ID")?;

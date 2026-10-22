@@ -586,7 +586,13 @@ impl AgentAutomationSupervisor {
                     loop {
                         match supervisor.run_next(crate::markdown_chat::now_ms()).await {
                             Ok(Some(_)) => {}
-                            Ok(None) if supervisor.queued_count().await > 0 => continue,
+                            Ok(None)
+                                if supervisor
+                                    .has_ready_action(crate::markdown_chat::now_ms())
+                                    .await =>
+                            {
+                                continue;
+                            }
                             Ok(None) => break,
                             Err(error) => {
                                 tracing::warn!(%error, "agent automation action failed");
@@ -637,6 +643,7 @@ impl AgentAutomationSupervisor {
             && state.action.kind == Some(AutomationActionKind::PairVerify);
         let orphaned_action = (first_registration
             && state.action.status == AutomationActionStatus::Queued
+            && state.browser_cooldown_until_ms().is_none()
             && state.action.kind != Some(AutomationActionKind::PairVerify))
         .then(|| state.action.id.clone())
         .flatten();
@@ -774,14 +781,24 @@ impl AgentAutomationSupervisor {
         if state.action.id.as_deref() != Some(expected_action_id) {
             return Err("The browser action changed before it could be cancelled".into());
         }
-        if state.action.status == AutomationActionStatus::Queued
+        let _waiting_guard = if state.action.status == AutomationActionStatus::Queued
             && !queue.iter().any(|execution| {
                 execution.task_key == task.stable_key()
                     && execution.request.action_id == expected_action_id
-            })
-        {
-            return Err("The browser action already started or left the queue".into());
-        }
+            }) {
+            if state.browser_cooldown_until_ms().is_none() {
+                return Err("The browser action already started or left the queue".into());
+            }
+            // A persisted cooldown can have no in-memory ticket after restart.
+            // Serialize with dispatch before cancelling that pending intent.
+            Some(
+                self.run_lock
+                    .try_lock()
+                    .map_err(|_| "The browser action already started or left the queue")?,
+            )
+        } else {
+            None
+        };
         let action = handle
             .store
             .cancel_action(&handle.task, expected_action_id, now_ms)?;
@@ -817,13 +834,21 @@ impl AgentAutomationSupervisor {
             .ok_or("Browser automation task is not registered")?;
         let mut queue = self.queue.lock().await;
         let state = handle.store.load(&handle.task)?;
-        if state.action.status == AutomationActionStatus::Queued
+        let _waiting_guard = if state.action.status == AutomationActionStatus::Queued
             && !queue.iter().any(|q| {
                 q.request.action_id == expected_action_id && q.task_key == task.stable_key()
-            })
-        {
-            return Err("The browser action already started or left the queue".into());
-        }
+            }) {
+            if state.browser_cooldown_until_ms().is_none() {
+                return Err("The browser action already started or left the queue".into());
+            }
+            Some(
+                self.run_lock
+                    .try_lock()
+                    .map_err(|_| "The browser action already started or left the queue")?,
+            )
+        } else {
+            None
+        };
         let action = handle
             .store
             .pause_action_retries(&handle.task, expected_action_id)?;
@@ -1094,6 +1119,40 @@ impl AgentAutomationSupervisor {
                 self.clear_live_action(task.task.stable_key(), action_id)
                     .await;
                 state = task.store.load(&task.task)?;
+            }
+            if state.browser_cooldown_until_ms().is_some()
+                && !activity.agent_stop_requested
+                && self.reconcile_chat_delivery(&task, &state, now_ms).await?
+            {
+                self.queue.lock().await.retain(|q| {
+                    q.task_key != task.task.stable_key()
+                        || Some(q.request.action_id.as_str()) != state.action.id.as_deref()
+                });
+                state = task.store.load(&task.task)?;
+            }
+            if let Some(until) = state.browser_cooldown_until_ms() {
+                let online = activity.is_online(now_ms, AUTOMATION_OFFLINE_AFTER_MS);
+                let queued = self
+                    .queue
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|q| q.task_key == task.task.stable_key());
+                if online || activity.agent_stop_requested || (!queued && now_ms >= until) {
+                    if task
+                        .store
+                        .restore_missing_cooldown_action(&task.task, &state.action)?
+                    {
+                        self.queue.lock().await.retain(|q| {
+                            q.task_key != task.task.stable_key()
+                                || Some(q.request.action_id.as_str()) != state.action.id.as_deref()
+                        });
+                    }
+                    state = task.store.load(&task.task)?;
+                } else if now_ms < until {
+                    self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
+                    continue;
+                }
             }
             // Wake at the actual jittered deadline, rather than rounding all
             // chats into the same 30-second scan and undoing their jitter.
@@ -1719,7 +1778,7 @@ impl AgentAutomationSupervisor {
                 );
                 if can_coalesce {
                     let queued = queue.get_mut(position).expect("queued action position");
-                    task.store.queue_action(
+                    let queued_action = task.store.queue_action(
                         &task.task,
                         &queued.request.action_id,
                         kind,
@@ -1733,6 +1792,8 @@ impl AgentAutomationSupervisor {
                     queued.unread_message_ids = unread_message_ids;
                     queued.transcript_revision = unread.revision;
                     queued.request.prompt = prompt;
+                    queued.request.bypass_conversation_cooldown =
+                        queued_action.bypass_conversation_cooldown;
                     queue
                         .make_contiguous()
                         .sort_by_key(|execution| action_priority(execution_kind(execution)));
@@ -1800,13 +1861,25 @@ impl AgentAutomationSupervisor {
 
     pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
         let _run_guard = self.run_lock.lock().await;
+        let maximum_candidates = self.queue.lock().await.len();
+        let mut considered = 0;
         let (execution, task) = loop {
+            if considered >= maximum_candidates {
+                return Ok(None);
+            }
+            considered += 1;
             let Some(mut execution) = self.queue.lock().await.pop_front() else {
                 return Ok(None);
             };
             let Some(task) = self.tasks.read().await.get(&execution.task_key).cloned() else {
                 continue;
             };
+            let cooldown = task.store.load(&task.task)?.browser_cooldown_until_ms();
+            if let Some(until) = cooldown.filter(|until| now_ms < *until) {
+                self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
+                self.queue.lock().await.push_back(execution);
+                continue;
+            }
             if task
                 .store
                 .restore_disabled_queued_retry(&task.task, &execution.request.action_id)?
@@ -1882,6 +1955,13 @@ impl AgentAutomationSupervisor {
                 return Err(error.into());
             };
             execution.request.connector_name = connector_name;
+            if cooldown.is_some() {
+                task.store.resume_cooldown_action(
+                    &task.task,
+                    &execution.request.action_id,
+                    now_ms,
+                )?;
+            }
             break (execution, task);
         };
 
@@ -1982,7 +2062,10 @@ impl AgentAutomationSupervisor {
         }
 
         let outcome = outcome.and_then(|snapshot| {
-            if pair_verification && !snapshot.send_accepted {
+            if pair_verification
+                && !snapshot.send_accepted
+                && snapshot.state != CompanionActionState::Waiting
+            {
                 return Err(execution_error(
                     snapshot
                         .attention
@@ -1997,6 +2080,43 @@ impl AgentAutomationSupervisor {
 
         let snapshot = match outcome {
             Ok(snapshot) => {
+                if snapshot.state == CompanionActionState::Waiting {
+                    let until = snapshot
+                        .cooldown_until_ms
+                        .ok_or("Browser cooldown deadline is missing")?;
+                    if snapshot.send_accepted || accumulator.send_accepted {
+                        return Err("A submitted browser action cannot be deferred".into());
+                    }
+                    let next_id = random_id("action")?;
+                    if task.store.defer_action_for_cooldown(
+                        &task.task,
+                        &execution.request.action_id,
+                        &next_id,
+                        until,
+                    )? {
+                        let mut queued = execution.clone();
+                        queued.request.action_id = next_id;
+                        queued.request.idempotency_key = random_id("execute")?;
+                        if let Some(batch_id) = execution_batch_id(&queued) {
+                            task.store.record_chat_submission(
+                                &task.task,
+                                &queued.request.action_id,
+                                queued.request.pairing_generation,
+                                AcceptedChatBatch {
+                                    owner_generation: queued.owner_generation,
+                                    batch_id,
+                                    message_ids: &queued.unread_message_ids,
+                                    transcript_revision: &queued.transcript_revision,
+                                },
+                            )?;
+                        }
+                        self.queue.lock().await.push_back(queued);
+                        self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
+                        self.notify();
+                    }
+                    self.clear_live_if_action(&execution).await;
+                    return Ok(Some(snapshot));
+                }
                 if snapshot.send_accepted
                     && matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
                 {
@@ -2355,6 +2475,21 @@ impl AgentAutomationSupervisor {
         Ok(Some(snapshot))
     }
 
+    async fn has_ready_action(&self, now_ms: u64) -> bool {
+        let tasks = self.tasks.read().await;
+        let queue = self.queue.lock().await;
+        queue.iter().any(|execution| {
+            tasks
+                .get(&execution.task_key)
+                .and_then(|task| task.store.load(&task.task).ok())
+                .is_none_or(|state| {
+                    state
+                        .browser_cooldown_until_ms()
+                        .is_none_or(|until| now_ms >= until)
+                })
+        })
+    }
+
     async fn record_approved_resume(
         &self,
         task: &AutomationTaskHandle,
@@ -2481,6 +2616,10 @@ impl AgentAutomationSupervisor {
         state.updated_at_ms = event.at_ms;
         match event.kind {
             CompanionEventKind::Queued => state.phase = AutomationActionStatus::Queued,
+            CompanionEventKind::Waiting { .. } => {
+                state.phase = AutomationActionStatus::Queued;
+                state.status = None;
+            }
             CompanionEventKind::Navigating
             | CompanionEventKind::ComposerReady
             | CompanionEventKind::ModelVerified { .. }
@@ -2677,6 +2816,17 @@ fn validate_terminal_snapshot(
     execution: &AutomationExecution,
     snapshot: &CompanionActionSnapshot,
 ) -> Result<(), AutomationExecutionError> {
+    if snapshot.state == CompanionActionState::Waiting
+        && (snapshot.send_accepted
+            || snapshot
+                .cooldown_until_ms
+                .is_none_or(|at| at == 0 || at > 9_007_199_254_740_991))
+    {
+        return Err(execution_error(
+            "Browser cooldown deferral is invalid".into(),
+            true,
+        ));
+    }
     if snapshot.action_id != execution.request.action_id {
         return Err(execution_error(
             "Browser companion returned the wrong action".into(),
@@ -3130,6 +3280,7 @@ fn companion_status(status: super::CompanionActionState) -> AutomationActionStat
         super::CompanionActionState::Unpaired => AutomationActionStatus::Unpaired,
         super::CompanionActionState::Unverified => AutomationActionStatus::Unverified,
         super::CompanionActionState::Queued => AutomationActionStatus::Queued,
+        super::CompanionActionState::Waiting => AutomationActionStatus::Queued,
         super::CompanionActionState::Navigating => AutomationActionStatus::Navigating,
         super::CompanionActionState::Sending => AutomationActionStatus::Sending,
         super::CompanionActionState::Generating => AutomationActionStatus::Generating,

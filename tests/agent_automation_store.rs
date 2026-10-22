@@ -2083,3 +2083,57 @@ fn configured_retry_timings_survive_restart_and_shortening_without_changing_send
     state.retry_timings.jitter_percent = 25;
     assert!((17_100..=21_350).contains(&state.approval_resume_until_ms().unwrap()));
 }
+
+#[test]
+fn saved_local_cooldown_errors_migrate_to_queued_deadlines_without_new_backoff() {
+    use codexify::agent_automation::AutomationActionState;
+    for (index, message, expected) in [
+        (
+            0,
+            "ChatGPT conversation loading is cooling down. Another conversation can load in 70s",
+            Some(71_000),
+        ),
+        (
+            1,
+            "ChatGPT conversation temporarily not accessible. Shared browser cooldown: conversation loading can retry in 300s",
+            Some(301_000),
+        ),
+        (2, "ChatGPT rejected the request with HTTP 429", None),
+        (3, "ChatGPT conversation temporarily not accessible", None),
+    ] {
+        for (accepted, paused) in [(false, false), (true, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+            let task = task(&format!("saved-cooldown-{index}-{accepted}-{paused}"));
+            store.set_goal(&task, "Keep the objective", 1).unwrap();
+            let mut state = store.load(&task).unwrap();
+            state.action = AutomationActionState {
+                id: Some("saved-action".into()),
+                automatic_retry_paused: paused,
+                pairing_generation: Some(1),
+                kind: Some(AutomationActionKind::OfflineChat),
+                status: AutomationActionStatus::RateLimited,
+                send_accepted: Some(accepted),
+                updated_at_ms: Some(1_000),
+                last_error: Some(message.into()),
+                chatgpt_access_retry_attempts: 2,
+                ..Default::default()
+            };
+            let path = store.task_directory(&task).unwrap().join("automation.json");
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            let loaded = store.load(&task).unwrap();
+            assert_eq!(loaded.action.chatgpt_access_retry_attempts, 2);
+            assert_eq!(loaded.goal, state.goal);
+            if let Some(until) = expected.filter(|_| !accepted && !paused) {
+                assert_eq!(loaded.action.status, AutomationActionStatus::Queued);
+                assert_eq!(loaded.browser_cooldown_until_ms(), Some(until));
+                assert!(loaded.action.last_error.is_none());
+                assert!(loaded.automatic_retry_at_ms().is_none());
+                assert!(!loaded.action_needs_attention());
+                assert_eq!(store.load(&task).unwrap().action, loaded.action);
+            } else {
+                assert_eq!(loaded.action, state.action);
+            }
+        }
+    }
+}

@@ -1087,6 +1087,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
                     && automation.action.automatic_retry_in_progress)
     );
     public_action["automaticRetryAtMs"] = json!(automation.automatic_retry_at_ms());
+    public_action["cooldownUntilMs"] = json!(automation.browser_cooldown_until_ms());
     public_action["automaticRetryAttempts"] = json!(automation.automatic_retry_attempts());
     public_action["automaticRetryLimit"] = json!(automation.automatic_retry_limit());
     if public_action["lastError"].is_null()
@@ -2380,7 +2381,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
 
     #[test]
     fn model_catalog_cache_is_account_and_protocol_scoped_across_local_updates() {
@@ -4830,6 +4831,7 @@ mod tests {
                     effort: execution.request.effort.unwrap(),
                 }),
                 last_event_sequence: 2,
+                cooldown_until_ms: None,
                 attention: None,
             })
         }

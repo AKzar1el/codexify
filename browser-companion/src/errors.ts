@@ -2,6 +2,7 @@ export type BrowserFailureCode =
   | "authentication_required"
   | "approval_required"
   | "rate_limited"
+  | "conversation_cooldown"
   | "external_interference"
   | "ambiguous_send"
   | "selector_drift"
@@ -23,6 +24,12 @@ export class BrowserCompanionError extends Error {
     this.code = code;
     this.sendAccepted = options.sendAccepted ?? false;
     this.cause = options.cause;
+  }
+}
+
+export class ConversationCooldownError extends BrowserCompanionError {
+  constructor(readonly availableAtMs:number) {
+    super("Waiting for the shared browser’s conversation-loading cooldown", "conversation_cooldown");
   }
 }
 

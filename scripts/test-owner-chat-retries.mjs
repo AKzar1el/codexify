@@ -278,3 +278,46 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(goal.status,'active');assert.equal(action.sendAccepted,false);assert.equal(operations.length,2);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: queued browser cooldown is a neutral live wait with one timer and manual override`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
+ const id='c'.repeat(64),base=Date.now(),writes=[],errors=[];
+ let serverNow=base;
+ const goal={revision:1,status:'active',markdown:'Keep working',turnCount:1};
+ let action={id:'deferred-action',kind:'offline_goal',status:'queued',cooldownUntilMs:base+164000,sendAccepted:false,lastError:null,retryMode:'retry',automaticRetryAtMs:null,automaticRetryAttempts:0,automaticRetriesEnabled:false,canPauseRetries:false};
+ try{
+  await page.clock.install({time:base+3600000});page.on('pageerror',error=>errors.push(error.message));
+  await routeOwner(page,origin+'/**',async route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.10',settingsAvailable:false}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Waiting chat',workspace:'test',goal,lastEntryAtMs:base,lastEntryEnd:0,totalToolCalls:0}],serverTimeMs:serverNow}});
+   if(req.method()!=='GET'){
+    writes.push(path);action={status:'idle'};
+    return route.fulfill({json:{}});
+   }
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'idle'},presence:{},serverTimeMs:serverNow}});
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:serverNow,messages:[],has_more:false}}}});
+  });
+  await page.goto(`${origin}/?chat=${id}#queued-wait-token`);
+  const host=page.locator('#chat-host'),notice=host.locator('#automation-error');
+  await notice.getByText(/available in 164s/).waitFor();
+  assert.equal(await notice.getAttribute('role'),'status');
+  assert.match(await notice.getAttribute('class'),/waiting-for-browser/);
+  assert.doesNotMatch(await notice.textContent(),/retry \d|Retrying|failed|disabled|not sent/);
+  assert.equal(await host.locator('#goal-caption').textContent(),'Pursuing goal');
+  assert.equal(await host.locator('#goal-retry').isVisible(),false);
+  assert.equal(await host.locator('#automation-pause-retries').isVisible(),false,'an initial queued action is not an automatic error retry');
+  assert.equal(await host.locator('#automation-retry-inline').isVisible(),true);
+  serverNow+=1000;await page.clock.fastForward(1000);await notice.getByText(/available in 163s/).waitFor();
+  await page.reload();await notice.getByText(/available in 163s/).waitFor();
+  serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser…',{exact:true}).waitFor();
+  assert.doesNotMatch(await notice.textContent(),/elapsed|\b0s\b|retry \d/);
+  assert.deepEqual(writes,[],'waiting for the clock never posts a browser action from the UI');
+  await host.locator('#automation-retry-inline').click();
+  await notice.waitFor({state:'hidden'});
+  assert.deepEqual(writes,[`/api/chats/${id}/automation/action/retry`]);
+  assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
+});

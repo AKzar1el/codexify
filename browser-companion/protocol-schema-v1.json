@@ -29,6 +29,7 @@
     "unpaired",
     "unverified",
     "queued",
+    "waiting",
     "navigating",
     "sending",
     "generating",
@@ -77,6 +78,7 @@
   },
   "eventTypes": [
     "queued",
+    "waiting",
     "navigating",
     "composer_ready",
     "model_verified",
@@ -149,6 +151,11 @@
     "response": ["protocolVersion", "build", "approved"],
     "scope": "Current verified conversation and its configured connector only; no navigation or message submission",
     "policy": "Core calls only while autoApproveToolCalls is enabled; checks yield to browser actions"
+  },
+  "navigationDeferral": {
+    "event": {"type":"waiting", "availableAtMs":"positive safe integer absolute deadline"},
+    "snapshot": {"state":"waiting", "cooldownUntilMs":"same absolute deadline", "sendAccepted":false},
+    "policy":"A local cooldown prevents navigation without failing the action or consuming a retry. The core queues the action until the deadline and releases the shared browser. HTTP 429 received after a real request remains a failure."
   },
   "executeOptionalFields": {
     "bypassConversationCooldown": "boolean, default false; explicit owner Retry only. Bypasses local conversation-load, access-error and HTTP cooldown checks for this action. Account, ownership and Send checks remain required; loads still reserve the next automatic cooldown."

@@ -37,6 +37,7 @@ test("TypeScript parses every golden request, receipt, snapshot, and event stric
   expect(fixture.executeRequests.map((request: unknown) => executeActionRequestSchema.parse(request)))
     .toEqual(fixture.executeRequests);
   expect(actionSnapshotSchema.parse(fixture.actionSnapshot)).toEqual(fixture.actionSnapshot);
+  expect(actionSnapshotSchema.parse(fixture.waitingSnapshot)).toEqual(fixture.waitingSnapshot);
   expect(cancelActionRequestSchema.parse(fixture.cancelRequest)).toEqual(fixture.cancelRequest);
   expect(cancelActionReceiptSchema.parse(fixture.cancelReceipt)).toEqual(fixture.cancelReceipt);
   expect(fixture.events.map((event: unknown) => actionEventSchema.parse(event))).toEqual(fixture.events);

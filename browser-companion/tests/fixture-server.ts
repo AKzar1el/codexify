@@ -2,6 +2,7 @@ import type { CapabilityCatalog } from "../src/protocol";
 import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } from "../src/browser-window";
 import { startControlServer } from "../src/control-server";
 import { protocolBuild, validateProtocolBuild } from "../src/protocol";
+import { ConversationCooldownError } from "../src/errors";
 
 const descriptorPath = process.argv[2];
 const build = process.argv[3]
@@ -36,6 +37,7 @@ class ContractDriver implements BrowserDriver {
   async reveal() {}
   async execute(execution: DriverExecution) {
     execution.emit({ type:"navigating" });
+    if(mode === "waiting")throw new ConversationCooldownError(Date.now()+180000);
     execution.emit({ type:"composer_ready" });
     if (execution.request.model !== null && execution.request.effort !== null) execution.emit({ type:"model_verified", model:execution.request.model, effort:execution.request.effort });
     execution.emit({ type:"connector_verified" });

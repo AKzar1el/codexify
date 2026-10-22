@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.11] - 2026-10-22
+
+### Fixed
+
+- Keep browser actions queued until the shared conversation-loading cooldown ends,
+  without treating the wait as a failure, consuming a retry, or adding another
+  backoff. Actual failed requests retain their configured retry schedule.
+- Show one neutral browser-wait countdown and preserve queued waits across
+  restarts, including manual Retry, cancellation, and pause controls.
+- Center the attachment preview's close icon inside its circular button.
+
 ## [2.3.10] - 2026-10-22
 
 ### Added
@@ -1010,7 +1021,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.10...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.11...HEAD
+[2.3.11]: https://github.com/devnoname120/codexify/compare/v2.3.10...v2.3.11
 [2.3.10]: https://github.com/devnoname120/codexify/compare/v2.3.9...v2.3.10
 [2.3.9]: https://github.com/devnoname120/codexify/compare/v2.3.8...v2.3.9
 [2.3.8]: https://github.com/devnoname120/codexify/compare/v2.3.7...v2.3.8

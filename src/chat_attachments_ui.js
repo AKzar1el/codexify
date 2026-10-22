@@ -114,7 +114,7 @@
       this.closeViewer();const previous=this.scope.activeElement;
       const label=this.displayName(record);
       const viewer=document.createElement('div');viewer.className='attachment-viewer';viewer.setAttribute('role','dialog');viewer.setAttribute('aria-modal','true');viewer.setAttribute('aria-label',label);
-      const close=document.createElement('button');close.type='button';close.className='attachment-viewer-close';close.setAttribute('aria-label','Close attachment preview');close.textContent='×';
+      const close=document.createElement('button');close.type='button';close.className='attachment-viewer-close';close.setAttribute('aria-label','Close attachment preview');close.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 5 14 14M19 5 5 19"/></svg>';
       const download=document.createElement('a');download.className='attachment-viewer-download';download.textContent='Download original';download.href=this.bridge.attachmentUrl(record.id,true);download.download=record.originalName;
       const media=document.createElement(record.mimeType.startsWith('image/')?'img':'video');media.src=this.bridge.attachmentUrl(record.id);if(media.tagName==='VIDEO'){media.controls=true;media.preload='metadata';}else media.alt=label;
       viewer.append(close,download,media);

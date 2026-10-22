@@ -128,7 +128,7 @@ test.skipIf(!native)("a failed conversation keeps its verified account signed in
   }
 });
 
-test.skipIf(!native)("ordinary sends and goal retries retain the specific conversation error before Send", async () => {
+test.skipIf(!native)("attempted recovery loads retain the specific conversation error before Send", async () => {
   const prompts: ActionPrompt[] = [
     {kind:"offline_chat", batchId:"batch", messages:[{id:"message", markdown:"Continue"}]},
     {kind:"offline_goal", goalRevision:1},
@@ -141,7 +141,7 @@ test.skipIf(!native)("ordinary sends and goal retries retain the specific conver
     const request: ExecuteActionRequest = {
       actionId:`unavailable-${render.name}-${index}`, idempotencyKey:`unavailable-${render.name}-${index}`, url:failedUrl, expectedUrl:failedUrl,
       pairingGeneration:1, connectorName:"Fixture connector", expectedAccountFingerprint:account,
-      model:"gpt-6-sol", effort:"high", prompt, autoApproveToolCalls:false,
+      model:"gpt-6-sol", effort:"high", prompt, autoApproveToolCalls:false, bypassConversationCooldown:true,
     };
     await coordinator.execute(request);
     const events = [];
@@ -194,6 +194,7 @@ test.skipIf(!native)("a sign-in page remains an authentication failure", async (
 test.skipIf(!native)('repeated signed-out retries each reload the open conversation once and remain confirmed unsent',async()=>{
  signedOut=true;
  try{
+  setSystemTime(Date.now()+300_001);
   currentHtml='<a href="/auth/login">Sign in</a>';await surface.navigate(projectUrl);
   const coordinator=new SingleWindowCoordinator(new ChatGptBrowserDriver(surface,build),build);
   for(const attempt of [1,2]){
@@ -222,7 +223,7 @@ test.skipIf(!native)("all chats share five-minute access recovery slots and a he
     const before=documentLoads.length;await coordinator.execute(request);
     const events=[];for await(const event of coordinator.events(id,0))events.push(event);
     expect(documentLoads.slice(before)).toEqual(loads);
-    expect(events.at(-1)).toMatchObject({type:'failed',code:'conversation_unavailable',message:expect.stringContaining(message)});
+    expect(events.at(-1)).toMatchObject(loads.length?{type:'failed',code:'conversation_unavailable',message:expect.stringContaining(message)}:{type:'waiting',availableAtMs:expect.any(Number)});
     expect(events.some(event=>event.type==='authentication_required'||event.type==='send_accepted')).toBeFalse();
     expect((await coordinator.action(id))?.sendAccepted).toBeFalse();
     expect((await coordinator.health()).activeActionId).toBeNull();
@@ -239,7 +240,7 @@ test.skipIf(!native)("all chats share five-minute access recovery slots and a he
   await navigatePage(page,projectUrl);
   expect(await driver.health()).toMatchObject({authenticated:true,status:'idle',detail:null});
   const recoveredAt=Date.now();setSystemTime(recoveredAt+179_000);
-  await expect(navigatePage(page,url)).rejects.toMatchObject({code:'rate_limited'});
+  await expect(navigatePage(page,url)).rejects.toMatchObject({code:'conversation_cooldown'});
   setSystemTime(recoveredAt+180_001);
   const before=documentLoads.length;await navigatePage(page,url);
   expect(documentLoads.slice(before)).toEqual([url]);

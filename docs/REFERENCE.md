@@ -3387,7 +3387,7 @@ shared browser. Defaults preserve the existing behavior:
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `actionDelaysSeconds` | `[30, 60, 120, 240, 480]` | Confirmed-unsent browser action failures. |
-| `chatgptAccessDelaysSeconds` | `[180, 300, 600, 1200, 1800, 3600]` | Sign-in, conversation access, rate-limit, and shared loading cooldown errors. |
+| `chatgptAccessDelaysSeconds` | `[180, 300, 600, 1200, 1800, 3600]` | Sign-in, conversation access, and actual rate-limit failures. |
 | `goalRecoveryDelaysSeconds` | `[60, 120, 240]` | Recover an active goal when the agent remains offline after a continuation. |
 | `jitterPercent` | `10` | Add a stable random wait between 0 and this percentage of each retry delay or approval resume wait. Set to `0` for no jitter. |
 | `approvalResumeGraceSeconds` | `180` | Wait for agent activity after accepting an approval before considering another continuation. |
@@ -3411,8 +3411,14 @@ local cooldown checks for that attempt. Account verification, browser ownership,
 and protection against replaying accepted messages still apply. The manual load
 also reserves the next automatic loading slot; it does not disable throttling for
 other chats or later retries. ChatGPT can still return HTTP 429 to that request.
-When an automatic retry is scheduled after the shared cooldown, only the automatic
-retry countdown is shown. Expired cooldowns are omitted.
+If a local cooldown blocks an action before a request is attempted, the action
+stays queued with a neutral **Waiting for the shared browser** countdown. It runs
+when the shared loading slot becomes available, without recording a failure,
+consuming a retry, or starting another backoff. This also applies to initial sends
+when automatic retries are disabled. Actual failed requests still use their
+configured retry schedule; if a due retry must wait for a shared slot, only that
+availability deadline applies until it can run. Another chat using the slot can
+extend the wait without consuming a retry. Queued waits survive server restarts.
 
 Changing schedules and restarting retains
 attempt counts and uses the original failure time for pending retries; shortening

@@ -223,6 +223,8 @@ pub struct AutomationActionState {
     // Granted by the owner Retry action; retained only until this attempt starts.
     #[serde(skip_serializing_if = "is_false")]
     pub bypass_conversation_cooldown: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_ms: Option<u64>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -349,6 +351,11 @@ fn retries_enabled_by_default() -> bool {
 }
 
 impl AutomationTaskState {
+    pub fn browser_cooldown_until_ms(&self) -> Option<u64> {
+        (self.action.status == AutomationActionStatus::Queued)
+            .then_some(self.action.cooldown_until_ms)
+            .flatten()
+    }
     fn can_resume_cancelled_action(&self) -> bool {
         self.action.status == AutomationActionStatus::Cancelled
             && (self.action.send_accepted == Some(false) || self.action.messages_fenced)
@@ -405,7 +412,8 @@ impl AutomationTaskState {
     }
 
     pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
-        if !self.automatic_retries_enabled
+        if self.browser_cooldown_until_ms().is_some()
+            || !self.automatic_retries_enabled
             || self.action.automatic_retry_paused
             || !self.offline_goal_retry_eligible()
         {
@@ -445,7 +453,10 @@ impl AutomationTaskState {
     }
 
     pub(crate) fn goal_recovery_retry_at_ms(&self) -> Option<u64> {
-        if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
+        if self.browser_cooldown_until_ms().is_some()
+            || !self.automatic_retries_enabled
+            || self.action.automatic_retry_paused
+        {
             return None;
         }
         let delay = self
@@ -469,7 +480,8 @@ impl AutomationTaskState {
     }
 
     pub(crate) fn goal_recovery_exhausted(&self) -> bool {
-        self.offline_goal_retry_eligible()
+        self.browser_cooldown_until_ms().is_none()
+            && self.offline_goal_retry_eligible()
             && !confirmed_unsent_failure(&self.action)
             && self.goal_wake.recovery_attempts as usize
                 >= self.retry_timings.goal_recovery_delays_seconds.len()
@@ -566,7 +578,10 @@ impl AutomationTaskState {
     }
 
     pub fn automatic_retry_at_ms(&self) -> Option<u64> {
-        if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
+        if self.browser_cooldown_until_ms().is_some()
+            || !self.automatic_retries_enabled
+            || self.action.automatic_retry_paused
+        {
             return None;
         }
         if chatgpt_access_failure(self.action.status) {
@@ -633,6 +648,9 @@ impl AutomationTaskState {
     }
 
     pub fn is_automatically_retrying(&self) -> bool {
+        if self.browser_cooldown_until_ms().is_some() {
+            return false;
+        }
         self.automatic_retry_at_ms().is_some()
             || self.automatic_retries_enabled
                 && !self.action.automatic_retry_paused
@@ -661,6 +679,9 @@ impl AutomationTaskState {
     }
 
     pub fn action_needs_attention_at(&self, now_ms: u64) -> bool {
+        if self.browser_cooldown_until_ms().is_some() {
+            return false;
+        }
         if let Some(until) = self.pairing_verification_wait_until_ms() {
             return now_ms >= until;
         }
@@ -722,6 +743,15 @@ fn chatgpt_access_failure(status: AutomationActionStatus) -> bool {
 
 fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
     let action = &state.action;
+    if action.cooldown_until_ms.is_some()
+        && action.status == AutomationActionStatus::Queued
+        && action.kind != Some(AutomationActionKind::PairVerify)
+        && action.send_accepted == Some(false)
+        && !action.messages_fenced
+        && !action.goal_turn_counted
+    {
+        return Some("retry");
+    }
     if action.status == AutomationActionStatus::Cancelled {
         return (action.id.is_some()
             && action.kind != Some(AutomationActionKind::PairVerify)
@@ -1994,6 +2024,9 @@ impl AgentAutomationStore {
                 (AutomationActionKind::PairVerify | AutomationActionKind::OfflineChat, None) => {}
                 (AutomationActionKind::TurnRenewal, _) => {}
             }
+            if !state.action.automatic_retry_in_progress {
+                state.suspended_retry = None;
+            }
             state.action = AutomationActionState {
                 id: Some(action_id.to_string()),
                 kind: Some(kind),
@@ -2009,9 +2042,107 @@ impl AgentAutomationStore {
                 bypass_conversation_cooldown: kind != AutomationActionKind::PairVerify
                     && state.action.bypass_conversation_cooldown
                     && (state.action.id.is_none() || state.action.id.as_deref() == Some(action_id)),
+                cooldown_until_ms: (state.action.id.as_deref() == Some(action_id))
+                    .then_some(state.action.cooldown_until_ms)
+                    .flatten(),
                 ..Default::default()
             };
             Ok(state.action.clone())
+        })
+    }
+
+    pub(crate) fn defer_action_for_cooldown(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        next_action_id: &str,
+        until_ms: u64,
+    ) -> Result<bool, String> {
+        if !valid_opaque(next_action_id) || until_ms == 0 || until_ms > 9_007_199_254_740_991 {
+            return Err("Browser cooldown deferral is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id)
+                || state.action.send_accepted != Some(false)
+                || state.action.messages_fenced
+                || state.action.goal_turn_counted
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Queued
+                        | AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
+            {
+                return Ok(false);
+            }
+            // Queueing reserved a retry, but no browser request was attempted.
+            // Keep the original failure for pause/disable and restore its budget.
+            if let Some(previous) = &state.suspended_retry {
+                state.action.automatic_retry_attempts = previous.action.automatic_retry_attempts;
+                state.action.chatgpt_access_retry_attempts =
+                    previous.action.chatgpt_access_retry_attempts;
+                state.goal_wake.recovery_attempts = previous.goal_wake.recovery_attempts;
+            }
+            state.action.id = Some(next_action_id.into());
+            state.action.status = AutomationActionStatus::Queued;
+            state.action.last_error = None;
+            state.action.cooldown_until_ms = Some(until_ms);
+            state.action.bypass_conversation_cooldown = false;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn resume_cooldown_action(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(action_id)
+                || state
+                    .browser_cooldown_until_ms()
+                    .is_none_or(|until| now_ms < until)
+            {
+                return Ok(());
+            }
+            if let Some(previous) = &state.suspended_retry {
+                if chatgpt_access_failure(previous.action.status) {
+                    state.action.chatgpt_access_retry_attempts =
+                        previous.action.chatgpt_access_retry_attempts + 1;
+                } else if confirmed_unsent_failure(&previous.action) {
+                    state.action.automatic_retry_attempts =
+                        previous.action.automatic_retry_attempts + 1;
+                } else {
+                    state.goal_wake.recovery_attempts = previous.goal_wake.recovery_attempts + 1;
+                }
+            }
+            state.action.cooldown_until_ms = None;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn restore_missing_cooldown_action(
+        &self,
+        task: &ConversationIdentity,
+        expected: &AutomationActionState,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != *expected || state.browser_cooldown_until_ms().is_none() {
+                return Ok(false);
+            }
+            if let Some(previous) = state.suspended_retry.take() {
+                state.action = previous.action;
+                state.goal_wake = previous.goal_wake;
+            } else {
+                state.action = AutomationActionState {
+                    automatic_retry_attempts: state.action.automatic_retry_attempts,
+                    chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts,
+                    ..Default::default()
+                };
+            }
+            Ok(true)
         })
     }
 
@@ -2071,11 +2202,15 @@ impl AgentAutomationStore {
             if state.action.id.as_deref() != Some(action_id) {
                 return Err("Agent automation action changed before its status update".into());
             }
-            if matches!(
+            if !matches!(
                 status,
-                AutomationActionStatus::Navigating | AutomationActionStatus::Idle
+                AutomationActionStatus::Queued
+                    | AutomationActionStatus::Navigating
+                    | AutomationActionStatus::Sending
+                    | AutomationActionStatus::Generating
             ) {
                 state.suspended_retry = None;
+                state.action.cooldown_until_ms = None;
             }
             let verified_pairing = state.action.kind == Some(AutomationActionKind::PairVerify)
                 && state.action.pairing_generation == Some(state.pairing.generation)
@@ -2203,6 +2338,7 @@ impl AgentAutomationStore {
                 || state.action.automatic_retry_in_progress
                 || state.action.last_error.is_some();
             state.action.status = AutomationActionStatus::Cancelled;
+            state.action.cooldown_until_ms = None;
             state.suspended_retry = None;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
@@ -2891,6 +3027,9 @@ impl AgentAutomationStore {
             state.automatic_retries_enabled = self.automatic_retries_enabled()?;
             state.retry_timings = self.retry_timings.clone();
             let result = mutation(&mut state)?;
+            if state.action.status != AutomationActionStatus::Queued {
+                state.action.cooldown_until_ms = None;
+            }
             validate_state(&state)?;
             persist_state(path, &state)?;
             Ok(result)
@@ -2907,6 +3046,9 @@ impl AgentAutomationStore {
             state.automatic_retries_enabled = self.automatic_retries_enabled()?;
             state.retry_timings = self.retry_timings.clone();
             let result = mutation(&mut state);
+            if state.action.status != AutomationActionStatus::Queued {
+                state.action.cooldown_until_ms = None;
+            }
             validate_state(&state)?;
             persist_state(path, &state)?;
             result
@@ -3372,6 +3514,41 @@ fn chat_delivery_candidate(
     Ok(None)
 }
 
+fn migrate_legacy_cooldown(state: &mut AutomationTaskState) -> bool {
+    let action = &mut state.action;
+    if !matches!(
+        action.status,
+        AutomationActionStatus::RateLimited | AutomationActionStatus::ConversationUnavailable
+    ) || action.kind == Some(AutomationActionKind::PairVerify)
+        || action.automatic_retry_paused
+        || action.send_accepted != Some(false)
+        || action.messages_fenced
+        || action.goal_turn_counted
+    {
+        return false;
+    }
+    let Some(text) = action.last_error.as_deref() else {
+        return false;
+    };
+    let seconds = [
+        "ChatGPT conversation loading is cooling down. Another conversation can load in ",
+        "ChatGPT conversation temporarily not accessible. Shared browser cooldown: conversation loading can retry in ",
+    ].into_iter().find_map(|prefix| text.strip_prefix(prefix))
+        .and_then(|text| text.strip_suffix('s')).and_then(|seconds| seconds.parse::<u64>().ok());
+    let Some((seconds, at)) = seconds.zip(action.updated_at_ms).filter(|(seconds, at)| {
+        *seconds <= 86_400
+            && (1..=9_007_199_254_740_991).contains(&at.saturating_add(seconds * 1000))
+    }) else {
+        return false;
+    };
+    action.status = AutomationActionStatus::Queued;
+    action.cooldown_until_ms = Some(at.saturating_add(seconds * 1000));
+    action.last_error = None;
+    action.automatic_retry_in_progress = false;
+    action.chatgpt_access_retry_in_progress = false;
+    true
+}
+
 fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
     let Some(bytes) = read_private_record(path)? else {
         return Ok(AutomationTaskState::default());
@@ -3429,8 +3606,14 @@ fn load_state(path: &Path) -> Result<AutomationTaskState, String> {
             }
         }
     }
+    let legacy_cooldown = migrate_legacy_cooldown(&mut state);
     validate_state(&state)?;
-    if legacy_goal || legacy_receipts || legacy_presence_timer || legacy_receipt_timers {
+    if legacy_goal
+        || legacy_receipts
+        || legacy_presence_timer
+        || legacy_receipt_timers
+        || legacy_cooldown
+    {
         persist_state(path, &state)?;
     }
     Ok(state)
@@ -3598,6 +3781,12 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
 }
 
 fn validate_action(action: &AutomationActionState) -> Result<(), String> {
+    if action
+        .cooldown_until_ms
+        .is_some_and(|at| at == 0 || at > 9_007_199_254_740_991)
+    {
+        return Err("Browser cooldown deadline is invalid".into());
+    }
     if action.automatic_retry_attempts as usize > MAX_AUTOMATIC_RETRY_ATTEMPTS
         || action.chatgpt_access_retry_attempts as usize > MAX_AUTOMATIC_RETRY_ATTEMPTS
         || action.chatgpt_access_retry_in_progress && !action.automatic_retry_in_progress

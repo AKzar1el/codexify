@@ -1,5 +1,5 @@
 import type {BrowserContext, Page} from "patchright";
-import {BrowserCompanionError} from "./errors";
+import {BrowserCompanionError,ConversationCooldownError} from "./errors";
 import {AsyncLocalStorage} from "node:async_hooks";
 
 const cooldownBypass = new AsyncLocalStorage<boolean>();
@@ -40,13 +40,6 @@ function isConversationUrl(url:URL):boolean {
   return url.origin === "https://chatgpt.com" && /^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(url.pathname);
 }
 
-function assertConversationAvailable(budget:Budget):void {
-  if(budget.unavailableUntil!==null&&Date.now()<budget.unavailableUntil){
-    const seconds=Math.ceil((budget.unavailableUntil-Date.now())/1_000);
-    throw new BrowserCompanionError(`ChatGPT conversation temporarily not accessible. Shared browser cooldown: conversation loading can retry in ${seconds}s`,"conversation_unavailable");
-  }
-}
-
 export function recordConversationUnavailable(page:Page):void {
   const budget=navigationBudget(page.context());
   // Repeated health checks of the same failure must not postpone recovery.
@@ -81,12 +74,8 @@ export async function navigatePage(page:Page,url:string,options:{signal?:AbortSi
     const sourceUrl=page.url();
     const conversation = isConversationUrl(target);
     if(conversation&&!cooldownBypass.getStore()){
-      assertConversationAvailable(budget);
-      if(Date.now()<budget.blockedUntil)throw new BrowserCompanionError("ChatGPT conversation loading is temporarily rate limited; wait before retrying", "rate_limited");
-      if(budget.lastLoad!==null){
-        const remaining = budget.lastLoad + timings.conversationLoadIntervalSeconds*1_000 - Date.now();
-        if(remaining>0)throw new BrowserCompanionError(`ChatGPT conversation loading is cooling down. Another conversation can load in ${Math.ceil(remaining/1_000)}s`,"rate_limited");
-      }
+      const availableAt=Math.max(budget.unavailableUntil??0,budget.blockedUntil,budget.lastLoad===null?0:budget.lastLoad+timings.conversationLoadIntervalSeconds*1_000);
+      if(availableAt>Date.now())throw new ConversationCooldownError(Math.min(availableAt,Number.MAX_SAFE_INTEGER));
       options.signal?.throwIfAborted();
     }
     if(page.url()!==sourceUrl)throw new BrowserCompanionError("ChatGPT changed pages while waiting to navigate", "external_interference");

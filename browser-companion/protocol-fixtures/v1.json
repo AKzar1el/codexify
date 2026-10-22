@@ -1,19 +1,19 @@
 {
-  "schemaHash": "b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
-  "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+  "schemaHash": "83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
+  "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
   "descriptor": {
     "version": 1,
     "kind": "codexify-browser-companion",
     "pid": 1234,
     "endpoint": "http://127.0.0.1:43123",
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "createdAt": "2026-10-09T12:00:00Z"
   },
   "health": {
     "protocolVersion": 1,
     "kind": "codexify-browser-companion",
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "status": "idle",
     "authenticated": true,
     "accountFingerprint": "fixture-account",
@@ -21,7 +21,7 @@
   },
   "capabilities": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "accountFingerprint": "fixture-account",
     "catalogRevision": "fixture-catalog",
     "models": [
@@ -50,7 +50,7 @@
   },
   "revealReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "revealed": true,
     "activeActionId": null
   },
@@ -151,7 +151,7 @@
   ],
   "actionSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "actionId": "fixture-action",
     "state": "generating",
     "sendAccepted": true,
@@ -163,13 +163,25 @@
     "lastEventSequence": 8,
     "attention": null
   },
+  "waitingSnapshot": {
+    "protocolVersion": 1,
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
+    "actionId": "fixture-waiting",
+    "state": "waiting",
+    "sendAccepted": false,
+    "canonicalUrl": null,
+    "selected": null,
+    "lastEventSequence": 2,
+    "attention": null,
+    "cooldownUntilMs": 180000
+  },
   "cancelRequest": {
     "actionId": "fixture-action",
     "idempotencyKey": "fixture-cancel"
   },
   "cancelReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067",
+    "build": "fixture+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627",
     "actionId": "fixture-action",
     "state": "ambiguous",
     "cancelled": true
@@ -300,6 +312,13 @@
       "atMs": 18,
       "type": "conversation_created",
       "canonicalUrl": "https://chatgpt.com/c/fixture"
+    },
+    {
+      "sequence": 19,
+      "actionId": "fixture-waiting",
+      "atMs": 19,
+      "type": "waiting",
+      "availableAtMs": 180000
     }
   ]
 }

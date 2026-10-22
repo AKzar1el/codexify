@@ -1,6 +1,6 @@
 import {withConversationCooldownBypass} from "./navigation";
 import { createHash } from "node:crypto";
-import { asCompanionError, BrowserCompanionError } from "./errors";
+import { asCompanionError, BrowserCompanionError, ConversationCooldownError } from "./errors";
 import { modelSelectionAllowed } from "./model-fallback";
 import {
   COMPANION_KIND,
@@ -109,7 +109,7 @@ function requestDigest(request: ExecuteActionRequest): string {
 function terminalType(type: ActionEvent["type"]): boolean {
   return [
     "submission_complete", "generation_complete", "approval_required", "authentication_required", "rate_limited",
-    "external_interference", "ambiguous_send", "failed",
+    "external_interference", "ambiguous_send", "failed", "waiting",
   ].includes(type);
 }
 
@@ -120,6 +120,7 @@ function cloneSnapshot(snapshot: ActionSnapshot): ActionSnapshot {
 function stateForEvent(type: ActionEvent["type"], current: ActionState): ActionState {
   switch (type) {
     case "queued": return "queued";
+    case "waiting": return "waiting";
     case "navigating": return "navigating";
     case "composer_ready": return "navigating";
     case "model_verified": return "navigating";
@@ -643,6 +644,10 @@ export class SingleWindowCoordinator {
   }
 
   private emitFailure(record: ActionRecord, error: BrowserCompanionError): void {
+    if(error instanceof ConversationCooldownError){
+      this.emit(record,{type:"waiting",availableAtMs:error.availableAtMs});
+      return;
+    }
     const message = boundedEventMessage(error.message);
     switch (error.code) {
       case "authentication_required":
@@ -667,6 +672,9 @@ export class SingleWindowCoordinator {
   }
 
   private emit(record: ActionRecord, raw: DriverEvent): void {
+    if(raw.type === "waiting" && record.snapshot.sendAccepted){
+      throw new BrowserCompanionError("A submitted browser action cannot be deferred", "ambiguous_send", {sendAccepted:true});
+    }
     if (record.terminal) return;
     if (raw.type === "stop_progress") {
       if (!STOP_PROGRESS_STEPS.includes(raw.step)) throw new BrowserCompanionError("Browser driver reported invalid Stop progress", "selector_drift");
@@ -762,6 +770,7 @@ export class SingleWindowCoordinator {
     record.snapshot.lastEventSequence = event.sequence;
     record.snapshot.state = stateForEvent(event.type, record.snapshot.state);
     record.snapshot.attention = attentionFor(event);
+    if(event.type === "waiting")record.snapshot.cooldownUntilMs=event.availableAtMs;
     if (event.type === "model_verified") record.snapshot.selected = { model:event.model, effort:event.effort };
     if (event.type === "send_accepted") {
       record.snapshot.sendAccepted = true;

@@ -206,6 +206,11 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
 
     let _: CompanionActionSnapshot =
         serde_json::from_value(fixture["actionSnapshot"].clone()).unwrap();
+    let waiting: CompanionActionSnapshot =
+        serde_json::from_value(fixture["waitingSnapshot"].clone()).unwrap();
+    assert_eq!(waiting.state, CompanionActionState::Waiting);
+    assert_eq!(waiting.cooldown_until_ms, Some(180_000));
+    assert!(!waiting.send_accepted);
     let _: CancelActionReceipt = serde_json::from_value(fixture["cancelReceipt"].clone()).unwrap();
     for event in fixture["events"].as_array().unwrap() {
         let _: CompanionEvent = serde_json::from_value(event.clone()).unwrap();
@@ -477,4 +482,57 @@ async fn companion_restart_republishes_the_descriptor_without_inventing_old_acti
         .err()
         .expect("a restarted companion must not invent previous in-memory action state");
     assert!(error.contains("unavailable"), "{error}");
+}
+
+#[tokio::test]
+#[ignore = "requires CODEXIFY_TEST_BROWSER_COMPANION_BUN; exercised explicitly by CI"]
+async fn rust_client_receives_a_typed_cooldown_deferral_and_released_browser() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = start_fixture_mode(root.path(), "waiting");
+    let client = BrowserCompanionClient::from_descriptor_path_with_timeouts(
+        &fixture.descriptor,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let request = contract_request("waiting-action", "waiting-execute");
+    client.execute(&request, &cancellation).await.unwrap();
+    let mut observed = Vec::new();
+    client
+        .stream_action_events(&request.action_id, 0, &cancellation, |event| {
+            observed.push(event);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let Some(CompanionEvent {
+        kind: CompanionEventKind::Waiting { available_at_ms },
+        ..
+    }) = observed.last()
+    else {
+        panic!("expected a typed cooldown deferral");
+    };
+    let snapshot = client
+        .action(&request.action_id, &cancellation)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.state, CompanionActionState::Waiting);
+    assert_eq!(snapshot.cooldown_until_ms, Some(*available_at_ms));
+    assert!(!snapshot.send_accepted);
+    assert!(snapshot.attention.is_none());
+    assert!(
+        client
+            .health(&cancellation)
+            .await
+            .unwrap()
+            .active_action_id
+            .is_none()
+    );
+    assert!(observed.iter().all(|event| !matches!(
+        event.kind,
+        CompanionEventKind::Failed { .. }
+            | CompanionEventKind::RateLimited { .. }
+            | CompanionEventKind::SendAccepted
+    )));
 }

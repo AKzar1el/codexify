@@ -15,7 +15,7 @@ use codexify::agent_automation::{
     AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AgentAutomationSupervisor,
     AutomationActionStatus, AutomationExecution, AutomationExecutionError, AutomationExecutor,
     AutomationTaskHandle, BrowserAutomationExecutor, CompanionActionSnapshot, CompanionActionState,
-    CompanionEvent, CompanionEventKind, PairingCommit,
+    CompanionEvent, CompanionEventKind, GoalFinish, GoalStatus, PairingCommit,
 };
 use codexify::config::default_config;
 use codexify::exec_sessions::SessionState;
@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -98,6 +98,7 @@ fn snapshot_for(execution: AutomationExecution) -> CompanionActionSnapshot {
                 |(model, effort)| codexify::agent_automation::CompanionSelection { model, effort },
             ),
         last_event_sequence: 2,
+        cooldown_until_ms: None,
         attention: None,
     }
 }
@@ -6238,6 +6239,7 @@ fn retained_goal_snapshot() -> CompanionActionSnapshot {
         canonical_url: Some("https://chatgpt.com/c/example".into()),
         selected: None,
         last_event_sequence: 10,
+        cooldown_until_ms: None,
         attention: None,
     }
 }
@@ -8809,7 +8811,7 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
             .into(),
             message: Some(
                 if rate_limited {
-                    "ChatGPT conversation loading is cooling down. Another conversation can load in 70s"
+                    "ChatGPT rejected the request with HTTP 429"
                 } else if editor_failure {
                     "ChatGPT did not accept the message in its editor; nothing was sent"
                 } else if access_failure {
@@ -9588,9 +9590,7 @@ impl AutomationExecutor for CooldownRetryExecutor {
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
         self.requests.lock().unwrap().push(execution.request);
         Err(AutomationExecutionError {
-            message:
-                "ChatGPT conversation loading is cooling down. Another conversation can load in 70s"
-                    .into(),
+            message: "ChatGPT rejected the request with HTTP 429".into(),
             send_accepted: false,
             failure_status: Some(AutomationActionStatus::RateLimited),
         })
@@ -9652,4 +9652,459 @@ async fn manual_retry_bypasses_only_its_attempt_and_preserves_automatic_cooldown
         "an online chat must not keep a bypass for a later automatic action"
     );
     assert_eq!(supervisor.queued_count().await, 0);
+}
+
+#[derive(Clone, Copy)]
+enum CooldownOutcome {
+    Wait(u64),
+    RateLimit,
+    Accepted,
+}
+struct WaitingExecutor {
+    outcomes: Mutex<std::collections::VecDeque<CooldownOutcome>>,
+    requests: Mutex<Vec<codexify::agent_automation::ExecuteActionRequest>>,
+}
+#[async_trait]
+impl AutomationExecutor for WaitingExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        _events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        let manual = execution.request.bypass_conversation_cooldown;
+        self.requests
+            .lock()
+            .unwrap()
+            .push(execution.request.clone());
+        let result = if manual {
+            CooldownOutcome::Accepted
+        } else {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(CooldownOutcome::Accepted)
+        };
+        match result {
+            CooldownOutcome::Wait(until) => {
+                let mut snapshot = snapshot_for(execution);
+                snapshot.state = CompanionActionState::Waiting;
+                snapshot.send_accepted = false;
+                snapshot.canonical_url = None;
+                snapshot.selected = None;
+                snapshot.cooldown_until_ms = Some(until);
+                Ok(snapshot)
+            }
+            CooldownOutcome::RateLimit => Err(AutomationExecutionError {
+                message: "ChatGPT rejected the request with HTTP 429".into(),
+                send_accepted: false,
+                failure_status: Some(AutomationActionStatus::RateLimited),
+            }),
+            CooldownOutcome::Accepted => Ok(snapshot_for(execution)),
+        }
+    }
+}
+async fn waiting_fixture(
+    outcomes: Vec<CooldownOutcome>,
+    automatic_retries: bool,
+) -> (
+    Fixture,
+    Arc<AgentAutomationSupervisor>,
+    Arc<WaitingExecutor>,
+) {
+    let mut f = fixture().await;
+    f.config.markdown_chat.automation.automatic_retries = automatic_retries;
+    let settings = f._root.path().join("retry-settings.json");
+    std::fs::write(&settings, serde_json::json!({"agentChat":{"automation":{"connectorName":"Fixture connector","automaticRetries":automatic_retries}}}).to_string()).unwrap();
+    f.config.loaded_config_path = Some(settings);
+    f.config
+        .markdown_chat
+        .automation
+        .retry_timings
+        .jitter_percent = 0;
+    f.store = Arc::new(AgentAutomationStore::for_config(&f.config).unwrap());
+    let executor = Arc::new(WaitingExecutor {
+        outcomes: Mutex::new(outcomes.into()),
+        requests: Mutex::new(Vec::new()),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    f.chat.record_agent_call(1000).await.unwrap();
+    (f, supervisor, executor)
+}
+#[tokio::test]
+async fn initial_cooldown_waits_without_failure_or_retry_even_when_automatic_retries_are_disabled()
+{
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 164_000;
+    let (f, supervisor, executor) = waiting_fixture(
+        vec![CooldownOutcome::Wait(until), CooldownOutcome::Accepted],
+        false,
+    )
+    .await;
+    let goal = f.store.set_goal(&f.task, "Already done", 100).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    f.store
+        .finish_goal(
+            &f.task,
+            goal.revision,
+            GoalFinish::Completed { summary: None },
+            102,
+        )
+        .unwrap();
+    f.chat
+        .append_user("initial-wait".into(), "Do this next".into())
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now + 1).await.unwrap();
+    let waiting = f.store.load(&f.task).unwrap();
+    assert_eq!(waiting.action.status, AutomationActionStatus::Queued);
+    assert_eq!(waiting.browser_cooldown_until_ms(), Some(until));
+    assert!(waiting.action.last_error.is_none());
+    assert!(waiting.automatic_retry_at_ms().is_none());
+    assert!(!waiting.action_needs_attention());
+    assert!(!waiting.is_automatically_retrying());
+    assert_eq!(waiting.automatic_retry_attempts(), 0);
+    assert_eq!(waiting.retry_mode(), Some("retry"));
+    assert_eq!(waiting.goal.as_ref().unwrap().status, GoalStatus::Completed);
+    for time in [now + 2, until - 1] {
+        supervisor.scan_once(time).await.unwrap();
+        assert!(supervisor.run_next(time).await.unwrap().is_none());
+    }
+    assert_eq!(executor.requests.lock().unwrap().len(), 1);
+    supervisor.scan_once(until).await.unwrap();
+    supervisor.run_next(until).await.unwrap();
+    let requests = executor.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(requests[0].action_id, requests[1].action_id);
+    assert_ne!(requests[0].idempotency_key, requests[1].idempotency_key);
+    let done = f.store.load(&f.task).unwrap();
+    assert_eq!(done.action.status, AutomationActionStatus::Idle);
+    assert!(done.action.last_error.is_none());
+    assert_eq!(done.automatic_retry_attempts(), 0);
+    assert_eq!(done.goal.unwrap().status, GoalStatus::Completed);
+}
+#[tokio::test]
+async fn repeated_cooldowns_preserve_real_failure_budget_and_resume_at_availability_without_extra_backoff()
+ {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let first = now + 900_000;
+    let second = first + 300_000;
+    let (f, supervisor, executor) = waiting_fixture(
+        vec![
+            CooldownOutcome::RateLimit,
+            CooldownOutcome::Wait(first),
+            CooldownOutcome::Wait(second),
+            CooldownOutcome::RateLimit,
+        ],
+        true,
+    )
+    .await;
+    f.chat
+        .append_user("retry-wait".into(), "Preserve this message".into())
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    let _ = supervisor.run_next(now).await;
+    let failed = f.store.load(&f.task).unwrap();
+    let ready = failed.automatic_retry_at_ms().unwrap();
+    assert_eq!(ready, failed.action.updated_at_ms.unwrap() + 180_000);
+    supervisor.scan_once(ready).await.unwrap();
+    assert_eq!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .action
+            .chatgpt_access_retry_attempts,
+        1
+    );
+    supervisor.run_next(ready).await.unwrap();
+    for (until, next) in [(first, second), (second, 0)] {
+        let waiting = f.store.load(&f.task).unwrap();
+        assert_eq!(waiting.action.chatgpt_access_retry_attempts, 0);
+        assert_eq!(waiting.browser_cooldown_until_ms(), Some(until));
+        assert!(waiting.automatic_retry_at_ms().is_none());
+        assert!(waiting.action.last_error.is_none());
+        assert_eq!(
+            waiting.suspended_retry.as_ref().unwrap().action,
+            failed.action
+        );
+        assert!(supervisor.run_next(until - 1).await.unwrap().is_none());
+        supervisor.scan_once(until).await.unwrap();
+        let result = supervisor.run_next(until).await;
+        if next != 0 {
+            result.unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(executor.requests.lock().unwrap().len(), 4);
+    let failed_again = f.store.load(&f.task).unwrap();
+    assert_eq!(failed_again.action.chatgpt_access_retry_attempts, 1);
+    assert_eq!(
+        failed_again.automatic_retry_at_ms(),
+        Some(failed_again.action.updated_at_ms.unwrap() + 300_000)
+    );
+}
+#[tokio::test]
+async fn goal_recovery_cooldown_does_not_consume_a_goal_retry_or_count_an_extra_turn() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 300_000;
+    let (f, supervisor, _) = waiting_fixture(
+        vec![
+            CooldownOutcome::Accepted,
+            CooldownOutcome::Wait(until),
+            CooldownOutcome::Accepted,
+        ],
+        true,
+    )
+    .await;
+    let goal = f.store.set_goal(&f.task, "Keep working", 100).unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    let failed = f.store.load(&f.task).unwrap();
+    let turns = failed.goal.as_ref().unwrap().turn_count;
+    let retry = failed.automatic_retry_at_ms().unwrap();
+    supervisor.scan_once(retry).await.unwrap();
+    supervisor.run_next(retry).await.unwrap();
+    let waiting = f.store.load(&f.task).unwrap();
+    assert_eq!(waiting.goal_wake.recovery_attempts, 0);
+    assert_eq!(waiting.goal.as_ref().unwrap().turn_count, turns);
+    assert!(waiting.automatic_retry_at_ms().is_none());
+    supervisor.scan_once(until).await.unwrap();
+    supervisor.run_next(until).await.unwrap();
+    let after = f.store.load(&f.task).unwrap();
+    assert_eq!(after.goal_wake.recovery_attempts, 1);
+    assert_eq!(after.goal.as_ref().unwrap().turn_count, turns + 1);
+    assert_eq!(
+        after.automatic_retry_at_ms(),
+        Some(
+            after
+                .action
+                .updated_at_ms
+                .unwrap()
+                .max(after.goal_wake.last_nudged_at_ms.unwrap_or(0))
+                + 120_000
+        )
+    );
+}
+#[tokio::test]
+async fn queued_cooldown_can_be_overridden_manually_without_waiting() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 180_000;
+    let (f, supervisor, executor) = waiting_fixture(vec![CooldownOutcome::Wait(until)], true).await;
+    f.chat
+        .append_user("manual-wait".into(), "Try on my request".into())
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    let waiting = f.store.load(&f.task).unwrap();
+    let retried = supervisor
+        .retry_failed_action(&f.task, waiting.action.id.as_deref().unwrap(), now + 1)
+        .await
+        .unwrap();
+    assert!(retried.bypass_conversation_cooldown);
+    assert!(retried.cooldown_until_ms.is_none());
+    supervisor.run_next(now + 2).await.unwrap();
+    let requests = executor.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].bypass_conversation_cooldown);
+}
+#[tokio::test]
+async fn cooldown_survives_restart_and_does_not_block_other_ready_chats() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 180_000;
+    let (f, supervisor, executor) = waiting_fixture(
+        vec![CooldownOutcome::Wait(until), CooldownOutcome::Accepted],
+        true,
+    )
+    .await;
+    f.chat
+        .append_user("restart-wait".into(), "Wait for availability".into())
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    let (other, chat) = add_task(&f, "cooldown-other", "https://chatgpt.com/c/other").await;
+    chat.record_agent_call(1000).await.unwrap();
+    chat.append_user("other-wait".into(), "Other ready work".into())
+        .await
+        .unwrap();
+    supervisor
+        .register_task(AutomationTaskHandle::new(other, 0, f.store.clone(), chat))
+        .await
+        .unwrap();
+    supervisor.scan_once(now + 1).await.unwrap();
+    supervisor.run_next(now + 1).await.unwrap();
+    assert_eq!(executor.requests.lock().unwrap().len(), 2);
+    assert_eq!(supervisor.queued_count().await, 1);
+    let restarted =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    restarted.scan_once(until - 1).await.unwrap();
+    assert_eq!(restarted.queued_count().await, 0);
+    assert!(f.store.load(&f.task).unwrap().action.last_error.is_none());
+    restarted.scan_once(until).await.unwrap();
+    restarted.run_next(until).await.unwrap();
+    assert_eq!(executor.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn pending_cooldown_honors_cancel_pause_and_global_retry_controls() {
+    for control in ["cancel", "pause", "disable"] {
+        let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+        let until = now + 900_000;
+        let (f, supervisor, executor) = waiting_fixture(
+            vec![CooldownOutcome::RateLimit, CooldownOutcome::Wait(until)],
+            true,
+        )
+        .await;
+        f.chat
+            .append_user(
+                "controlled-wait".into(),
+                "Preserve this unread message".into(),
+            )
+            .await
+            .unwrap();
+        supervisor.scan_once(now).await.unwrap();
+        assert!(supervisor.run_next(now).await.is_err());
+        let failed = f.store.load(&f.task).unwrap();
+        let ready = failed.automatic_retry_at_ms().unwrap();
+        supervisor.scan_once(ready).await.unwrap();
+        supervisor.run_next(ready).await.unwrap();
+        let waiting = f.store.load(&f.task).unwrap();
+        let id = waiting.action.id.as_deref().unwrap();
+        let supervisor = AgentAutomationSupervisor::new(
+            f.config.markdown_chat.automation.clone(),
+            executor.clone(),
+        );
+        supervisor
+            .register_task(AutomationTaskHandle::new(
+                f.task.clone(),
+                0,
+                f.store.clone(),
+                f.chat.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor.queued_count().await,
+            0,
+            "controls also work while only the persisted wait exists after restart"
+        );
+        match control {
+            "cancel" => {
+                supervisor
+                    .cancel_action(&f.task, id, ready + 1)
+                    .await
+                    .unwrap();
+            }
+            "pause" => {
+                supervisor.pause_action_retries(&f.task, id).await.unwrap();
+            }
+            _ => {
+                std::fs::write(f.config.loaded_config_path.as_ref().unwrap(), serde_json::json!({"agentChat":{"automation":{"connectorName":"Fixture connector","automaticRetries":false}}}).to_string()).unwrap();
+            }
+        }
+        supervisor.scan_once(until).await.unwrap();
+        assert!(supervisor.run_next(until).await.unwrap().is_none());
+        let after = f.store.load(&f.task).unwrap();
+        assert!(after.browser_cooldown_until_ms().is_none());
+        assert!(after.automatic_retry_at_ms().is_none());
+        assert_eq!(after.action.chatgpt_access_retry_attempts, 0);
+        assert_eq!(after.action.last_error.is_some(), control != "cancel");
+        assert_eq!(executor.requests.lock().unwrap().len(), 2);
+        assert_eq!(f.chat.unread_snapshot().await.unwrap().messages.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn native_delivery_during_cooldown_clears_pending_work_without_another_browser_request() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 180_000;
+    let (f, supervisor, executor) = waiting_fixture(vec![CooldownOutcome::Wait(until)], true).await;
+    let goal = f
+        .store
+        .set_goal(&f.task, "Keep the current goal", 100)
+        .unwrap();
+    f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+    f.chat
+        .append_user(
+            "delivered-wait".into(),
+            "Delivered through the connector".into(),
+        )
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    assert!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .browser_cooldown_until_ms()
+            .is_some()
+    );
+    f.chat.read(true).await.unwrap();
+    f.chat.record_agent_call(now + 1).await.unwrap();
+    supervisor.scan_once(now + 1).await.unwrap();
+    let delivered = f.store.load(&f.task).unwrap();
+    assert!(delivered.browser_cooldown_until_ms().is_none());
+    assert_eq!(delivered.action.status, AutomationActionStatus::Idle);
+    assert_eq!(delivered.goal.unwrap().turn_count, 1);
+    assert_eq!(supervisor.queued_count().await, 0);
+    assert!(supervisor.run_next(until).await.unwrap().is_none());
+    assert_eq!(executor.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn first_real_failure_after_initial_cooldown_starts_at_the_first_retry_delay() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let until = now + 70_000;
+    let (f, supervisor, _) = waiting_fixture(
+        vec![CooldownOutcome::Wait(until), CooldownOutcome::RateLimit],
+        true,
+    )
+    .await;
+    f.chat
+        .append_user("initial-budget".into(), "First actual attempt".into())
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    assert!(
+        f.store
+            .load(&f.task)
+            .unwrap()
+            .automatic_retry_at_ms()
+            .is_none()
+    );
+    supervisor.scan_once(until).await.unwrap();
+    assert!(supervisor.run_next(until).await.is_err());
+    let failed = f.store.load(&f.task).unwrap();
+    assert_eq!(failed.action.chatgpt_access_retry_attempts, 0);
+    assert_eq!(
+        failed.automatic_retry_at_ms(),
+        Some(failed.action.updated_at_ms.unwrap() + 180_000)
+    );
 }

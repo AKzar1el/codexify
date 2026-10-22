@@ -465,6 +465,7 @@ mod tests {
                     effort: execution.request.effort.unwrap(),
                 }),
                 last_event_sequence: 0,
+                cooldown_until_ms: None,
                 attention: None,
             })
         }
