@@ -60,6 +60,7 @@ let page: Page;
 let profile: string;
 let currentHtml = errorPage(...labels[0]);
 let sessionRequests = 0;
+let signedOut=false;
 let clicks = 0;
 const documentLoads: string[] = [];
 const surface: SingleBrowserSurface = {
@@ -78,7 +79,7 @@ beforeAll(async () => {
   await context.route("https://chatgpt.com/**", async route => {
     if (new URL(route.request().url()).pathname === "/api/auth/session") {
       sessionRequests++;
-      await route.fulfill({json:{user:{id:"fixture-user"}, account:{id:"fixture-account", planType:"pro", structure:"personal"}}});
+      await route.fulfill({json:signedOut?{}:{user:{id:"fixture-user"}, account:{id:"fixture-account", planType:"pro", structure:"personal"}}});
     } else {
       documentLoads.push(route.request().url());
       await route.fulfill({contentType:"text/html", body:`<!doctype html><meta charset="utf-8">${currentHtml}<script>document.addEventListener('click',()=>window.recordClick());</script>`});
@@ -202,3 +203,21 @@ test.skipIf(!native)("a sign-in page remains an authentication failure", async (
   await surface.navigate("https://chatgpt.com/auth/login");
   expect(await new ChatGptBrowserDriver(surface, build).health()).toMatchObject({authenticated:false, status:"authentication_required"});
 });
+
+test.skipIf(!native)('repeated signed-out retries each reload the open conversation once and remain confirmed unsent',async()=>{
+ signedOut=true;
+ try{
+  currentHtml='<a href="/auth/login">Sign in</a>';await surface.navigate(projectUrl);
+  const coordinator=new SingleWindowCoordinator(new ChatGptBrowserDriver(surface,build),build);
+  for(const attempt of [1,2]){
+   const request:ExecuteActionRequest={actionId:`signed-out-${attempt}`,idempotencyKey:`signed-out-${attempt}`,url:projectUrl,expectedUrl:projectUrl,pairingGeneration:1,connectorName:'Fixture connector',expectedAccountFingerprint:account,model:'gpt-6-sol',effort:'high',prompt:{kind:'offline_goal',goalRevision:1},autoApproveToolCalls:false};
+   const before=documentLoads.length;await coordinator.execute(request);
+   const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
+   expect(documentLoads.slice(before)).toEqual([projectUrl]);
+   expect(events.at(-1)?.type).toBe('authentication_required');
+   expect((await coordinator.action(request.actionId))?.sendAccepted).toBeFalse();
+   expect((await coordinator.health()).activeActionId).toBeNull();
+  }
+  expect(clicks).toBe(0);
+ }finally{signedOut=false;}
+},15_000);

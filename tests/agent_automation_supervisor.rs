@@ -3277,8 +3277,8 @@ async fn real_executor_defers_only_an_unowned_busy_pairing_window_to_companion_v
 }
 
 #[tokio::test]
-async fn real_executor_rejects_missing_authentication_and_account_mismatch_before_execute() {
-    for authenticated in [false, true] {
+async fn real_executor_delegates_authentication_recovery_but_rejects_known_account_mismatch() {
+    for (authenticated, legacy_rejection) in [(false, false), (false, true), (true, false)] {
         let execute_calls = Arc::new(AtomicUsize::new(0));
         let execute_counter = execute_calls.clone();
         let app = Router::new()
@@ -3310,7 +3310,16 @@ async fn real_executor_rejects_missing_authentication_and_account_mismatch_befor
                     let execute_counter = execute_counter.clone();
                     async move {
                         execute_counter.fetch_add(1, Ordering::SeqCst);
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        if legacy_rejection {
+                            return StatusCode::CONFLICT.into_response();
+                        }
+                        axum::Json(serde_json::json!({
+                            "protocolVersion":codexify::agent_automation::PROTOCOL_VERSION,
+                            "build":COMPANION_BUILD, "actionId":"action-account-check",
+                            "state":"authentication_required", "sendAccepted":false,
+                            "canonicalUrl":null, "selected":null, "lastEventSequence":0,
+                            "attention":{"code":"authentication_required","message":"Sign in after recovery reload"}
+                        })).into_response()
                     }
                 }),
             );
@@ -3354,23 +3363,31 @@ async fn real_executor_rejects_missing_authentication_and_account_mismatch_befor
         };
         let (events, _events_rx) = mpsc::unbounded_channel();
 
-        let error = executor
+        let outcome = executor
             .execute(execution, events, CancellationToken::new())
-            .await
-            .err()
-            .unwrap();
-
-        assert!(!error.send_accepted);
-        assert_eq!(
-            error.failure_status,
-            Some(AutomationActionStatus::AuthenticationRequired)
-        );
-        assert!(error.message.contains(if authenticated {
-            "account"
+            .await;
+        if authenticated || legacy_rejection {
+            let error = outcome.err().unwrap();
+            assert!(!error.send_accepted);
+            assert_eq!(
+                error.failure_status,
+                Some(AutomationActionStatus::AuthenticationRequired)
+            );
+            assert!(error.message.contains(if authenticated {
+                "account"
+            } else {
+                "authentication"
+            }));
+            assert_eq!(
+                execute_calls.load(Ordering::SeqCst),
+                usize::from(legacy_rejection)
+            );
         } else {
-            "authentication"
-        }));
-        assert_eq!(execute_calls.load(Ordering::SeqCst), 0);
+            let snapshot = outcome.unwrap();
+            assert!(!snapshot.send_accepted);
+            assert_eq!(snapshot.state, CompanionActionState::AuthenticationRequired);
+            assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        }
         server.abort();
     }
 }

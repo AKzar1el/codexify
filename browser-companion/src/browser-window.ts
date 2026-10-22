@@ -75,6 +75,7 @@ export interface BrowserDriver {
   refreshConnectorSteps?(name:string,run:BrowserStepRunner,signal?:AbortSignal):Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
   reveal(url: string | null, signal?: AbortSignal): Promise<void>;
   replacePairingDraft?(request: ExecuteActionRequest, signal?: AbortSignal): Promise<boolean>;
+  recoverAuthentication?(request:ExecuteActionRequest,signal:AbortSignal):Promise<void>;
   submissionMayHaveBeenAccepted?(actionId:string): boolean;
   execute(execution: DriverExecution): Promise<void>;
   close?(): Promise<void>;
@@ -88,6 +89,7 @@ interface ActionRecord {
   eventBytes: number;
   listeners: Set<(event: ActionEvent) => void>;
   abort: AbortController;
+  recoverAuthentication: boolean;
   terminal: boolean;
   runSettledPromise: Promise<void>;
   resolveRunSettled(): void;
@@ -361,17 +363,19 @@ export class SingleWindowCoordinator {
       if (this.activeActionId) throw new Error(`Browser companion is busy with action ${this.activeActionId}`);
       let health = await this.driver.health();
       if (health.status === "unavailable") throw new Error(health.detail || "Browser companion Chrome window is unavailable");
-      if (!health.authenticated || health.status === "authentication_required") {
+      const recoverAuthentication = !health.authenticated && health.status === "authentication_required"
+        && request.prompt.kind !== "create_chat";
+      if ((!health.authenticated || health.status === "authentication_required") && !recoverAuthentication) {
         throw new Error("Browser companion requires ChatGPT authentication");
       }
-      if (health.accountFingerprint !== request.expectedAccountFingerprint) {
+      if (!recoverAuthentication && health.accountFingerprint !== request.expectedAccountFingerprint) {
         throw new Error("Browser companion account changed before the action could start");
       }
       if (health.status === "busy" && request.prompt.kind === "pair_verify"
         && await this.driver.replacePairingDraft?.(request, operationSignal)) {
         health = await this.driver.health();
       }
-      if (health.status !== "idle" && request.prompt.kind !== "create_chat") {
+      if (health.status !== "idle" && request.prompt.kind !== "create_chat" && !recoverAuthentication) {
         throw new Error(health.detail || `Browser companion window is not idle (${health.status})`);
       }
       this.pruneActionHistory();
@@ -396,6 +400,7 @@ export class SingleWindowCoordinator {
         eventBytes:0,
         listeners:new Set(),
         abort:new AbortController(),
+        recoverAuthentication,
         terminal:false,
         runSettledPromise,
         resolveRunSettled,
@@ -582,22 +587,35 @@ export class SingleWindowCoordinator {
   private async run(record: ActionRecord): Promise<void> {
     const completedSteps = new Set<string>();
     try {
-      await this.bounded((signal,progress)=>this.driver.execute({
-        request:record.request,
-        renderedPrompt:renderActionPrompt(record.request.prompt as ActionPrompt),
-        signal,
-        emit:event => {
-          this.emit(record,event);
-          // Only a newly verified stage renews the stall deadline. Repeated
-          // events and response output cannot keep browser ownership alive.
-          const progressKey=event.type==='stop_progress'?`stop:${event.step}`:event.type;
-          if (!record.terminal && !completedSteps.has(progressKey)
-            && ["navigating","composer_ready","model_verified","connector_verified","connector_omitted","stop_progress","send_accepted","conversation_created"].includes(event.type)) {
-            completedSteps.add(progressKey);
-            progress();
-          }
-        },
-      }),record.abort.signal,()=>this.driver.submissionMayHaveBeenAccepted?.(record.request.actionId)??false);
+      await this.bounded(async(signal,progress)=>{
+        if(record.recoverAuthentication){
+          // Recovery owns the window and produces a typed terminal failure if
+          // reloading cannot restore the paired account. Passive health never navigates.
+          this.emit(record,{type:"navigating"});progress();
+          if(!this.driver.recoverAuthentication)throw new BrowserCompanionError("Browser companion requires ChatGPT authentication","authentication_required");
+          await this.driver.recoverAuthentication(record.request,signal);
+          const health=await this.driver.health();
+          if(!health.authenticated||health.status==="authentication_required")throw new BrowserCompanionError("Browser companion requires ChatGPT authentication","authentication_required");
+          if(health.accountFingerprint!==record.request.expectedAccountFingerprint)throw new BrowserCompanionError("Browser companion account changed before the action could start","authentication_required");
+          if(health.status!=="idle")throw new BrowserCompanionError(health.detail||"Browser companion window is not idle","external_interference");
+        }
+        await this.driver.execute({
+          request:record.request,
+          renderedPrompt:renderActionPrompt(record.request.prompt as ActionPrompt),
+          signal,
+          emit:event => {
+            this.emit(record,event);
+            // Only a newly verified stage renews the stall deadline. Repeated
+            // events and response output cannot keep browser ownership alive.
+            const progressKey=event.type==='stop_progress'?`stop:${event.step}`:event.type;
+            if (!record.terminal && !completedSteps.has(progressKey)
+              && ["navigating","composer_ready","model_verified","connector_verified","connector_omitted","stop_progress","send_accepted","conversation_created"].includes(event.type)) {
+              completedSteps.add(progressKey);
+              progress();
+            }
+          },
+        });
+      },record.abort.signal,()=>this.driver.submissionMayHaveBeenAccepted?.(record.request.actionId)??false);
       if (!record.terminal) {
         this.emit(record, {
           type:"failed",

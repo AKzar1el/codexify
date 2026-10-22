@@ -226,10 +226,20 @@ async function exactConversationPage(
   try {sameConversation=canonicalChatGptConversationUrl(page.url())===canonicalChatGptConversationUrl(expectedUrl);}catch{}
   if(!sameConversation)page=await surface.navigate(requestedUrl,signal);
   else {
+    let recoveryNeeded=false;
     try {await throwIfSessionAttention(page);}
     catch(error){
-      if(!(error instanceof BrowserCompanionError&&error.code==="conversation_unavailable"))throw error;
-      // A retry of a known load-failure page needs one deliberate recovery load.
+      if(!(error instanceof BrowserCompanionError
+        &&(error.code==="conversation_unavailable"||error.code==="authentication_required")))throw error;
+      recoveryNeeded=true;
+    }
+    // This is also reported as an authentication failure below. Without a
+    // recovery load, retries of an unrecognized no-composer page never progress.
+    if(!recoveryNeeded){
+      try {await assertAuthenticatedChatGptPage(page);}catch{recoveryNeeded=true;}
+    }
+    if(recoveryNeeded){
+      // A known load or sign-in failure needs one deliberate recovery load.
       await navigatePage(page,requestedUrl,{signal,reload:page.url()===requestedUrl});
     }
   }
@@ -552,6 +562,17 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       if(!same)await this.surface.navigate(url,signal);
     }
     await this.surface.reveal();
+  }
+
+  async recoverAuthentication(request:ExecuteActionRequest,signal:AbortSignal):Promise<void> {
+    signal.throwIfAborted();
+    await this.surface.beginAction();
+    try {
+      const page=await this.surface.page();
+      // Preserve a pending approval rather than discard its in-memory card.
+      await throwIfConversationApproval(page);
+      await navigatePage(page,request.url,{signal,reload:page.url()===request.url});
+    } finally {await this.surface.endAction();}
   }
 
   async replacePairingDraft(request: ExecuteActionRequest, signal?:AbortSignal): Promise<boolean> {

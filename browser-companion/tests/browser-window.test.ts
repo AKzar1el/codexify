@@ -618,6 +618,32 @@ test("pairing and default conversation actions allow an omitted connector and st
   await coordinator.close();
 });
 
+test('authentication recovery owns the action and rechecks sign-in and the paired account before execution',async()=>{
+ for(const outcome of ['restored','signed-out','changed-account'] as const){
+  class RecoveryDriver extends DeferredDriver {
+   recoveryCalls=0;
+   override async health(){const health=await super.health();return {...health,accountFingerprint:this.authenticated&&outcome==='changed-account'?'other-account':health.accountFingerprint};}
+   async recoverAuthentication(_request:ExecuteActionRequest,signal:AbortSignal){signal.throwIfAborted();this.recoveryCalls++;this.authenticated=outcome!=='signed-out';this.status=this.authenticated?'idle':'authentication_required';}
+   override async execute(execution:DriverExecution){this.runs.push(execution.request.actionId);execution.emit({type:'model_verified',model:execution.request.model!,effort:execution.request.effort!});execution.emit({type:'connector_verified'});execution.emit({type:'send_accepted'});execution.emit({type:'submission_complete',canonicalUrl:execution.request.expectedUrl});}
+  }
+  const driver=new RecoveryDriver();driver.authenticated=false;driver.status='authentication_required';
+  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD),submitted=request(`recover-${outcome}`);
+  await coordinator.execute(submitted);const events=await collect(coordinator,submitted.actionId);
+  expect(driver.recoveryCalls).toBe(1);
+  expect(events.at(-1)?.type).toBe(outcome==='restored'?'submission_complete':'authentication_required');
+  expect(driver.runs).toEqual(outcome==='restored'?[submitted.actionId]:[]);
+  expect((await coordinator.action(submitted.actionId))?.sendAccepted).toBe(outcome==='restored');
+  expect((await coordinator.health()).activeActionId).toBeNull();
+ }
+});
+
+test('an older driver without authentication recovery cannot execute an unauthenticated action',async()=>{
+ const driver=new DeferredDriver();driver.authenticated=false;driver.status='authentication_required';
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD),submitted=request('missing-recovery');
+ await coordinator.execute(submitted);const events=await collect(coordinator,submitted.actionId);
+ expect(events.at(-1)?.type).toBe('authentication_required');expect(driver.runs).toEqual([]);
+});
+
 
 test("automatic pairing verifies conversation preferences after acceptance and before completion",async()=>{
   for(const restore of [true,false]){

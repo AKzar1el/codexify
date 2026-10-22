@@ -2012,6 +2012,12 @@ button and response lifetime do not hold the browser queue. Account and connecto
 the existing tab and restore its original URL, even while ChatGPT is responding.
 User drafts remain protected.
 
+Retries of conversation-load or sign-in failures deliberately reload an
+already-open target conversation once. Sign-in recovery verifies authentication
+and the paired account again before sending; a pending connector approval is
+preserved instead of reloaded. Healthy conversation pages remain reusable, and
+passive health checks do not navigate.
+
 During offline-send preparation, each Stop click gets up to **20 seconds** to
 settle. An optional Stop confirmation starts its own full 20-second window.
 Preparation continues as soon as the response stops; retries and reload recovery

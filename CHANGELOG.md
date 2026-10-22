@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.9] - 2026-10-22
+
+### Fixed
+
+- Reload an already-open ChatGPT sign-in failure before retrying a paired
+  conversation, then verify the signed-in account again before sending.
+
 ## [2.3.8] - 2026-10-22
 
 ### Fixed
@@ -972,7 +979,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.8...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.9...HEAD
+[2.3.9]: https://github.com/devnoname120/codexify/compare/v2.3.8...v2.3.9
 [2.3.8]: https://github.com/devnoname120/codexify/compare/v2.3.7...v2.3.8
 [2.3.7]: https://github.com/devnoname120/codexify/compare/v2.3.6...v2.3.7
 [2.3.6]: https://github.com/devnoname120/codexify/compare/v2.3.5...v2.3.6

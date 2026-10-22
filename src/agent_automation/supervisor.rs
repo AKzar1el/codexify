@@ -277,14 +277,21 @@ impl AutomationExecutor for BrowserAutomationExecutor {
                 false,
             ));
         }
-        if !health.authenticated {
+        // An owned companion action may reload a stale sign-in page, then must
+        // verify authentication and the paired account again before any Send.
+        let recover_authentication = !health.authenticated
+            && health.status == CompanionSessionStatus::AuthenticationRequired
+            && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. });
+        if !health.authenticated && !recover_authentication {
             return Err(AutomationExecutionError {
                 message: "Browser companion authentication is required".into(),
                 send_accepted: false,
                 failure_status: Some(AutomationActionStatus::AuthenticationRequired),
             });
         }
-        if health.account_fingerprint.as_deref() != Some(execution.account_fingerprint.as_str()) {
+        if !recover_authentication
+            && health.account_fingerprint.as_deref() != Some(execution.account_fingerprint.as_str())
+        {
             return Err(AutomationExecutionError {
                 message: "Browser companion account changed; refresh capabilities and verify the pairing again".into(),
                 send_accepted: false,
@@ -304,6 +311,7 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. }
         );
         if health.status != CompanionSessionStatus::Idle
+            && !recover_authentication
             && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
             && !(replacing_pairing && health.status == CompanionSessionStatus::Busy)
         {
@@ -332,7 +340,19 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         let initial = client
             .execute_with_acceptance(&execution.request, &cancellation)
             .await
-            .map_err(|error| execution_error(error.message, error.send_accepted))?;
+            .map_err(|error| {
+                if recover_authentication && !error.send_accepted {
+                    // Older compatible companions can reject recovery before
+                    // recording an action. Retain the known sign-in failure.
+                    AutomationExecutionError {
+                        message: "Browser companion authentication is required".into(),
+                        send_accepted: false,
+                        failure_status: Some(AutomationActionStatus::AuthenticationRequired),
+                    }
+                } else {
+                    execution_error(error.message, error.send_accepted)
+                }
+            })?;
         if action_is_terminal(initial.state) {
             if initial.last_event_sequence > 0 {
                 let mut last_event_sequence = 0;

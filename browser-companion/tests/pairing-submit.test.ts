@@ -53,6 +53,7 @@ let documentLoads = 0;
 let stopReloadAt=2;
 let loadedFixtureState="";
 let sessionRequests = 0;
+let sessionUnavailableBeforeLoad=0;
 let changedAccountAfterReload = false;
 let changedUrlAfterReload = false;
 let shiftedEfforts = false;
@@ -76,6 +77,7 @@ beforeAll(async () => {
   await context.route("https://chatgpt.com/**",async route => {
     if (new URL(route.request().url()).pathname === "/api/auth/session") {
       sessionRequests++;
+      if(documentLoads<sessionUnavailableBeforeLoad){await route.fulfill({json:{}});return;}
       await route.fulfill({json:{user:{id:"fixture-user"},account:{id:sessionRequests>=changeAccountAtRequest||changedAccountAfterReload&&documentLoads>=stopReloadAt ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
       return;
     }
@@ -223,7 +225,7 @@ async function executeCoordinatorFixture(coordinator:SingleWindowCoordinator,req
 async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating=false,stopWorks:boolean|number|"reload"=true,model={family:"6",value:4,locked:[] as number[]}) {
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
   generatingOnLoad=generating;acceptsStop=stopWorks;stopFinishDelayMs=200;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
-  documentLoads=0;stopReloadAt=2;sessionRequests=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
+  documentLoads=0;stopReloadAt=2;sessionRequests=0;sessionUnavailableBeforeLoad=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
   initialModel=model;shiftedEfforts=false;hideEffortLabels=false;nestedHistory=false;missingHistoryId=false;duplicateHistoryViews=false;
   destinationLocks={};absentFamilies=[];duplicateEffortLabels=false;changeAccountAtRequest=Number.MAX_SAFE_INTEGER;
   await surface.navigate(url);
@@ -334,6 +336,38 @@ const offlineRequest = (model = "gpt-5.5-sol", effort = "low"): ExecuteActionReq
   ...request, model, effort, prompt:{kind:"offline_goal",goalRevision:1},
 });
 
+test.skipIf(!native)('a stale expired-session, sign-in or no-composer page reloads once before a single send',async()=>{
+ for(const kind of ['expired','signed-out','missing-composer'] as const){
+  const driver=await fixture();
+  if(kind==='expired')await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div role="alert">Your session has expired</div>'));
+  else {if(kind==='signed-out')sessionUnavailableBeforeLoad=documentLoads+1;await page.locator('form').evaluate(form=>form.remove());}
+  const coordinator=new SingleWindowCoordinator(driver,build),loads=documentLoads;
+  expect((await coordinator.health()).status).toBe(kind==='missing-composer'?'idle':'authentication_required');
+  expect(documentLoads).toBe(loads);
+  const submitted=offlineRequest('gpt-6-astra','max');
+  await executeCoordinatorFixture(coordinator,submitted);
+  const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe('submission_complete');
+  expect(documentLoads).toBe(loads+1);expect(page.url()).toBe(url);
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+ }
+},30_000);
+
+test.skipIf(!native)('authentication recovery refuses a changed account and preserves a pending materialization card',async()=>{
+ for(const kind of ['account','approval'] as const){
+  const driver=await fixture();
+  await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div role="alert">Your session has expired</div>'));
+  if(kind==='account')changedAccountAfterReload=true;
+  else await page.evaluate(()=>document.body.insertAdjacentHTML('beforeend','<div data-codex-approval-surface="true">Pending materialization</div>'));
+  const coordinator=new SingleWindowCoordinator(driver,build),loads=documentLoads,submitted=offlineRequest('gpt-6-astra','max');
+  await executeCoordinatorFixture(coordinator,submitted);
+  const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe(kind==='account'?'authentication_required':'approval_required');
+  expect(documentLoads).toBe(loads+(kind==='account'?1:0));
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+  expect(await composerText(await activeComposer(page))).toBe('');
+ }
+},15_000);
 test.skipIf(!native)("pairing, messages, and new chats clear pre-existing drafts before sending",async()=>{
   const requests:ExecuteActionRequest[]=[request,offlineRequest(),{
     ...offlineRequest(),prompt:{kind:"offline_chat",batchId:"draft-test",messages:[{id:"message-one",markdown:"Continue the fixture task"}]},
