@@ -89,6 +89,7 @@ fn contract_request(action_id: &str, idempotency_key: &str) -> ExecuteActionRequ
         },
         expected_url: "https://chatgpt.com/c/contract".into(),
         auto_approve_tool_calls: false,
+        bypass_conversation_cooldown: false,
     }
 }
 
@@ -151,6 +152,7 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
         prompt,
         expected_url: "https://chatgpt.com/c/fixture".into(),
         auto_approve_tool_calls: false,
+        bypass_conversation_cooldown: false,
     };
     let requests = vec![
         base(

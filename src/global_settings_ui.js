@@ -173,6 +173,15 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     workDir:['Project directory Codexify can access.','general'],projectCloneDir:['Where new Git repositories are cloned.','general'],uiWidgets:['Show embedded chat interfaces in tool responses.','general'],port:['HTTP port used by the server.','general'],debug:['Include diagnostic timing information.','advanced'],
     'agentChat.rolloutEnabled':['Keep chronological per-chat progress reports and checkpoint reminders. Independent of turn renewal. Applies immediately.','chats','Progress journal'],
     'agentChat.automation.automaticRetries':['Retry failed browser actions automatically. Turn off to keep manual Retry available without scheduling retries. Applies immediately.','chats','Automatic retries'],
+    'agentChat.automation.retryTimings.actionDelaysSeconds':['Delays between retries when a browser action failed before sending. One delay per retry, in order; stop after the last entry. Use s, m, or h, for example 30s, 1m, 2m. Restart to apply.','chats','Failed send retry delays'],
+    'agentChat.automation.retryTimings.chatgptAccessDelaysSeconds':['Retry delays for sign-in, inaccessible conversations, rate limits, and shared loading cooldowns. One delay per retry, then stop. Use s, m, or h. Restart to apply.','chats','ChatGPT access retry delays'],
+    'agentChat.automation.retryTimings.goalRecoveryDelaysSeconds':['Delays before trying to recover a goal when the agent stays offline after a continuation. One delay per retry, then stop. Use s, m, or h. Restart to apply.','chats','Goal recovery retry delays'],
+    'agentChat.automation.retryTimings.jitterPercent':['Add a random extra wait from 0 to this percentage of each retry delay and approval resume wait. Stable for each attempt; 0 disables jitter. Restart to apply.','chats','Retry jitter (%)'],
+    'agentChat.automation.retryTimings.approvalResumeGraceSeconds':['Wait for agent activity after accepting a tool or file approval before considering another continuation. Seconds, plus retry jitter. Restart to apply.','chats','Wait after accepting approval (seconds)'],
+    'agentChat.automation.retryTimings.conversationLoadIntervalSeconds':['Minimum time between conversation loads or reloads across the shared browser. Reusing the open conversation needs no load. Seconds. Restart to apply.','chats','Conversation loading interval (seconds)'],
+    'agentChat.automation.retryTimings.conversationUnavailableCooldownSeconds':['Shared delay between conversation loads while a conversation is inaccessible. The normal loading interval also applies. Seconds. Restart to apply.','chats','Conversation error cooldown (seconds)'],
+    'agentChat.automation.retryTimings.rateLimitCooldownSeconds':['Shared cooldown after an HTTP 429 without Retry-After. A server-provided Retry-After and the normal loading interval still apply. Seconds. Restart to apply.','chats','Rate limit fallback cooldown (seconds)'],
+
     'agentChat.turnRenewal.enabled':['Ask for a final handoff at the model limit, then continue automatically after the report finishes. Applies immediately.','chats','Turn renewal'],
     'agentChat.turnRenewal.limits':['Renew only checked model and effort pairs, measured from the last accepted ChatGPT send using the actual model. Unchecked and unlisted selections are left alone. Limits stay editable while off. Applies immediately.','chats','Turn limits by model'],
     'agentChat.enabled':['Enable conversations and agent messaging.','chats'], 'agentChat.rolloutReminderInterval':['Agent work tool calls between progress checkpoint reminders. UI polling and idle wait loops do not count. Applies immediately.','chats','Progress report interval'], 'agentChat.defaultMessageMode':['Default composer action. Cmd+Enter on Mac or Ctrl+Enter on Windows/Linux uses the other mode for one message.','chats','Default message mode'], 'agentChat.port':['Port for the owner chat interface.','chats'], 'agentChat.maxWaitMs':['Maximum duration of a chat_await or turn_completed call, in milliseconds.','chats'],
@@ -280,6 +289,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     if(group==='notifications')section=path.includes('.events.')?'Events':'Delivery';
     if(group==='browser')section='Browser companion';
     if(path.startsWith('agentChat.turnRenewal'))section='Turn renewal';
+    if(path.startsWith('agentChat.automation.retryTimings')||path==='agentChat.automation.automaticRetries')section='Automatic retries';
     if(path==='agentChat.rolloutEnabled'||path==='agentChat.rolloutReminderInterval')section='Progress journal';
     if(group==='connections')section=['apiKey','conversationAuthToken','allowedHosts'].includes(root)?'Authentication & access':'Integrations';
     return {path,sample,category:group,section,name:meta?.[2]||label(key),help:meta?.[0]||'',secret:/(?:token|key|password|secret)/i.test(key)&&(sample==null||typeof sample!=='object')};
@@ -293,9 +303,11 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
       else fields.push(describe(path,sample));
     }
   }
+  const retrySchedule=path=>path.startsWith('agentChat.automation.retryTimings.')&&path.endsWith('DelaysSeconds');
+  const formatRetryDelays=values=>values.map(seconds=>seconds%3600===0?`${seconds/3600}h`:seconds%60===0?`${seconds/60}m`:`${seconds}s`).join(', ');
   function defaultText(path) {
     const value=storedAt(snapshot.defaults,path),label=snapshot.defaultLabels?.[path];
-    const text=label??(enums[path]?.find(([choice])=>choice===value)?.[1]
+    const text=retrySchedule(path)?formatRetryDelays(value):label??(enums[path]?.find(([choice])=>choice===value)?.[1]
       ??(typeof value==='boolean'?(annotationHintOverrides.has(path)?String(value):(value?'On':'Off')):value==null?'None':typeof value==='object'?JSON.stringify(value):String(value)));
     return label==='Required'?label:`${text} (default)`;
   }
@@ -344,6 +356,19 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
         button.addEventListener('click',()=>{for(const row of checks){row.limit.enabled=checked;row.enabled.checked=checked;row.line.dataset.enabled=String(checked);}queue(path,structuredClone(limits),control);});tools.append(button);
       }
       const reset=document.createElement('button');reset.type='button';reset.textContent='Use defaults';reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});tools.append(reset);controls.append(tools,control);
+    } else if(retrySchedule(path)) {
+      control=document.createElement('input');control.type='text';control.className='setting-input';control.value=value==null?'':formatRetryDelays(value);control.placeholder=defaultText(path);control.id=`setting-${path.replaceAll('.','-')}`;control.setAttribute('aria-label',path);caption.htmlFor=control.id;
+      if(invalidText.has(path))control.value=invalidText.get(path);
+      control.addEventListener('input',()=>{
+        const fail=()=>{delete dirty[path];invalidText.set(path,control.value);invalidFields.set(path,`${name}: enter 1 to 32 delays, separated by commas, each between 1s and 24h (for example 30s, 1m, 2m).`);control.setAttribute('aria-invalid','true');message(invalidFields.get(path),true);};
+        if(!control.value.trim()){queue(path,RESET,control);return;}
+        const entries=control.value.split(',');
+        if(entries.length>32){fail();return;}
+        const delays=[];
+        for(const entry of entries){const match=entry.trim().match(/^(\d+)\s*([smh]?)$/i);if(!match){fail();return;}const seconds=Number(match[1])*({s:1,m:60,h:3600}[match[2].toLowerCase()||'s']);if(!Number.isSafeInteger(seconds)||seconds<1||seconds>86400){fail();return;}delays.push(seconds);}
+        queue(path,delays,control);
+      });
+      const reset=document.createElement('button');reset.type='button';reset.className='setting-reset';reset.textContent='Use default';reset.setAttribute('aria-label',`Use default for ${name}`);reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});controls.append(control,reset);
     } else if(typeof sample==='boolean') {
       control=document.createElement('div');control.className='setting-boolean';control.setAttribute('role','group');control.setAttribute('aria-label',path);
       const hintOverride=annotationHintOverrides.has(path);
@@ -364,10 +389,11 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
         control=document.createElement('textarea');control.hidden=true;control.value=value==null?'':JSON.stringify(value,null,2);control.placeholder=value==null?defaultText(path):'';read=()=>control.value.trim()?JSON.parse(control.value):RESET;
         edit.addEventListener('click',()=>{control.hidden=!control.hidden;tools.hidden=control.hidden;edit.setAttribute('aria-expanded',String(!control.hidden));edit.firstChild.textContent=control.hidden?'Edit configuration ':'Hide editor ';if(!control.hidden)control.focus();});
         const tools=document.createElement('div');tools.className='setting-editor-tools';tools.hidden=true;const format=document.createElement('button');format.type='button';format.textContent='Format JSON';format.addEventListener('click',()=>{try{control.value=JSON.stringify(JSON.parse(control.value),null,2);control.dispatchEvent(new Event('input'));}catch{control.dispatchEvent(new Event('input'));}});tools.append(format,document.createTextNode('JSON · validated before saving'));controls.append(control,tools);
-      }else{control=document.createElement('input');control.type=typeof sample==='number'||path.endsWith('port')?'number':field.secret?'password':'text';control.value=value??'';control.placeholder=value==null?defaultText(path):'';if(control.type==='password')control.autocomplete='new-password';read=()=>control.value.trim()===''?RESET:control.type==='number'?Number(control.value):control.value;}
+      }else{control=document.createElement('input');control.type=typeof sample==='number'||path.endsWith('port')?'number':field.secret?'password':'text';control.value=value??'';control.placeholder=value==null?defaultText(path):'';if(path.startsWith('agentChat.automation.retryTimings.')){control.min=path.endsWith('jitterPercent')?'0':'1';control.max=path.endsWith('jitterPercent')?'100':'86400';control.step='1';}if(control.type==='password')control.autocomplete='new-password';read=()=>control.value.trim()===''?RESET:control.type==='number'?Number(control.value):control.value;}
+      if(path.startsWith('agentChat.automation.retryTimings.'))read=()=>{if(!control.value.trim())return RESET;const number=Number(control.value);if(!Number.isInteger(number)||number<Number(control.min)||number>Number(control.max))throw new Error(`${name} must be a whole number between ${control.min} and ${control.max}.`);return number;};
       if(invalidText.has(path))control.value=invalidText.get(path);
       control.dataset.default=String(value==null);control.className='setting-input';control.id=`setting-${path.replaceAll('.','-')}`;control.setAttribute('aria-label',path);caption.htmlFor=control.id;
-      control.addEventListener(control.tagName==='SELECT'?'change':'input',()=>{try{queue(path,read(),control);}catch{delete dirty[path];invalidText.set(path,control.value);invalidFields.set(path,`${name} must be valid JSON.`);control.setAttribute('aria-invalid','true');message(invalidFields.get(path),true);}});
+      control.addEventListener(control.tagName==='SELECT'?'change':'input',()=>{try{queue(path,read(),control);}catch(error){delete dirty[path];invalidText.set(path,control.value);invalidFields.set(path,path.startsWith('agentChat.automation.retryTimings.')?error.message:`${name} must be valid JSON.`);control.setAttribute('aria-invalid','true');message(invalidFields.get(path),true);}});
       if(!structured)controls.append(control);
       if(stringList||structured){const reset=document.createElement('button');reset.type='button';reset.className='setting-reset';reset.textContent='Use default';reset.setAttribute('aria-label',`Use default for ${name}`);reset.addEventListener('click',()=>{queue(path,RESET,control);renderForm();});controls.append(reset);}
     }

@@ -2380,7 +2380,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
 
     #[test]
     fn model_catalog_cache_is_account_and_protocol_scoped_across_local_updates() {

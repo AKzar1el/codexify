@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+    "test-build-v1+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -865,6 +865,7 @@ fn action_request() -> ExecuteActionRequest {
         prompt: ActionPrompt::OfflineGoal { goal_revision: 3 },
         expected_url: "https://chatgpt.com/c/example".into(),
         auto_approve_tool_calls: false,
+        bypass_conversation_cooldown: false,
     }
 }
 

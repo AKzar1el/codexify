@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -3245,6 +3245,7 @@ async fn real_executor_defers_only_an_unowned_busy_pairing_window_to_companion_v
                 model: None,
                 effort: None,
                 auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
                 prompt: if pairing {
                     ActionPrompt::PairVerify {
                         reference: "A".repeat(43),
@@ -3359,6 +3360,7 @@ async fn real_executor_delegates_authentication_recovery_but_rejects_known_accou
                 prompt: ActionPrompt::OfflineGoal { goal_revision: 1 },
                 expected_url: "https://chatgpt.com/c/example".into(),
                 auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
             },
         };
         let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3494,6 +3496,7 @@ async fn real_executor_marks_an_unreconciled_execute_receipt_as_ambiguous() {
             },
             expected_url: "https://chatgpt.com/c/ambiguous-execute".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3613,6 +3616,7 @@ async fn successful_execute_receipt_stays_ambiguous_when_status_returns_not_foun
             },
             expected_url: "https://chatgpt.com/c/ambiguous-not-found".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3743,6 +3747,7 @@ async fn terminal_receipt_without_send_proof(
             },
             expected_url: "https://chatgpt.com/c/idle-without-send".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3893,6 +3898,7 @@ async fn accepted_execute_with_unreconciled_event_stream_is_ambiguous() {
             },
             expected_url: "https://chatgpt.com/c/unreconciled-stream".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -4088,6 +4094,7 @@ async fn real_pair_executor_records_the_candidate_before_the_async_send_receipt(
             },
             expected_url: expected_url.into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events, mut events_rx) = mpsc::unbounded_channel();
@@ -4260,6 +4267,7 @@ async fn real_executor_skips_catalog_refresh_and_reconnects_a_dropped_stream() {
             },
             expected_url: "https://chatgpt.com/c/stream-reconnect".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -4438,6 +4446,7 @@ async fn real_executor_replays_retained_prefix_from_an_idempotent_generating_rec
             },
             expected_url: "https://chatgpt.com/c/generating-replay".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -4592,6 +4601,7 @@ async fn real_executor_reconnects_retained_events_from_an_idempotent_terminal_re
             },
             expected_url: "https://chatgpt.com/c/terminal-replay".into(),
             auto_approve_tool_calls: false,
+            bypass_conversation_cooldown: false,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -5451,6 +5461,7 @@ async fn real_executor_accepts_chat_id_aliases_but_rejects_different_conversatio
                     prompt: prompt.clone(),
                     expected_url: expected.into(),
                     auto_approve_tool_calls: false,
+                    bypass_conversation_cooldown: false,
                 },
             };
             let (events, _) = mpsc::unbounded_channel();
@@ -8758,17 +8769,27 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
             }
             return Ok(snapshot_for(execution));
         }
-        if self.failure == "authentication_preflight" {
+        let rate_limited = self.failure.starts_with("rate_limit");
+        if matches!(
+            self.failure,
+            "authentication_preflight" | "rate_limit_preflight"
+        ) {
             return Err(AutomationExecutionError {
                 message: "Authentication unavailable before browser execution".into(),
                 send_accepted: false,
-                failure_status: Some(AutomationActionStatus::AuthenticationRequired),
+                failure_status: Some(if rate_limited {
+                    AutomationActionStatus::RateLimited
+                } else {
+                    AutomationActionStatus::AuthenticationRequired
+                }),
             });
         }
         let mut snapshot = snapshot_for(execution);
         let editor_failure = self.failure.starts_with("editor");
         let access_failure = self.failure.starts_with("conversation") || editor_failure;
-        snapshot.state = if access_failure {
+        snapshot.state = if rate_limited {
+            CompanionActionState::RateLimited
+        } else if access_failure {
             CompanionActionState::Failed
         } else {
             CompanionActionState::AuthenticationRequired
@@ -8776,7 +8797,9 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
         snapshot.send_accepted = self.failure == "editor_accepted";
         snapshot.last_event_sequence = 0;
         snapshot.attention = Some(codexify::agent_automation::CompanionAttention {
-            code: if editor_failure {
+            code: if rate_limited {
+                "rate_limited"
+            } else if editor_failure {
                 "editor_unavailable"
             } else if access_failure {
                 "conversation_unavailable"
@@ -8785,7 +8808,9 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
             }
             .into(),
             message: Some(
-                if editor_failure {
+                if rate_limited {
+                    "ChatGPT conversation loading is cooling down. Another conversation can load in 70s"
+                } else if editor_failure {
                     "ChatGPT did not accept the message in its editor; nothing was sent"
                 } else if access_failure {
                     "ChatGPT conversation temporarily not accessible"
@@ -8795,21 +8820,30 @@ impl AutomationExecutor for AuthenticationRetryExecutor {
                 .into(),
             ),
         });
-        if matches!(self.failure, "conversation_stream" | "editor_stream") {
+        if matches!(
+            self.failure,
+            "conversation_stream" | "editor_stream" | "rate_limit_stream"
+        ) {
             events
                 .send(CompanionEvent {
                     sequence: 1,
                     action_id: snapshot.action_id.clone(),
                     at_ms: 1,
-                    kind: CompanionEventKind::Failed {
-                        code: snapshot.attention.as_ref().unwrap().code.clone(),
-                        message: snapshot
-                            .attention
-                            .as_ref()
-                            .unwrap()
-                            .message
-                            .clone()
-                            .unwrap(),
+                    kind: if rate_limited {
+                        CompanionEventKind::RateLimited {
+                            message: snapshot.attention.as_ref().unwrap().message.clone(),
+                        }
+                    } else {
+                        CompanionEventKind::Failed {
+                            code: snapshot.attention.as_ref().unwrap().code.clone(),
+                            message: snapshot
+                                .attention
+                                .as_ref()
+                                .unwrap()
+                                .message
+                                .clone()
+                                .unwrap(),
+                        }
                     },
                 })
                 .unwrap();
@@ -8829,6 +8863,9 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
             "conversation_stream",
             "editor_snapshot",
             "editor_stream",
+            "rate_limit_preflight",
+            "rate_limit_snapshot",
+            "rate_limit_stream",
         ] {
             let f = fixture().await;
             if mode != "chat" {
@@ -8873,7 +8910,9 @@ async fn chatgpt_access_retries_persist_across_restart_stop_after_six_and_reset_
                 let failed = f.store.load(&f.task).unwrap();
                 assert_eq!(
                     failed.action.status,
-                    if failure.starts_with("conversation") || failure.starts_with("editor") {
+                    if failure.starts_with("rate_limit") {
+                        AutomationActionStatus::RateLimited
+                    } else if failure.starts_with("conversation") || failure.starts_with("editor") {
                         AutomationActionStatus::ConversationUnavailable
                     } else {
                         AutomationActionStatus::AuthenticationRequired
@@ -9439,4 +9478,178 @@ async fn approval_found_on_open_resumes_existing_turn_and_waits_across_restart_f
         assert_eq!(restarted.queued_count().await, 0);
         assert_eq!(executor.visits.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn configured_retry_timings_drive_dispatch_and_exhaustion_across_restart() {
+    for mode in ["send", "access", "goal"] {
+        let mut f = fixture().await;
+        let timings = &mut f.config.markdown_chat.automation.retry_timings;
+        timings.action_delays_seconds = vec![7, 13];
+        timings.chatgpt_access_delays_seconds = vec![7, 13];
+        timings.goal_recovery_delays_seconds = vec![7, 13];
+        timings.jitter_percent = 0;
+        let executor: Arc<dyn AutomationExecutor> = match mode {
+            "send" => Arc::new(PreSendFailureExecutor::default()),
+            "access" => Arc::new(AuthenticationRetryExecutor {
+                calls: AtomicUsize::new(0),
+                recovered: AtomicBool::new(false),
+                failure: "rate_limit_preflight",
+            }),
+            _ => {
+                let goal = f
+                    .store
+                    .set_goal(&f.task, "Continue after custom recovery delay", 100)
+                    .unwrap();
+                f.store.run_goal(&f.task, goal.revision, 101).unwrap();
+                f.executor.events.lock().unwrap().extend([
+                    CompanionEventKind::SendAccepted,
+                    CompanionEventKind::GenerationComplete {
+                        final_markdown: None,
+                        canonical_url: Some("https://chatgpt.com/c/example".into()),
+                    },
+                ]);
+                f.executor.clone()
+            }
+        };
+        f.chat.record_agent_call(1_000).await.unwrap();
+        if mode != "goal" {
+            f.chat
+                .append_user(
+                    "custom-policy-message".into(),
+                    "Retry on the configured schedule".into(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut now = 1_000 + AUTOMATION_OFFLINE_AFTER_MS;
+        for attempt in 0..=2 {
+            let store = Arc::new(AgentAutomationStore::for_config(&f.config).unwrap());
+            let supervisor = AgentAutomationSupervisor::new(
+                f.config.markdown_chat.automation.clone(),
+                executor.clone(),
+            );
+            supervisor
+                .register_task(AutomationTaskHandle::new(
+                    f.task.clone(),
+                    0,
+                    store.clone(),
+                    f.chat.clone(),
+                ))
+                .await
+                .unwrap();
+            if attempt > 0 {
+                supervisor.scan_once(now - 1).await.unwrap();
+                assert_eq!(supervisor.queued_count().await, 0, "{mode}");
+            }
+            supervisor.scan_once(now).await.unwrap();
+            assert_eq!(
+                supervisor.queued_count().await,
+                1,
+                "{mode}, attempt {attempt}"
+            );
+            let _ = supervisor.run_next(now + 1).await;
+            let failed = store.load(&f.task).unwrap();
+            assert_eq!(failed.automatic_retry_limit(), 2, "{mode}");
+            assert_eq!(failed.automatic_retry_attempts(), attempt, "{mode}");
+            if let Some(seconds) = [7, 13].get(attempt as usize) {
+                let deadline = failed.automatic_retry_at_ms().expect(mode);
+                assert_eq!(
+                    deadline,
+                    failed
+                        .action
+                        .updated_at_ms
+                        .unwrap()
+                        .max(failed.goal_wake.last_nudged_at_ms.unwrap_or(0))
+                        + seconds * 1000,
+                    "{mode}"
+                );
+                now = deadline;
+            } else {
+                assert_eq!(failed.automatic_retry_at_ms(), None, "{mode}");
+                supervisor.scan_once(now + 100_000).await.unwrap();
+                assert_eq!(supervisor.queued_count().await, 0, "{mode}");
+            }
+        }
+    }
+}
+
+struct CooldownRetryExecutor {
+    requests: Mutex<Vec<codexify::agent_automation::ExecuteActionRequest>>,
+}
+
+#[async_trait]
+impl AutomationExecutor for CooldownRetryExecutor {
+    async fn execute(
+        &self,
+        execution: AutomationExecution,
+        _events: mpsc::UnboundedSender<CompanionEvent>,
+        _cancellation: CancellationToken,
+    ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        self.requests.lock().unwrap().push(execution.request);
+        Err(AutomationExecutionError {
+            message:
+                "ChatGPT conversation loading is cooling down. Another conversation can load in 70s"
+                    .into(),
+            send_accepted: false,
+            failure_status: Some(AutomationActionStatus::RateLimited),
+        })
+    }
+}
+
+#[tokio::test]
+async fn manual_retry_bypasses_only_its_attempt_and_preserves_automatic_cooldowns() {
+    let f = fixture().await;
+    let executor = Arc::new(CooldownRetryExecutor {
+        requests: Mutex::new(Vec::new()),
+    });
+    let supervisor =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    supervisor
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    f.chat.record_agent_call(1000).await.unwrap();
+    f.chat
+        .append_user(
+            "cooldown-retry".into(),
+            "Keep this message until Send is accepted".into(),
+        )
+        .await
+        .unwrap();
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    supervisor.scan_once(now).await.unwrap();
+    let _ = supervisor.run_next(now + 1).await;
+    assert!(!executor.requests.lock().unwrap()[0].bypass_conversation_cooldown);
+    let failed = f.store.load(&f.task).unwrap();
+    assert!(failed.automatic_retry_at_ms().unwrap() > now + 2);
+    let retried = supervisor
+        .retry_failed_action(&f.task, failed.action.id.as_deref().unwrap(), now + 2)
+        .await
+        .unwrap();
+    assert!(retried.bypass_conversation_cooldown);
+    let _ = supervisor.run_next(now + 3).await;
+    assert!(executor.requests.lock().unwrap()[1].bypass_conversation_cooldown);
+    let failed = f.store.load(&f.task).unwrap();
+    assert!(!failed.action.bypass_conversation_cooldown);
+    let deadline = failed.automatic_retry_at_ms().unwrap();
+    supervisor.scan_once(deadline).await.unwrap();
+    let _ = supervisor.run_next(deadline + 1).await;
+    assert!(!executor.requests.lock().unwrap()[2].bypass_conversation_cooldown);
+    let failed = f.store.load(&f.task).unwrap();
+    f.chat.record_agent_call(deadline + 2).await.unwrap();
+    let unqueued = supervisor
+        .retry_failed_action(&f.task, failed.action.id.as_deref().unwrap(), deadline + 3)
+        .await
+        .unwrap();
+    assert!(
+        !unqueued.bypass_conversation_cooldown,
+        "an online chat must not keep a bypass for a later automatic action"
+    );
+    assert_eq!(supervisor.queued_count().await, 0);
 }

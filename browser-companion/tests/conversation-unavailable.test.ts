@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { throwIfSessionAttention } from "../src/browser-session";
 import { ChatGptBrowserDriver, type SingleBrowserSurface } from "../src/chatgpt-driver";
 import { privateChromeExecutable } from "../src/chrome-executable";
 import { protocolBuild, type ActionPrompt, type ExecuteActionRequest } from "../src/protocol";
+import {navigatePage} from "../src/navigation";
 
 const native = process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME === "1";
 const build = protocolBuild("conversation-error-test");
@@ -54,6 +55,12 @@ function inlineErrorPage(title:string,retry:string):string {
     </div></div></div>`;
 }
 
+function identifiedInlineErrorPage(title:string,retry:string):string {
+  return `<main data-app-shell-main-surface="browser"><div data-app-shell-focus-area="main">${inlineErrorPage(title,retry)
+    .replace('data-chatgpt-conversation-selection-target="true"','data-chatgpt-conversation-selection-target="6ad55395-b6ac-83eb-8d39-691e7e1f855f"')
+    .replace('<button type="button">','<button type="button" disabled>')}</div></main>`;
+}
+
 const healthyPage = '<form data-chatgpt-composer><div id="prompt-textarea" contenteditable="true" style="min-height:24px"></div></form>';
 let context: BrowserContext;
 let page: Page;
@@ -86,10 +93,16 @@ beforeAll(async () => {
     }
   });
 }, 30_000);
-afterAll(async () => { await context?.close(); if (profile) await rm(profile, {recursive:true, force:true}); });
+beforeEach(async()=>{
+  if(!native)return;
+  currentHtml=healthyPage;
+  await surface.navigate(url);
+  await new ChatGptBrowserDriver(surface,build).health();
+});
+afterAll(async () => { await context?.close(); if (profile) await rm(profile, {recursive:true, force:true});setSystemTime(); });
 
 test.skipIf(!native)("conversation load failures are recognized in English, Greek and Italian on both chat URL forms", async () => {
-  for (const render of [errorPage,inlineErrorPage]) for (const [title, retry] of labels) {
+  for (const render of [errorPage,inlineErrorPage,identifiedInlineErrorPage]) for (const [title, retry] of labels) {
     currentHtml = render(title, retry);
     for (const destination of [url, projectUrl]) {
       await surface.navigate(destination);
@@ -100,8 +113,8 @@ test.skipIf(!native)("conversation load failures are recognized in English, Gree
   expect(clicks).toBe(0);
 });
 
-test.skipIf(!native)("a failed conversation does not falsely sign out a verified account or block navigation to another chat", async () => {
-  for (const render of [errorPage,inlineErrorPage]) {
+test.skipIf(!native)("a failed conversation keeps its verified account signed in and a healthy conversation clears the cooldown", async () => {
+  for (const render of [errorPage,inlineErrorPage,identifiedInlineErrorPage]) {
   currentHtml = render("Unavailable", "Another language");
   await surface.navigate(url);
   const driver = new ChatGptBrowserDriver(surface, build);
@@ -120,7 +133,7 @@ test.skipIf(!native)("ordinary sends and goal retries retain the specific conver
     {kind:"offline_chat", batchId:"batch", messages:[{id:"message", markdown:"Continue"}]},
     {kind:"offline_goal", goalRevision:1},
   ];
-  for (const render of [errorPage,inlineErrorPage]) for (const [index, prompt] of prompts.entries()) {
+  for (const render of [errorPage,inlineErrorPage,identifiedInlineErrorPage]) for (const [index, prompt] of prompts.entries()) {
     const failedUrl = index === 0 ? url : projectUrl;
     currentHtml = render("Unavailable", "Riprova");
     await surface.navigate(failedUrl);
@@ -133,37 +146,11 @@ test.skipIf(!native)("ordinary sends and goal retries retain the specific conver
     await coordinator.execute(request);
     const events = [];
     for await (const event of coordinator.events(request.actionId, 0)) events.push(event);
-    expect(events.at(-1)).toMatchObject({type:"failed", code:"conversation_unavailable", message});
+    expect(events.at(-1)).toMatchObject({type:"failed", code:"conversation_unavailable", message:expect.stringContaining(message)});
     expect(events.some(event => event.type === "authentication_required" || event.type === "send_accepted")).toBeFalse();
-    expect(await coordinator.action(request.actionId)).toMatchObject({state:"failed", sendAccepted:false, attention:{code:"conversation_unavailable", message}});
+    expect(await coordinator.action(request.actionId)).toMatchObject({state:"failed", sendAccepted:false, attention:{code:"conversation_unavailable", message:expect.stringContaining(message)}});
     expect((await coordinator.health()).activeActionId).toBeNull();
   }
-  expect(clicks).toBe(0);
-},20_000);
-
-test.skipIf(!native)("retry reloads the failed conversation and navigates back to it from another failed chat", async () => {
-  currentHtml = errorPage("Unavailable", "Riprova");
-  await surface.navigate(projectUrl);
-  const coordinator = new SingleWindowCoordinator(new ChatGptBrowserDriver(surface, build), build);
-  const base: ExecuteActionRequest = {
-    actionId:"initial-failed-goal", idempotencyKey:"initial-failed-goal", url:projectUrl, expectedUrl:projectUrl,
-    pairingGeneration:1, connectorName:"Fixture connector", expectedAccountFingerprint:account,
-    model:"gpt-6-sol", effort:"high", prompt:{kind:"offline_goal", goalRevision:1}, autoApproveToolCalls:false,
-  };
-  const run = async (request: ExecuteActionRequest) => {
-    const loadsBefore = documentLoads.length;
-    await coordinator.execute(request);
-    for await (const _event of coordinator.events(request.actionId, 0)) { /* Wait for the terminal receipt. */ }
-    // A fresh document request proves an actual reload even at the same URL.
-    expect(documentLoads.slice(loadsBefore)).toEqual([projectUrl]);
-    expect(page.url()).toBe(projectUrl);
-    expect(await coordinator.action(request.actionId)).toMatchObject({state:"failed", sendAccepted:false, attention:{code:"conversation_unavailable", message}});
-    expect((await coordinator.health()).activeActionId).toBeNull();
-  };
-  await run(base);
-  await run({...base, actionId:"retry-same-conversation", idempotencyKey:"retry-same-conversation"});
-  await surface.navigate(url);
-  await run({...base, actionId:"retry-from-another-conversation", idempotencyKey:"retry-from-another-conversation"});
   expect(clicks).toBe(0);
 },20_000);
 
@@ -210,6 +197,7 @@ test.skipIf(!native)('repeated signed-out retries each reload the open conversat
   currentHtml='<a href="/auth/login">Sign in</a>';await surface.navigate(projectUrl);
   const coordinator=new SingleWindowCoordinator(new ChatGptBrowserDriver(surface,build),build);
   for(const attempt of [1,2]){
+   if(attempt===2)setSystemTime(Date.now()+180_001);
    const request:ExecuteActionRequest={actionId:`signed-out-${attempt}`,idempotencyKey:`signed-out-${attempt}`,url:projectUrl,expectedUrl:projectUrl,pairingGeneration:1,connectorName:'Fixture connector',expectedAccountFingerprint:account,model:'gpt-6-sol',effort:'high',prompt:{kind:'offline_goal',goalRevision:1},autoApproveToolCalls:false};
    const before=documentLoads.length;await coordinator.execute(request);
    const events=[];for await(const event of coordinator.events(request.actionId,0))events.push(event);
@@ -221,3 +209,39 @@ test.skipIf(!native)('repeated signed-out retries each reload the open conversat
   expect(clicks).toBe(0);
  }finally{signedOut=false;}
 },15_000);
+
+test.skipIf(!native)("all chats share five-minute access recovery slots and a healthy load restores normal navigation",async()=>{
+  currentHtml=identifiedInlineErrorPage(...labels[0]);await surface.navigate(projectUrl);
+  const controlled:SingleBrowserSurface={...surface,navigate:async(destination,signal)=>{await navigatePage(page,destination,{signal});return page;}};
+  const driver=new ChatGptBrowserDriver(controlled,build),coordinator=new SingleWindowCoordinator(driver,build);
+  const failedAt=Date.now();
+  expect(await driver.health()).toMatchObject({authenticated:true,detail:message});
+  const base:ExecuteActionRequest={actionId:'cooldown-initial',idempotencyKey:'cooldown-initial',url:projectUrl,expectedUrl:projectUrl,pairingGeneration:1,connectorName:'Fixture connector',expectedAccountFingerprint:account,model:'gpt-6-sol',effort:'high',prompt:{kind:'offline_goal',goalRevision:1},autoApproveToolCalls:false};
+  const run=async(id:string,destination:string,loads:string[])=>{
+    const request={...base,actionId:id,idempotencyKey:id,url:destination,expectedUrl:destination};
+    const before=documentLoads.length;await coordinator.execute(request);
+    const events=[];for await(const event of coordinator.events(id,0))events.push(event);
+    expect(documentLoads.slice(before)).toEqual(loads);
+    expect(events.at(-1)).toMatchObject({type:'failed',code:'conversation_unavailable',message:expect.stringContaining(message)});
+    expect(events.some(event=>event.type==='authentication_required'||event.type==='send_accepted')).toBeFalse();
+    expect((await coordinator.action(id))?.sendAccepted).toBeFalse();
+    expect((await coordinator.health()).activeActionId).toBeNull();
+  };
+  await run('cooldown-initial',projectUrl,[]);
+  setSystemTime(failedAt+299_000);await driver.health();
+  await run('cooldown-another-too-soon',url,[]);
+  setSystemTime(failedAt+301_000);
+  await run('cooldown-reload-slot',projectUrl,[projectUrl]);
+  await run('cooldown-another-blocked',url,[]);
+  setSystemTime(Date.now()+300_000);
+  await run('cooldown-another-slot',url,[url]);
+  setSystemTime(Date.now()+300_000);currentHtml=healthyPage;
+  await navigatePage(page,projectUrl);
+  expect(await driver.health()).toMatchObject({authenticated:true,status:'idle',detail:null});
+  const recoveredAt=Date.now();setSystemTime(recoveredAt+179_000);
+  await expect(navigatePage(page,url)).rejects.toMatchObject({code:'rate_limited'});
+  setSystemTime(recoveredAt+180_001);
+  const before=documentLoads.length;await navigatePage(page,url);
+  expect(documentLoads.slice(before)).toEqual([url]);
+  expect(context.pages()).toEqual([page]);expect(clicks).toBe(0);
+},20_000);

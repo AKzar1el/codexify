@@ -41,6 +41,94 @@ pub const DEFAULT_AUTOMATION_DESCRIPTOR_PATH: &str = "~/.codexify/browser/descri
 pub const DEFAULT_AUTOMATION_CONNECTOR_NAME: &str = "";
 pub const DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS: usize = 64;
 
+pub(crate) const MAX_AUTOMATIC_RETRY_ATTEMPTS: usize = 32;
+pub(crate) const MAX_RETRY_DELAY_SECONDS: u64 = 86_400;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct RetryTimings {
+    pub action_delays_seconds: Vec<u64>,
+    pub chatgpt_access_delays_seconds: Vec<u64>,
+    pub goal_recovery_delays_seconds: Vec<u64>,
+    pub jitter_percent: u64,
+    pub approval_resume_grace_seconds: u64,
+    pub conversation_load_interval_seconds: u64,
+    pub conversation_unavailable_cooldown_seconds: u64,
+    pub rate_limit_cooldown_seconds: u64,
+}
+
+impl Default for RetryTimings {
+    fn default() -> Self {
+        Self {
+            action_delays_seconds: vec![30, 60, 120, 240, 480],
+            chatgpt_access_delays_seconds: vec![180, 300, 600, 1200, 1800, 3600],
+            goal_recovery_delays_seconds: vec![60, 120, 240],
+            jitter_percent: 10,
+            approval_resume_grace_seconds: 180,
+            conversation_load_interval_seconds: 180,
+            conversation_unavailable_cooldown_seconds: 300,
+            rate_limit_cooldown_seconds: 180,
+        }
+    }
+}
+
+impl RetryTimings {
+    fn validate(&self) -> Result<(), String> {
+        for (key, delays) in [
+            ("actionDelaysSeconds", &self.action_delays_seconds),
+            (
+                "chatgptAccessDelaysSeconds",
+                &self.chatgpt_access_delays_seconds,
+            ),
+            (
+                "goalRecoveryDelaysSeconds",
+                &self.goal_recovery_delays_seconds,
+            ),
+        ] {
+            if delays.is_empty() || delays.len() > MAX_AUTOMATIC_RETRY_ATTEMPTS {
+                return Err(format!(
+                    "agentChat.automation.retryTimings.{key} must contain 1 to {MAX_AUTOMATIC_RETRY_ATTEMPTS} retry delays"
+                ));
+            }
+            if delays
+                .iter()
+                .any(|delay| !(1..=MAX_RETRY_DELAY_SECONDS).contains(delay))
+            {
+                return Err(format!(
+                    "agentChat.automation.retryTimings.{key} must contain whole seconds between 1 and {MAX_RETRY_DELAY_SECONDS}"
+                ));
+            }
+        }
+        for (key, seconds) in [
+            (
+                "approvalResumeGraceSeconds",
+                self.approval_resume_grace_seconds,
+            ),
+            (
+                "conversationLoadIntervalSeconds",
+                self.conversation_load_interval_seconds,
+            ),
+            (
+                "conversationUnavailableCooldownSeconds",
+                self.conversation_unavailable_cooldown_seconds,
+            ),
+            ("rateLimitCooldownSeconds", self.rate_limit_cooldown_seconds),
+        ] {
+            if !(1..=MAX_RETRY_DELAY_SECONDS).contains(&seconds) {
+                return Err(format!(
+                    "agentChat.automation.retryTimings.{key} must be whole seconds between 1 and {MAX_RETRY_DELAY_SECONDS}"
+                ));
+            }
+        }
+        if self.jitter_percent > 100 {
+            return Err(
+                "agentChat.automation.retryTimings.jitterPercent must be between 0 and 100".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentAutomationConfig {
@@ -50,6 +138,7 @@ pub struct AgentAutomationConfig {
     pub max_queued_actions: usize,
     pub auto_approve_tool_calls: bool,
     pub automatic_retries: bool,
+    pub retry_timings: RetryTimings,
     pub chatgpt_project_url: Option<String>,
     #[serde(deserialize_with = "deserialize_request_block_list")]
     pub request_block_list: Vec<String>,
@@ -65,6 +154,7 @@ impl Default for AgentAutomationConfig {
             max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
             auto_approve_tool_calls: true,
             automatic_retries: true,
+            retry_timings: RetryTimings::default(),
             chatgpt_project_url: None,
             request_block_list: vec![
                 r"^https?://(www\.)?chatgpt\.com/.*/rgstr".into(),
@@ -88,6 +178,7 @@ impl AgentAutomationConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.retry_timings.validate()?;
         if self.request_block_list.len() > 128 {
             return Err(
                 "agentChat.automation.requestBlockList accepts at most 128 patterns".into(),
@@ -542,6 +633,78 @@ pub(crate) async fn history_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_timings_default_and_partial_configuration() {
+        let defaults = AgentAutomationConfig::default();
+        let omitted: AgentAutomationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.retry_timings, defaults.retry_timings);
+        let custom: AgentAutomationConfig = serde_json::from_value(serde_json::json!({
+            "retryTimings": {"chatgptAccessDelaysSeconds":[12, 48], "jitterPercent":0}
+        }))
+        .unwrap();
+        custom.validate().unwrap();
+        assert_eq!(custom.retry_timings.chatgpt_access_delays_seconds, [12, 48]);
+        assert_eq!(custom.retry_timings.jitter_percent, 0);
+        assert_eq!(
+            custom.retry_timings.action_delays_seconds,
+            defaults.retry_timings.action_delays_seconds
+        );
+        assert_eq!(custom.retry_timings.conversation_load_interval_seconds, 180);
+    }
+
+    #[test]
+    fn retry_timings_validate_lists_units_bounds_and_unknown_fields() {
+        for key in [
+            "actionDelaysSeconds",
+            "chatgptAccessDelaysSeconds",
+            "goalRecoveryDelaysSeconds",
+        ] {
+            for invalid in [
+                serde_json::json!([]),
+                serde_json::json!([0]),
+                serde_json::json!([86401]),
+                serde_json::json!(vec![1; 33]),
+            ] {
+                let config: AgentAutomationConfig =
+                    serde_json::from_value(serde_json::json!({"retryTimings":{key:invalid}}))
+                        .unwrap();
+                assert!(config.validate().unwrap_err().contains(key));
+            }
+            for invalid in [
+                serde_json::json!([-1]),
+                serde_json::json!([1.5]),
+                serde_json::json!(["3m"]),
+            ] {
+                assert!(
+                    serde_json::from_value::<AgentAutomationConfig>(
+                        serde_json::json!({"retryTimings":{key:invalid}})
+                    )
+                    .is_err()
+                );
+            }
+        }
+        for key in [
+            "approvalResumeGraceSeconds",
+            "conversationLoadIntervalSeconds",
+            "conversationUnavailableCooldownSeconds",
+            "rateLimitCooldownSeconds",
+            "jitterPercent",
+        ] {
+            for invalid in [if key == "jitterPercent" { 101 } else { 0 }, 86401] {
+                let config: AgentAutomationConfig =
+                    serde_json::from_value(serde_json::json!({"retryTimings":{key:invalid}}))
+                        .unwrap();
+                assert!(config.validate().unwrap_err().contains(key));
+            }
+        }
+        assert!(
+            serde_json::from_value::<AgentAutomationConfig>(
+                serde_json::json!({"retryTimings":{"unknownDelay":42}})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn request_block_list_defaults_and_configuration_bounds() {
         for (value, expected_len) in [

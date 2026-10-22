@@ -3,6 +3,7 @@
 import type { Locator, Page } from "patchright";
 import { BrowserCompanionError } from "./errors";
 import {uiLabelPattern,uiTemplatePattern} from "./ui-localization";
+import {recordConversationUnavailable} from "./navigation";
 
 const rateLimitDialog = (page: Page): Locator => page.locator('[role="dialog"]')
   .filter({ hasText:uiLabelPattern("rateTitle",false) })
@@ -41,7 +42,7 @@ export async function conversationUnavailableVisible(page: Page): Promise<boolea
     const conversationContent = 'form, [role="textbox"], textarea, [contenteditable="true"], article, [data-turn-key], [data-turn-id], [data-message-author-role]';
     // The inline load failure replaces the transcript, with one message and
     // one retry button. Match its app-owned structure, never translated text.
-    for (const target of document.querySelectorAll('[data-chatgpt-conversation-selection-target="true"][data-thread-find-target="conversation"]')) {
+    for (const target of document.querySelectorAll('[data-chatgpt-conversation-selection-target][data-thread-find-target="conversation"]')) {
       if (!target.closest('[data-mcp-app-portal-target="true"][data-thread-user-message-navigation-content="true"]')
         || !target.closest('[data-request-input-activity-root="true"]')
         || target.closest('article, [data-turn-key], [data-turn-id], [data-message-author-role]')
@@ -90,6 +91,7 @@ export async function throwIfSessionAttention(page: Page): Promise<void> {
     throw new BrowserCompanionError("ChatGPT could not load the current subscription.", "failed");
   }
   if (await conversationUnavailableVisible(page)) {
+    recordConversationUnavailable(page);
     throw new BrowserCompanionError("ChatGPT conversation temporarily not accessible", "conversation_unavailable");
   }
   if (await page.getByTestId("regenerate-thread-error-button").last().isVisible().catch(() => false)

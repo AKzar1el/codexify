@@ -2637,6 +2637,7 @@ mod tests {
             &[
                 "autoApproveToolCalls",
                 "automaticRetries",
+                "retryTimings",
                 "connectorName",
                 "descriptorPath",
                 "enabled",
@@ -2644,6 +2645,11 @@ mod tests {
                 "requestBlockList",
                 "requestBlockingEnabled",
             ],
+        );
+        assert_eq!(
+            example["agentChat"]["automation"]["retryTimings"],
+            serde_json::to_value(crate::markdown_chat::RetryTimings::default()).unwrap(),
+            "The settings field schema must include every retry timing and its default"
         );
         assert_keys(
             &example["agentChat"]["notifications"],

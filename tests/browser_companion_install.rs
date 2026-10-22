@@ -605,6 +605,11 @@ import sys
 descriptor = os.environ["CODEXIFY_BROWSER_DESCRIPTOR"]
 build = os.environ["CODEXIFY_BROWSER_BUILD"]
 assert json.loads(os.environ["CODEXIFY_BROWSER_REQUEST_BLOCK_LIST"]) == [r"^https?://example\.invalid/blocked"]
+assert json.loads(os.environ["CODEXIFY_BROWSER_NAVIGATION_TIMINGS"]) == {
+    "conversationLoadIntervalSeconds": 23,
+    "conversationUnavailableCooldownSeconds": 47,
+    "rateLimitCooldownSeconds": 89,
+}
 token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -691,6 +696,13 @@ server.serve_forever()
     let browser_root = root.path().join("browser");
     let mut launch_config = enabled_config(&browser_root.join("descriptor.json"));
     launch_config.request_blocking_enabled = true;
+    launch_config
+        .retry_timings
+        .conversation_load_interval_seconds = 23;
+    launch_config
+        .retry_timings
+        .conversation_unavailable_cooldown_seconds = 47;
+    launch_config.retry_timings.rate_limit_cooldown_seconds = 89;
     launch_config.request_block_list = vec![r"^https?://example\.invalid/blocked".into()];
     let manager = BrowserCompanionManager::for_test(
         browser_root.clone(),

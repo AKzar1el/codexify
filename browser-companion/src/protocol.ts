@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891" as const;
+export const PROTOCOL_SCHEMA_HASH = "b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;
@@ -216,6 +216,7 @@ export const executeActionRequestSchema = z.strictObject({
   prompt: actionPromptSchema,
   expectedUrl: chatGptUrlSchema,
   autoApproveToolCalls: z.boolean(),
+  bypassConversationCooldown: z.boolean().optional(),
 }).superRefine((value, context) => {
   if ((value.model === null) !== (value.effort === null)
     || (value.prompt.kind === "pair_verify" && value.model !== null)) {

@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+    "b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.48f20d764836362d8572fa7dc893a510c433b3c86ad7fcc273cc9a1a126cc891";
+    "+protocol.b6e4832987ab4eaa5252bdedc7948855ac81a844360d5131be38ac46439c7067";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -142,6 +142,8 @@ pub struct ExecuteActionRequest {
     pub prompt: ActionPrompt,
     pub expected_url: String,
     pub auto_approve_tool_calls: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bypass_conversation_cooldown: bool,
 }
 
 #[derive(Clone, Serialize)]

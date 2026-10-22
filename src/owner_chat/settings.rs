@@ -328,8 +328,8 @@ pub(super) async fn save(State(state): State<OwnerState>, Json(body): Json<SaveB
 }
 
 pub(super) async fn restart(State(state): State<OwnerState>) -> ApiResult {
-    // Request rules are launch-time Chrome policy. The existing Restart action
-    // applies changed rules only when no companion UI action is in progress.
+    // Request rules and navigation timings are launch-time browser policy.
+    // Apply them only when no companion UI action is in progress.
     if let Some(path) = state.config.loaded_config_path.clone() {
         let next = tokio::task::spawn_blocking(move || {
             use clap::Parser;
@@ -348,7 +348,13 @@ pub(super) async fn restart(State(state): State<OwnerState>) -> ApiResult {
         let new = &next.markdown_chat.automation;
         if old.enabled
             && (!new.enabled
-                || old.effective_request_block_list() != new.effective_request_block_list())
+                || old.effective_request_block_list() != new.effective_request_block_list()
+                || old.retry_timings.conversation_load_interval_seconds
+                    != new.retry_timings.conversation_load_interval_seconds
+                || old.retry_timings.conversation_unavailable_cooldown_seconds
+                    != new.retry_timings.conversation_unavailable_cooldown_seconds
+                || old.retry_timings.rate_limit_cooldown_seconds
+                    != new.retry_timings.rate_limit_cooldown_seconds)
         {
             let manager = crate::agent_automation::BrowserCompanionManager::from_config(old)
                 .map_err(internal_error)?;

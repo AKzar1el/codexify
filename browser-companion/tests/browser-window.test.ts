@@ -16,6 +16,8 @@ import {
 } from "../src/browser-window";
 import { protocolBuild } from "../src/protocol";
 import { BrowserCompanionError } from "../src/errors";
+import {navigatePage} from "../src/navigation";
+import type {BrowserContext,Page} from "patchright";
 
 const TEST_BUILD = protocolBuild("test-build");
 
@@ -258,6 +260,32 @@ async function collect(coordinator: SingleWindowCoordinator, actionId: string): 
   for await (const event of coordinator.events(actionId, 0)) events.push(event);
   return events;
 }
+
+test("only an explicitly manual action bypasses navigation cooldown and still requires its verified account",async()=>{
+  let current="https://chatgpt.com/";const loads:string[]=[],context={} as BrowserContext;
+  const page={context:()=>context,url:()=>current,goto:async(url:string)=>{current=url;loads.push(url);return {status:()=>200};}} as unknown as Page;
+  await navigatePage(page,"https://chatgpt.com/c/existing");
+  class NavigationDriver extends DeferredDriver {
+    override async execute(execution:DriverExecution):Promise<void>{
+      execution.emit({type:"navigating"});await navigatePage(page,execution.request.url);
+      execution.emit({type:"composer_ready"});execution.emit({type:"model_verified",model:"gpt-6-sol",effort:"high"});
+      execution.emit({type:"connector_verified"});execution.emit({type:"send_accepted"});
+      execution.emit({type:"generation_complete",finalMarkdown:"Done",canonicalUrl:execution.request.url});
+    }
+  }
+  const coordinator=new SingleWindowCoordinator(new NavigationDriver(),TEST_BUILD);
+  const automatic=request("cooldown-automatic");await coordinator.execute(automatic);
+  expect((await collect(coordinator,automatic.actionId)).some(event=>event.type==="rate_limited")).toBe(true);
+  await coordinator.execute({...automatic,bypassConversationCooldown:false});
+  await expect(coordinator.execute({...automatic,bypassConversationCooldown:true})).rejects.toThrow("different request");
+  const manual={...request("cooldown-manual"),bypassConversationCooldown:true};await coordinator.execute(manual);
+  expect((await collect(coordinator,manual.actionId)).some(event=>event.type==="send_accepted")).toBe(true);
+  expect(loads).toEqual(["https://chatgpt.com/c/existing",manual.url]);
+  const after=request("cooldown-after");await coordinator.execute(after);
+  expect((await collect(coordinator,after.actionId)).some(event=>event.type==="rate_limited")).toBe(true);
+  await expect(coordinator.execute({...request("cooldown-wrong-account"),expectedAccountFingerprint:"other",bypassConversationCooldown:true})).rejects.toThrow("account changed");
+  expect(loads).toHaveLength(2);
+});
 
 test("one companion window refuses a second task while its submission operation is unsettled", async () => {
   const driver = new DeferredDriver();

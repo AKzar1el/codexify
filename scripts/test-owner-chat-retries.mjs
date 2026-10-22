@@ -5,6 +5,66 @@ import {createRequire} from 'node:module';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const origin='http://127.0.0.1:43357',META='io.github.devnoname120/codexify/markdown-chat';
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: saved conversation cooldowns count down locally across polls, reopening and expiry`,{timeout:30000},async()=>{
+ const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
+ const id='9'.repeat(64),base=Date.now(),errors=[],writes=[];
+ let serverNow=base,action,hold=false,pending=[],notifyHeld=null;
+ const goal={revision:1,status:'active',markdown:'Keep this goal',turnCount:1};
+ const release=async()=>{const queued=pending;pending=[];await Promise.all(queued.map(resolve=>resolve()));};
+ try{
+  // Browser and server clocks differ by an hour; only elapsed time matters.
+  await page.clock.install({time:base+3600000});page.on('pageerror',error=>errors.push(error.message));
+  await routeOwner(page,origin+'/**',async route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(req.method()!=='GET')writes.push(path);
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.9',settingsAvailable:false}});
+   if(path==='/api/analytics/extras')return route.fulfill({status:503});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[{id,title:'Cooling down',workspace:'test',goal,lastEntryAtMs:base,lastEntryEnd:0,totalToolCalls:0}],serverTimeMs:serverNow}});
+   if(path.endsWith('/automation')){
+    if(hold)await new Promise(resolve=>{pending.push(resolve);notifyHeld?.();notifyHeld=null;});
+    return route.fulfill({json:{enabled:true,goal,action,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'idle'},presence:{},serverTimeMs:serverNow}});
+   }
+   return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:serverNow,messages:[],has_more:false}}}});
+  });
+  const open=()=>page.goto(`${origin}/?chat=${id}#retry-test-token`);
+  const error=page.locator('#chat-host #automation-error');
+  const advance=async ms=>{serverNow+=ms;await page.clock.fastForward(ms);};
+  for(const [status,seconds,prefix]of [
+   ['rate_limited',70,'ChatGPT conversation loading is cooling down. Another conversation can load in '],
+   ['conversation_unavailable',300,'ChatGPT conversation temporarily not accessible. Shared browser cooldown: conversation loading can retry in '],
+   ['rate_limited',3600,'ChatGPT conversation loading is cooling down. Another conversation can load in '],
+  ]){
+   action={id:status,kind:'offline_goal',status,lastError:`${prefix}${seconds}s`,updatedAtMs:serverNow,sendAccepted:false,retryMode:'retry',automaticRetryAtMs:null};
+   await open();await error.getByText(new RegExp(`${seconds}s`)).waitFor();
+   assert.equal(await page.locator('#chat-host #goal-retry').isVisible(),false,'manual Retry stays out of the goal bar');
+   assert.equal(await page.locator('#chat-host #automation-retry-inline').isVisible(),true);
+   assert.doesNotMatch(await error.textContent(),/Wait for ChatGPT's limit to reset/,'local throttling is not a provider rate limit');
+   await advance(1000);await error.getByText(new RegExp(`${seconds-1}s`)).waitFor();
+   await advance(4000);await error.getByText(new RegExp(`${seconds-5}s`)).waitFor();
+   await page.waitForLoadState('networkidle');
+   const heldPoll=new Promise(resolve=>notifyHeld=resolve);
+   hold=true;await advance(3000);await heldPoll;await error.getByText(new RegExp(`${seconds-8}s`)).waitFor();
+   assert(pending.length>0,'a pending poll must not freeze the local countdown');
+   hold=false;await release();await page.reload();await error.getByText(new RegExp(`${seconds-8}s`)).waitFor();
+   await advance(seconds*1000);await error.getByText(/Use Retry to try again/).waitFor();
+   assert.doesNotMatch(await error.textContent(),/cooldown|\bin \d+s/,'expired cooldowns are omitted');
+   assert.doesNotMatch(await error.textContent(),/\b0s\b|\bin -\d+s/,'elapsed cooldowns do not leave a frozen zero or negative timer');
+   assert.match(await error.textContent(),/Use Retry to try again/);
+   await page.reload();await error.getByText(/Use Retry to try again/).waitFor();
+   assert.doesNotMatch(await error.textContent(),/cooldown|\bin \d+s/);
+   action={...action,id:`${status}-long-retry`,updatedAtMs:serverNow,automaticRetryAtMs:serverNow+seconds*1000+3600000};
+   await open();await error.getByText(/Retrying the goal automatically in/).waitFor();
+   assert.doesNotMatch(await error.textContent(),/Another conversation can load in|conversation loading can retry in|has elapsed/,'the shorter cooldown does not compete with the retry countdown');
+   await advance((seconds+1)*1000);await error.getByText(/Retrying the goal automatically in/).waitFor();
+   assert.doesNotMatch(await error.textContent(),/cooling down|Another conversation can load in|conversation loading can retry in|has elapsed/,'expired cooldowns stay omitted while automatic retry remains pending');
+   action={...action,id:`${status}-short-retry`,updatedAtMs:serverNow,automaticRetryAtMs:serverNow+10000};
+   await open();await error.getByText(new RegExp(`${seconds}s`)).waitFor();
+   assert.match(await error.textContent(),/Retrying the goal automatically in 10s/,'a cooldown longer than the automatic retry is still relevant');
+  }
+  assert.deepEqual(writes,[],'a timer reaching zero must not submit or retry anything');assert.deepEqual(errors,[]);
+ }finally{hold=false;await release();await browser.close();}
+});
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: chat switches use cached models and never request browser discovery`,{timeout:30000},async()=>{
  const browser=await engine.launch(),page=await browser.newPage({viewport:{width:1280,height:820}});page.setDefaultTimeout(5000);
  const now=Date.now(),a='d'.repeat(64),b='f'.repeat(64),errors=[],operations=[];
@@ -89,7 +149,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   const host=page.locator('#chat-host'),error=host.locator('#automation-error'),button=host.locator('#automation-retry-inline');
   for(const width of [1280,390]){
    await page.setViewportSize({width,height:844});
-   for(const [failure,mode,accepted]of [['conversation_unavailable','retry',false],['authentication_required','retry',false],['failed','retry',false],['ambiguous','continue_goal',true]]){
+   for(const [failure,mode,accepted]of [['conversation_unavailable','retry',false],['authentication_required','retry',false],['rate_limited','retry',false],['failed','retry',false],['ambiguous','continue_goal',true]]){
     action={id:`${failure}-${width}`,kind:'offline_goal',status:failure,goalRevision:4,lastError:failure==='conversation_unavailable'?'ChatGPT conversation temporarily not accessible':'Browser action needs recovery',sendAccepted:accepted,messagesFenced:accepted,retryMode:mode,automaticRetryAtMs:Date.now()+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
     await page.clock.fastForward(1600);
     const verb=mode==='continue_goal'?'continue':'retry';
@@ -104,6 +164,9 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
     const count=retries.length;await button.click();await button.waitFor({state:'hidden'});
     assert.equal(retries.length,count+1,'one explicit click retries the current action once');
    }
+   action={id:`exhausted-cooldown-${width}`,kind:'offline_goal',status:'rate_limited',lastError:'ChatGPT conversation loading is cooling down. Another conversation can load in 70s',updatedAtMs:Date.now(),sendAccepted:false,retryMode:'retry',automaticRetryAtMs:null,automaticRetryAttempts:6,automaticRetryLimit:6};
+   await page.clock.fastForward(1600);await error.getByText(/All 6 automatic retries failed/).waitFor();
+   assert.equal(await host.locator('#goal-retry').isVisible(),false);assert.equal(await button.isVisible(),true);
    action={id:`cancelled-before-send-${width}`,kind:'offline_goal',status:'cancelled',lastError:'Browser action cancelled before Send',sendAccepted:false,retryMode:'retry',automaticRetryAtMs:null};
    await page.clock.fastForward(1600);await error.getByText(/Browser action cancelled before Send/).waitFor();
    await button.waitFor();await button.click();await button.waitFor({state:'hidden'});
@@ -113,7 +176,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
    assert.doesNotMatch(await error.textContent(),/You can also (continue|retry) now/,'do not advertise a manual action the server has not permitted');
    assert.equal(await button.isVisible(),false);
   }
-  assert.equal(retries.length,10);assert.deepEqual(sends,[],'Continue must use the retry API rather than resend a user message');assert.deepEqual(errors,[]);
+  assert.equal(retries.length,12);assert.deepEqual(sends,[],'Continue must use the retry API rather than resend a user message');assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: sidebar recovery spins red through backoff and execution, then recovers or stops on terminal failure`,{timeout:30000},async()=>{
@@ -179,7 +242,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
  try{
   const id='c'.repeat(64),now=Date.now(),operations=[],errors=[];
   const goal={revision:1,status:'active',markdown:'Keep this goal',turnCount:1};
-  let action={id:'failure',kind:'offline_goal',status:'authentication_required',lastError:'Sign in to ChatGPT',sendAccepted:false,retryMode:'retry',automaticRetriesEnabled:true,canPauseRetries:true,automaticRetryAtMs:now+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
+  let action={id:'failure',kind:'offline_goal',status:'rate_limited',lastError:'ChatGPT conversation loading is cooling down. Another conversation can load in 70s',updatedAtMs:now,sendAccepted:false,retryMode:'retry',automaticRetriesEnabled:true,canPauseRetries:true,automaticRetryAtMs:now+180000,automaticRetryAttempts:0,automaticRetryLimit:6};
   await page.clock.install({time:now});page.on('pageerror',e=>errors.push(e.message));
   await routeOwner(page,origin+'/**',route=>{
    const req=route.request(),path=new URL(req.url()).pathname;
@@ -204,7 +267,8 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
    const box=await button.boundingBox();assert(box.x>=0&&box.x+box.width<=390,'retry controls stay in the mobile viewport');
   }
   await pause.click();await error.getByText(/Automatic retries paused/).waitFor();assert.equal(await pause.isVisible(),false);
-  assert.equal(await host.locator('#goal-retry').isVisible(),true);
+  assert.equal(await host.locator('#goal-retry').isVisible(),false);
+  assert.equal(await host.locator('#automation-retry-inline').isVisible(),true);
   if(process.env.RETRY_BUTTON_SCREENSHOTS){mkdirSync(process.env.RETRY_BUTTON_SCREENSHOTS,{recursive:true});await page.screenshot({path:`${process.env.RETRY_BUTTON_SCREENSHOTS}/${name.toLowerCase()}-paused.png`});}
   await page.reload();host=page.locator('#chat-host');error=host.locator('#automation-error');
   await error.getByText(/Automatic retries paused/).waitFor();

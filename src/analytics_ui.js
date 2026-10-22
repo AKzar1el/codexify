@@ -102,17 +102,19 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
 @media(max-width:580px){:is(#settings-dialog,#statistics-dialog) .analytics-select{font-size:16px;line-height:1.4;min-height:42px;padding:8px 24px 8px 9px}:is(#settings-dialog,#statistics-dialog) .analytics-controls button{height:42px;min-height:42px}:is(#settings-dialog,#statistics-dialog) .analytics-controls button[aria-label="Refresh analytics"]{height:42px}}
 `;
  document.head.append(style);
- function dayBins(){
-  const today=data?.today||new Date().toISOString().slice(0,10),map=new Map((data?.daily||[]).map(d=>[d.date,d.models]));
-  const first=range==='all'?(data?.daily[0]?.date||today):new Date(new Date(today+'T12:00:00Z').getTime()-(Number(range)-1)*86400000).toISOString().slice(0,10);
+ function dayBins(source=data,period=range){
+  const today=source?.today||new Date().toISOString().slice(0,10),map=new Map((source?.daily||[]).map(d=>[d.date,d.models]));
+  const first=period==='all'?(source?.daily[0]?.date||today):new Date(new Date(today+'T12:00:00Z').getTime()-(Number(period)-1)*86400000).toISOString().slice(0,10);
   const length=Math.min(36600,Math.max(1,Math.round((Date.parse(today)-Date.parse(first))/86400000)+1)),size=Math.max(1,Math.ceil(length/90)),bins=[];
   for(let i=0;i<length;i+=size){const start=new Date(Date.parse(first)+i*86400000).toISOString().slice(0,10),end=new Date(Date.parse(first)+Math.min(length-1,i+size-1)*86400000).toISOString().slice(0,10),models=new Map();for(let j=i;j<Math.min(length,i+size);j++){const date=new Date(Date.parse(first)+j*86400000).toISOString().slice(0,10);for(const [id,t]of map.get(date)||[]){const sum=models.get(id)||emptyTotals();for(const k of Object.keys(sum))sum[k]+=t[k];models.set(id,sum);}}bins.push({start,end,models});}return bins;
  }
- function colorMap(){const map=new Map(),used=new Set();for(const [i,m]of (data?.models||[]).entries()){let hash=0;for(const c of m.id)hash=(hash*31+c.charCodeAt(0))>>>0;let n=hash%palette.length;while(used.has(n)&&used.size<palette.length)n=(n+1)%palette.length;used.add(n);map.set(m.id,palette[n]||palette[i%palette.length]);}return map;}
+ function colorMap(models=data?.models||[]){const map=new Map(),used=new Set();for(const [i,m]of models.entries()){let hash=0;for(const c of m.id)hash=(hash*31+c.charCodeAt(0))>>>0;let n=hash%palette.length;while(used.has(n)&&used.size<palette.length)n=(n+1)%palette.length;used.add(n);map.set(m.id,palette[n]||palette[i%palette.length]);}return map;}
  function chart(key,title,copy,wide=false){
-  const card=el('section',`analytics-card${wide?' analytics-wide':''}`);card.append(el('h4','',title),el('p','analytics-card-copy',copy));
+  const source=range==='1'?rangeCache.get('7'):data,period=range==='1'?'7':range;
+  const card=el('section',`analytics-card${wide?' analytics-wide':''}`);card.append(el('h4','',title),el('p','analytics-card-copy',range==='1'?`Last 7 days. ${copy}`:copy));
+  if(range==='1'&&!source){card.append(el('p','analytics-empty',loading?'Loading seven-day activity…':'Seven-day activity is temporarily unavailable.'));return card;}
   const chartWidth=wide?1040:520,wrap=el('div','analytics-chart'),image=svg('svg',{viewBox:`0 0 ${chartWidth} 200`,role:'img','aria-label':`${title} by model and effort`});wrap.append(image);
-  const bins=dayBins(),visible=(data?.models||[]).filter(m=>!hiddenModels.has(m.id)),colors=colorMap();const sums=bins.map(b=>visible.reduce((s,m)=>s+(b.models.get(m.id)?.[key]||0),0));const rawMax=Math.max(...sums,1),max=key==='activeMs'?Math.max(rawMax,180000):Math.max(3,Math.ceil(rawMax/3)*3),width=chartWidth-64,height=142,left=43,top=8;
+  const bins=dayBins(source,period),visible=(source?.models||[]).filter(m=>!hiddenModels.has(m.id)),colors=colorMap(source?.models||[]);const sums=bins.map(b=>visible.reduce((s,m)=>s+(b.models.get(m.id)?.[key]||0),0));const rawMax=Math.max(...sums,1),max=key==='activeMs'?Math.max(rawMax,180000):Math.max(3,Math.ceil(rawMax/3)*3),width=chartWidth-64,height=142,left=43,top=8;
   for(let i=0;i<=3;i++){const y=top+height-i*height/3;image.append(svg('line',{x1:left,x2:chartWidth-9,y1:y,y2:y,class:'chart-grid'}));const text=svg('text',{x:left-8,y:y+3,'text-anchor':'end'});text.textContent=valueText(key,max*i/3);image.append(text);}
   const detail=el('p','analytics-chart-detail','Focus or hover a day to explore its totals.');detail.setAttribute('aria-live','polite');
   const groupWidth=width/bins.length,barWidth=Math.max(2,Math.min(36,groupWidth*.63));
@@ -123,7 +125,7 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
    const show=()=>{detail.textContent=`${bin.start}${bin.end!==bin.start?' – '+bin.end:''} · ${valueText(key,sums[index])} ${metricNames[key].toLowerCase()}`;};g.addEventListener('pointerenter',show);g.addEventListener('focus',show);g.addEventListener('click',show);g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();show();}});image.append(g);
    const every=Math.max(1,Math.ceil(bins.length/7));if(index%every===0||index===bins.length-1&&bins.length>1){const label=svg('text',{x:left+index*groupWidth+groupWidth/2,y:top+height+24,'text-anchor':'middle'});label.textContent=new Date(bin.start+'T12:00:00Z').toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});image.append(label);}
   });
-  card.append(wrap,detail);const legend=el('div','analytics-legend');for(const m of data?.models||[]){const button=el('button','');button.type='button';button.setAttribute('aria-pressed',String(!hiddenModels.has(m.id)));button.dataset.analyticsFocus=`legend-${key}-${m.id}`;const dot=el('i','analytics-dot');dot.style.setProperty('--series',colors.get(m.id));button.append(dot,document.createTextNode(fullModel(m)));button.addEventListener('click',()=>{hiddenModels.has(m.id)?hiddenModels.delete(m.id):hiddenModels.add(m.id);render();});legend.append(button);}card.append(legend);return card;
+  card.append(wrap,detail);const legend=el('div','analytics-legend');for(const m of source?.models||[]){const button=el('button','');button.type='button';button.setAttribute('aria-pressed',String(!hiddenModels.has(m.id)));button.dataset.analyticsFocus=`legend-${key}-${m.id}`;const dot=el('i','analytics-dot');dot.style.setProperty('--series',colors.get(m.id));button.append(dot,document.createTextNode(fullModel(m)));button.addEventListener('click',()=>{hiddenModels.has(m.id)?hiddenModels.delete(m.id):hiddenModels.add(m.id);render();});legend.append(button);}card.append(legend);return card;
  }
  function league(){
   const card=el('section','analytics-card');card.append(el('h4','','Conversation league'),el('p','analytics-card-copy','The conversations moving things forward in this period.'));
@@ -154,7 +156,11 @@ function createUsageAnalytics({api,getChats,onOpenChat,isVisible,cutoffCard,getH
   if(cutoffCard)root.append(cutoffCard());
   if(focused)for(const node of root.querySelectorAll('[data-analytics-focus]'))if(node.dataset.analyticsFocus===focused){node.focus({preventScroll:true});break;}
  }
- async function load(){const epoch=++request;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${range}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);rangeCache.set(range,data);}catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
+ async function load(){const epoch=++request,period=range;loading=true;render();try{const response=await api(`/api/analytics/usage?days=${period}`);const value=await response.json();if(epoch!==request)return;data=sanitize(value);rangeCache.set(period,data);
+  // The three daily charts need a week of history even when totals cover today.
+  // Read sequentially: the server permits only one optional usage read at a time.
+  if(period==='1'){const response=await api('/api/analytics/usage?days=7'),value=await response.json();if(epoch!==request)return;rangeCache.set('7',sanitize(value));}
+ }catch{/* Optional analytics remains silent and preserves the last successful view. */}finally{if(epoch===request){loading=false;render();}}}
  window.addEventListener('statistics-extras-change',()=>{if(isVisible())render();});
  const timer=setInterval(()=>{if(isVisible()&&!document.hidden&&!loading&&!shareCard?.isOpen())void load();},30000);
  window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});

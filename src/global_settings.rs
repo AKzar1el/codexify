@@ -1002,6 +1002,66 @@ mod tests {
         assert_eq!(rollout_reminder_interval(&config).unwrap(), 25);
     }
     #[test]
+    fn retry_timings_save_require_restart_without_connector_schema_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({"workDir":root.path(),"codexMcp":{"enabled":false},"multiProject":false})
+                .to_string(),
+        )
+        .unwrap();
+        let mut config = crate::config::default_config(root.path().to_owned());
+        config.loaded_config_path = Some(path.clone());
+        let shown = snapshot(&config).unwrap();
+        assert_eq!(
+            shown["defaults"]["agentChat"]["automation"]["retryTimings"]["chatgptAccessDelaysSeconds"],
+            json!([180, 300, 600, 1200, 1800, 3600])
+        );
+        let saved = save(
+            &config,
+            shown["revision"].as_str().unwrap(),
+            None,
+            Some(Map::from_iter([
+                (
+                    "agentChat.automation.retryTimings.chatgptAccessDelaysSeconds".into(),
+                    json!([25, 95]),
+                ),
+                (
+                    "agentChat.automation.retryTimings.conversationLoadIntervalSeconds".into(),
+                    json!(60),
+                ),
+                (
+                    "agentChat.automation.retryTimings.jitterPercent".into(),
+                    json!(0),
+                ),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(saved["restartRequired"], true);
+        assert_eq!(saved["schemaRefreshRequired"], false);
+        assert_eq!(saved["schemaRestartRequired"], false);
+        assert_eq!(
+            saved["document"]["agentChat"]["automation"]["retryTimings"]["chatgptAccessDelaysSeconds"],
+            json!([25, 95])
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            save(
+                &config,
+                saved["revision"].as_str().unwrap(),
+                None,
+                Some(Map::from_iter([(
+                    "agentChat.automation.retryTimings.chatgptAccessDelaysSeconds".into(),
+                    json!([0])
+                )]))
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn automatic_retries_default_on_and_hot_reload_without_restart_or_schema_refresh() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.json");

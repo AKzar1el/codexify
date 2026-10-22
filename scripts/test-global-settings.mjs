@@ -623,3 +623,60 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(enabled,true);assert.equal(writes.length,2);
  }finally{await browser.close();}
 });
+
+for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: retry timings use duration editors, save in seconds, validate, and reset`,{timeout:25000},async()=>{
+ const browser=await engine.launch();
+ try{
+  const page=await browser.newPage();page.setDefaultTimeout(5000);await page.clock.install();
+  const errors=[];page.on('pageerror',error=>errors.push(String(error)));
+  const retryTimings=JSON.parse(readFileSync(new URL('../codexify.config.example.json',import.meta.url),'utf8')).agentChat.automation.retryTimings;
+  const defaults={agentChat:{automation:{automaticRetries:true,retryTimings}}};
+  let document={},revision=1;const writes=[];
+  const snapshot=()=>({document,defaults,fieldSchema:defaults,raw:JSON.stringify(document),revision:String(revision),restartRequired:revision>1,schemaRefreshRequired:false});
+  await routeOwner(page,'http://127.0.0.1:43278/**',route=>{
+   const req=route.request(),path=new URL(req.url()).pathname;
+   if(path==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(path==='/api/global')return route.fulfill({json:{version:'2.3.9',settingsAvailable:true}});
+   if(path==='/api/chats')return route.fulfill({json:{chats:[],serverTimeMs:Date.now()}});
+   if(path==='/api/settings'&&req.method()==='GET')return route.fulfill({json:snapshot()});
+   if(path==='/api/settings'){
+    const body=req.postDataJSON();writes.push(body);
+    if(body.raw!==undefined)document=JSON.parse(body.raw);
+    else for(const [path,value]of Object.entries(body.changes)){const parts=path.split('.');let node=document;for(const key of parts.slice(0,-1))node=node[key]??={};node[parts.at(-1)]=value;}
+    revision++;return route.fulfill({json:snapshot()});
+   }
+   return route.fulfill({status:404});
+  });
+  await page.goto('http://127.0.0.1:43278/#test-token');await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Codexify settings'});await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  const field=key=>dialog.getByLabel(`agentChat.automation.retryTimings.${key}`,{exact:true});
+  assert.equal(await dialog.locator('[data-setting^="agentChat.automation.retryTimings."]').count(),8);
+  assert.equal(await field('chatgptAccessDelaysSeconds').getAttribute('placeholder'),'3m, 5m, 10m, 20m, 30m, 1h (default)');
+  assert.equal(await field('chatgptAccessDelaysSeconds').inputValue(),'');assert.deepEqual(writes,[]);
+  await field('actionDelaysSeconds').fill('10s, 2m');
+  await field('chatgptAccessDelaysSeconds').fill('1m, 2h, 86400');
+  await field('goalRecoveryDelaysSeconds').fill('11s, 31s, 61s, 91s');
+  for(const [key,value]of Object.entries({jitterPercent:0,approvalResumeGraceSeconds:17,conversationLoadIntervalSeconds:41,conversationUnavailableCooldownSeconds:83,rateLimitCooldownSeconds:167}))await field(key).fill(String(value));
+  await page.clock.fastForward(700);await dialog.getByText('Saved. Restart Codexify to apply changes.',{exact:true}).waitFor();
+  assert.deepEqual(document.agentChat.automation.retryTimings,{actionDelaysSeconds:[10,120],chatgptAccessDelaysSeconds:[60,7200,86400],goalRecoveryDelaysSeconds:[11,31,61,91],jitterPercent:0,approvalResumeGraceSeconds:17,conversationLoadIntervalSeconds:41,conversationUnavailableCooldownSeconds:83,rateLimitCooldownSeconds:167});
+  const savedCount=writes.length;
+  for(const invalid of ['0s','1.5m','25h','1m,','wat',Array(33).fill('1s').join(',')]){
+   await field('actionDelaysSeconds').fill(invalid);await page.clock.fastForward(700);
+   assert.equal(await field('actionDelaysSeconds').getAttribute('aria-invalid'),'true');assert.equal(writes.length,savedCount);
+  }
+  await field('jitterPercent').fill('101');await page.clock.fastForward(700);
+  assert.equal(await field('jitterPercent').getAttribute('aria-invalid'),'true');assert.equal(writes.length,savedCount);
+  await field('jitterPercent').fill('0');await field('actionDelaysSeconds').fill('10s, 2m');
+  await page.clock.fastForward(700);assert.equal(await field('jitterPercent').getAttribute('aria-invalid'),null);assert.equal(await field('actionDelaysSeconds').getAttribute('aria-invalid'),null);
+  await dialog.getByRole('button',{name:'Use default for ChatGPT access retry delays',exact:true}).click();await page.clock.fastForward(700);
+  await dialog.getByText('Saved. Restart Codexify to apply changes.',{exact:true}).waitFor();
+  assert.equal(document.agentChat.automation.retryTimings.chatgptAccessDelaysSeconds,undefined);
+  assert.equal(document.agentChat.automation.retryTimings.rateLimitCooldownSeconds,167);
+  await dialog.getByRole('button',{name:'Close settings',exact:true}).click();await page.getByRole('button',{name:'Codexify settings',exact:true}).click();
+  await dialog.getByRole('button',{name:'Chats & goals',exact:true}).click();
+  assert.equal(await field('actionDelaysSeconds').inputValue(),'10s, 2m');assert.equal(await field('chatgptAccessDelaysSeconds').inputValue(),'');
+  await page.setViewportSize({width:390,height:850});
+  assert.equal(await dialog.evaluate(element=>element.scrollWidth>element.clientWidth),false);
+  assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
+});

@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::markdown_chat::{MAX_AUTOMATIC_RETRY_ATTEMPTS, RetryTimings};
 use crate::project_bindings::ConversationIdentity;
 use crate::types::AppConfig;
 
@@ -20,17 +21,11 @@ const MAX_OWNER_GOAL_REQUESTS: usize = 32;
 const STATE_FILE: &str = "automation.json";
 const LOCK_FILE: &str = "automation.lock";
 const CHAT_SUBMISSION_FILE: &str = "chat-submission.json";
-pub(crate) const GOAL_RETRY_DELAYS_MS: [u64; 3] = [60_000, 120_000, 240_000];
 const PAIRING_INDEX_DIR: &str = ".pairings";
 
 pub const MAX_GOAL_BYTES: usize = 10 * 1024;
 pub const PAIRING_REFERENCE_TTL_MS: u64 = 60 * 60 * 1000;
 pub const PAIRING_VERIFICATION_GRACE_MS: u64 = 60_000;
-const AUTOMATIC_RETRY_DELAYS_MS: [u64; 5] = [30_000, 60_000, 120_000, 240_000, 480_000];
-const CHATGPT_ACCESS_RETRY_DELAYS_MS: [u64; 6] =
-    [180_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000];
-pub(crate) const APPROVAL_RESUME_GRACE_MS: u64 = 180_000;
-const GOAL_RECOVERY_EXHAUSTED: &str = "Automatic goal recovery stopped after three retries without agent activity. Use Continue to try again.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -225,6 +220,13 @@ pub struct AutomationActionState {
     // Presentation only: keep recovery visible while a scheduled retry runs.
     pub automatic_retry_in_progress: bool,
     pub automatic_retry_paused: bool,
+    // Granted by the owner Retry action; retained only until this attempt starts.
+    #[serde(skip_serializing_if = "is_false")]
+    pub bypass_conversation_cooldown: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -312,6 +314,9 @@ pub struct AutomationTaskState {
     // Runtime policy, read from global settings on each load; never persisted per chat.
     #[serde(skip, default = "retries_enabled_by_default")]
     pub automatic_retries_enabled: bool,
+    // Startup policy; changing timings requires restarting the shared browser too.
+    #[serde(skip)]
+    pub retry_timings: RetryTimings,
     #[serde(skip_serializing_if = "super::turn_renewal::TurnRenewalState::is_empty")]
     pub turn_renewal: super::turn_renewal::TurnRenewalState,
     #[serde(default)]
@@ -332,6 +337,7 @@ impl Default for AutomationTaskState {
             approval_resume: None,
             suspended_retry: None,
             automatic_retries_enabled: true,
+            retry_timings: RetryTimings::default(),
             turn_renewal: Default::default(),
             owner_goal_requests: Vec::new(),
         }
@@ -406,9 +412,17 @@ impl AutomationTaskState {
             return None;
         }
         let delay = if confirmed_unsent_failure(&self.action) {
-            *AUTOMATIC_RETRY_DELAYS_MS.get(self.action.automatic_retry_attempts as usize)?
+            *self
+                .retry_timings
+                .action_delays_seconds
+                .get(self.action.automatic_retry_attempts as usize)?
+                * 1000
         } else {
-            *GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?
+            *self
+                .retry_timings
+                .goal_recovery_delays_seconds
+                .get(self.goal_wake.recovery_attempts as usize)?
+                * 1000
         };
         let last = self
             .action
@@ -421,14 +435,24 @@ impl AutomationTaskState {
         } else {
             self.goal_wake.recovery_attempts
         };
-        Some(retry_deadline(&self.action, attempt, last, delay))
+        Some(retry_deadline(
+            &self.action,
+            attempt,
+            last,
+            delay,
+            self.retry_timings.jitter_percent,
+        ))
     }
 
     pub(crate) fn goal_recovery_retry_at_ms(&self) -> Option<u64> {
         if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
             return None;
         }
-        let delay = GOAL_RETRY_DELAYS_MS.get(self.goal_wake.recovery_attempts as usize)?;
+        let delay = self
+            .retry_timings
+            .goal_recovery_delays_seconds
+            .get(self.goal_wake.recovery_attempts as usize)?
+            * 1000;
         let last = self
             .action
             .updated_at_ms
@@ -439,23 +463,25 @@ impl AutomationTaskState {
             &self.action,
             self.goal_wake.recovery_attempts,
             last,
-            *delay,
+            delay,
+            self.retry_timings.jitter_percent,
         ))
     }
 
     pub(crate) fn goal_recovery_exhausted(&self) -> bool {
         self.offline_goal_retry_eligible()
             && !confirmed_unsent_failure(&self.action)
-            && self.goal_wake.recovery_attempts as usize >= GOAL_RETRY_DELAYS_MS.len()
+            && self.goal_wake.recovery_attempts as usize
+                >= self.retry_timings.goal_recovery_delays_seconds.len()
     }
 
     pub fn automatic_retry_limit(&self) -> usize {
         if self.uses_chatgpt_access_retry() {
-            CHATGPT_ACCESS_RETRY_DELAYS_MS.len()
+            self.retry_timings.chatgpt_access_delays_seconds.len()
         } else if self.uses_goal_recovery() {
-            GOAL_RETRY_DELAYS_MS.len()
+            self.retry_timings.goal_recovery_delays_seconds.len()
         } else {
-            AUTOMATIC_RETRY_DELAYS_MS.len()
+            self.retry_timings.action_delays_seconds.len()
         }
     }
 
@@ -470,29 +496,23 @@ impl AutomationTaskState {
     }
 
     fn uses_chatgpt_access_retry(&self) -> bool {
-        matches!(
-            self.action.status,
-            AutomationActionStatus::AuthenticationRequired
-                | AutomationActionStatus::ConversationUnavailable
-        ) || self.action.chatgpt_access_retry_in_progress
-            && self.action.automatic_retry_in_progress
-            && matches!(
-                self.action.status,
-                AutomationActionStatus::Idle
-                    | AutomationActionStatus::Queued
-                    | AutomationActionStatus::Navigating
-                    | AutomationActionStatus::Sending
-                    | AutomationActionStatus::Generating
-            )
+        chatgpt_access_failure(self.action.status)
+            || self.action.chatgpt_access_retry_in_progress
+                && self.action.automatic_retry_in_progress
+                && matches!(
+                    self.action.status,
+                    AutomationActionStatus::Idle
+                        | AutomationActionStatus::Queued
+                        | AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
     }
 
     fn chatgpt_access_retry_at_ms(&self) -> Option<u64> {
         let action = &self.action;
-        if !matches!(
-            action.status,
-            AutomationActionStatus::AuthenticationRequired
-                | AutomationActionStatus::ConversationUnavailable
-        ) || action_retry_mode(self) != Some("retry")
+        if !chatgpt_access_failure(action.status)
+            || action_retry_mode(self) != Some("retry")
             || action.send_accepted != Some(false)
             || action.messages_fenced
             || action.goal_turn_counted
@@ -504,13 +524,17 @@ impl AutomationTaskState {
         {
             return None;
         }
-        let delay =
-            *CHATGPT_ACCESS_RETRY_DELAYS_MS.get(action.chatgpt_access_retry_attempts as usize)?;
+        let delay = *self
+            .retry_timings
+            .chatgpt_access_delays_seconds
+            .get(action.chatgpt_access_retry_attempts as usize)?
+            * 1000;
         Some(retry_deadline(
             action,
             action.chatgpt_access_retry_attempts,
             action.updated_at_ms?,
             delay,
+            self.retry_timings.jitter_percent,
         ))
     }
 
@@ -535,7 +559,8 @@ impl AutomationTaskState {
                 &self.action,
                 0,
                 resume.resumed_at_ms,
-                APPROVAL_RESUME_GRACE_MS,
+                self.retry_timings.approval_resume_grace_seconds * 1000,
+                self.retry_timings.jitter_percent,
             )
         })
     }
@@ -544,11 +569,7 @@ impl AutomationTaskState {
         if !self.automatic_retries_enabled || self.action.automatic_retry_paused {
             return None;
         }
-        if matches!(
-            self.action.status,
-            AutomationActionStatus::AuthenticationRequired
-                | AutomationActionStatus::ConversationUnavailable
-        ) {
+        if chatgpt_access_failure(self.action.status) {
             return self.chatgpt_access_retry_at_ms();
         }
         if self.action.kind == Some(AutomationActionKind::TurnRenewal)
@@ -595,9 +616,19 @@ impl AutomationTaskState {
                 }) => {}
             _ => return None,
         }
-        let delay = AUTOMATIC_RETRY_DELAYS_MS.get(action.automatic_retry_attempts as usize)?;
+        let delay = self
+            .retry_timings
+            .action_delays_seconds
+            .get(action.automatic_retry_attempts as usize)?
+            * 1000;
         action.updated_at_ms.map(|finished| {
-            retry_deadline(action, action.automatic_retry_attempts, finished, *delay)
+            retry_deadline(
+                action,
+                action.automatic_retry_attempts,
+                finished,
+                delay,
+                self.retry_timings.jitter_percent,
+            )
         })
     }
 
@@ -653,8 +684,14 @@ impl AutomationTaskState {
 }
 
 // Stable per failed action/attempt: polling and restarts must not move the
-// deadline. Different random action IDs spread chats by 0–10% after the base wait.
-fn retry_deadline(action: &AutomationActionState, attempt: u32, finished: u64, delay: u64) -> u64 {
+// deadline. Different random action IDs spread chats after the configured base wait.
+fn retry_deadline(
+    action: &AutomationActionState,
+    attempt: u32,
+    finished: u64,
+    delay: u64,
+    jitter_percent: u64,
+) -> u64 {
     let mut hash = Sha256::new();
     hash.update(b"retry-jitter-v1\0");
     hash.update(action.id.as_deref().unwrap_or_default().as_bytes());
@@ -664,7 +701,7 @@ fn retry_deadline(action: &AutomationActionState, attempt: u32, finished: u64, d
     let seed = u64::from_le_bytes(hash.finalize()[..8].try_into().expect("SHA-256 prefix"));
     finished
         .saturating_add(delay)
-        .saturating_add(seed % (delay / 10 + 1))
+        .saturating_add(seed % (delay.saturating_mul(jitter_percent) / 100 + 1))
 }
 
 fn confirmed_unsent_failure(action: &AutomationActionState) -> bool {
@@ -672,6 +709,15 @@ fn confirmed_unsent_failure(action: &AutomationActionState) -> bool {
         && action.send_accepted == Some(false)
         && !action.messages_fenced
         && !action.goal_turn_counted
+}
+
+fn chatgpt_access_failure(status: AutomationActionStatus) -> bool {
+    matches!(
+        status,
+        AutomationActionStatus::AuthenticationRequired
+            | AutomationActionStatus::ConversationUnavailable
+            | AutomationActionStatus::RateLimited
+    )
 }
 
 fn action_retry_mode(state: &AutomationTaskState) -> Option<&'static str> {
@@ -732,6 +778,7 @@ pub struct AgentAutomationStore {
     pub(super) renewal_config: super::turn_renewal::TurnRenewalConfig,
     pub(super) settings_path: Option<PathBuf>,
     automatic_retries: bool,
+    retry_timings: RetryTimings,
     pub(super) usage_options: crate::usage_analytics::Options,
 }
 
@@ -791,6 +838,7 @@ impl AgentAutomationStore {
             renewal_config: Default::default(),
             settings_path: None,
             automatic_retries: true,
+            retry_timings: RetryTimings::default(),
             usage_options: Default::default(),
         })
     }
@@ -800,6 +848,7 @@ impl AgentAutomationStore {
         self.renewal_config = config.markdown_chat.turn_renewal.clone();
         self.settings_path = config.loaded_config_path.clone();
         self.automatic_retries = config.markdown_chat.automation.automatic_retries;
+        self.retry_timings = config.markdown_chat.automation.retry_timings.clone();
         self.usage_options = crate::usage_analytics::Options::from_config(config);
         self.notification_workspace = config
             .work_dir
@@ -854,6 +903,7 @@ impl AgentAutomationStore {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
             state.automatic_retries_enabled = self.automatic_retries_enabled()?;
+            state.retry_timings = self.retry_timings.clone();
             Ok(state)
         })
     }
@@ -1956,6 +2006,9 @@ impl AgentAutomationStore {
                 chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts,
                 chatgpt_access_retry_in_progress: state.action.chatgpt_access_retry_in_progress,
                 automatic_retry_in_progress: state.action.automatic_retry_in_progress,
+                bypass_conversation_cooldown: kind != AutomationActionKind::PairVerify
+                    && state.action.bypass_conversation_cooldown
+                    && (state.action.id.is_none() || state.action.id.as_deref() == Some(action_id)),
                 ..Default::default()
             };
             Ok(state.action.clone())
@@ -2034,6 +2087,9 @@ impl AgentAutomationStore {
             } else {
                 status
             };
+            if status != AutomationActionStatus::Queued {
+                state.action.bypass_conversation_cooldown = false;
+            }
             if status == AutomationActionStatus::Ambiguous {
                 state.action.send_accepted = Some(true);
             }
@@ -2205,9 +2261,22 @@ impl AgentAutomationStore {
             }
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
+                bypass_conversation_cooldown: true,
                 ..Default::default()
             };
             Ok(state.action.clone())
+        })
+    }
+
+    pub(crate) fn clear_unused_manual_retry(
+        &self,
+        task: &ConversationIdentity,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.action.id.is_none() {
+                state.action.bypass_conversation_cooldown = false;
+            }
+            Ok(())
         })
     }
 
@@ -2306,10 +2375,10 @@ impl AgentAutomationStore {
                 && state.goal_recovery_exhausted()
             {
                 state.action.status = AutomationActionStatus::Stalled;
-                state
-                    .action
-                    .last_error
-                    .get_or_insert_with(|| GOAL_RECOVERY_EXHAUSTED.into());
+                let retries = state.retry_timings.goal_recovery_delays_seconds.len();
+                state.action.last_error.get_or_insert_with(|| {
+                    format!("Automatic goal recovery stopped after {retries} retries without agent activity. Use Continue to try again.")
+                });
                 state.action.automatic_retry_in_progress = false;
                 state.action.chatgpt_access_retry_in_progress = false;
             }
@@ -2335,25 +2404,14 @@ impl AgentAutomationStore {
                 action: state.action.clone(),
                 goal_wake: state.goal_wake.clone(),
             });
+            let access_retry = chatgpt_access_failure(state.action.status);
             state.action = AutomationActionState {
                 updated_at_ms: Some(now_ms),
                 automatic_retry_attempts: state.action.automatic_retry_attempts
-                    + u32::from(!matches!(
-                        state.action.status,
-                        AutomationActionStatus::AuthenticationRequired
-                            | AutomationActionStatus::ConversationUnavailable
-                    )),
+                    + u32::from(!access_retry),
                 chatgpt_access_retry_attempts: state.action.chatgpt_access_retry_attempts
-                    + u32::from(matches!(
-                        state.action.status,
-                        AutomationActionStatus::AuthenticationRequired
-                            | AutomationActionStatus::ConversationUnavailable
-                    )),
-                chatgpt_access_retry_in_progress: matches!(
-                    state.action.status,
-                    AutomationActionStatus::AuthenticationRequired
-                        | AutomationActionStatus::ConversationUnavailable
-                ),
+                    + u32::from(access_retry),
+                chatgpt_access_retry_in_progress: access_retry,
                 automatic_retry_in_progress: true,
                 ..Default::default()
             };
@@ -2831,6 +2889,7 @@ impl AgentAutomationStore {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
             state.automatic_retries_enabled = self.automatic_retries_enabled()?;
+            state.retry_timings = self.retry_timings.clone();
             let result = mutation(&mut state)?;
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -2846,6 +2905,7 @@ impl AgentAutomationStore {
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
             state.automatic_retries_enabled = self.automatic_retries_enabled()?;
+            state.retry_timings = self.retry_timings.clone();
             let result = mutation(&mut state);
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -3538,8 +3598,8 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
 }
 
 fn validate_action(action: &AutomationActionState) -> Result<(), String> {
-    if action.automatic_retry_attempts as usize > AUTOMATIC_RETRY_DELAYS_MS.len()
-        || action.chatgpt_access_retry_attempts as usize > CHATGPT_ACCESS_RETRY_DELAYS_MS.len()
+    if action.automatic_retry_attempts as usize > MAX_AUTOMATIC_RETRY_ATTEMPTS
+        || action.chatgpt_access_retry_attempts as usize > MAX_AUTOMATIC_RETRY_ATTEMPTS
         || action.chatgpt_access_retry_in_progress && !action.automatic_retry_in_progress
         || action
             .id
@@ -3598,7 +3658,7 @@ fn validate_action(action: &AutomationActionState) -> Result<(), String> {
 }
 
 fn validate_goal_wake(wake: &GoalWakeState) -> Result<(), String> {
-    if wake.recovery_attempts as usize > GOAL_RETRY_DELAYS_MS.len() {
+    if wake.recovery_attempts as usize > MAX_AUTOMATIC_RETRY_ATTEMPTS {
         return Err("Agent automation goal recovery count is invalid".into());
     }
     for value in [wake.activity_epoch.as_deref(), wake.nudged_epoch.as_deref()]

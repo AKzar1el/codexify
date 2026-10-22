@@ -622,6 +622,20 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     let current = null, models = [], closed = false, timer = null, requestInFlight = false, catalogLoaded = false, savingSelection = false, selectionDraft = null, selectionRevision = 0, catalogContext = null;
     let pairingSubmitting = false, pairingRevision = 0, pairingSubmissionError = "", lastSubmittedPairingUrl = "";
     let dismissedError = null, shownErrorSignature = null;
+    function conversationCooldown(action, now) {
+      // These two companion messages contain the duration left when the error
+      // was saved. Anchor to that receipt, never to a poll or the first render.
+      const text = action?.lastError;
+      if (typeof text !== "string") return null;
+      const match = text.match(/^(ChatGPT conversation loading is cooling down\. Another conversation can load in |ChatGPT conversation temporarily not accessible\. Shared browser cooldown: conversation loading can retry in )(\d+)s$/);
+      if (!match || !Number.isSafeInteger(action.updatedAtMs) || action.updatedAtMs <= 0) return null;
+      const seconds = Number(match[2]);
+      if (!Number.isSafeInteger(seconds) || seconds < 0 || seconds > 86400) return null;
+      const until = action.updatedAtMs + seconds * 1000;
+      const remaining = Math.max(0, Math.ceil((until - now) / 1000));
+      const summary = action.lastError.startsWith("ChatGPT conversation temporarily") ? "ChatGPT conversation temporarily not accessible." : remaining ? "ChatGPT conversation loading is cooling down." : "";
+      return {until, summary, message:remaining ? `${match[1]}${remaining}s` : summary};
+    }
     const errorSignature = message => JSON.stringify([current?.action?.id, current?.action?.status, current?.action?.lastError || current?.live?.status || pairingSubmissionError || message]);
     const setError = (message, signature = message) => {
       if (!message) dismissedError = null;
@@ -755,17 +769,18 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const actionFailed = !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "rate_limited", "interference"].includes(state.action?.status));
       const actionNeedsAttention = !automaticRetry && actionFailed;
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
-      const failure = state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
+      const cooldown = conversationCooldown(state.action, Date.now() + clockOffset);
+      const failure = cooldown ? (automaticRetry && state.action.automaticRetryAtMs > cooldown.until ? cooldown.summary : cooldown.message) : state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
       renderGoalBar(goal, {needsAttention:goalNeedsAttention,failure});
       const retryMode = state.action && "retryMode" in state.action ? state.action.retryMode : state.action?.status === "failed" && state.action.kind !== "pair_verify" ? "retry" : null;
       const inlineRetry = byId("automation-retry-inline");
-      inlineRetry.hidden = Boolean(goal && goalNeedsAttention) || !retryMode;
+      inlineRetry.hidden = !retryMode;
       inlineRetry.disabled = !retryMode;
       inlineRetry.textContent = retryMode === "continue_goal" ? "Continue" : "Retry";
       inlineRetry.setAttribute("aria-label", retryMode === "continue_goal" ? "Continue goal now" : "Retry now");
       inlineRetry.title = retryMode === "continue_goal" ? "Continue without resending previously submitted messages" : "Retry now instead of waiting";
       const retryLabel = retryMode === "continue_goal" ? "Continue goal" : "Retry failed action";
-      byId("goal-retry").hidden = !goalNeedsAttention;
+      byId("goal-retry").hidden = !goalNeedsAttention || Boolean(retryMode);
       byId("goal-retry").disabled = !retryMode && (state.action?.kind === "pair_verify" ? nodes.pair.disabled : nodes.reveal.disabled);
       byId("goal-retry").textContent = retryMode === "continue_goal" ? "Continue" : retryMode ? "Retry" : state.action?.kind === "pair_verify" ? "Pair again" : "ChatGPT";
       byId("goal-retry").setAttribute("aria-label", retryMode ? retryLabel : state.action?.kind === "pair_verify" ? "Replace pairing" : "Open in ChatGPT");
@@ -775,7 +790,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const retryLimit = state.action?.automaticRetryLimit ?? 5;
       const retryNow = retryMode === "continue_goal" ? " You can also continue now." : retryMode ? " You can also retry now." : "";
       const retryStatus = automaticRetry ? (goalRetry ? `Retrying the goal automatically in ${retrySeconds}s.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}).`) + retryNow : "";
-      nodes.liveStatus.textContent = automaticRetry ? retryStatus : state.live?.status || state.action?.lastError || "";
+      nodes.liveStatus.textContent = automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
       for (const node of [nodes.liveStatus,nodes.liveCommentary,nodes.liveAnswer]) node.hidden = !node.textContent;
@@ -786,14 +801,14 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.retryAction.textContent = retryLabel;
       if (pairingWaiting || verified && state.action?.kind === "pair_verify") setStateError("");
       else if (pairingSubmissionError) setStateError(pairingSubmissionError);
-      else if (automaticRetry) setStateError(`${failure} ${retryStatus}`);
+      else if (automaticRetry) setStateError(`${failure ? failure + " " : ""}${retryStatus}`);
       else if (actionNeedsAttention) {
-        const preparation = state.action?.status === "authentication_required" ? "Sign in from Codexify settings → Browser, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" ? "Wait for ChatGPT's limit to reset. " : "";
+        const preparation = state.action?.status === "authentication_required" ? "Sign in from Codexify settings → Browser, or replace pairing if the account changed. " : state.action?.status === "approval_required" ? "Open in ChatGPT to review the approval. " : state.action?.status === "rate_limited" && !cooldown ? "Wait for ChatGPT's limit to reset. " : "";
         const retryPolicy = state.action?.automaticRetryPaused ? "Automatic retries paused. " : state.action?.automaticRetriesEnabled === false ? "Automatic retries disabled in settings. " : "";
         const exhausted = retryPolicy || (state.action?.automaticRetryAttempts >= retryLimit ? `All ${retryLimit} automatic retries failed. ` : "");
         const nextStep = retryMode === "retry" ? `${preparation}${exhausted}Use Retry to try again. The message was not sent.` : retryMode === "continue_goal" ? `${exhausted}Use Continue to start another goal turn. Previously submitted messages will not be resent.` : state.action?.kind === "pair_verify" ? "Use Retry chat pairing to create a new verification request." : "Open in ChatGPT to check whether the message was sent before sending it again.";
         setStateError(`${failure} ${nextStep}`);
-      } else if (state.action?.lastError) setStateError(state.action.lastError);
+      } else if (state.action?.lastError) setStateError(failure);
       else setStateError("");
       if (nodes.error.hidden) inlineRetry.hidden = true;
       byId("automation-dismiss-inline").hidden = nodes.error.hidden;
@@ -981,7 +996,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     }
     void refreshState();
     timer = setInterval(() => { if (!document.hidden) void refreshState({ quiet:true }); }, 1500);
-    const metricsTimer = setInterval(() => { if (!document.hidden) updateGoalMetrics(); }, 1000);
+    const metricsTimer = setInterval(() => {
+      if (!document.hidden) {
+        if (current && conversationCooldown(current.action, Date.now() + clockOffset)) render(current);
+        else updateGoalMetrics();
+      }
+    }, 1000);
     return { close() { closed = true; showSettings(false); clearInterval(timer); clearInterval(metricsTimer); window.removeEventListener("codexify-browser-change",browserChanged); document.removeEventListener("pointerdown",dismissEditors); } };
   }
   function conversationDetail(chat) {

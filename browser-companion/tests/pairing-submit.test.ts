@@ -24,6 +24,7 @@ const request: ExecuteActionRequest = {
 };
 const prompt = renderActionPrompt(request.prompt);
 let context: BrowserContext;
+let browserContext: BrowserContext;
 let page: Page;
 let profile: string;
 let initialDraft = "";
@@ -40,7 +41,7 @@ const fixtureUi={
   it:{send:"Invia",stop:"Interrompi",counter:"di",efforts:["Immediato","Medio","Alto","Molto alto","Pro"]},
 } as const;
 let localizedStopFallback=false;
-let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;duplicateSubmit?:boolean;changeUrl?:boolean}|undefined;
+let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;duplicateSubmit?:boolean;changeUrl?:boolean;frame?:"url"|"srcdoc"|"nested"|"hidden"|"foreign"}|undefined;
 // Same structural contract as ChatGPT, with localized labels and arbitrary Radix IDs.
 const stopDialogHtml = `<div class="codex-dialog-overlay" style="position:fixed;inset:0;z-index:50;background:#0005"></div>
   <div role="dialog" id="radix-fixture" data-state="open" class="codex-dialog" aria-modal="true" aria-labelledby="radix-heading" aria-describedby="radix-description" style="position:fixed;inset:30% 20%;z-index:51;background:white">
@@ -73,13 +74,22 @@ beforeAll(async () => {
   profile = await mkdtemp(join(tmpdir(),"pairing-submit-fixture-"));
   const executablePath = await privateChromeExecutable(join(import.meta.dirname,"../.browsers",`${process.platform}-${process.arch}`));
   context = await chromium.launchPersistentContext(profile,{channel:"chrome",executablePath,headless:true,viewport:null});
+  browserContext=context;
   page = context.pages()[0]!;
+  await installFixtureRoutes();
+},30_000);
+
+async function installFixtureRoutes(){
+  await context.route("https://untrusted.example/**",route=>route.fulfill({contentType:"text/html",body:stopDialogHtml+`<script>document.querySelector('form').onsubmit=event=>{event.preventDefault();parent.postMessage('fixture-stop-confirmed','*');};</script>`}));
   await context.route("https://chatgpt.com/**",async route => {
     if (new URL(route.request().url()).pathname === "/api/auth/session") {
       sessionRequests++;
       if(documentLoads<sessionUnavailableBeforeLoad){await route.fulfill({json:{}});return;}
       await route.fulfill({json:{user:{id:"fixture-user"},account:{id:sessionRequests>=changeAccountAtRequest||changedAccountAfterReload&&documentLoads>=stopReloadAt ? "changed-account" : "fixture-account",planType:"pro",structure:"personal"}}});
       return;
+    }
+    if(new URL(route.request().url()).pathname==="/stop-confirmation-frame"){
+      await route.fulfill({contentType:"text/html",body:"<!doctype html><html><body></body></html>"});return;
     }
     documentLoads++;
     const dialogHtml=fixtureLanguage==="it"?stopDialogHtml
@@ -147,15 +157,34 @@ beforeAll(async () => {
         const stopConfirmation=${JSON.stringify(stopConfirmation??null)};
         const finishStop=stop=>setTimeout(()=>{stop.remove();document.body.dataset.order+='stopped,';document.body.dataset.stoppedAt=String(Date.now());},${stopFinishDelayMs});
         const showStopDialog=stop=>{
-          if(document.querySelector('[role="dialog"]'))return;
-          document.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
-          const dialog=document.querySelector('[role="dialog"]'),dialogForm=dialog.querySelector('form');
-          if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
-          if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
-          dialogForm.addEventListener('submit',event=>{
-            event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());
-            if(!stopConfirmation.persists){dialog.remove();document.querySelector('.codex-dialog-overlay').remove();finishStop(stop);}
-          });
+          if(document.querySelector('[role="dialog"], [data-stop-dialog-frame]'))return;
+          const show=(dialogDocument,frame)=>{
+            dialogDocument.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
+            const dialog=dialogDocument.querySelector('[role="dialog"]'),dialogForm=dialog.querySelector('form');
+            if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
+            if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
+            dialogForm.addEventListener('submit',event=>{
+              event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());
+              if(!stopConfirmation.persists){dialog.remove();dialogDocument.querySelector('.codex-dialog-overlay').remove();frame?.remove();finishStop(stop);}
+            });
+          };
+          if(!stopConfirmation.frame){show(document);return;}
+          const attach=(owner,nested=false)=>{
+            const frame=owner.createElement('iframe');frame.dataset.stopDialogFrame='true';
+            frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0;z-index:100';
+            if(stopConfirmation.frame==='hidden')frame.style.display='none';
+            frame.onload=()=>{
+              if(stopConfirmation.frame==='foreign')return;
+              if(stopConfirmation.frame==='nested'&&!nested)attach(frame.contentDocument,true);
+              else show(frame.contentDocument,document.querySelector('[data-stop-dialog-frame]'));
+            };
+            if(stopConfirmation.frame==='foreign')frame.src='https://untrusted.example/stop-confirmation';
+            else if(stopConfirmation.frame==='url')frame.src='/stop-confirmation-frame';
+            else frame.srcdoc='<!doctype html><html><body></body></html>';
+            owner.body.append(frame);
+          };
+          window.addEventListener('message',event=>{if(event.data==='fixture-stop-confirmed')document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);});
+          attach(document);
         };
         if(stopConfirmation?.preexisting)showStopDialog(form.querySelector('[data-testid="stop-button"]'));
         form.addEventListener('click',event=>{
@@ -202,10 +231,11 @@ beforeAll(async () => {
         });
       </script></body></html>`});
   });
-},30_000);
+}
 
 afterAll(async () => {
   await context?.close();
+  if(browserContext!==context)await browserContext?.close();
   if (profile) await rm(profile,{recursive:true,force:true});
 });
 
@@ -223,6 +253,11 @@ async function executeFixture(driver:ChatGptBrowserDriver,execution:DriverExecut
 async function executeCoordinatorFixture(coordinator:SingleWindowCoordinator,request:ExecuteActionRequest){await syncFixture();return coordinator.execute(request);}
 
 async function fixture(draft="",canSend=true,name=connector,quietMs=0,generating=false,stopWorks:boolean|number|"reload"=true,model={family:"6",value:4,locked:[] as number[]}) {
+  // Isolate each scenario's navigation budget without freezing live deadlines.
+  if(context!==browserContext)await context.close();
+  context=await browserContext.browser()!.newContext({viewport:null});
+  page=await context.newPage();
+  await installFixtureRoutes();
   initialDraft=draft;ready=canSend;chipName=name;quietGenerationMs=quietMs;
   generatingOnLoad=generating;acceptsStop=stopWorks;stopFinishDelayMs=200;stopConfirmation=undefined;fixtureLanguage="en";localizedStopFallback=false;
   documentLoads=0;stopReloadAt=2;sessionRequests=0;sessionUnavailableBeforeLoad=0;changedAccountAfterReload=false;changedUrlAfterReload=false;
@@ -896,6 +931,50 @@ test.skipIf(!native)("offline Stop never confirms a preexisting or ambiguous dia
   }
 },15_000);
 
+test.skipIf(!native)("offline Stop confirms dialogs in ChatGPT frames without reloading",async()=>{
+  for(const frame of ["url","srcdoc","nested"] as const){
+    const driver=await fixture("",true,connector,0,true);
+    fixtureLanguage="it";stopConfirmation={frame,delayMs:100};
+    await syncFixture();const loads=documentLoads;
+    const offline=offlineRequest();
+    await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(12_000),emit:()=>{}});
+    expect(await page.locator("body").getAttribute("data-order")).toBe("stop,confirm,stopped,send,");
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
+    expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+    expect(documentLoads).toBe(loads);
+  }
+},40_000);
+
+test.skipIf(!native)("offline Stop rejects preexisting or ambiguous iframe dialogs without reloading",async()=>{
+  for(const scenario of ["preexisting","duplicateSubmit"] as const){
+    const driver=await fixture("",true,connector,0,true);
+    stopConfirmation={frame:"srcdoc",[scenario]:true};
+    const offline=offlineRequest();
+    const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(5_000),emit:()=>{}}).then(()=>undefined,error=>error);
+    expect(failure).toMatchObject({code:"external_interference"});
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+    expect(documentLoads).toBe(2);
+  }
+},15_000);
+
+test.skipIf(!native)("offline Stop never confirms hidden or foreign iframe copies",async()=>{
+  for(const frame of ["hidden","foreign"] as const){
+    const driver=await fixture("",true,connector,0,true);
+    stopConfirmation={frame};await syncFixture();const loads=documentLoads;
+    const controller=new AbortController(),offline=offlineRequest();
+    const running=executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
+    await page.locator('[data-stop-dialog-frame]').waitFor({state:"attached",timeout:5_000});
+    const child=await page.locator('[data-stop-dialog-frame]').elementHandle().then(handle=>handle!.contentFrame());
+    await child!.locator('[role="dialog"]').waitFor({state:"attached",timeout:5_000});
+    controller.abort();expect(await running).toBeDefined();
+    expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
+    expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+    expect(documentLoads).toBe(loads);
+  }
+},15_000);
+
 test.skipIf(!native)("offline Stop rechecks account and conversation before confirming",async()=>{
   for(const mismatch of ["account","conversation"]) {
     const driver=await fixture("",true,connector,0,true);
@@ -927,9 +1006,25 @@ test.skipIf(!native)("an unresponsive Stop confirmation is bounded and does not 
   expect(documentLoads).toBe(2);
 },30_000);
 
+test.skipIf(!native)("an unresponsive iframe Stop confirmation waits twenty seconds without reloading",async()=>{
+  const driver=await fixture("",true,connector,0,true);
+  stopConfirmation={frame:"srcdoc",persists:true};
+  await syncFixture();const loads=documentLoads,began=Date.now();
+  const coordinator=new SingleWindowCoordinator(driver,build),offline=offlineRequest();
+  await executeCoordinatorFixture(coordinator,offline);
+  const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+  expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
+  expect(Date.now()-began).toBeGreaterThanOrEqual(20_000);expect(Date.now()-began).toBeLessThan(28_000);
+  expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
+  expect((await coordinator.health()).activeActionId).toBeNull();
+  expect(documentLoads).toBe(loads);
+},30_000);
+
 test.skipIf(!native)("a cancelled Stop confirmation never inserts or sends a prompt",async()=>{
   const driver=await fixture("",true,connector,0,true);
-  stopConfirmation={persists:true};
+  stopConfirmation={frame:"nested",persists:true};
   const controller=new AbortController();
   const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
   const running=executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:controller.signal,emit:()=>{}}).then(()=>undefined,error=>error);
@@ -996,7 +1091,7 @@ test.skipIf(!native)("slow Stop completion, with or without confirmation, sends 
   for(const confirmation of [false,true]){
     const driver=await fixture("",true,connector,0,true);
     stopFinishDelayMs=15_000;
-    if(confirmation)stopConfirmation={delayMs:200};
+    if(confirmation)stopConfirmation={frame:"nested",delayMs:200};
     await syncFixture();const loads=documentLoads,began=Date.now();
     const coordinator=new SingleWindowCoordinator(driver,build);
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
@@ -1013,7 +1108,7 @@ test.skipIf(!native)("slow Stop completion, with or without confirmation, sends 
 
 test.skipIf(!native)("a late Stop confirmation gets its own settling window before any retry or reload",async()=>{
   const driver=await fixture("",true,connector,0,true);
-  stopConfirmation={delayMs:18_000};stopFinishDelayMs=5_000;
+  stopConfirmation={frame:"url",delayMs:18_000};stopFinishDelayMs=5_000;
   await syncFixture();const loads=documentLoads;
   const coordinator=new SingleWindowCoordinator(driver,build),offline:ExecuteActionRequest={...request,prompt:{kind:'offline_goal',goalRevision:1}};
   await executeCoordinatorFixture(coordinator,offline);

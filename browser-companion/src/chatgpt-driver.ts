@@ -1,4 +1,4 @@
-import type { Locator, Page } from "patchright";
+import type { Frame, Locator, Page } from "patchright";
 import {completedHandoff} from "./turn-renewal";
 import {classifyPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
@@ -6,7 +6,7 @@ import {approveConversationCard,throwIfConversationApproval} from "./conversatio
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
-import {navigatePage} from "./navigation";
+import {navigatePage,recordConversationAvailable} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
@@ -68,6 +68,43 @@ async function clearExistingDraft(page:Page,signal?:AbortSignal):Promise<Locator
   return activeComposer(page,30_000,signal);
 }
 
+async function visibleStopDialogs(page:Page):Promise<Locator[]> {
+  const dialogs:Locator[]=[];
+  const frames=new Map<Frame,boolean>();
+  const visibleChatGptFrame=async(frame:Frame):Promise<boolean>=>{
+    if(frame===page.mainFrame())return true;
+    if(frames.has(frame))return frames.get(frame)!;
+    frames.set(frame,false);
+    const parent=frame.parentFrame();
+    if(frame.isDetached()||!parent||!await visibleChatGptFrame(parent))return false;
+    if(!frame.url())return false;
+    const frameUrl=new URL(frame.url());
+    if(frameUrl.origin!=="https://chatgpt.com"&&frameUrl.href!=="about:blank"&&frameUrl.href!=="about:srcdoc")return false;
+    try {
+      // Blank/srcdoc frames must inherit ChatGPT's origin. A sandboxed app's
+      // copy of the same markup must never become an approval target.
+      if(!await frame.evaluate(()=>{try{return !!window.parent.document;}catch{return false;}}))return false;
+      const element=await frame.frameElement();
+      try {frames.set(frame,await element.isVisible());}
+      finally {await element.dispose();}
+      return frames.get(frame)!;
+    } catch(error) {
+      if(frame.isDetached())return false;
+      throw error;
+    }
+  };
+  for(const frame of page.frames()) {
+    try {
+      if(await visibleChatGptFrame(frame)) {
+        dialogs.push(...await frame.locator('[role="dialog"], [role="alertdialog"]').filter({visible:true}).all());
+      }
+    } catch(error) {
+      if(!frame.isDetached())throw error;
+    }
+  }
+  return dialogs;
+}
+
 async function stopLingeringResponse(
   page: Page,
   signal: AbortSignal,
@@ -75,7 +112,7 @@ async function stopLingeringResponse(
   emit: DriverExecution["emit"],
 ): Promise<void> {
   if (signal.aborted) throw new DOMException("Browser action aborted", "AbortError");
-  if (!await generationRunning(page)) return;
+  if (!await generationRunning(page) && !(await visibleStopDialogs(page)).length) return;
   const settleMs = 20_000;
   // Three bounded Stop attempts, one optional confirmation, and recovery work.
   const recoveryMs = settleMs * 4 + 10_000;
@@ -107,15 +144,15 @@ async function stopLingeringResponse(
       throw new BrowserCompanionError("ChatGPT account changed while stopping the previous response", "authentication_required");
     }
   };
-  const dialogs = page.locator('[role="dialog"], [role="alertdialog"]').filter({ visible:true });
   let stopRequested = false;
   let confirmationSubmitted = false;
   const waitForStopped = async (stop:Locator) => {
     let settleDeadline = Math.min(deadline,(lastStopRequestedAt||Date.now())+settleMs);
     while (!boundedSignal.aborted) {
-      const count = await dialogs.count();
+      const dialogs = await visibleStopDialogs(page);
+      const count = dialogs.length;
       if (count) {
-        const dialog = dialogs.first();
+        const dialog = dialogs[0]!;
         // This generic dialog shell also serves other actions. Only handle a
         // confirmation that appeared after our own verified Stop click.
         if (!stopRequested || count !== 1 || !await dialog.evaluate(element => {
@@ -145,9 +182,10 @@ async function stopLingeringResponse(
           // here, even when the dialog appeared near the first click's deadline.
           settleDeadline = Math.min(deadline,lastStopRequestedAt+settleMs);
         }
-        await dialog.waitFor({state:"hidden",timeout:Math.max(1,Math.min(timeout(settleMs),settleDeadline-Date.now())),signal:boundedSignal});
       }
-      if (!await stop.isVisible()) return;
+      // Confirmation can remove its entire iframe. Re-scan on the next poll
+      // instead of waiting on a detached locator and retrying Stop prematurely.
+      if (!count && !await stop.isVisible()) return;
       if (Date.now() >= settleDeadline) throw new Error("ChatGPT Stop has not completed");
       await new Promise(resolve => setTimeout(resolve,50));
     }
@@ -159,7 +197,7 @@ async function stopLingeringResponse(
     if (boundedSignal.aborted) break;
     const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true });
     const count = await stop.count();
-    const dialogCount = await dialogs.count();
+    const dialogCount = (await visibleStopDialogs(page)).length;
     if (dialogCount && !stopRequested) {
       throw new BrowserCompanionError("ChatGPT has an open dialog before stopping the response", "external_interference");
     }
@@ -180,9 +218,9 @@ async function stopLingeringResponse(
       if (signal.aborted || error instanceof BrowserCompanionError) throw error;
       lastError = error;
     }
-    if (confirmationSubmitted && await dialogs.count()) break;
+    if (confirmationSubmitted && (await visibleStopDialogs(page)).length) break;
     if (attempt === 1 && !boundedSignal.aborted) {
-      if (await dialogs.count()) break;
+      if ((await visibleStopDialogs(page)).length) break;
       // Rehydrate a stuck Stop control only before inserting our prompt.
       await assertTarget();
       let composer:Locator;
@@ -338,9 +376,8 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         await throwIfSessionAttention(page);
       } catch (error) {
         if (error instanceof BrowserCompanionError && error.code === "conversation_unavailable") {
-          // The account was verified independently. This page-local failure
-          // leaves the browser free to navigate; the target action reports it
-          // if that conversation still cannot load. Do not block all chats.
+          // The account was verified independently. Keep it signed in; the
+          // shared navigation budget enforces the conversation-load cooldown.
           return {authenticated:true, accountFingerprint:account.fingerprint, status:"idle", detail:error.message};
         }
         if (error instanceof BrowserCompanionError && error.code === "authentication_required") {
@@ -375,6 +412,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           detail:"The shared ChatGPT window has no unique usable composer",
         };
       }
+      recordConversationAvailable(page);
       return {
         authenticated:true,
         accountFingerprint:account.fingerprint,
@@ -664,6 +702,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       }
       ownedPage = page;
       await throwIfConversationApproval(page);
+      recordConversationAvailable(page);
       const renewal=execution.request.prompt.kind === "turn_renewal" ? execution.request.prompt : null;
       const verifyHandoff=async()=>{
         if(renewal && !await completedHandoff(page,canonicalUrl,account.fingerprint,renewal.handoffId,execution.signal)) {

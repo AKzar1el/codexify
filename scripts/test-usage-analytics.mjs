@@ -5,15 +5,16 @@ import {mkdirSync} from 'node:fs';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
 const META='io.github.devnoname120/codexify/markdown-chat',ids=['a'.repeat(64),'b'.repeat(64)],modelIds=['gpt-6-astra\x1fmax','gpt-5.6-sol\x1fhigh'];
-function fixture(range){
+function fixture(range,historicalModel=false){
  const n=range==='all'?90:Number(range),today=new Date().toISOString().slice(0,10),daily=[],totals={turns:0,toolCalls:0,activeMs:0,goals:0},models=[{id:modelIds[0],model:'gpt-6-astra',effort:'max',turns:0,toolCalls:0,activeMs:0,goals:0},{id:modelIds[1],model:'gpt-5.6-sol',effort:'high',turns:0,toolCalls:0,activeMs:0,goals:0}];
  for(let i=0;i<n;i++){const day={date:new Date(Date.parse(today)-(n-1-i)*86400000).toISOString().slice(0,10),models:{}};for(let j=0;j<2;j++){const value={turns:(i+j)%4+1,toolCalls:(i+j+1)*8,activeMs:((i+j)%5+1)*12*60000,goals:(i+j)%5===0?1:0};day.models[modelIds[j]]=value;for(const key of Object.keys(totals)){totals[key]+=value[key];models[j][key]+=value[key];}}daily.push(day);}
+ if(historicalModel&&range==='7'){const id='gpt-5.5-sol\x1fmedium',value={turns:4,toolCalls:64,activeMs:1200000,goals:0};daily[0].models[id]=value;models.push({id,model:'gpt-5.5-sol',effort:'medium',...value});for(const key of Object.keys(totals))totals[key]+=value[key];}
  return {today,timezone:'CEST',since:Date.now()-120*86400000,daily,models,totals,lifetime:Object.fromEntries(Object.entries(totals).map(([k,v])=>[k,v*3])),activeDays:n,streak:4,conversations:[{id:ids[0],turns:27,toolCalls:900,activeMs:5400000,goals:3},{id:ids[1],turns:14,toolCalls:1600,activeMs:10800000,goals:1}]};
 }
 for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name}: colorful analytics use the full panel, stay always on, and preserve charts and silent failures`,{timeout:45000},async()=>{
  const browser=await engine.launch();try{
   const page=await browser.newPage({viewport:{width:1500,height:1000}});page.setDefaultTimeout(7000);
-  const errors=[],writes=[],reads=[];page.on('pageerror',e=>errors.push(e.message));let fail=false,malformed=false,revision=1,mixMinutes=null;
+  const errors=[],writes=[],reads=[];page.on('pageerror',e=>errors.push(e.message));let fail=false,malformed=false,revision=1,mixMinutes=null,historicalModel=false;
   const config={agentChat:{analyticsEnabled:false,turnRenewal:{enabled:false,limits:[]}}},snapshot=()=>({document:config,defaults:{agentChat:{analyticsEnabled:true}},raw:JSON.stringify(config),path:'/fixture/config.json',revision:String(revision),restartRequired:false});
   await routeOwner(page,'http://127.0.0.1:43318/**',async route=>{
    const request=route.request(),url=new URL(request.url()),path=url.pathname;
@@ -25,7 +26,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
    if(path==='/api/settings'&&request.method()==='GET')return route.fulfill({json:snapshot()});
    if(path==='/api/settings')assert.fail('Analytics must never write a collection setting');
    if(path==='/api/analytics/turn-cutoffs')return route.fulfill({json:{models:[],samples:0}});
-   if(path==='/api/analytics/usage'){reads.push(url.searchParams.get('days'));if(fail)return route.fulfill({status:500,body:'private disk error'});const value=fixture(url.searchParams.get('days'));if(mixMinutes!==null){value.models[0].activeMs=mixMinutes*60000;value.models[1].activeMs=0;}return route.fulfill({json:malformed?{models:[null,42],daily:[null,{date:'bad'}],conversations:[null],totals:{turns:-1}}:value});}
+   if(path==='/api/analytics/usage'){reads.push(url.searchParams.get('days'));if(fail)return route.fulfill({status:500,body:'private disk error'});const value=fixture(url.searchParams.get('days'),historicalModel);if(mixMinutes!==null){value.models[0].activeMs=mixMinutes*60000;value.models[1].activeMs=0;}return route.fulfill({json:malformed?{models:[null,42],daily:[null,{date:'bad'}],conversations:[null],totals:{turns:-1}}:value});}
    if(path.endsWith('/automation'))return route.fulfill({json:{enabled:false,pairing:{status:'unpaired'},action:{status:'idle'},catalog:{models:[]},selection:{},presence:{},serverTimeMs:Date.now()}});
    if(ids.some(id=>path===`/api/chats/${id}`))return route.fulfill({json:{_meta:{[META]:{messages:[],revision:'0',chat_file:'/fixture/CHAT.md',last_agent_call_at_ms:null,server_time_ms:Date.now(),total_tool_calls:0,has_more:false}}}});
    return route.fulfill({status:404});
@@ -55,8 +56,14 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   mixMinutes=null;await page.setViewportSize({width:1500,height:1000});
   const card=dashboard.locator('.analytics-card').filter({hasText:'Conversation league'});assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'BioShock optimization');await card.getByRole('button',{name:'Active time',exact:true}).click();assert.equal(await card.locator('.analytics-chat-link').first().textContent(),'Reader annotations');
   const legend=dashboard.locator('.analytics-legend button').first();await legend.click();assert.equal(await dashboard.locator('.analytics-legend button').first().getAttribute('aria-pressed'),'false');await dashboard.locator('.analytics-legend button').first().click();
-  await dashboard.getByLabel('Analytics date range').selectOption('1');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='Today'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.equal(reads.at(-1),'1');assert.equal(await dashboard.locator('.analytics-kpi[data-metric=turns] .analytics-kpi-value').textContent(),String(fixture('1').totals.turns));assert.equal(await dashboard.locator('.analytics-chart g[role=button]').count(),3,'each chart shows just one day');
+  historicalModel=true;
+  await dashboard.getByLabel('Analytics date range').selectOption('1');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='Today'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.deepEqual(reads.slice(-2),['1','7']);assert.equal(await dashboard.locator('.analytics-kpi[data-metric=turns] .analytics-kpi-value').textContent(),String(fixture('1').totals.turns));assert.equal(await dashboard.locator('.analytics-chart g[role=button]').count(),21,'the three daily charts show seven days');
+  assert.equal(await dashboard.locator('.analytics-legend button').filter({hasText:'GPT-5.5 Sol · Medium'}).count(),3,'the charts include models used earlier in the week');
+  assert.equal(await dashboard.locator('.analytics-model-name').filter({hasText:'GPT-5.5 Sol'}).count(),0,'model mix still covers today');
+  assert.equal(await dashboard.locator('.analytics-chart').locator('..').locator('.analytics-card-copy').filter({hasText:'Last 7 days.'}).count(),3);
+  const oneDayCharts=await dashboard.locator('.analytics-chart svg').evaluateAll(nodes=>nodes.map(node=>node.outerHTML));
   if(process.env.ANALYTICS_SCREENSHOT_DIR){mkdirSync(process.env.ANALYTICS_SCREENSHOT_DIR,{recursive:true});await page.screenshot({animations:'disabled',path:`${process.env.ANALYTICS_SCREENSHOT_DIR}/${name.toLowerCase()}-one-day.png`});}
+  await dashboard.getByLabel('Analytics date range').selectOption('7');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='The last 7 days'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.deepEqual(await dashboard.locator('.analytics-chart svg').evaluateAll(nodes=>nodes.map(node=>node.outerHTML)),oneDayCharts,'one-day trend charts exactly match the seven-day view');
   await dashboard.getByLabel('Analytics date range').selectOption('30');await page.waitForFunction(()=>document.querySelector('.analytics-hero h4')?.textContent==='The last 30 days'&&!document.querySelector('[aria-label="Refresh analytics"]:disabled'));assert.equal(reads.at(-1),'30');
   const out=process.env.ANALYTICS_SCREENSHOT_DIR;if(out){mkdirSync(out,{recursive:true});await dialog.locator('#settings-main').evaluate(n=>n.scrollTop=0);await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-desktop.png`});}
   if(out){await card.scrollIntoViewIfNeeded();await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-leaderboard.png`});await dashboard.getByRole('heading',{name:'Momentum',exact:true}).locator('..').scrollIntoViewIfNeeded();await page.screenshot({animations:'disabled',path:`${out}/${name.toLowerCase()}-momentum.png`});await dialog.locator('#settings-main').evaluate(n=>n.scrollTop=0);}
@@ -114,6 +121,6 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   version=6;await openStats();await expectFigures(stats,700,70);old.release();await page.waitForTimeout(75);assert.equal(await turns(stats).textContent(),'700');await closeStats();
   fail=true;await openStats();await page.waitForFunction(()=>!document.querySelector('#statistics-dialog [aria-label="Share analytics"]').disabled);assert.equal(await turns(stats).textContent(),'700','a temporary read failure preserves the last successful snapshot');await closeStats();
   fail=false;version=7;await openStats();await expectFigures(stats,800,80);
-  assert.equal(usageReads,10,'each opening and the date-range change issue one fresh read');assert(extrasReads>=8,'opening analytics also refreshes streaks and records');assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
+  assert.equal(usageReads,14,'one-day views refresh today and the seven-day trends without stale requests starting extra reads');assert(extrasReads>=8,'opening analytics also refreshes streaks and records');assert.deepEqual(writes,[]);assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });

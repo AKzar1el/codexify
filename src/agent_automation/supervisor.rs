@@ -875,7 +875,9 @@ impl AgentAutomationSupervisor {
             .store
             .reset_failed_action_for_retry(&handle.task, expected_action_id, now_ms)?;
         self.live.write().await.remove(handle.task.stable_key());
-        self.scan_once(now_ms).await?;
+        let scanned = self.scan_once(now_ms).await;
+        handle.store.clear_unused_manual_retry(&handle.task)?;
+        scanned?;
         self.notify();
         Ok(handle.store.load(&handle.task)?.action)
     }
@@ -1022,6 +1024,7 @@ impl AgentAutomationSupervisor {
                 },
                 expected_url: candidate_url,
                 auto_approve_tool_calls: self.config.auto_approve_tool_calls,
+                bypass_conversation_cooldown: false,
             },
         });
         queue
@@ -1754,7 +1757,7 @@ impl AgentAutomationSupervisor {
             }
             let action_id = random_id("action")?;
             let idempotency_key = random_id("execute")?;
-            task.store.queue_action(
+            let queued_action = task.store.queue_action(
                 &task.task,
                 &action_id,
                 kind,
@@ -1785,6 +1788,7 @@ impl AgentAutomationSupervisor {
                     prompt,
                     expected_url: url,
                     auto_approve_tool_calls: self.config.auto_approve_tool_calls,
+                    bypass_conversation_cooldown: queued_action.bypass_conversation_cooldown,
                 },
             });
             queue
@@ -2767,6 +2771,7 @@ mod model_fallback_snapshot_tests {
                 effort: Some("max".into()),
                 prompt: ActionPrompt::OfflineGoal { goal_revision: 1 },
                 auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
             },
         }
     }
@@ -3347,6 +3352,7 @@ mod browser_startup_tests {
                     reference: "A".repeat(43),
                 },
                 auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
             },
         };
         let (events, _) = mpsc::unbounded_channel();

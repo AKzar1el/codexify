@@ -6,6 +6,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.10] - 2026-10-22
+
+### Added
+
+- Configure browser retry schedules, jitter, approval-resume waits, and shared
+  conversation-loading cooldowns in Settings → Chats & goals → Automatic retries.
+  Existing timings remain the defaults; timing changes apply after a restart.
+
+### Changed
+
+- Limit shared ChatGPT conversation loads and reloads to one per three minutes
+  normally, or one per five minutes while conversation access is failing.
+- Manual Retry bypasses local browser cooldowns for that attempt while retaining
+  account verification, browser ownership, and protection against duplicate sends.
+- Daily turns, Time in motion, and Daily tool calls show seven days of activity
+  when Today is selected; summary totals and other analytics still cover Today.
+
+### Fixed
+
+- Recognize current ChatGPT conversation-load errors, including disabled retry
+  controls, without incorrectly asking the user to sign in again.
+- Handle Stop confirmation dialogs inside ChatGPT iframes and allow the full
+  settling period after confirming before attempting another Stop or reload.
+- Retry confirmed-unsent rate-limit and shared cooldown failures on the same
+  jittered schedule as conversation-access errors, respecting pause and global
+  retry settings.
+- Keep Retry and Continue beside their error banner during pending, paused, and
+  exhausted retries instead of inserting them into the goal bar.
+- Update shared cooldown countdowns every second. Hide the shorter cooldown when
+  the automatic retry is later, and omit expired-cooldown notices.
+
 ## [2.3.9] - 2026-10-22
 
 ### Fixed
@@ -979,7 +1010,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.9...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.10...HEAD
+[2.3.10]: https://github.com/devnoname120/codexify/compare/v2.3.9...v2.3.10
 [2.3.9]: https://github.com/devnoname120/codexify/compare/v2.3.8...v2.3.9
 [2.3.8]: https://github.com/devnoname120/codexify/compare/v2.3.7...v2.3.8
 [2.3.7]: https://github.com/devnoname120/codexify/compare/v2.3.6...v2.3.7

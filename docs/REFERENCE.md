@@ -1900,8 +1900,9 @@ or submit a prompt. Continuation actions also check their destination's latest t
 for approvals after opening it and again during preparation, before Send. An approval
 found there is resolved on that same page before another continuation can be sent.
 Granting permission resumes the existing turn and preserves queued messages and
-accepted-message records. A persisted three-minute grace period (plus up to ten
-percent jitter) allows the first tool call to arrive; fresh agent activity ends this
+accepted-message records. A persisted grace period (three minutes plus up to ten
+percent jitter by default; configured by `retryTimings.approvalResumeGraceSeconds`
+and `retryTimings.jitterPercent`) allows the first tool call to arrive; fresh agent activity ends this
 wait immediately. Browser restart does not reset the wait. Approval alone does not
 mark pending user messages delivered or count a new goal turn. It does not enable file materialization
 in Codexify when that feature is disabled.
@@ -2161,8 +2162,11 @@ picker. A send reuses a healthy destination conversation
 already open in the shared tab, or opens it when necessary, then selects and
 verifies the preferred model and effort there. A known conversation-load failure
 still receives a deliberate recovery reload. Required conversation loads share
-a three-second minimum spacing across chats; HTTP 429 conversation-load responses pause further
-conversation loads for Retry-After, or three minutes when none is supplied.
+a three-minute minimum spacing across chats by default, or five minutes while a
+conversation is inaccessible. HTTP 429 conversation-load responses pause further
+conversation loads for Retry-After, or three minutes by default when none is supplied.
+These waits are configurable under `agentChat.automation.retryTimings`; see
+[Automatic error retries](#automatic-error-retries).
 Plan inspection reads the account menu first when it identifies the full plan,
 and maintenance skips restoration when the original page is already current.
 Prepared empty new chats are reused at creation. Handoff checks do not reload
@@ -2215,14 +2219,15 @@ written after the action's transcript checkpoint. Status/commentary rows never
 become transcript messages, browser output does not make the agent appear online,
 and mirrored messages remain unread until the normal chat cursor advances.
 
-Confirmed pre-Send failures in chats and active goals retry automatically after
-30, 60, 120, 240, and 480 seconds, then wait for manual Retry. Submitted or stalled
+By default, confirmed pre-Send failures in chats and active goals retry automatically
+after 30, 60, 120, 240, and 480 seconds, then wait for manual Retry. Submitted or stalled
 goal turns recover after 60, 120, and 240 seconds, then require Continue.
-Authentication-required, conversation-unavailable, and editor-insertion failures
+Authentication-required, conversation-unavailable, rate-limit, and editor-insertion failures
 that are confirmed unsent share a separate six-retry
 schedule: 3, 5, 10, 20, 30, and 60 minutes, then wait for manual Retry. Each interval
-starts after the preceding failed attempt. All three schedules add 0–10% extra
-jitter to spread retries from different chats. The jitter is stable for each failed
+starts after the preceding failed attempt. These schedules and their jitter are
+configurable in [Automatic error retries](#automatic-error-retries). All three
+schedules add 0–10% extra jitter by default to spread retries from different chats. The jitter is stable for each failed
 action and attempt, so polling and service restarts do not move its deadline.
 These counts survive service restarts; verified agent activity resets the goal recovery
 count, while Send acceptance alone does not. If fresh agent activity resumes
@@ -3374,6 +3379,45 @@ Chats & goals → Automatic retries** to apply the policy immediately, including
 retries already queued. With it off, initial sends and normal goal continuations
 still work, and failed actions can be retried manually. Error retry backoff is not
 scheduled until the option is enabled again.
+
+The same settings section exposes `agentChat.automation.retryTimings`. All timing
+changes require **Restart Codexify** to apply to both the retry scheduler and the
+shared browser. Defaults preserve the existing behavior:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `actionDelaysSeconds` | `[30, 60, 120, 240, 480]` | Confirmed-unsent browser action failures. |
+| `chatgptAccessDelaysSeconds` | `[180, 300, 600, 1200, 1800, 3600]` | Sign-in, conversation access, rate-limit, and shared loading cooldown errors. |
+| `goalRecoveryDelaysSeconds` | `[60, 120, 240]` | Recover an active goal when the agent remains offline after a continuation. |
+| `jitterPercent` | `10` | Add a stable random wait between 0 and this percentage of each retry delay or approval resume wait. Set to `0` for no jitter. |
+| `approvalResumeGraceSeconds` | `180` | Wait for agent activity after accepting an approval before considering another continuation. |
+| `conversationLoadIntervalSeconds` | `180` | Minimum interval between conversation document loads or reloads across all chats. |
+| `conversationUnavailableCooldownSeconds` | `300` | Shared conversation loading cooldown while a conversation is inaccessible. |
+| `rateLimitCooldownSeconds` | `180` | Shared fallback cooldown after HTTP 429 when no valid `Retry-After` is supplied. |
+
+In the GUI, enter retry schedules as comma-separated durations, for example
+`30s, 1m, 2m`. Bare numbers mean seconds. The JSON configuration always stores
+whole seconds. Each schedule accepts 1–32 entries, each between 1 second and
+24 hours. Each entry is the wait after the preceding failure; automatic retries
+stop after the final entry. The other waits accept 1–86400 seconds, and jitter
+accepts 0–100 percent. Clearing a field or choosing **Use default** restores its
+application default.
+
+The normal conversation loading interval still applies during error cooldowns;
+an HTTP `Retry-After` is also respected. A chat's retry becoming due cannot bypass
+the shared browser cooldown. Reusing an already-open, healthy conversation does
+not consume a document-loading slot. An explicit owner **Retry** bypasses these
+local cooldown checks for that attempt. Account verification, browser ownership,
+and protection against replaying accepted messages still apply. The manual load
+also reserves the next automatic loading slot; it does not disable throttling for
+other chats or later retries. ChatGPT can still return HTTP 429 to that request.
+When an automatic retry is scheduled after the shared cooldown, only the automatic
+retry countdown is shown. Expired cooldowns are omitted.
+
+Changing schedules and restarting retains
+attempt counts and uses the original failure time for pending retries; shortening
+a schedule can exhaust an existing retry budget. Accepted or uncertain sends
+remain protected from automatic replay regardless of timing settings.
 
 **Pause retries** keeps the saved error but stops automatic retries for that
 failure across browsers and restarts. **Retry** (or **Continue**) starts a manual

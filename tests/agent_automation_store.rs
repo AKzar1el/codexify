@@ -1795,64 +1795,94 @@ fn authentication_retries_use_six_separate_intervals_and_never_replay_uncertain_
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         assert_eq!(restored.automatic_retry_at_ms(), Some(deadline));
         assert!(restored.is_automatically_retrying());
-        let mut conversation_failure = state.clone();
-        conversation_failure.action.status = AutomationActionStatus::ConversationUnavailable;
-        assert_eq!(conversation_failure.automatic_retry_at_ms(), Some(deadline));
-        assert_eq!(conversation_failure.automatic_retry_limit(), 6);
-        assert_eq!(
-            conversation_failure.automatic_retry_attempts(),
-            attempt as u32
-        );
+        for status in [
+            AutomationActionStatus::ConversationUnavailable,
+            AutomationActionStatus::RateLimited,
+        ] {
+            let mut access_failure = state.clone();
+            access_failure.action.status = status;
+            assert_eq!(access_failure.automatic_retry_at_ms(), Some(deadline));
+            assert_eq!(access_failure.automatic_retry_limit(), 6);
+            assert_eq!(access_failure.automatic_retry_attempts(), attempt as u32);
+        }
     }
     state.action.chatgpt_access_retry_attempts = 6;
-    assert!(state.automatic_retry_at_ms().is_none());
-    assert!(!state.is_automatically_retrying());
+    for status in [
+        AutomationActionStatus::AuthenticationRequired,
+        AutomationActionStatus::ConversationUnavailable,
+        AutomationActionStatus::RateLimited,
+    ] {
+        let mut exhausted = state.clone();
+        exhausted.action.status = status;
+        assert!(exhausted.automatic_retry_at_ms().is_none());
+        assert!(!exhausted.is_automatically_retrying());
+    }
     assert_eq!(state.retry_mode(), Some("retry"));
     state.action.chatgpt_access_retry_attempts = 0;
     state.action.status = AutomationActionStatus::ConversationUnavailable;
-    for variant in [
-        "accepted",
-        "unknown",
-        "fenced",
-        "counted",
-        "pairing",
-        "cancelled",
+    for status in [
+        AutomationActionStatus::AuthenticationRequired,
+        AutomationActionStatus::ConversationUnavailable,
+        AutomationActionStatus::RateLimited,
     ] {
-        let mut unsafe_state = state.clone();
-        match variant {
-            "accepted" => unsafe_state.action.send_accepted = Some(true),
-            "unknown" => unsafe_state.action.send_accepted = None,
-            "fenced" => unsafe_state.action.messages_fenced = true,
-            "counted" => unsafe_state.action.goal_turn_counted = true,
-            "pairing" => unsafe_state.action.kind = Some(AutomationActionKind::PairVerify),
-            "cancelled" => unsafe_state.action.status = AutomationActionStatus::Cancelled,
-            _ => unreachable!(),
+        let mut disabled = state.clone();
+        disabled.action.status = status;
+        disabled.automatic_retries_enabled = false;
+        assert!(disabled.automatic_retry_at_ms().is_none());
+        disabled.automatic_retries_enabled = true;
+        disabled.action.automatic_retry_paused = true;
+        assert!(disabled.automatic_retry_at_ms().is_none());
+        for variant in [
+            "accepted",
+            "unknown",
+            "fenced",
+            "counted",
+            "pairing",
+            "cancelled",
+        ] {
+            let mut unsafe_state = state.clone();
+            unsafe_state.action.status = status;
+            match variant {
+                "accepted" => unsafe_state.action.send_accepted = Some(true),
+                "unknown" => unsafe_state.action.send_accepted = None,
+                "fenced" => unsafe_state.action.messages_fenced = true,
+                "counted" => unsafe_state.action.goal_turn_counted = true,
+                "pairing" => unsafe_state.action.kind = Some(AutomationActionKind::PairVerify),
+                "cancelled" => unsafe_state.action.status = AutomationActionStatus::Cancelled,
+                _ => unreachable!(),
+            }
+            assert!(
+                unsafe_state.automatic_retry_at_ms().is_none(),
+                "{variant} must not schedule an authentication replay"
+            );
         }
-        assert!(
-            unsafe_state.automatic_retry_at_ms().is_none(),
-            "{variant} must not schedule an authentication replay"
-        );
     }
     let root = tempfile::tempdir().unwrap();
     let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
     let task = task("authentication-goal");
     let goal = store.set_goal(&task, "Continue", 1).unwrap();
     let active = store.run_goal(&task, goal.revision, 2).unwrap();
-    for kind in [
-        AutomationActionKind::OfflineGoal,
-        AutomationActionKind::OfflineCombined,
+    for status in [
+        AutomationActionStatus::ConversationUnavailable,
+        AutomationActionStatus::RateLimited,
     ] {
-        state.action.kind = Some(kind);
-        state.action.goal_revision = Some(active.revision);
-        state.goal = Some(active.clone());
-        assert!(state.automatic_retry_at_ms().is_some());
-        for status in [
-            GoalStatus::Configured,
-            GoalStatus::Blocked,
-            GoalStatus::Completed,
+        state.action.status = status;
+        for kind in [
+            AutomationActionKind::OfflineGoal,
+            AutomationActionKind::OfflineCombined,
         ] {
-            state.goal.as_mut().unwrap().status = status;
-            assert!(state.automatic_retry_at_ms().is_none());
+            state.action.kind = Some(kind);
+            state.action.goal_revision = Some(active.revision);
+            state.goal = Some(active.clone());
+            assert!(state.automatic_retry_at_ms().is_some());
+            for status in [
+                GoalStatus::Configured,
+                GoalStatus::Blocked,
+                GoalStatus::Completed,
+            ] {
+                state.goal.as_mut().unwrap().status = status;
+                assert!(state.automatic_retry_at_ms().is_none());
+            }
         }
     }
     let mut legacy = serde_json::to_value(AutomationTaskState::default()).unwrap();
@@ -1924,4 +1954,132 @@ fn retry_jitter_is_stable_bounded_and_spreads_chats_on_each_schedule() {
             "independent chats must not share one fixed retry time"
         );
     }
+}
+
+#[test]
+fn configured_retry_timings_survive_restart_and_shortening_without_changing_send_safety() {
+    use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
+    let root = tempfile::tempdir().unwrap();
+    let mut config = codexify::config::default_config(root.path().to_owned());
+    let timings = &mut config.markdown_chat.automation.retry_timings;
+    timings.action_delays_seconds = vec![7, 19];
+    timings.chatgpt_access_delays_seconds = vec![11, 23, 37, 41, 43, 47, 53];
+    timings.goal_recovery_delays_seconds = vec![13, 29, 31, 59];
+    timings.jitter_percent = 0;
+    timings.approval_resume_grace_seconds = 17;
+    let store = AgentAutomationStore::for_state_root(&config, root.path()).unwrap();
+    let task = task("custom-retry-policy");
+    store
+        .issue_pairing(&task, "https://chatgpt.com/c/custom", 0, 1)
+        .unwrap();
+    let goal = store.set_goal(&task, "Continue", 1).unwrap();
+    store.run_goal(&task, goal.revision, 2).unwrap();
+    for (status, kind, delays, accepted) in [
+        (
+            AutomationActionStatus::Failed,
+            AutomationActionKind::OfflineChat,
+            vec![7, 19],
+            false,
+        ),
+        (
+            AutomationActionStatus::ConversationUnavailable,
+            AutomationActionKind::OfflineChat,
+            vec![11, 23, 37, 41, 43, 47, 53],
+            false,
+        ),
+        (
+            AutomationActionStatus::RateLimited,
+            AutomationActionKind::OfflineChat,
+            vec![11, 23, 37, 41, 43, 47, 53],
+            false,
+        ),
+        (
+            AutomationActionStatus::Stalled,
+            AutomationActionKind::OfflineGoal,
+            vec![13, 29, 31, 59],
+            true,
+        ),
+    ] {
+        let mut state = store.load(&task).unwrap();
+        state.action = AutomationActionState {
+            id: Some("custom-failure".into()),
+            pairing_generation: Some(state.pairing.generation),
+            kind: Some(kind),
+            status,
+            goal_revision: (kind == AutomationActionKind::OfflineGoal).then_some(goal.revision),
+            send_accepted: Some(accepted),
+            updated_at_ms: Some(100),
+            ..Default::default()
+        };
+        let path = store.task_directory(&task).unwrap().join("automation.json");
+        for attempt in 0..=delays.len() {
+            state.action.automatic_retry_attempts = if status == AutomationActionStatus::Failed {
+                attempt as u32
+            } else {
+                0
+            };
+            state.action.chatgpt_access_retry_attempts = if matches!(
+                status,
+                AutomationActionStatus::ConversationUnavailable
+                    | AutomationActionStatus::RateLimited
+            ) {
+                attempt as u32
+            } else {
+                0
+            };
+            state.goal_wake.recovery_attempts = if kind == AutomationActionKind::OfflineGoal {
+                attempt as u32
+            } else {
+                0
+            };
+            let bytes = serde_json::to_vec(&state).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(json.get("retryTimings").is_none());
+            std::fs::write(&path, &bytes).unwrap();
+            let restarted = AgentAutomationStore::for_state_root(&config, root.path())
+                .unwrap()
+                .load(&task)
+                .unwrap();
+            assert_eq!(restarted.automatic_retry_limit(), delays.len());
+            assert_eq!(
+                restarted.automatic_retry_at_ms(),
+                delays.get(attempt).map(|seconds| 100 + seconds * 1000)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            if !accepted {
+                for evidence in [None, Some(true)] {
+                    let mut uncertain = restarted.clone();
+                    uncertain.action.send_accepted = evidence;
+                    assert_eq!(uncertain.automatic_retry_at_ms(), None);
+                }
+            }
+        }
+        let mut shorter = config.clone();
+        shorter
+            .markdown_chat
+            .automation
+            .retry_timings
+            .action_delays_seconds = vec![1];
+        shorter
+            .markdown_chat
+            .automation
+            .retry_timings
+            .chatgpt_access_delays_seconds = vec![1];
+        shorter
+            .markdown_chat
+            .automation
+            .retry_timings
+            .goal_recovery_delays_seconds = vec![1];
+        let shorter = AgentAutomationStore::for_state_root(&shorter, root.path()).unwrap();
+        assert_eq!(shorter.load(&task).unwrap().automatic_retry_at_ms(), None);
+        // Mutations must remain possible when an old counter exceeds the new schedule length.
+        shorter
+            .set_selection(&task, "gpt-6-sol", "high", "catalog", "account", 500)
+            .unwrap();
+    }
+    let mut state: AutomationTaskState = store.load(&task).unwrap();
+    state.approval_resume=Some(serde_json::from_value(serde_json::json!({"resumedAtMs":100,"ownerGeneration":0,"pairingGeneration":0,"goalRevision":null})).unwrap());
+    assert_eq!(state.approval_resume_until_ms(), Some(17_100));
+    state.retry_timings.jitter_percent = 25;
+    assert!((17_100..=21_350).contains(&state.approval_resume_until_ms().unwrap()));
 }

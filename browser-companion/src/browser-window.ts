@@ -1,3 +1,4 @@
+import {withConversationCooldownBypass} from "./navigation";
 import { createHash } from "node:crypto";
 import { asCompanionError, BrowserCompanionError } from "./errors";
 import { modelSelectionAllowed } from "./model-fallback";
@@ -102,7 +103,7 @@ interface RetiredActionRecord {
 }
 
 function requestDigest(request: ExecuteActionRequest): string {
-  return createHash("sha256").update(JSON.stringify(request)).digest("hex");
+  return createHash("sha256").update(JSON.stringify({...request,bypassConversationCooldown:request.bypassConversationCooldown??false})).digest("hex");
 }
 
 function terminalType(type: ActionEvent["type"]): boolean {
@@ -585,6 +586,10 @@ export class SingleWindowCoordinator {
   }
 
   private async run(record: ActionRecord): Promise<void> {
+    return withConversationCooldownBypass(record.request.bypassConversationCooldown === true, () => this.runWithNavigationPolicy(record));
+  }
+
+  private async runWithNavigationPolicy(record: ActionRecord): Promise<void> {
     const completedSteps = new Set<string>();
     try {
       await this.bounded(async(signal,progress)=>{

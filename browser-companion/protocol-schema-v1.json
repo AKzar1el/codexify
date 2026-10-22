@@ -150,6 +150,9 @@
     "scope": "Current verified conversation and its configured connector only; no navigation or message submission",
     "policy": "Core calls only while autoApproveToolCalls is enabled; checks yield to browser actions"
   },
+  "executeOptionalFields": {
+    "bypassConversationCooldown": "boolean, default false; explicit owner Retry only. Bypasses local conversation-load, access-error and HTTP cooldown checks for this action. Account, ownership and Send checks remain required; loads still reserve the next automatic cooldown."
+  },
   "launchConfiguration": {
     "requestBlockList": "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST: JSON array of RE2 URL patterns; verified browser-wide before navigation"
   },

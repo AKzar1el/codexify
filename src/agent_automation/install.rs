@@ -307,6 +307,14 @@ impl BrowserCompanionManager {
             .env("CODEXIFY_BROWSER_DESCRIPTOR", &self.layout.descriptor_path)
             .env("CODEXIFY_BROWSER_BUILD", &runtime.manifest.build)
             .env(
+                "CODEXIFY_BROWSER_NAVIGATION_TIMINGS",
+                serde_json::json!({
+                    "conversationLoadIntervalSeconds": self.config.retry_timings.conversation_load_interval_seconds,
+                    "conversationUnavailableCooldownSeconds": self.config.retry_timings.conversation_unavailable_cooldown_seconds,
+                    "rateLimitCooldownSeconds": self.config.retry_timings.rate_limit_cooldown_seconds,
+                }).to_string(),
+            )
+            .env(
                 "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST",
                 serde_json::to_string(self.config.effective_request_block_list())
                     .map_err(|_| "Could not encode browser request block list")?,
