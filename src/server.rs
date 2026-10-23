@@ -209,10 +209,8 @@ impl CodexHandler {
         {
             tracing::warn!(%error, "could not record queued-message turn progress");
         }
-        if !matches!(
-            tool_name,
-            "chat_await" | "turn_completed" | "automation_verify_pairing"
-        ) && let Some(root) = self.selected_project_root(task_conversation)
+        if counts_rollout_work(tool_name)
+            && let Some(root) = self.selected_project_root(task_conversation)
             && let Ok(config) = self.effective_task_config(task_conversation, root)
             && let Ok(chat) = self
                 .markdown_chat
@@ -531,6 +529,13 @@ fn app_only_tool(tool: &dyn Tool) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|visibility| !visibility.contains(&json!("model")))
     })
+}
+
+fn counts_rollout_work(name: &str) -> bool {
+    !matches!(
+        name,
+        "chat_await" | "turn_completed" | "goal_finish" | "automation_verify_pairing"
+    )
 }
 
 fn ticketed_model_tool(tool: &dyn Tool, config: &AppConfig) -> bool {
@@ -1652,7 +1657,8 @@ impl ServerHandler for CodexHandler {
                 };
                 let renewing = renewal.is_some();
                 output_fields.push((crate::agent_automation::turn_renewal::NOTICE_FIELD, renewal));
-                let notice = if renewing
+                let notice = if !counts_rollout_work(&name)
+                    || renewing
                     || !crate::global_settings::rollout_enabled(&config).unwrap_or(false)
                     || chat.agent_stop_requested().await.unwrap_or(true)
                 {

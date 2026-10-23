@@ -838,6 +838,21 @@ async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_
         .chat(&config, Some(&identity), &handler.session)
         .unwrap();
     chat.ensure().await.unwrap();
+    for name in ["chat_await", "turn_completed", "goal_finish"] {
+        for _ in 0..25 {
+            let activity = handler
+                .record_chat_activity(Some(&identity), None, crate::markdown_chat::now_ms(), name)
+                .await;
+            assert!(
+                activity.is_some(),
+                "waiting still records normal agent activity"
+            );
+        }
+    }
+    assert!(
+        chat.rollout_reminder(20).await.unwrap().is_none(),
+        "25 waiting/completion calls per tool must not advance the progress counter"
+    );
     std::fs::write(
         chat.path().with_file_name("automation.json"),
         r#"{"goal":{"status":"blocked"}}"#,
@@ -869,6 +884,47 @@ async fn rollout_reminders_count_model_work_and_recovery_tools_preserve_private_
         request
     };
     let field = crate::markdown_chat::rollout::REMINDER_FIELD;
+    // A due checkpoint from earlier work must remain pending while the agent
+    // waits or completes a goal, rather than being attached to those results.
+    for _ in 0..20 {
+        chat.record_rollout_work().await.unwrap();
+    }
+    for name in ["chat_await", "turn_completed", "goal_finish"] {
+        let response = client.call_tool(request(name, json!({}))).await.unwrap();
+        assert!(
+            response
+                .structured_content
+                .as_ref()
+                .is_none_or(|body| body.get(field).is_none()),
+            "waiting/completion results must not request a progress checkpoint: {name}"
+        );
+    }
+    let waiting_state: Value = serde_json::from_str(
+        &std::fs::read_to_string(chat.path().with_file_name("rollout-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(waiting_state["work_calls"], 20);
+    assert_eq!(waiting_state["reminded_calls"], 0);
+    let work = client
+        .call_tool(request("chat_read", json!({})))
+        .await
+        .unwrap();
+    assert!(
+        work.structured_content
+            .as_ref()
+            .unwrap()
+            .get(field)
+            .is_some(),
+        "the next work result must still deliver the pending checkpoint"
+    );
+    chat.append_rollout(
+        "initial-checkpoint".into(),
+        "Working".into(),
+        "Saved prior work".into(),
+        "Continue verification".into(),
+    )
+    .await
+    .unwrap();
     for count in 1..=20 {
         let result = client
             .call_tool(request("chat_read", json!({})))

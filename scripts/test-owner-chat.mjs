@@ -526,12 +526,14 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
       ["completed", now, null, "goal-completed"],
       ["completed", null, null, "goal-completed"],
       ["completed", now, null, "online", true],
-      ["completed", null, null, "offline", true]
+      ["completed", null, null, "offline", true],
+      ["active", null, null, "browser-cooldown", false, {automationWaitingForBrowser:true}],
+      [null, null, null, "error", false, {automationWaitingForBrowser:true,automationError:"Browser action failed"}]
     ];
-    const chats = cases.map(([goalStatus, lastAgentCallAtMs, agentWaitingUntilMs, , goalCompletionDismissed = false], i) => ({
+    const chats = cases.map(([goalStatus, lastAgentCallAtMs, agentWaitingUntilMs, , goalCompletionDismissed = false, flags = {}], i) => ({
       id:i.toString(16).repeat(64), title:`Icon case ${i}`, workspace:"icons", goalStatus,
       goalCompletionDismissed, goalCompletedAtMs:now-1000, goalCompletedChatEnd:0,
-      lastAgentCallAtMs, agentWaitingUntilMs, lastEntryEnd:0, lastEntryAtMs:now - i, totalToolCalls:1
+      lastAgentCallAtMs, agentWaitingUntilMs, lastEntryEnd:0, lastEntryAtMs:now - i, totalToolCalls:1, ...flags
     }));
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
@@ -561,6 +563,21 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     }
     assert.equal(await icons.nth(12).locator('.presence-spinner').count(),1);
     assert.equal(await icons.nth(13).isVisible(),false);
+    const cooldownIcon=icons.nth(14);
+    assert.equal(await cooldownIcon.isVisible(),true,'cooldown waits stay visible while the agent is offline');
+    assert.equal(await cooldownIcon.getAttribute('aria-label'),'Waiting for browser cooldown');
+    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)');
+    assert.equal(await cooldownIcon.locator('path').getAttribute('d'),'M6 2h12v5l-6 5 6 5v5H6v-5l6-5-6-5ZM4 2h16M4 22h16');
+    const spinSettings=node=>{
+      const css=getComputedStyle(node);return [css.animationName,css.animationDuration,css.animationTimingFunction,css.animationIterationCount];
+    };
+    assert.deepEqual(await cooldownIcon.locator('svg').evaluate(spinSettings),['presence-spin','2s','linear','infinite']);
+    assert.deepEqual(await cooldownIcon.locator('svg').evaluate(spinSettings),await icons.nth(0).locator('svg').evaluate(spinSettings),'the hourglass uses the same continuous rotation as the other spinners');
+    assert.equal(await icons.nth(15).getAttribute('aria-label'),'Chat error: Browser action failed','actual errors take priority over the cooldown indicator');
+    if(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS){
+      mkdirSync(process.env.CODEXIFY_WORKSPACE_SCREENSHOTS,{recursive:true});
+      await page.locator(`.conversation-row[data-chat-id="${chats[14].id}"]`).screenshot({path:`${process.env.CODEXIFY_WORKSPACE_SCREENSHOTS}/${engineName.toLowerCase()}-browser-cooldown.png`});
+    }
     assert.equal(await icons.nth(0).locator(".presence-spinner").count(),1);
     assert.equal(await icons.nth(0).locator("svg").evaluate(node => getComputedStyle(node).animationName),"presence-spin");
     assert.equal(await icons.nth(3).locator("path").getAttribute("d"),"M9 8v8m6-8v8");
@@ -584,23 +601,27 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     const initialRotation=await ring.evaluate(node=>getComputedStyle(node).transform);
     await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
     assert.notEqual(await ring.evaluate(node=>getComputedStyle(node).transform),initialRotation);
-    const phaseError=await page.evaluate(async()=>{
+    const phaseErrors=await page.evaluate(async()=>{
       const sample=()=>{
-        const node=document.querySelector(".conversation .presence-spinner");
-        const matrix=new DOMMatrixReadOnly(getComputedStyle(node).transform);
-        return {time:performance.now(),angle:Math.atan2(matrix.b,matrix.a)};
+        return [".conversation .presence.online .presence-spinner",".conversation .presence.browser-cooldown .presence-spinner"].map(selector=>{
+          const matrix=new DOMMatrixReadOnly(getComputedStyle(document.querySelector(selector)).transform);
+          return {time:performance.now(),angle:Math.atan2(matrix.b,matrix.a)};
+        });
       };
       const before=sample();
       document.getElementById("view-recent").click();
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
       const after=sample();
-      const difference=after.angle-before.angle-(after.time-before.time)*2*Math.PI/2000;
-      return Math.abs(Math.atan2(Math.sin(difference),Math.cos(difference)));
+      return after.map((sample,index)=>{
+        const difference=sample.angle-before[index].angle-(sample.time-before[index].time)*2*Math.PI/2000;
+        return Math.abs(Math.atan2(Math.sin(difference),Math.cos(difference)));
+      });
     });
-    assert(phaseError<.2,"sidebar redraws must preserve the standalone spinner's rotation phase");
+    assert(phaseErrors.every(error=>error<.2),"sidebar redraws must preserve the spinner and hourglass rotation phases");
     assert.equal(await icons.nth(1).locator("path:not(.goal-outer-ring)").evaluate(node=>getComputedStyle(node).transform),"none");
     assert.equal(await icons.nth(5).locator(".goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
     await page.emulateMedia({colorScheme:"dark"});
+    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)','browser cooldowns stay green in dark mode');
     assert.equal(await icons.nth(5).evaluate(node=>getComputedStyle(node).color),"rgb(255, 133, 142)");
     assert.equal(await icons.nth(11).evaluate(node=>getComputedStyle(node).color),await icons.nth(7).evaluate(node=>getComputedStyle(node).color),'completed offline goals match the offline gray in dark mode');
     await page.emulateMedia({colorScheme:"light"});
@@ -612,6 +633,14 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     await page.locator(".conversation").filter({ hasText:/Icon case 7/ }).click();
     await page.locator('#chat-host #presence[data-state="offline"]').waitFor();
     assert.equal(await page.locator('#chat-host #presence[data-state="offline"] svg').isVisible(),true,"the header offline icon stays visible");
+    chats[14].goalStatus=null;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator(`.conversation-row[data-chat-id="${chats[14].id}"] .presence.browser-cooldown`).waitFor();
+    assert.equal(await cooldownIcon.isVisible(),true,'ordinary chats also show the cooldown hourglass');
+    chats[14].automationWaitingForBrowser=false;
+    await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+    await page.locator(`.conversation-row[data-chat-id="${chats[14].id}"] .presence.offline`).waitFor({state:'attached'});
+    assert.equal(await cooldownIcon.isVisible(),false,'the cooldown indicator clears when the queued action resumes');
     chats[3].goalStatus = null;
     chats[4].goalStatus = null;
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
@@ -805,10 +834,10 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
     page.on("pageerror", error => errors.push(error.message));
     const now = Date.now();
     const chats = [
-      { id:"1".repeat(64), title:"Newest alpha", workspace:"same-name", projectId:"alpha", projectPath:"/projects/alpha/same-name", lastEntryAtMs:now },
-      { id:"2".repeat(64), title:"Middle beta", workspace:"same-name", projectId:"beta", projectPath:"/projects/beta/same-name", lastEntryAtMs:now - 1000 },
-      { id:"3".repeat(64), title:"Older alpha", workspace:"same-name", projectId:"alpha", projectPath:"/projects/alpha/same-name", lastEntryAtMs:now - 2000 },
-      { id:"4".repeat(64), title:"Oldest beta", workspace:"same-name", projectId:"beta", projectPath:"/projects/beta/same-name", lastEntryAtMs:now - 3000 }
+      { id:"1".repeat(64), title:"Newest alpha", workspace:"feature-a", projectId:"alpha-worktree-a", projectPath:"/worktrees/feature-a", projectGroup:{path:"/projects/alpha/same-name",name:"same-name"}, lastEntryAtMs:now },
+      { id:"2".repeat(64), title:"Middle beta", workspace:"same-name", projectId:"beta", projectPath:"/projects/beta/same-name", projectGroup:{path:"/projects/beta/same-name",name:"same-name"}, lastEntryAtMs:now - 1000 },
+      { id:"3".repeat(64), title:"Older alpha", workspace:"feature-b", projectId:"alpha-worktree-b", projectPath:"/worktrees/feature-b", projectGroup:{path:"/projects/alpha/same-name",name:"same-name"}, lastEntryAtMs:now - 2000 },
+      { id:"4".repeat(64), title:"Oldest beta", workspace:"beta-worktree", projectId:"beta-worktree", projectPath:"/worktrees/beta", projectGroup:{path:"/projects/beta/same-name",name:"same-name"}, lastEntryAtMs:now - 3000 }
     ].map(chat => ({ ...chat, customTitle:null, latestTitle:chat.title, lastEntryEnd:100, lastAgentCallAtMs:null, totalToolCalls:0 }));
     let releaseOldSearch = null;
     await routeOwner(page, "http://127.0.0.1:43212/**", async route => {
@@ -838,6 +867,7 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
     await page.locator(".project-heading").first().waitFor();
     assert.deepEqual(await page.locator(".conversation-title").allTextContents(), ["Newest alpha", "Older alpha", "Middle beta", "Oldest beta"]);
     assert.deepEqual(await page.locator(".project-heading").evaluateAll(nodes => nodes.map(node => node.title)), ["/projects/alpha/same-name", "/projects/beta/same-name"]);
+    assert.deepEqual(await page.locator(".project-heading").allTextContents(), ["same-name", "same-name"], "worktrees share their base project heading; unrelated same-name repositories stay separate");
     await page.getByRole("button", { name:"Recent", exact:true }).click();
     assert.deepEqual(await page.locator(".conversation-title").allTextContents(), ["Newest alpha", "Middle beta", "Older alpha", "Oldest beta"]);
     await page.reload();
@@ -888,6 +918,39 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
     await assertHeaderMatchesSidebar();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
+});
+
+test(`${engineName}: model selectors retain per-chat preferences and readable cached labels`, {timeout:30000}, async()=>{
+ const browser=await engine.launch();
+ try {
+  const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
+  const now=Date.now(),chats=['b','c'].map((n,i)=>({id:n.repeat(64),title:`Model preference ${i}`,workspace:'test',lastEntryEnd:0,lastEntryAtMs:now-i,totalToolCalls:0}));
+  const selections=new Map(chats.map((chat,i)=>[chat.id,{model:'gpt-5.6-sol',effort:i?'medium':'max'}]));
+  const model={id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:[{id:'medium',label:'Medium',available:true},{id:'high',label:'High',available:true},{id:'max',label:'Pro',available:true}]};
+  let catalogReady=false,authenticated=true;const operations=[],errors=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await routeOwner(page,'http://127.0.0.1:43224/**',async route=>{
+   const request=route.request(),url=new URL(request.url()),id=url.pathname.split('/')[3];
+   if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
+   if(url.pathname==='/api/chats')return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
+   if(url.pathname.endsWith('/automation/selection')){const body=request.postDataJSON();operations.push(body);selections.set(id,{model:body.model,effort:body.effort});return route.fulfill({json:{selection:selections.get(id)}});}
+   if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},selection:selections.get(id),goal:null,action:{status:'idle'},companion:{authenticated,status:authenticated?'idle':'unavailable',catalogContext:authenticated?'account-one':null},catalog:catalogReady&&authenticated?{models:[model]}:null,serverTimeMs:Date.now()}});
+   assert(!url.pathname.endsWith('/capabilities'),'opening a chat must not discover models');
+   return route.fulfill({json:{_meta:{[META]:{chat_file:`/test/${id}/CHAT.md`,revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
+  });
+  await page.goto(`http://127.0.0.1:43224/?chat=${chats[0].id}#test-token`);
+  const host=page.locator('#chat-host'),picker=host.locator('#automation-model'),effort=host.locator('#automation-effort');
+  await picker.waitFor();assert.equal(await picker.locator('option:checked').textContent(),'GPT-5.6 Sol');
+  assert.equal(await effort.locator('option:checked').textContent(),'Pro');
+  catalogReady=true;await host.locator('#automation-effort:enabled').waitFor();await effort.selectOption('high');await host.locator('#automation-effort:enabled').waitFor();
+  await page.locator(`[data-chat-id="${chats[1].id}"] .conversation`).click();await page.waitForFunction(()=>document.querySelector('#chat-host .chat-shell').shadowRoot.querySelector('#automation-effort')?.value==='medium');
+  await page.locator(`[data-chat-id="${chats[0].id}"] .conversation`).click();await page.waitForFunction(()=>document.querySelector('#chat-host .chat-shell').shadowRoot.querySelector('#automation-effort')?.value==='high');
+  model.efforts.find(effort=>effort.id==='high').available=false;
+  await effort.locator('option[value="high"]:disabled').waitFor({state:'attached'});assert.equal(await effort.inputValue(),'high','availability changes do not silently select another effort');
+  authenticated=false;await host.locator('#automation-effort:disabled').waitFor();assert.equal(await effort.locator('option:checked').textContent(),'High');
+  await page.reload();await picker.waitFor();assert.equal(await picker.locator('option:checked').textContent(),'GPT-5.6 Sol');assert.equal(await effort.locator('option:checked').textContent(),'High');
+  assert.equal(operations.length,1,'only the explicit user change saves a selection');assert.deepEqual(errors,[]);
+ }finally{await browser.close();}
 });
 
 test(`${engineName}: standalone automation controls drive only authenticated owner APIs`, { timeout:45000 }, async () => {
@@ -1206,9 +1269,10 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     automation.companion.activeActionId = "unrelated-action";
     assert.equal(await panel.getByRole("button", { name:"Open in ChatGPT" }).isDisabled(), true);
     automation.companion.authenticated = false;
-    await model.locator("option").filter({hasText:"Saved model"}).waitFor({state:"attached"});
-    assert.equal(await model.locator("option:checked").textContent(), "Saved model");
-    assert.equal(await effort.locator("option:checked").textContent(), "Saved effort");
+    await page.waitForFunction(()=>document.querySelector('#chat-host .chat-shell').shadowRoot.querySelector('#automation-effort').disabled);
+    const savedModel=catalog.models.find(model=>model.id===automation.selection.model);
+    assert.equal(await model.locator("option:checked").textContent(), savedModel.label);
+    assert.equal(await effort.locator("option:checked").textContent(), savedModel.efforts.find(effort=>effort.id===automation.selection.effort).label);
     assert(!operations.includes("capabilities"),"browsing and preference changes use the cached model list");
     assert(operations.includes("reveal"));
     assert(operations.some(entry => Array.isArray(entry) && entry[0] === "selection"));
@@ -1304,7 +1368,7 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
     const browser=await engine.launch();
     try {
       const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
-      const chats=[], submitted=[], errors=[];let preparations=0;
+      const chats=[], submitted=[], createdProjects=[], errors=[];let preparations=0;
       page.on('pageerror',error=>errors.push(error.message));
       await routeOwner(page, 'http://127.0.0.1:43215/**',async route=>{
         const request=route.request(),url=new URL(request.url());
@@ -1318,7 +1382,12 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
             {id:'future-model',label:'Future model',efforts:[{id:'variable',label:'Variable choice',available:true},{id:'expanded',label:'Expanded choice',available:true}]}
           ]}});
         }
-        if(url.pathname==='/api/projects')return route.fulfill({json:{createWorktree:true,catalog:{projects:[{selector:'repo',name:'Existing repo'}],total:1,warnings:[]}}});
+        if(url.pathname==='/api/projects'&&request.method()==='POST'){
+          const body=request.postDataJSON();createdProjects.push(body);
+          if(body.name==='duplicate')return route.fulfill({status:409,body:'A file or folder with that name already exists'});
+          return route.fulfill({json:{path:`/workspace/${body.name}`,name:body.name}});
+        }
+        if(url.pathname==='/api/projects')return route.fulfill({json:{createWorktree:true,catalog:{access_root:'/workspace',projects:[{selector:'repo',name:'Existing repo'}],total:1,warnings:[]}}});
         if(url.pathname==='/api/projects/worktrees')return route.fulfill({json:{worktrees:[{name:'Saved worktree',path:'/workspace/saved'}]}});
         if(url.pathname==='/api/chats'&&request.method()==='POST'){
           const body=request.postDataJSON();submitted.push(body);
@@ -1407,7 +1476,29 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
       assert.equal(submitted[8].path,'repo');assert.equal(submitted[8].worktreePath,'/workspace/saved');assert.equal(submitted[8].createWorktree,true);
       await open();await url.fill('/workspace/saved');await create.click();await dialog.waitFor({state:'hidden'});
       assert.equal(submitted[9].path,'/workspace/saved');assert.equal(submitted[9].createWorktree,true);
-      assert.equal(preparations,10,'every New chat must freshly discover its destination-specific models');
+      await open();await dialog.getByRole('button',{name:'Existing repo',exact:true}).click();
+      await dialog.getByRole('button',{name:'New project',exact:true}).click();
+      const projectName=dialog.getByLabel('New project name'),createProject=dialog.getByRole('button',{name:'Create project',exact:true});
+      assert.equal(await createProject.isDisabled(),true);
+      for(const control of [projectName,createProject]){
+        const box=await control.boundingBox();assert(box.x>=0&&box.x+box.width<=390,'project creation controls fit on mobile');
+      }
+      await dialog.getByText('Creates a folder in /workspace.',{exact:true}).waitFor();
+      await projectName.fill('duplicate');await createProject.click();
+      await dialog.getByRole('alert').getByText('A file or folder with that name already exists',{exact:true}).waitFor();
+      assert.equal(await dialog.locator('#new-chat-selection').textContent(),'Existing repo','a failed folder creation preserves the selection');
+      await projectName.fill('  My new project  ');await projectName.press('Enter');
+      await dialog.locator('#new-chat-selection').getByText('/workspace/My new project',{exact:true}).waitFor();
+      assert.equal(await projectName.isHidden(),true);
+      assert.equal(await url.inputValue(),'/workspace/My new project');
+      assert.equal(await checkbox.isChecked(),false,'new empty folders are used directly');
+      assert.equal(submitted.length,10,'creating a project must not create or send a chat');
+      assert.deepEqual(createdProjects,[{name:'duplicate'},{name:'My new project'}]);
+      await create.click();await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[10].path,'/workspace/My new project');assert.equal(submitted[10].createWorktree,false);
+      await open();assert.equal(await projectName.isHidden(),true);assert.equal(await projectName.inputValue(),'');
+      await dialog.getByRole('button',{name:'Close new chat',exact:true}).click();
+      assert.equal(preparations,12,'every New chat must freshly discover its destination-specific models');
       assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });

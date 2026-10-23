@@ -11,6 +11,7 @@ import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressSte
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
 import { asCompanionError, BrowserCompanionError } from "./errors";
+import { uiLabelPattern } from "./ui-localization";
 import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
 import { buildCapabilityCatalog, type AccountCapabilities } from "./models";
@@ -144,7 +145,6 @@ async function stopLingeringResponse(
       throw new BrowserCompanionError("ChatGPT account changed while stopping the previous response", "authentication_required");
     }
   };
-  let stopRequested = false;
   let confirmationSubmitted = false;
   const waitForStopped = async (stop:Locator) => {
     let settleDeadline = Math.min(deadline,(lastStopRequestedAt||Date.now())+settleMs);
@@ -153,9 +153,10 @@ async function stopLingeringResponse(
       const count = dialogs.length;
       if (count) {
         const dialog = dialogs[0]!;
-        // This generic dialog shell also serves other actions. Only handle a
-        // confirmation that appeared after our own verified Stop click.
-        if (!stopRequested || count !== 1 || !await dialog.evaluate(element => {
+        // A previous action or the user may already have opened this dialog.
+        // Its generic shell also serves other actions: require the exact shape
+        // and a localized Stop submit button before confirming it.
+        if (count !== 1 || !await dialog.evaluate(element => {
           if (!element.matches('.codex-dialog[role="dialog"][aria-modal="true"][data-state="open"]')) return false;
           const forms = element.querySelectorAll('form');
           if (forms.length !== 1) return false;
@@ -171,11 +172,15 @@ async function stopLingeringResponse(
         })) {
           throw new BrowserCompanionError("ChatGPT has an unexpected dialog while stopping the response", "external_interference");
         }
+        const confirm = dialog.locator('form button[type="submit"].bg-primary-solid')
+          .and(dialog.getByRole('button',{name:uiLabelPattern('stopControl')}));
+        if (await confirm.count() !== 1) {
+          throw new BrowserCompanionError("ChatGPT has an unexpected dialog while stopping the response", "external_interference");
+        }
         if (!confirmationSubmitted) {
           await assertTarget();
           boundedSignal.throwIfAborted();
-          // Do not use localized labels or generated Radix IDs to choose Stop.
-          await dialog.locator('form button[type="submit"].bg-primary-solid').click({timeout:timeout(750),signal:boundedSignal});
+          await confirm.click({timeout:timeout(750),signal:boundedSignal});
           confirmationSubmitted = true;
           await requested("confirmation");
           // Confirmation is a fresh Stop request. Its full settling window starts
@@ -198,9 +203,6 @@ async function stopLingeringResponse(
     const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true });
     const count = await stop.count();
     const dialogCount = (await visibleStopDialogs(page)).length;
-    if (dialogCount && !stopRequested) {
-      throw new BrowserCompanionError("ChatGPT has an open dialog before stopping the response", "external_interference");
-    }
     if (count === 0 && dialogCount === 0) {emit({type:"stop_progress",step:"complete"});return;}
     if (count !== 1 && dialogCount === 0) {
       throw new BrowserCompanionError("ChatGPT does not have one visible Stop control", "selector_drift");
@@ -208,7 +210,6 @@ async function stopLingeringResponse(
     try {
       if (dialogCount === 0 && await stop.isEnabled()) {
         await stop.click({ timeout:timeout(750), signal:boundedSignal });
-        stopRequested = true;
         await requested((["initial","retry","recovery"] as const)[attempt]!);
       }
       await waitForStopped(stop);
@@ -447,7 +448,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
 
   async prepareNewChat(projectUrl:string | null, signal?:AbortSignal): Promise<CapabilityCatalog> {
     await this.surface.beginAction();
-    try { await openNewChat(this.surface, projectUrl,signal); return await this.capabilities(signal); }
+    try {
+      await openNewChat(this.surface, projectUrl,signal);
+      await clearExistingDraft(await this.surface.page(),signal);
+      return await this.capabilities(signal);
+    }
     finally { await this.surface.endAction(); }
   }
 
@@ -464,7 +469,6 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       throw new BrowserCompanionError("Sign in to ChatGPT before refreshing browser capabilities", "authentication_required", { cause:error });
     }
     const account = await readChatGptAccount(page);
-    await clearExistingDraft(page,signal);
     const capabilities = await detectChatGptAccountCapabilities(page,{signal});
     const planKind = this.planCache?.plan.accountFingerprint === account.fingerprint
       ? this.planCache.plan.kind : classifyPlan(account.planType).kind;
@@ -711,7 +715,6 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       };
       await verifyHandoff();
       if (execution.request.prompt.kind === "pair_verify") await this.replacePairingDraft(execution.request);
-      await clearExistingDraft(page,execution.signal);
       if (execution.request.prompt.kind !== "pair_verify" && !creating && !renewal) {
         // Offline actions are dispatched after tool-call inactivity. Stop only
         // while preparing this send; ongoing conversations need no observation.
@@ -719,6 +722,8 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         if (canonicalChatGptConversationUrl(page.url()) !== canonicalUrl) {
           throw new BrowserCompanionError("ChatGPT changed conversations while stopping the previous response", "conversation_unavailable");
         }
+      } else {
+        await clearExistingDraft(page,execution.signal);
       }
       const cache = this.capabilitiesCache;
       await clearExistingDraft(page,execution.signal);

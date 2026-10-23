@@ -25,6 +25,45 @@ pub(super) async fn projects(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateProjectBody {
+    name: String,
+}
+
+pub(super) async fn create_project(
+    State(state): State<OwnerState>,
+    Json(body): Json<CreateProjectBody>,
+) -> ApiResult {
+    let name = body.name.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || matches!(name, "." | "..")
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Enter a project folder name without path separators".into(),
+        ));
+    }
+    let (root, _) = crate::project_bindings::resolve_project_root(&state.config, ".")
+        .map_err(internal_error)?;
+    let path = root.join(name);
+    std::fs::create_dir(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            (
+                StatusCode::CONFLICT,
+                "A file or folder with that name already exists".into(),
+            )
+        } else {
+            internal_error(format!("Could not create project folder: {error}"))
+        }
+    })?;
+    Ok(Json(json!({"path":path,"name":name})))
+}
+
+#[derive(Deserialize)]
 pub(super) struct WorktreeQuery {
     path: String,
 }
@@ -97,7 +136,11 @@ pub(super) async fn prepare_chat(
         catalog: catalog.clone(),
     };
     write_catalog_cache(&state, &entry).map_err(internal_error)?;
-    *state.catalog_cache.lock().await = Some(entry);
+    state
+        .catalog_cache
+        .lock()
+        .await
+        .remember(entry, crate::markdown_chat::now_ms());
     Ok(Json(
         json!({"models":catalog.models,"catalogRevision":catalog.catalog_revision,"chatgptProjectUrl":state.config.markdown_chat.automation.chatgpt_project_url,"workspaceName":state.config.work_dir.file_name().map(|name|name.to_string_lossy()),"createWorktree":state.config.worktrees.mode != crate::types::WorktreeMode::Never}),
     ))
@@ -565,6 +608,145 @@ mod tests {
             model: "discovered-model".into(),
             effort: "adaptive-choice".into(),
             catalog_revision: "creation-catalog".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_projects_create_only_new_folders_under_the_access_root() {
+        let (temp, state, executor, server) = fixture().await;
+        let app = router(state.clone());
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/projects")
+                    .header("host", "127.0.0.1:3120")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"unauthorized"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!state.config.work_dir.join("unauthorized").exists());
+
+        for name in [
+            "",
+            " ",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/absolute",
+            "C:drive",
+            "bad\nname",
+        ] {
+            let error = create_project(
+                State(state.clone()),
+                Json(CreateProjectBody { name: name.into() }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{name:?}");
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/api/projects")
+                    .header("host", "127.0.0.1:3120")
+                    .header("authorization", "Bearer owner-test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"New project"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let path = std::fs::canonicalize(state.config.work_dir.join("New project")).unwrap();
+        assert_eq!(created["path"], path.to_str().unwrap());
+        assert_eq!(created["name"], "New project");
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        std::fs::write(path.join("keep.txt"), "keep").unwrap();
+        let error = create_project(
+            State(state.clone()),
+            Json(CreateProjectBody {
+                name: "New project".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        std::fs::write(state.config.work_dir.join("existing-file"), "keep").unwrap();
+        let error = create_project(
+            State(state.clone()),
+            Json(CreateProjectBody {
+                name: "existing-file".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, state.config.work_dir.join("link")).unwrap();
+            let error = create_project(
+                State(state.clone()),
+                Json(CreateProjectBody {
+                    name: "link".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+        }
+        assert!(executor.executions.lock().unwrap().is_empty());
+        assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn new_chats_accept_plain_folders_and_unborn_repositories_with_default_worktrees() {
+        for initialized in [false, true] {
+            let (_temp, state, _, server) = fixture().await;
+            if initialized {
+                let output = std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(state.config.work_dir.join("repo"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            }
+            let _ = prepare_chat(State(state.clone()), Json(Default::default()))
+                .await
+                .unwrap();
+            let mut request = body("default-worktree-folder", false);
+            request.create_worktree = Some(true);
+            let _ = create_chat(State(state.clone()), Json(request))
+                .await
+                .unwrap();
+            let identity = creation_identity(&state.config, "default-worktree-folder").unwrap();
+            assert_eq!(
+                state
+                    .project_bindings
+                    .selected_project_root(&state.config, &identity)
+                    .unwrap(),
+                Some(std::fs::canonicalize(state.config.work_dir.join("repo")).unwrap())
+            );
+            assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 1);
+            server.abort();
         }
     }
 

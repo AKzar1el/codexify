@@ -100,7 +100,7 @@ struct OwnerState {
     continuations: Arc<ConversationContinuationStore>,
     automation: Option<Arc<AgentAutomationSupervisor>>,
     open_browser: BrowserOpener,
-    catalog_cache: Arc<tokio::sync::Mutex<Option<OwnerCatalogCache>>>,
+    catalog_cache: Arc<tokio::sync::Mutex<OwnerCatalogRuntime>>,
     global: Arc<tokio::sync::Mutex<settings::GlobalRuntime>>,
     token: String,
 }
@@ -112,17 +112,32 @@ struct OwnerCatalogCache {
     catalog: crate::agent_automation::CapabilityCatalog,
 }
 
+const MODEL_CATALOG_REFRESH_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Default)]
+struct OwnerCatalogRuntime {
+    entry: Option<OwnerCatalogCache>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    refresh_key: Option<String>,
+    refresh_after_ms: u64,
+}
+
+impl OwnerCatalogRuntime {
+    fn remember(&mut self, entry: OwnerCatalogCache, now_ms: u64) {
+        self.refresh_key = Some(entry.key.clone());
+        self.refresh_after_ms = now_ms.saturating_add(MODEL_CATALOG_REFRESH_MS);
+        self.entry = Some(entry);
+    }
+}
+
 fn catalog_context(health: &crate::agent_automation::CompanionHealth) -> String {
     catalog_key(&health.build, health.account_fingerprint.as_deref())
 }
 
-fn catalog_key(build: &str, account: Option<&str>) -> String {
-    // Model choices belong to the ChatGPT account, not the companion release.
-    // Keep protocol isolation while reusing the same list across local updates.
-    let schema = build
-        .split_once("+protocol.")
-        .map_or(build, |(_, schema)| schema);
-    hashed_catalog_key(schema, account)
+fn catalog_key(_build: &str, account: Option<&str>) -> String {
+    // This cache contains model metadata, not executable browser requests.
+    // Validate its schema separately from the companion's changing protocol hash.
+    hashed_catalog_key("browser-model-catalog-v1", account)
 }
 
 fn hashed_catalog_key(context: &str, account: Option<&str>) -> String {
@@ -158,9 +173,17 @@ fn read_catalog_cache(state: &OwnerState, key: &str) -> Option<OwnerCatalogCache
     let mut entry: OwnerCatalogCache = serde_json::from_reader(file.take(1024 * 1024 + 1)).ok()?;
     let account = Some(entry.catalog.account_fingerprint.as_str());
     let current_key = catalog_key(&entry.catalog.build, account);
+    let protocol_key = hashed_catalog_key(
+        entry
+            .catalog
+            .build
+            .split_once("+protocol.")
+            .map_or(entry.catalog.build.as_str(), |(_, schema)| schema),
+        account,
+    );
     let legacy_key = hashed_catalog_key(&entry.catalog.build, account);
     if current_key != key
-        || (entry.key != current_key && entry.key != legacy_key)
+        || (entry.key != current_key && entry.key != protocol_key && entry.key != legacy_key)
         || BrowserCompanionClient::validate_cached_catalog(&entry.catalog).is_err()
     {
         return None;
@@ -185,10 +208,11 @@ async fn cached_owner_catalog(
     key: &str,
 ) -> Option<crate::agent_automation::CapabilityCatalog> {
     let mut cached = state.catalog_cache.lock().await;
-    if cached.as_ref().is_none_or(|entry| entry.key != key) {
-        *cached = read_catalog_cache(state, key);
+    if cached.entry.as_ref().is_none_or(|entry| entry.key != key) {
+        cached.entry = read_catalog_cache(state, key);
     }
     cached
+        .entry
         .as_ref()
         .filter(|entry| entry.key == key)
         .map(|entry| entry.catalog.clone())
@@ -206,6 +230,19 @@ async fn owner_catalog(
 > {
     let client = companion_client(state)?;
     let cancellation = CancellationToken::new();
+    if !force {
+        let health = client.health(&cancellation).await.map_err(internal_error)?;
+        if !health.authenticated {
+            return Err(internal_error("ChatGPT authentication is required"));
+        }
+        if let Some(catalog) = cached_owner_catalog(state, &catalog_context(&health)).await {
+            return Ok((health, catalog));
+        }
+    }
+    let refresh_lock = state.catalog_cache.lock().await.refresh_lock.clone();
+    let _refresh = refresh_lock.lock().await;
+    // Another refresh may have filled the cache while this request waited.
+    // Verify the current account again before reusing its result.
     let health = client.health(&cancellation).await.map_err(internal_error)?;
     if !health.authenticated {
         return Err(internal_error("ChatGPT authentication is required"));
@@ -237,8 +274,54 @@ async fn owner_catalog(
     if write_catalog_cache(state, &entry).is_err() {
         tracing::warn!("could not persist the browser model catalog cache");
     }
-    *state.catalog_cache.lock().await = Some(entry);
+    state
+        .catalog_cache
+        .lock()
+        .await
+        .remember(entry, crate::markdown_chat::now_ms());
     Ok((health, catalog))
+}
+
+async fn refresh_owner_catalog_if_due(
+    state: &OwnerState,
+    health: &crate::agent_automation::CompanionHealth,
+    now_ms: u64,
+) -> bool {
+    if !state.config.markdown_chat.automation.enabled
+        || !health.authenticated
+        || health.status != crate::agent_automation::CompanionSessionStatus::Idle
+        || health.active_action_id.is_some()
+    {
+        return false;
+    }
+    let key = catalog_context(health);
+    {
+        let mut runtime = state.catalog_cache.lock().await;
+        if runtime.refresh_key.as_ref() != Some(&key) {
+            runtime.refresh_key = Some(key);
+            runtime.refresh_after_ms = 0;
+        }
+        if now_ms < runtime.refresh_after_ms {
+            return false;
+        }
+        // One attempt on startup and then daily. Failed discovery never erases
+        // the last successful list or starts a refresh loop from chat polling.
+        runtime.refresh_after_ms = now_ms.saturating_add(MODEL_CATALOG_REFRESH_MS);
+    }
+    if let Err((_, error)) = owner_catalog(state, true).await {
+        if error == "Finish the current browser action before refreshing models"
+            || error == "Browser companion returned HTTP status 423"
+        {
+            state.catalog_cache.lock().await.refresh_after_ms = 0;
+            return false;
+        }
+        tracing::warn!(%error, "model catalog refresh failed; retaining the cached model list");
+    }
+    let mut runtime = state.catalog_cache.lock().await;
+    runtime.refresh_after_ms = runtime
+        .refresh_after_ms
+        .max(now_ms.saturating_add(MODEL_CATALOG_REFRESH_MS));
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -397,6 +480,40 @@ struct LocatedChat {
     is_scratch: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct ProjectGroup {
+    path: String,
+    name: String,
+}
+
+fn project_group(
+    config: &AppConfig,
+    workspace: &FilePath,
+    name: &str,
+    is_scratch: bool,
+) -> ProjectGroup {
+    let source = if is_scratch {
+        None
+    } else {
+        crate::worktrees::worktree_source_project(config, &workspace.to_string_lossy())
+            .ok()
+            .flatten()
+    };
+    let root = source
+        .or_else(|| std::fs::canonicalize(workspace).ok())
+        .unwrap_or_else(|| workspace.to_owned());
+    ProjectGroup {
+        path: root.to_string_lossy().into_owned(),
+        name: if is_scratch {
+            name.to_owned()
+        } else {
+            root.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_owned())
+        },
+    }
+}
+
 fn state_roots(config: &AppConfig) -> Vec<PathBuf> {
     let base = config
         .memory
@@ -536,6 +653,7 @@ struct ChatListing {
     workspace: String,
     project_id: String,
     project_path: String,
+    project_group: ProjectGroup,
     is_scratch: bool,
     last_entry_end: u64,
     last_incoming_entry_end: u64,
@@ -551,6 +669,7 @@ struct ChatListing {
     goal_completed_chat_end: Option<u64>,
     automation_error: Option<String>,
     automation_retrying: bool,
+    automation_waiting_for_browser: bool,
     total_tool_calls: u64,
 }
 
@@ -655,6 +774,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         )
     };
     let mut list = Vec::new();
+    let mut project_groups = std::collections::HashMap::new();
     for located in located_chats {
         let chat = state
             .chats
@@ -712,12 +832,19 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         {
             matched.insert(located.id.clone());
         }
-        let project_path = located
-            .work_dir
-            .as_ref()
-            .unwrap_or(&located.state_root)
-            .to_string_lossy()
-            .into_owned();
+        let workspace_path = located.work_dir.as_ref().unwrap_or(&located.state_root);
+        let project_group = project_groups
+            .entry(workspace_path.clone())
+            .or_insert_with(|| {
+                project_group(
+                    &state.config,
+                    workspace_path,
+                    &located.workspace,
+                    located.is_scratch,
+                )
+            })
+            .clone();
+        let project_path = workspace_path.to_string_lossy().into_owned();
         let project_id = format!("{:x}", Sha256::digest(project_path.as_bytes()));
         // Read persisted goal/action state without registering browser work.
         let goal_task = automation_task(&located)?;
@@ -753,6 +880,8 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                         .unwrap_or_else(|| "Browser action needs attention".into())
                 })
         });
+        let automation_waiting_for_browser =
+            automation_error.is_none() && automation.browser_cooldown_until_ms().is_some();
         let goal = automation.goal;
         let goal_status = goal.as_ref().map(|goal| goal.status);
         let goal_completion_dismissed = goal.as_ref().is_some_and(|goal| {
@@ -779,6 +908,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             workspace: located.workspace,
             project_id,
             project_path,
+            project_group,
             is_scratch: located.is_scratch,
             last_entry_end,
             last_incoming_entry_end,
@@ -794,6 +924,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             goal,
             automation_error,
             automation_retrying,
+            automation_waiting_for_browser,
             total_tool_calls,
         });
     }
@@ -874,8 +1005,14 @@ async fn change_project_path(
         supervisor.discard_queued_work(&task).await;
     }
     let project_path = path.to_string_lossy().into_owned();
+    let project_group = project_group(
+        &state.config,
+        &path,
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+        false,
+    );
     Ok(Json(
-        json!({"projectPath":project_path,"projectId":format!("{:x}",Sha256::digest(project_path.as_bytes())),"workspace":path.file_name().unwrap_or_default().to_string_lossy(),"isScratch":false}),
+        json!({"projectPath":project_path,"projectId":format!("{:x}",Sha256::digest(project_path.as_bytes())),"projectGroup":project_group,"workspace":path.file_name().unwrap_or_default().to_string_lossy(),"isScratch":false}),
     ))
 }
 
@@ -2265,7 +2402,10 @@ fn router(state: OwnerState) -> Router {
         .route("/api/chats", get(list_chats).post(creation::create_chat))
         .route("/api/new-chat", post(creation::prepare_chat))
         .route("/api/new-chat/login", post(creation::login))
-        .route("/api/projects", get(creation::projects))
+        .route(
+            "/api/projects",
+            get(creation::projects).post(creation::create_project),
+        )
         .route("/api/projects/worktrees", get(creation::worktrees))
         .route(
             "/api/chats/{id}/automation/create/retry",
@@ -2369,7 +2509,7 @@ pub async fn dashboard_url() -> anyhow::Result<String> {
 mod tests {
     include!("owner_chat_catalog_tests.rs");
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::agent_automation::{
         AutomationExecution, AutomationExecutionError, AutomationExecutor, CompanionActionSnapshot,
@@ -2384,7 +2524,110 @@ mod tests {
     const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
 
     #[test]
-    fn model_catalog_cache_is_account_and_protocol_scoped_across_local_updates() {
+    fn project_groups_resolve_registered_worktrees_without_merging_same_named_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let access = temp.path().join("projects");
+        let source = access.join("first/repo");
+        let other = access.join("second/repo");
+        let hooks = temp.path().join("empty-hooks");
+        for path in [&source, &other, &hooks] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let git = |path: &FilePath, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-c")
+                .arg(format!("core.hooksPath={}", hooks.display()))
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.test",
+                ])
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&source, &["init", "-q"]);
+        std::fs::create_dir_all(source.join("packages/ui")).unwrap();
+        std::fs::write(source.join("packages/ui/fixture.txt"), "fixture\n").unwrap();
+        git(&source, &["add", "-f", "packages/ui/fixture.txt"]);
+        git(&source, &["commit", "-qm", "Initial project"]);
+        git(&other, &["init", "-q"]);
+        let first = temp.path().join("worktrees/feature-a");
+        let second = temp.path().join("worktrees/feature-b");
+        for path in [&first, &second] {
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "-q",
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+        }
+        let config = crate::config::default_config(access);
+        let group = project_group(&config, &source, "repo", false);
+        assert_eq!(group.name, "repo");
+        for worktree in [&first, &second] {
+            let grouped = project_group(&config, worktree, "feature", false);
+            assert_eq!(grouped.path, group.path);
+            assert_eq!(grouped.name, group.name);
+            let package = project_group(&config, &worktree.join("packages/ui"), "ui", false);
+            assert_eq!(
+                package.path,
+                source
+                    .join("packages/ui")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            assert_eq!(package.name, "ui");
+            assert_ne!(package.path, group.path);
+        }
+        let separate = project_group(&config, &other, "repo", false);
+        assert_eq!(separate.name, group.name);
+        assert_ne!(separate.path, group.path);
+        std::fs::write(
+            first.join(".codexify-worktree.json"),
+            serde_json::json!({"sourceProjectRoot":other}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            project_group(&config, &first, "feature", false).path,
+            group.path,
+            "display grouping uses Git registration, not an unverified metadata claim"
+        );
+        let unregistered = temp.path().join("unregistered/repo");
+        std::fs::create_dir_all(&unregistered).unwrap();
+        std::fs::copy(first.join(".git"), unregistered.join(".git")).unwrap();
+        assert_ne!(
+            project_group(&config, &unregistered, "repo", false).path,
+            group.path
+        );
+        let scratch = project_group(&config, &first, "Scratch conversation", true);
+        assert_ne!(scratch.path, group.path);
+        assert_eq!(scratch.name, "Scratch conversation");
+        let missing = temp.path().join("missing/repo");
+        assert_eq!(
+            project_group(&config, &missing, "repo", false).path,
+            missing.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn model_catalog_cache_is_account_scoped_across_protocol_and_local_updates() {
         let first = format!("2.3.0{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
         let updated = format!("2.3.3{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
         assert_eq!(
@@ -2395,7 +2638,7 @@ mod tests {
             catalog_key(&first, Some("same-account")),
             catalog_key(&updated, Some("different-account"))
         );
-        assert_ne!(
+        assert_eq!(
             catalog_key(&first, Some("same-account")),
             catalog_key("2.3.3+protocol.other-schema", Some("same-account"))
         );
@@ -2405,6 +2648,7 @@ mod tests {
     struct OwnerCompanionState {
         login_calls: Arc<AtomicUsize>,
         capabilities_calls: Arc<AtomicUsize>,
+        capabilities_fail: Arc<AtomicBool>,
         reveal_calls: Arc<AtomicUsize>,
         revealed_url: Arc<std::sync::Mutex<Option<String>>>,
     }
@@ -2454,6 +2698,9 @@ mod tests {
             return StatusCode::UNAUTHORIZED.into_response();
         }
         state.capabilities_calls.fetch_add(1, Ordering::SeqCst);
+        if state.capabilities_fail.load(Ordering::SeqCst) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Json(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "build": OWNER_COMPANION_BUILD,
@@ -2782,6 +3029,8 @@ mod tests {
             .unwrap();
         let rows = listing["chats"].as_array().unwrap();
         let original = rows.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(original["projectGroup"]["path"], original["projectPath"]);
+        assert_eq!(original["projectGroup"]["name"], "first");
         assert!(
             rows.iter()
                 .any(|row| row["isScratch"] == true && row["workspace"] == "Scratch conversation")
@@ -2838,6 +3087,9 @@ mod tests {
             .find(|row| row["id"] == id)
             .unwrap();
         assert_eq!(row["projectPath"], changed["projectPath"]);
+        assert_eq!(row["projectGroup"], changed["projectGroup"]);
+        assert_eq!(row["projectGroup"]["path"], changed["projectPath"]);
+        assert_eq!(row["projectGroup"]["name"], "second");
         assert_eq!(row["goalStatus"], "completed");
         let page: Value = client
             .get(format!("{base}/api/chats/{id}"))
@@ -3602,6 +3854,21 @@ mod tests {
             listing().await["automationError"].is_null(),
             "retrying clears the stale error indicator"
         );
+        assert_eq!(listing().await["automationWaitingForBrowser"], false);
+        let until = crate::markdown_chat::now_ms() + 60_000;
+        assert!(
+            store
+                .defer_action_for_cooldown(&identity, "sidebar-retry", "sidebar-cooldown", until)
+                .unwrap()
+        );
+        let waiting = listing().await;
+        assert_eq!(waiting["automationWaitingForBrowser"], true);
+        assert!(waiting["automationError"].is_null());
+        assert_eq!(waiting["automationRetrying"], false);
+        store
+            .resume_cooldown_action(&identity, "sidebar-cooldown", until)
+            .unwrap();
+        assert_eq!(listing().await["automationWaitingForBrowser"], false);
         server.abort();
     }
 
@@ -4451,11 +4718,19 @@ mod tests {
         let (health, restored) = owner_catalog(&restarted, false).await.unwrap();
         assert_eq!(restored.catalog_revision, "owner_catalog_1");
         assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 1);
+        let refresh_lock = restarted.catalog_cache.lock().await.refresh_lock.clone();
+        let held_refresh = refresh_lock.lock().await;
+        let cached = tokio::time::timeout(Duration::from_secs(1), owner_catalog(&restarted, false))
+            .await
+            .expect("cached preference reads must not wait for browser discovery")
+            .unwrap();
+        assert_eq!(cached.1.models, restored.models);
+        drop(held_refresh);
         let mut legacy_catalog = restored.clone();
-        legacy_catalog.build = format!("2.3.0{}", crate::agent_automation::PROTOCOL_BUILD_SUFFIX);
+        legacy_catalog.build = format!("2.3.0+protocol.{}", "0".repeat(64));
         let legacy = OwnerCatalogCache {
             key: hashed_catalog_key(
-                &legacy_catalog.build,
+                legacy_catalog.build.split_once("+protocol.").unwrap().1,
                 Some(&legacy_catalog.account_fingerprint),
             ),
             catalog: legacy_catalog,
@@ -4484,6 +4759,59 @@ mod tests {
             )
             .await
             .is_none()
+        );
+        let cache_path =
+            BrowserCompanionClient::catalog_cache_path(&restarted.config.markdown_chat.automation)
+                .unwrap();
+        let cached_bytes = std::fs::read(&cache_path).unwrap();
+        restarted.catalog_cache = Arc::default();
+        companion_state
+            .capabilities_fail
+            .store(true, Ordering::SeqCst);
+        let now = crate::markdown_chat::now_ms();
+        assert!(
+            refresh_owner_catalog_if_due(&restarted, &health, now).await,
+            "startup attempts one refresh even with a recent disk cache"
+        );
+        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(&cache_path).unwrap(),
+            cached_bytes,
+            "failed refreshes preserve the last successful disk cache"
+        );
+        let (_, retained) = owner_catalog(&restarted, false).await.unwrap();
+        assert_eq!(retained.models, restored.models);
+        assert!(
+            !refresh_owner_catalog_if_due(&restarted, &health, now + MODEL_CATALOG_REFRESH_MS - 1)
+                .await
+        );
+        let mut busy = health.clone();
+        busy.active_action_id = Some("another-chat-action".into());
+        assert!(
+            !refresh_owner_catalog_if_due(&restarted, &busy, now + MODEL_CATALOG_REFRESH_MS).await
+        );
+        companion_state
+            .capabilities_fail
+            .store(false, Ordering::SeqCst);
+        assert!(
+            refresh_owner_catalog_if_due(&restarted, &health, now + MODEL_CATALOG_REFRESH_MS).await
+        );
+        assert_eq!(companion_state.capabilities_calls.load(Ordering::SeqCst), 3);
+        assert!(
+            !refresh_owner_catalog_if_due(&restarted, &health, now + MODEL_CATALOG_REFRESH_MS + 1)
+                .await
+        );
+        std::fs::remove_file(cache_path).unwrap();
+        restarted.catalog_cache = Arc::default();
+        let (first, second) = tokio::join!(
+            owner_catalog(&restarted, false),
+            owner_catalog(&restarted, false)
+        );
+        assert_eq!(first.unwrap().1.models, second.unwrap().1.models);
+        assert_eq!(
+            companion_state.capabilities_calls.load(Ordering::SeqCst),
+            4,
+            "simultaneous cache misses share one discovery"
         );
         owner_task.abort();
         companion_task.abort();

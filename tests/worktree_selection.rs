@@ -149,6 +149,56 @@ async fn setup_script_runs_only_when_the_opt_in_is_enabled() {
 }
 
 #[tokio::test]
+async fn folders_without_git_commits_use_the_selected_directory_in_auto_and_always_modes() {
+    for mode in [WorktreeMode::Auto, WorktreeMode::Always] {
+        for initialized in [false, true] {
+            let root = TempDir::new().unwrap();
+            let access = root.path().join("projects");
+            let project = access.join("demo");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join("draft.txt"), "uncommitted content").unwrap();
+            if initialized {
+                git(&project, &["init", "--quiet"]);
+                git(&project, &["add", "draft.txt"]);
+            }
+            let config = config(&root, access, mode);
+            let store = ProjectBindingStore::new(root.path().join("bindings"));
+            for name in ["first", "second"] {
+                let selected = store
+                    .select_project_root(&config, &identity(name), "demo")
+                    .await
+                    .unwrap();
+                assert!(!selected.managed_worktree);
+                assert_eq!(selected.project_root, fs::canonicalize(&project).unwrap());
+                assert_eq!(
+                    store
+                        .selected_project_root(&config, &identity(name))
+                        .unwrap(),
+                    Some(selected.project_root)
+                );
+            }
+            assert!(
+                !config.worktrees.root.exists(),
+                "no worktree allocation is needed"
+            );
+            assert_eq!(project.join(".git").exists(), initialized);
+            assert_eq!(
+                fs::read_to_string(project.join("draft.txt")).unwrap(),
+                "uncommitted content"
+            );
+            if initialized {
+                let head = Command::new("git")
+                    .args(["rev-parse", "--verify", "HEAD"])
+                    .current_dir(&project)
+                    .output()
+                    .unwrap();
+                assert!(!head.status.success(), "selection must not invent a commit");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn auto_mode_uses_the_source_checkout_once_then_creates_a_worktree() {
     let root = TempDir::new().unwrap();
     let (access_root, project_root) = repository(&root);

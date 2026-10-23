@@ -15,6 +15,16 @@ test(`${name}: attachments support paste focus, page-wide drop, drafts, retries,
  const browser=await engine.launch();let server;
  try {
   const context=await browser.newContext({acceptDownloads:true,viewport:{width:1280,height:900}}),page=await context.newPage();page.setDefaultTimeout(5000);
+  await page.addInitScript(()=>{
+   const send=window.fetch.bind(window);
+   window.rejectDiskBackedUpload=false;
+   window.fetch=(url,options)=>{
+    // Model Safari's failed networking-process read of a disk-backed File.
+    // Page reads still work; uploading those bytes must not hit this path.
+    if(window.rejectDiskBackedUpload&&options?.method==='POST'&&String(url).includes('/attachments?')&&options.body instanceof File)return Promise.reject(new TypeError('Load failed'));
+    return send(url,options);
+   };
+  });
   const id='8'.repeat(64),files=new Map(),uploads=[],sent=[],errors=[];let failNext=false,thumbnailBodies=0,thumbnailValidations=0,originalImageRequests=0;
   page.on('pageerror',e=>errors.push(e.message));
   const messages=[];let revision=0;
@@ -78,6 +88,10 @@ test(`${name}: attachments support paste focus, page-wide drop, drafts, retries,
   await page.waitForFunction(()=>[...document.querySelector('#chat-host .chat-shell').shadowRoot.querySelectorAll('.draft-attachments .attachment-size')].every(n=>!n.textContent.includes('Uploading')));
   assert.equal(await draft.locator('.attachment-card').count(),2);assert.equal(await draft.locator('img').count(),1,'only images get previews');
   assert.deepEqual(await draft.locator('.attachment-name').allTextContents(),['picked.png','notes résumé.txt']);
+  const removeAlignment=await draft.locator('.attachment-remove').first().evaluate(button=>{
+   const circle=button.getBoundingClientRect(),cross=button.querySelector('svg path').getBoundingClientRect();
+   return {x:Math.abs(circle.x+circle.width/2-cross.x-cross.width/2),y:Math.abs(circle.y+circle.height/2-cross.y-cross.height/2)};
+  });assert(removeAlignment.x<.1&&removeAlignment.y<.1,`the remove cross is centered: ${JSON.stringify(removeAlignment)}`);
   await draft.locator('img').evaluate(image=>image.decode());assert.match(await draft.locator('img').getAttribute('src'),/\?thumbnail=true$/);assert.equal(originalImageRequests,0,'chat cards never request original images');const bodiesBeforeReload=thumbnailBodies;
   assert.equal(uploads[0].pasted,'false');assert(uploads[0].bytes.equals(png));
   await page.reload();await draft.locator('.attachment-card').first().waitFor();assert.equal(await draft.locator('.attachment-card').count(),2,'ready uploads survive a reload');await draft.locator('img').evaluate(image=>image.decode());assert.equal(thumbnailBodies,bodiesBeforeReload,'reopening reuses cached preview bytes');assert(thumbnailValidations>0,'cached previews revalidate instead of downloading another body');assert.equal(originalImageRequests,0);
@@ -87,6 +101,18 @@ test(`${name}: attachments support paste focus, page-wide drop, drafts, retries,
   await input.focus();assert(!(await paste()).includes('clipboard.png'),'pasted filenames are hidden even during upload');await host.getByRole('button',{name:'Open attachment Pasted image',exact:true}).waitFor();
   await page.waitForFunction(()=>[...document.querySelector('#chat-host .chat-shell').shadowRoot.querySelectorAll('.draft-attachments .attachment-size')].every(n=>!n.textContent.includes('Uploading')));
   assert.equal(uploads.at(-1).pasted,'true');
+  const firstPastedRequest=uploads.at(-1).requestId;
+  await page.evaluate(()=>window.rejectDiskBackedUpload=true);
+  await input.focus();await paste();
+  await page.waitForFunction(()=>{
+   const cards=[...document.querySelector('#chat-host .chat-shell').shadowRoot.querySelectorAll('.draft-attachments .attachment-card[aria-label="Open attachment Pasted image"]')];
+   return cards.length===2&&cards.every(card=>!card.disabled);
+  });
+  assert.notEqual(uploads.at(-1).requestId,firstPastedRequest,'consecutive pastes with the same filename are distinct uploads');
+  assert(uploads.at(-1).bytes.equals(png),'the second paste sends every original byte');
+  assert.equal(await draft.getByRole('button',{name:'Retry upload',exact:true}).count(),0,'a second pasted image uploads even when raw File uploads fail');
+  await draft.getByRole('button',{name:'Remove attachment Pasted image',exact:true}).last().click();
+  await page.evaluate(()=>window.rejectDiskBackedUpload=false);
   const pastedCard=draft.getByRole('button',{name:'Open attachment Pasted image',exact:true});
   assert.equal(await pastedCard.locator('.attachment-name').count(),0);assert(!(await pastedCard.getAttribute('title')).includes('clipboard.png'));assert.equal(await pastedCard.locator('img').getAttribute('alt'),'Pasted image');
   await page.reload();await draft.getByRole('button',{name:'Open attachment Pasted image',exact:true}).waitFor();assert.equal(await draft.getByRole('button',{name:'Open attachment Pasted image',exact:true}).locator('.attachment-name').count(),0,'restored pasted uploads keep the filename hidden');

@@ -52,7 +52,7 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 [hidden] { display:none !important; }
 .presence { display:grid; place-items:center; width:13px; height:13px; flex:none; border-radius:50%; }
 .presence svg { display:block; width:13px; height:13px; }
-.presence.online { color:#159b27; }
+.presence.online,.presence.browser-cooldown { color:#159b27; }
 .presence.goal-running,.presence.goal-completed { color:#159b27; }
 .presence.goal-paused { color:var(--muted); }
 .presence .presence-spinner { animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
@@ -162,9 +162,11 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   <label for="new-chat-model">ChatGPT model</label><select id="new-chat-model" disabled></select>
   <label for="new-chat-effort">Reasoning effort</label><select id="new-chat-effort" disabled></select>
   <div class="new-chat-row"><button type="button" id="new-chat-login">Sign in to ChatGPT</button><button type="button" id="new-chat-refresh">Refresh models</button></div>
-  <h3>Workspace</h3><div id="new-chat-workspace-picker"><button type="button" id="new-chat-scratch">Chat without a project</button>
+  <h3>Workspace</h3><div id="new-chat-workspace-picker"><div class="new-chat-row"><button type="button" id="new-chat-scratch">Chat without a project</button><button type="button" id="new-chat-new-project" aria-expanded="false" aria-controls="new-chat-project-creation">New project</button></div>
+  <div id="new-chat-project-creation" hidden><label for="new-chat-project-name">New project name</label><div class="new-chat-row"><input id="new-chat-project-name" type="text" maxlength="255" autocomplete="off" placeholder="my-project"><button type="button" id="new-chat-create-project">Create project</button></div><p id="new-chat-project-root" class="muted"></p></div>
   <label><input id="new-chat-worktree" type="checkbox"> Create a worktree for the selected project</label>
-  <label for="new-chat-url">Project path or Git URL</label><div class="new-chat-row"><input id="new-chat-url" type="text" placeholder="Git repository, GitHub PR, branch, or commit URL"><button type="button" id="new-chat-use-url">Confirm</button></div>
+  <p class="muted">Folders without Git commits are used directly.</p>
+  <label for="new-chat-url">Project path or Git URL</label><div class="new-chat-row"><input id="new-chat-url" type="text" placeholder="Folder path, Git repository, GitHub PR, branch, or commit URL"><button type="button" id="new-chat-use-url">Confirm</button></div>
   <label for="new-chat-search">Search projects</label><input id="new-chat-search" type="search" autocomplete="off">
   <div id="new-chat-projects"></div><div id="new-chat-worktrees" hidden></div></div>
   <p id="new-chat-selection" hidden></p><p id="new-chat-error" role="alert" hidden></p>
@@ -337,6 +339,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     // Discovery follows ChatGPT's slider from lowest to highest, including new labels.
     return [...(model?.efforts || [])].reverse();
   }
+  function savedModelLabel(id) {
+    return id.replace(/^gpt-/i,"GPT-").replace(/-(sol|luna|astra)$/i,(_,tier)=>" "+tier[0].toUpperCase()+tier.slice(1));
+  }
+  function savedEffortLabel(id) {
+    return ({max:"Pro",xhigh:"Extra High"})[id] || id.replace(/[-_]/g," ").replace(/\b\w/g,letter=>letter.toUpperCase());
+  }
   const chatMeta = "io.github.devnoname120/codexify/markdown-chat";
   const readPositions = new Map(), reading = new Set();
   let legacySeen = {};
@@ -412,6 +420,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   function presenceIcon(state) {
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true");
+    if (state === "browser-cooldown") {
+      svg.classList.add("presence-spinner");
+      svg.innerHTML = '<path d="M6 2h12v5l-6 5 6 5v5H6v-5l6-5-6-5ZM4 2h16M4 22h16"/>';
+      for (const [key, value] of Object.entries({fill:"none",stroke:"currentColor","stroke-width":2.5,"stroke-linecap":"round","stroke-linejoin":"round"})) svg.setAttribute(key,String(value));
+      return svg;
+    }
     if (state === "error") {
       svg.innerHTML = '<circle cx="12" cy="12" r="10.5"/><path d="M12 6v7m0 4h.01"/>';
       for (const [key, value] of Object.entries({fill:"none",stroke:"currentColor","stroke-width":2.5,"stroke-linecap":"round"})) svg.setAttribute(key,String(value));
@@ -457,6 +471,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   function sidebarState(chat, now) {
     if (chat.automationRetrying === true) return chat.goalStatus === "active" ? "goal-retrying" : "retrying";
     if (chat.automationError) return "error";
+    if (chat.automationWaitingForBrowser === true) return "browser-cooldown";
     const state = presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, chat.agentIdleUntilMs);
     if (chat.goalStatus === "configured") return "goal-paused";
     if (chat.goalStatus === "completed" && !chat.goalCompletionDismissed) return "goal-completed";
@@ -702,10 +717,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       for (const effort of descendingEfforts(model)) {
         if (effort.available) nodes.effort.append(new Option(effort.label, effort.id));
       }
-      if (!nodes.effort.options.length) {
-        const saved = !catalogLoaded ? (selectionDraft || current?.selection)?.effort : null;
-        nodes.effort.append(new Option(saved ? "Saved effort" : "Effort", saved || ""));
+      if (preferred && ![...nodes.effort.options].some(option => option.value === preferred)) {
+        const saved = new Option(model?.efforts.find(effort=>effort.id===preferred)?.label || savedEffortLabel(preferred), preferred);
+        saved.disabled = catalogLoaded;
+        nodes.effort.append(saved);
       }
+      if (!nodes.effort.options.length) nodes.effort.append(new Option("Effort", ""));
       if ([...nodes.effort.options].some(option => option.value === preferred)) nodes.effort.value = preferred;
       sizePicker(nodes.model); sizePicker(nodes.effort);
     }
@@ -714,7 +731,11 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       nodes.model.replaceChildren();
       for (const model of models) if (model.efforts.some(effort => effort.available)) nodes.model.append(new Option(displayModelLabel(model), model.id));
       if (!selected) { const prompt = new Option(catalogLoaded ? "Select model" : "Models unavailable", ""); prompt.disabled = true; prompt.hidden = true; nodes.model.prepend(prompt); nodes.model.value = ""; }
-      if (!catalogLoaded && selected && !models.length) nodes.model.append(new Option("Saved model", selected));
+      if (selected && ![...nodes.model.options].some(option => option.value === selected)) {
+        const saved = new Option(models.find(model=>model.id===selected)?.label || savedModelLabel(selected), selected);
+        saved.disabled = catalogLoaded;
+        nodes.model.append(saved);
+      }
       if (selected && [...nodes.model.options].some(option => option.value === selected)) nodes.model.value = selected;
       renderEfforts();
     }
@@ -795,7 +816,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const retryNow = retryMode === "continue_goal" ? " You can also continue now." : retryMode ? " You can also retry now." : "";
       const retryStatus = automaticRetry ? (goalRetry ? `Retrying the goal automatically in ${retrySeconds}s.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}).`) + retryNow : "";
       const cooldownSeconds = waitingForBrowser ? Math.max(0,Math.ceil((state.action.cooldownUntilMs-Date.now()-clockOffset)/1000)) : 0;
-      const waitingStatus = cooldownSeconds ? `Waiting for the shared browser. Conversation loading is available in ${cooldownSeconds}s.` : "Waiting for the shared browser…";
+      const queuePosition = Number.isSafeInteger(state.queue?.position) && state.queue.position > 0 ? ` (position in queue: ${state.queue.position})` : "";
+      const waitingStatus = cooldownSeconds ? `Waiting for the shared browser${queuePosition}. Conversation loading is available in ${cooldownSeconds}s.` : `Waiting for the shared browser${queuePosition}…`;
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
@@ -835,7 +857,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
           if (Number.isSafeInteger(state.serverTimeMs)) clockOffset = state.serverTimeMs - Date.now();
           if (!quiet) setError("");
           const context = state.companion?.catalogContext || null;
-          if (context !== catalogContext || !state.companion?.authenticated) { models = []; catalogLoaded = false; catalogContext = context; }
+          if (context && context !== catalogContext) { models = []; catalogLoaded = false; catalogContext = context; }
           if (state.catalog) { models = state.catalog.models || []; catalogLoaded = true; }
           render(state);
         }
@@ -1041,8 +1063,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     const pinned = visible.filter(chat => chat.pinnedAtMs != null).sort((a,b) => b.pinnedAtMs - a.pinnedAtMs || byDate(a,b));
     const groups = new Map();
     for (const chat of visible.filter(chat => chat.pinnedAtMs == null).sort(byDate)) {
-      const key = listMode === "projects" ? (chat.projectId || chat.projectPath || chat.workspace) : recentPeriod(chat.lastEntryAtMs, Date.now() + clockOffset);
-      if (!groups.has(key)) groups.set(key, { heading:listMode === "projects" ? (chat.isScratch ? "Scratch conversation" : chat.workspace) : key, title:listMode === "projects" ? (chat.projectPath || chat.workspace) : key, chats:[] });
+      const key = listMode === "projects" ? (chat.projectGroup?.path || chat.projectId || chat.projectPath || chat.workspace) : recentPeriod(chat.lastEntryAtMs, Date.now() + clockOffset);
+      if (!groups.has(key)) groups.set(key, { heading:listMode === "projects" ? (chat.isScratch ? "Scratch conversation" : chat.projectGroup?.name || chat.workspace) : key, title:listMode === "projects" ? (chat.projectGroup?.path || chat.projectPath || chat.workspace) : key, chats:[] });
       groups.get(key).chats.push(chat);
     }
     return [...(pinned.length ? [{ heading:"Pinned", chats:pinned }] : []), ...groups.values()];
@@ -1154,9 +1176,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       lastPresence.set(chat.id,{ state, agentState });
       const icon = textNode("span", `presence ${state}`, "");
       icon.dataset.agentState = agentState;
-      if (["goal-running", "goal-retrying", "online", "retrying"].includes(state)) icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
+      if (["goal-running", "goal-retrying", "online", "retrying", "browser-cooldown"].includes(state)) icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
       icon.append(presenceIcon(state));
-      icon.title = state === "retrying" || state === "goal-retrying" ? `${state === "goal-retrying" ? "Goal" : "Chat"} retrying automatically${chat.automationError ? ": " + chat.automationError : ""}` : state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;
+      icon.title = state === "browser-cooldown" ? "Waiting for browser cooldown" : state === "retrying" || state === "goal-retrying" ? `${state === "goal-retrying" ? "Goal" : "Chat"} retrying automatically${chat.automationError ? ": " + chat.automationError : ""}` : state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;
       icon.setAttribute("role", "img"); icon.setAttribute("aria-label", icon.title);
       const content = textNode("span", "conversation-main", "");
       content.append(textNode("span", "conversation-title", chat.title));
@@ -1271,7 +1293,13 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       async getAttachment(attachment) {return (await (await api(`/api/chats/${id}/attachments/${encodeURIComponent(attachment)}`)).json()).attachment;},
       async uploadAttachment(file,pasted,requestId,signal) {
         const query=new URLSearchParams({requestId,name:file.name||"Pasted image.png",pasted:String(pasted),lastModifiedAtMs:String(file.lastModified ?? Date.now())});
-        const response=await fetch(`/api/chats/${id}/attachments?${query}`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":file.type||"application/octet-stream"},body:file,signal,cache:"no-store"});
+        if(file.size>128*1024*1024)throw new Error("Attachments are limited to 128 MiB per file");
+        signal.throwIfAborted();
+        // Read in the page: Safari can lose access to a File's backing storage
+        // when the networking process tries to upload it directly (WebKit 319985).
+        const bytes=await file.arrayBuffer();
+        signal.throwIfAborted();
+        const response=await fetch(`/api/chats/${id}/attachments?${query}`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":file.type||"application/octet-stream"},body:bytes,signal,cache:"no-store"});
         if(!response.ok)throw new Error((await response.text())||"Attachment upload failed");
         return (await response.json()).attachment;
       },
@@ -1390,7 +1418,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     newNode("submit").disabled = newBusy || newPreparing || !newCatalog || !choice || !newNode("model").value || !newNode("effort").value;
     newNode("close").disabled = newBusy; newNode("refresh").disabled = newBusy || newPreparing; newNode("login").disabled = newBusy || newPreparing || Boolean(newCatalog);
     newNode("worktree").disabled = newBusy || Boolean(choice && (!choice.path));
-    for (const button of newDialog.querySelectorAll("#new-chat-projects button,#new-chat-worktrees button,#new-chat-scratch,#new-chat-use-url")) button.disabled = newBusy;
+    for (const button of newDialog.querySelectorAll("#new-chat-projects button,#new-chat-worktrees button,#new-chat-scratch,#new-chat-use-url,#new-chat-new-project")) button.disabled = newBusy;
+    newNode("project-name").disabled = newBusy;
+    newNode("create-project").disabled = newBusy || !newNode("project-name").value.trim();
     newNode("use-url").disabled = newBusy || !newNode("url").value.trim();
     if (newChoice?.worktreePath) {
       newNode("selection").textContent = newNode("worktree").checked ? `New worktree from ${newChoice.worktreePath}` : newChoice.worktreePath;
@@ -1419,6 +1449,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     try {
       const response = await (await api(`/api/projects?${new URLSearchParams({q:query})}`)).json();
       if (epoch !== newSearchEpoch || !newDialog.open) return;
+      newNode("project-root").textContent = response.catalog.access_root ? `Creates a folder in ${response.catalog.access_root}.` : "";
       if (!newWorktreeEdited) newNode("worktree").checked = response.createWorktree;
       newNode("projects").replaceChildren();
       for (const project of response.catalog.projects) {
@@ -1449,6 +1480,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
         });
         row.append(choose,worktrees);newNode("projects").append(row);
       }
+      newReady();
     } catch(error) {if(epoch===newSearchEpoch)newError(error.message);}
   }
   async function prepareNewModels(epoch) {
@@ -1470,7 +1502,8 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     try { if (!await ensureConnectorName()) return; }
     catch (error) { showError(error.message); return; }
     newChoice=null;newCatalog=null;newBusy=false;newWorktreeEdited=false;newRequest=requestId("create-chat");const epoch=++newEpoch;
-    for(const name of ["url","search"])newNode(name).value="";
+    for(const name of ["url","search","project-name"])newNode(name).value="";
+    newNode("project-creation").hidden=true;newNode("new-project").setAttribute("aria-expanded","false");newNode("project-root").textContent="";
     for(const name of ["model","effort"]) {newNode(name).replaceChildren();newNode(name).disabled=true;}
     newNode("selection").hidden=newNode("worktrees").hidden=true;newError("");newDialog.showModal();newReady();void newProjects();void prepareNewModels(epoch);
   });
@@ -1481,6 +1514,22 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   newNode("login").addEventListener("click",async()=>{try{await api("/api/new-chat/login",{method:"POST",body:"{}"});newNode("loading").textContent="Sign in in Chrome, then refresh models.";}catch(error){newError(error.message);}});
   newNode("refresh").addEventListener("click",()=>{newError("");void prepareNewModels(newEpoch);});
   newNode("scratch").addEventListener("click",()=>chooseNew({withoutProject:true},"Chat without a project"));
+  newNode("new-project").addEventListener("click",()=>{
+    const form=newNode("project-creation");form.hidden=!form.hidden;newNode("new-project").setAttribute("aria-expanded",String(!form.hidden));
+    if(!form.hidden)newNode("project-name").focus();
+  });
+  newNode("project-name").addEventListener("input",newReady);
+  newNode("project-name").addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();newNode("create-project").click();}});
+  newNode("create-project").addEventListener("click",async()=>{
+    if(newNode("create-project").disabled)return;newBusy=true;newReady();newError("");
+    try {
+      const project=await(await api("/api/projects",{method:"POST",body:JSON.stringify({name:newNode("project-name").value.trim()})})).json();
+      newNode("url").value=project.path;newWorktreeEdited=true;newNode("worktree").checked=false;
+      chooseNew({path:project.path},project.path);
+      newNode("project-creation").hidden=true;newNode("new-project").setAttribute("aria-expanded","false");
+    }catch(error){newError(error.message);}
+    finally{newBusy=false;newReady();}
+  });
   newNode("url").addEventListener("input",newReady);
   newNode("use-url").addEventListener("click",()=>{if(newNode("url").value.trim())chooseNew(null,newNode("url").value.trim());});
   let newSearchTimer;newNode("search").addEventListener("input",()=>{clearTimeout(newSearchTimer);newSearchTimer=setTimeout(()=>newProjects(newNode("search").value),200);});

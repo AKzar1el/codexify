@@ -1308,7 +1308,23 @@ impl BrowserCompanionClient {
         if catalog.protocol_version != PROTOCOL_VERSION {
             return Err("Cached browser catalog protocol is invalid".into());
         }
-        validate_build(&catalog.build)?;
+        // Cached model metadata may outlive the request protocol that discovered
+        // it. Live companion envelopes still require the exact current build.
+        validate_visible(&catalog.build, 128, "cached browser build")?;
+        if !catalog
+            .build
+            .split_once("+protocol.")
+            .is_some_and(|(release, hash)| {
+                !release.is_empty()
+                    && release
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                    && hash.len() == 64
+                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err("Cached browser build is invalid".into());
+        }
         validate_catalog(catalog)
     }
 

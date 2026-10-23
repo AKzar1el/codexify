@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type BrowserContext, type Page } from "patchright";
@@ -41,7 +42,8 @@ const fixtureUi={
   it:{send:"Invia",stop:"Interrompi",counter:"di",efforts:["Immediato","Medio","Alto","Molto alto","Pro"]},
 } as const;
 let localizedStopFallback=false;
-let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;duplicateSubmit?:boolean;changeUrl?:boolean;frame?:"url"|"srcdoc"|"nested"|"hidden"|"foreign"}|undefined;
+let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;captured?:boolean;duplicateSubmit?:boolean;unrelated?:boolean;changeUrl?:boolean;frame?:"url"|"srcdoc"|"nested"|"hidden"|"foreign"}|undefined;
+const capturedStopDialogHtml=readFileSync(join(import.meta.dirname,'fixtures/stop-response-dialog.html'),'utf8');
 // Same structural contract as ChatGPT, with localized labels and arbitrary Radix IDs.
 const stopDialogHtml = `<div class="codex-dialog-overlay" style="position:fixed;inset:0;z-index:50;background:#0005"></div>
   <div role="dialog" id="radix-fixture" data-state="open" class="codex-dialog" aria-modal="true" aria-labelledby="radix-heading" aria-describedby="radix-description" style="position:fixed;inset:30% 20%;z-index:51;background:white">
@@ -92,11 +94,11 @@ async function installFixtureRoutes(){
       await route.fulfill({contentType:"text/html",body:"<!doctype html><html><body></body></html>"});return;
     }
     documentLoads++;
-    const dialogHtml=fixtureLanguage==="it"?stopDialogHtml
+    const dialogHtml=stopConfirmation?.captured?capturedStopDialogHtml:fixtureLanguage==="it"?stopDialogHtml
       .replaceAll("Arrêter cette réponse ?","Interrompere questa risposta?")
       .replaceAll("Vous pourrez envoyer un autre message.","Puoi chiedere di nuovo o inviare un messaggio di follow-up quando vuoi.")
       .replaceAll("Continuer la réflexion","Continua a pensare").replaceAll("Arrêter","Interrompi").replaceAll("Fermer","Chiudi"):stopDialogHtml;
-    await route.fulfill({contentType:"text/html",body:`<!doctype html><html><meta charset="utf-8"><style>[data-model-reasoning-effort-slider]{height:24px;min-width:240px}</style><body>
+    await route.fulfill({contentType:"text/html",body:`<!doctype html><html><meta charset="utf-8"><style>[data-model-reasoning-effort-slider]{height:24px;min-width:240px}${stopConfirmation?.captured?'.codex-dialog-overlay{position:fixed;inset:0;z-index:50;background:#0005}.codex-dialog{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:51;background:white}':''}</style><body>
       <section id="history"></section>
       <form data-chatgpt-composer>
         <div role="textbox" contenteditable="true" style="white-space:pre-wrap;min-height:24px" data-composer-markdown><p>${pill(chipName)}${initialDraft}</p></div>
@@ -161,10 +163,11 @@ async function installFixtureRoutes(){
           const show=(dialogDocument,frame)=>{
             dialogDocument.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
             const dialog=dialogDocument.querySelector('[role="dialog"]'),dialogForm=dialog.querySelector('form');
+            if(stopConfirmation.unrelated){dialogForm.querySelector('h2').textContent='Delete this conversation?';dialogForm.querySelector('.heading-dialog').textContent='Delete this conversation?';dialogForm.querySelector('[type="submit"]').textContent='Delete';}
             if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
             if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
             dialogForm.addEventListener('submit',event=>{
-              event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());
+              event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());document.body.dataset.draftOnConfirmation=editor.textContent;
               if(!stopConfirmation.persists){dialog.remove();dialogDocument.querySelector('.codex-dialog-overlay').remove();frame?.remove();finishStop(stop);}
             });
           };
@@ -441,14 +444,19 @@ test.skipIf(!native)("whitespace-only drafts are removed from the submitted text
   }
 },25_000);
 
-test.skipIf(!native)("model discovery and new-chat preparation clear existing drafts",async()=>{
-  for(const creating of [false,true]) {
-    const driver=await fixture('An old model-picker draft');
-    const catalog=await (creating?driver.prepareNewChat(null):driver.capabilities());
-    expect(catalog.models.length).toBeGreaterThan(0);
-    expect(await composerText(await activeComposer(page))).toBe('');
-    expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
-  }
+test.skipIf(!native)("model discovery preserves an unsent draft and waits for an empty composer",async()=>{
+  const driver=await fixture('Keep this model-picker draft');
+  await expect(driver.capabilities()).rejects.toThrow('requires an empty composer');
+  expect(await composerText(await activeComposer(page))).toBe('Keep this model-picker draft');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
+},20_000);
+
+test.skipIf(!native)("new-chat preparation clears the draft on the new chat surface",async()=>{
+  const driver=await fixture('An old model-picker draft');
+  const catalog=await driver.prepareNewChat(null);
+  expect(catalog.models.length).toBeGreaterThan(0);
+  expect(await composerText(await activeComposer(page))).toBe('');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
 },20_000);
 
 test.skipIf(!native)("a cold-cache send navigates before touching models and selects only the destination family",async()=>{
@@ -917,16 +925,36 @@ test.skipIf(!native)("offline Stop confirms an optional localized dialog before 
   }
 },30_000);
 
-test.skipIf(!native)("offline Stop never confirms a preexisting or ambiguous dialog",async()=>{
-  for(const scenario of ["preexisting","duplicateSubmit"] as const) {
+test.skipIf(!native)("offline Stop resumes the captured already-open confirmation before sending",async()=>{
+  for(const scenario of [{frame:undefined,captured:true,draft:'Existing draft'},{frame:'srcdoc',captured:true,draft:''},{frame:undefined,captured:false,draft:''},{frame:'nested',captured:false,draft:''}] as const){
+    const driver=await fixture(scenario.draft,true,connector,0,true);
+    fixtureLanguage=scenario.frame==='nested'?'it':'en';
+    stopConfirmation={preexisting:true,captured:scenario.captured,frame:scenario.frame};stopFinishDelayMs=1_200;
+    await syncFixture();const loads=documentLoads;
+    const offline=offlineRequest();
+    await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(12_000),emit:()=>{}});
+    expect(await page.locator('body').getAttribute('data-order')).toBe('confirm,stopped,send,');
+    expect(await page.locator('body').getAttribute('data-stops')).toBe('0');
+    expect(await page.locator('body').getAttribute('data-confirmations')).toBe('1');
+    expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+    if(scenario.draft)expect(await page.locator('body').getAttribute('data-draft-on-confirmation')).toContain(scenario.draft);
+    const times=await page.evaluate(()=>({confirmed:Number(document.body.dataset.confirmedAt),stopped:Number(document.body.dataset.stoppedAt),sent:Number(document.body.dataset.sentAt)}));
+    expect(times.stopped-times.confirmed).toBeGreaterThanOrEqual(1_200);
+    expect(times.sent).toBeGreaterThanOrEqual(times.stopped);
+    expect(documentLoads).toBe(loads);
+  }
+},45_000);
+
+test.skipIf(!native)("offline Stop never confirms unrelated or ambiguous dialogs",async()=>{
+  for(const scenario of [{unrelated:true,preexisting:true},{unrelated:true},{duplicateSubmit:true}] as const) {
     const driver=await fixture("",true,connector,0,true);
-    stopConfirmation={[scenario]:true};
+    stopConfirmation=scenario;
     const offline:ExecuteActionRequest={...request,prompt:{kind:"offline_goal",goalRevision:1}};
     const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:new AbortController().signal,emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:"external_interference"});
     expect(await page.locator("body").getAttribute("data-confirmations")).toBe("0");
     expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
-    expect(await page.locator("body").getAttribute("data-stops")).toBe(scenario==="preexisting"?"0":"1");
+    expect(await page.locator("body").getAttribute("data-stops")).toBe('preexisting' in scenario?"0":"1");
     expect(documentLoads).toBe(2);
   }
 },15_000);
@@ -946,10 +974,10 @@ test.skipIf(!native)("offline Stop confirms dialogs in ChatGPT frames without re
   }
 },40_000);
 
-test.skipIf(!native)("offline Stop rejects preexisting or ambiguous iframe dialogs without reloading",async()=>{
-  for(const scenario of ["preexisting","duplicateSubmit"] as const){
+test.skipIf(!native)("offline Stop rejects unrelated or ambiguous iframe dialogs without reloading",async()=>{
+  for(const scenario of [{unrelated:true,preexisting:true},{unrelated:true},{duplicateSubmit:true}] as const){
     const driver=await fixture("",true,connector,0,true);
-    stopConfirmation={frame:"srcdoc",[scenario]:true};
+    stopConfirmation={frame:"srcdoc",...scenario};
     const offline=offlineRequest();
     const failure=await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(5_000),emit:()=>{}}).then(()=>undefined,error=>error);
     expect(failure).toMatchObject({code:"external_interference"});
@@ -1019,6 +1047,21 @@ test.skipIf(!native)("an unresponsive iframe Stop confirmation waits twenty seco
   expect(await page.locator("body").getAttribute("data-confirmations")).toBe("1");
   expect(await page.locator("body").getAttribute("data-sends")).toBe("0");
   expect((await coordinator.health()).activeActionId).toBeNull();
+  expect(documentLoads).toBe(loads);
+},30_000);
+
+test.skipIf(!native)("an already-open captured Stop confirmation gets twenty seconds without reloading",async()=>{
+  const driver=await fixture("",true,connector,0,true);
+  stopConfirmation={captured:true,preexisting:true,persists:true};
+  await syncFixture();const loads=documentLoads,began=Date.now();
+  const coordinator=new SingleWindowCoordinator(driver,build),offline=offlineRequest();
+  await executeCoordinatorFixture(coordinator,offline);
+  const events=[];for await(const event of coordinator.events(offline.actionId,0))events.push(event);
+  expect(events.at(-1)).toMatchObject({type:"failed",message:"ChatGPT did not stop the previous response; the new message was not sent"});
+  expect(Date.now()-began).toBeGreaterThanOrEqual(20_000);expect(Date.now()-began).toBeLessThan(28_000);
+  expect(await page.locator('body').getAttribute('data-stops')).toBe('0');
+  expect(await page.locator('body').getAttribute('data-confirmations')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
   expect(documentLoads).toBe(loads);
 },30_000);
 

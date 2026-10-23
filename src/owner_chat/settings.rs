@@ -165,6 +165,7 @@ pub(super) fn start(state: OwnerState) {
                         }
                     }
                 }
+                refresh_owner_catalog_if_due(&state, &health, crate::markdown_chat::now_ms()).await;
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }

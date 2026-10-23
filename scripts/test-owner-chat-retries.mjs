@@ -99,13 +99,14 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   // previous account's labels or attempting discovery merely to render a chat.
   cached=false;context='other-account-build';
   await page.evaluate(()=>window.dispatchEvent(new Event('codexify-browser-change')));
-  await host.locator('#automation-model option:checked').filter({hasText:/^Saved model$/}).waitFor({state:'attached'});
+  await host.locator('#automation-model option:checked').filter({hasText:/^GPT-6 Astra$/}).waitFor({state:'attached'});
+  assert.equal(await host.locator('#automation-effort option:checked').textContent(),'Pro');
   assert.equal(await host.locator('#automation-model').isDisabled(),true);
   assert.equal(await host.locator('#automation-model').inputValue(),'gpt-6-astra');
   assert.match(await host.locator('#automation-model').getAttribute('title'),/Model list unavailable/);
   assert.equal(await host.locator('#automation-error').isVisible(),false);
   await page.locator(`[data-chat-id="${b}"] .conversation`).click();
-  await host.locator('#automation-model option:checked').filter({hasText:/^Saved model$/}).waitFor({state:'attached'});
+  await host.locator('#automation-model option:checked').filter({hasText:/^GPT-6 Astra$/}).waitFor({state:'attached'});
   assert.equal(await host.locator('#automation-error').isVisible(),false);
   actionFailed=true;
   const refresh=page.waitForResponse(response=>new URL(response.url()).pathname===`/api/chats/${b}/automation`);
@@ -285,6 +286,7 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
  let serverNow=base;
  const goal={revision:1,status:'active',markdown:'Keep working',turnCount:1};
  let action={id:'deferred-action',kind:'offline_goal',status:'queued',cooldownUntilMs:base+164000,sendAccepted:false,lastError:null,retryMode:'retry',automaticRetryAtMs:null,automaticRetryAttempts:0,automaticRetriesEnabled:false,canPauseRetries:false};
+ let queue={position:2,total:3};
  try{
   await page.clock.install({time:base+3600000});page.on('pageerror',error=>errors.push(error.message));
   await routeOwner(page,origin+'/**',async route=>{
@@ -297,12 +299,13 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
     writes.push(path);action={status:'idle'};
     return route.fulfill({json:{}});
    }
-   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'idle'},presence:{},serverTimeMs:serverNow}});
+   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:true,goal,action,queue,pairing:{status:'verified'},catalog:{models:[]},companion:{authenticated:true,status:'idle'},presence:{},serverTimeMs:serverNow}});
    return route.fulfill({json:{_meta:{[META]:{chat_file:'/fixture/CHAT.md',revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:serverNow,messages:[],has_more:false}}}});
   });
   await page.goto(`${origin}/?chat=${id}#queued-wait-token`);
   const host=page.locator('#chat-host'),notice=host.locator('#automation-error');
   await notice.getByText(/available in 164s/).waitFor();
+  assert.match(await notice.textContent(),/Waiting for the shared browser \(position in queue: 2\)\./);
   assert.equal(await notice.getAttribute('role'),'status');
   assert.match(await notice.getAttribute('class'),/waiting-for-browser/);
   assert.doesNotMatch(await notice.textContent(),/retry \d|Retrying|failed|disabled|not sent/);
@@ -312,7 +315,13 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.equal(await host.locator('#automation-retry-inline').isVisible(),true);
   serverNow+=1000;await page.clock.fastForward(1000);await notice.getByText(/available in 163s/).waitFor();
   await page.reload();await notice.getByText(/available in 163s/).waitFor();
-  serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser…',{exact:true}).waitFor();
+  assert.match(await notice.textContent(),/position in queue: 2/,'reopening preserves the reported queue position');
+  queue={position:1,total:2};await page.clock.fastForward(2000);await notice.getByText(/position in queue: 1/).waitFor();
+  assert.doesNotMatch(await notice.textContent(),/position in queue: 2/,'the position updates as earlier conversations leave the queue');
+  queue=null;await page.clock.fastForward(2000);await notice.getByText(/^Waiting for the shared browser\. Conversation loading/).waitFor();
+  assert.doesNotMatch(await notice.textContent(),/position in queue/,'an unknown position is not invented');
+  queue={position:1,total:1};await page.clock.fastForward(2000);await notice.getByText(/position in queue: 1/).waitFor();
+  serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser (position in queue: 1)…',{exact:true}).waitFor();
   assert.doesNotMatch(await notice.textContent(),/elapsed|\b0s\b|retry \d/);
   assert.deepEqual(writes,[],'waiting for the clock never posts a browser action from the UI');
   await host.locator('#automation-retry-inline').click();

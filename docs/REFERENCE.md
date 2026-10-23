@@ -1879,6 +1879,13 @@ rules as the setup widget, including scratch, Git/PR/branch/commit URLs, and sav
 worktrees. The picker discovers model and effort choices from a fresh ChatGPT
 chat at its destination before creation.
 
+Project paths may be ordinary folders or Git repositories without commits. These
+are used directly, even when Create a worktree is selected; Git worktrees require
+an existing commit. No Git initialization or initial commit is performed.
+**New project** creates a new empty folder directly under the configured project
+access root and selects it in the picker. Existing files and folders are never
+overwritten, and creating the folder does not submit a ChatGPT message.
+
 Set optional `agentChat.automation.chatgptProjectUrl` to an HTTPS ChatGPT project
 URL ending in `/project` to place these chats inside that project. Omit it to
 create chats at the top level. Project URLs cannot contain credentials, query
@@ -1981,7 +1988,17 @@ Failed recoveries back off for 30 seconds.
 
 Global settings under **Browser** offer **Start browser** and **Stop browser**,
 matching the CLI commands, along with **Sign in** and **Refresh models**. These
-controls are shared by all conversations. An explicit stop is stored privately
+controls are shared by all conversations.
+
+Model availability is cached globally for the verified ChatGPT account and
+shared by all chat selectors. Codexify attempts a refresh after startup when the
+browser is idle, then once every 24 hours. A failed refresh retains the last
+successful cache. Chat switching only reads that cache, and each chat keeps its
+last user-selected model and effort even if an option becomes unavailable.
+Compatible browser-protocol updates do not discard model metadata. Discovery
+waits for an empty composer instead of clearing an unsent draft.
+
+An explicit stop is stored privately
 in `browser/lifecycle.json`
 and survives a core restart. Automatic maintenance and queued actions honor it;
 Start restores automatic recovery. Startup can be interrupted by Stop. A shared
@@ -2021,6 +2038,8 @@ passive health checks do not navigate.
 
 During offline-send preparation, each Stop click gets up to **20 seconds** to
 settle. An optional Stop confirmation starts its own full 20-second window.
+Recognized confirmations that are already open are accepted before editing the
+composer, after verifying the conversation and account.
 Preparation continues as soon as the response stops; retries and reload recovery
 wait for that settling window.
 
@@ -2078,8 +2097,9 @@ instead of causing a guessed selection or an automatic model fallback.
 
 Model descriptions and retirement notices are separated from the model's primary
 label or machine identity. The account's chosen language does not change saved
-model/effort IDs. The optional Stop confirmation remains scoped to the initiating
-Stop action and is identified structurally. Unused English approval-clicking code
+model/effort IDs. Stop confirmations remain scoped to the verified conversation
+and account, and require the expected dialog structure and a reviewed localized
+Stop button label. Unused English approval-clicking code
 has been removed; pairing draft recovery waits while any modal is visible.
 
 `browser-companion/ui-locales.json` records the public source URLs and SHA-256
@@ -2375,8 +2395,10 @@ and live state take precedence.
 `agentChat.rolloutReminderInterval` defaults to **25** and accepts integers from
 1 to 10000. It is editable under **Settings → Chats & goals → Progress report
 interval** and applies without a restart. Agent work calls, including errors,
-count; app-only polling, `chat_await`, `turn_completed`, and pairing verification
-do not. When due, tool results include an optional `rollout_checkpoint_required`
+count; app-only polling, `chat_await`, `turn_completed`, `goal_finish`, and pairing
+verification do not. Waiting and completion results never deliver checkpoint
+reminders; a due reminder stays pending for the next work call. When due, work
+tool results include an optional `rollout_checkpoint_required`
 string instructing the agent to append current status, concrete progress or
 verification, and next steps before more work. A saved report resets the interval;
 unanswered reminders repeat at that interval. The count survives service restarts.
@@ -2440,7 +2462,10 @@ To explicitly rotate the token, stop Codexify, remove `~/.codexify/owner-chat.js
 then start it and run `codexify chat` for a new URL. Old URLs remain authorized
 until this deliberate rotation; restarting the service no longer revokes them.
 
-The left pane groups persisted conversations by project by default. Projects
+The left pane groups persisted conversations by project by default. A source
+checkout and its registered Git worktrees share one base-project heading;
+separate projects with the same folder name remain separate. Each chat retains
+its actual checkout path in the header and project-path editor. Projects
 and their chats are ordered by the timestamp of the latest chat entry. The
 **Projects** and **Recent** buttons switch between this grouping and a flat
 recent-first list, and the browser remembers the choice. **Search chats** searches

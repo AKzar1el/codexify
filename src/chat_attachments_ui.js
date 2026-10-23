@@ -70,7 +70,7 @@
         const card=this.card(record,url,()=>{if(item.state==='ready')this.open(item.record);});
         if(item.state!=='ready')card.disabled=true;
         card.querySelector('.attachment-size').textContent=item.state==='uploading'?'Uploading…':item.state==='failed'?item.error:this.formatSize(record.size);
-        const remove=document.createElement('button');remove.type='button';remove.className='attachment-remove';remove.setAttribute('aria-label',`Remove attachment ${this.displayName(record)}`);remove.title='Remove attachment';remove.textContent='×';
+        const remove=document.createElement('button');remove.type='button';remove.className='attachment-remove';remove.setAttribute('aria-label',`Remove attachment ${this.displayName(record)}`);remove.title='Remove attachment';remove.innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 5 14 14M19 5 5 19"/></svg>';
         remove.onclick=()=>{item.controller?.abort();this.items=this.items.filter(i=>i!==item);if(item.preview){URL.revokeObjectURL(item.preview);this.urls.delete(item.preview);}this.renderDraft();this.changed();};
         wrapper.append(card,remove);
         if(item.state==='failed'&&item.file){const retry=document.createElement('button');retry.type='button';retry.className='attachment-upload-retry';retry.textContent='Retry upload';retry.onclick=()=>void this.upload(item);wrapper.append(retry);}

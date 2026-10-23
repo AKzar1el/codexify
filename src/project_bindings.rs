@@ -523,6 +523,19 @@ impl ProjectBindingStore {
         let mut warnings = prepared.warnings;
         warnings.extend(scan.warnings);
 
+        let create_worktree = if create_worktree
+            && checkout_commit.is_none()
+            && !crate::worktrees::has_worktree_commit(config, &source_project_root).await?
+        {
+            warnings.push(
+                "The selected folder has no Git commit to base a worktree on; using it directly."
+                    .into(),
+            );
+            false
+        } else {
+            create_worktree
+        };
+
         let managed = if create_worktree {
             let worktree = create_managed_worktree_at(
                 config,

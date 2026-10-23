@@ -6,6 +6,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.12] - 2026-10-23
+
+### Added
+
+- Create and select a new project folder directly under the configured projects
+  root from the New chat dialog.
+
+### Fixed
+
+- Accept ordinary folders and Git repositories without commits in the New chat
+  picker, using the selected folder directly when a worktree cannot be created.
+- Confirm already-open ChatGPT Stop dialogs before editing the composer, then
+  allow the full 20-second settling window before retry or reload recovery.
+- Show a continuously rotating green hourglass for browser-cooldown waits and
+  display the conversation's current position in the shared browser queue.
+- Group linked worktrees under their base project in the chat sidebar while
+  keeping each chat's actual workspace intact.
+- Retain per-chat model and effort selections and reuse a global model catalog
+  across upgrades. Refresh it at startup and daily, preserving the last good
+  catalog when discovery fails.
+- Buffer pasted-image uploads to avoid Safari upload failures and center the
+  attachment removal icons.
+- Exclude waiting and completion operations from progress-journal checkpoint
+  counts and reminders while preserving normal agent activity tracking.
+
 ## [2.3.11] - 2026-10-22
 
 ### Fixed
@@ -1021,7 +1046,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.11...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.12...HEAD
+[2.3.12]: https://github.com/devnoname120/codexify/compare/v2.3.11...v2.3.12
 [2.3.11]: https://github.com/devnoname120/codexify/compare/v2.3.10...v2.3.11
 [2.3.10]: https://github.com/devnoname120/codexify/compare/v2.3.9...v2.3.10
 [2.3.9]: https://github.com/devnoname120/codexify/compare/v2.3.8...v2.3.9

@@ -85,6 +85,43 @@ pub async fn create_managed_worktree(
     create_managed_worktree_at(config, source_project_root, None).await
 }
 
+/// Plain folders and unborn repositories can be used directly, but cannot be
+/// the base of a Git worktree. Keep other Git failures visible to the caller.
+pub(crate) async fn has_worktree_commit(
+    config: &AppConfig,
+    project_root: &Path,
+) -> Result<bool, String> {
+    if !project_root
+        .ancestors()
+        .any(|path| path.join(".git").exists())
+    {
+        return Ok(false);
+    }
+    let output = git_output(
+        config,
+        project_root,
+        &[
+            OsString::from("rev-parse"),
+            OsString::from("--verify"),
+            OsString::from("--quiet"),
+            OsString::from("HEAD^{commit}"),
+        ],
+        &[],
+        DEFAULT_GIT_TIMEOUT,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(true)
+    } else if output.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "Could not check the project worktree base: {}",
+            bounded_output(&output)
+        ))
+    }
+}
+
 pub async fn create_managed_worktree_at(
     config: &AppConfig,
     source_project_root: &Path,
