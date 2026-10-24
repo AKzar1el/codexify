@@ -2142,7 +2142,7 @@ impl AgentAutomationSupervisor {
                     && snapshot.attention.is_none()
                     && !pair_verification
                 {
-                    task.store.record_turn_send(
+                    task.store.record_browser_turn_send(
                         &task.task,
                         super::turn_renewal::TurnSend {
                             action_id: execution.request.action_id.clone(),
@@ -2152,6 +2152,7 @@ impl AgentAutomationSupervisor {
                             pairing_generation: execution.request.pairing_generation,
                             owner_generation: execution.owner_generation,
                         },
+                        &execution,
                     )?;
                 }
                 accumulator.send_accepted |= snapshot.send_accepted;
@@ -2570,7 +2571,7 @@ impl AgentAutomationSupervisor {
         if matches!(event.kind, CompanionEventKind::SendAccepted)
             && let Some(task) = self.tasks.read().await.get(&execution.task_key)
         {
-            task.store.record_turn_send(
+            task.store.record_browser_turn_send(
                 &task.task,
                 super::turn_renewal::TurnSend {
                     action_id: execution.request.action_id.clone(),
@@ -2580,6 +2581,7 @@ impl AgentAutomationSupervisor {
                     pairing_generation: execution.request.pairing_generation,
                     owner_generation: execution.owner_generation,
                 },
+                execution,
             )?;
         }
         if matches!(event.kind, CompanionEventKind::SendAccepted)

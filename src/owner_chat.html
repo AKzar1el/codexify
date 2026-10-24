@@ -52,14 +52,14 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 [hidden] { display:none !important; }
 .presence { display:grid; place-items:center; width:13px; height:13px; flex:none; border-radius:50%; }
 .presence svg { display:block; width:13px; height:13px; }
-.presence.online,.presence.browser-cooldown { color:#159b27; }
+.presence.online { color:#159b27; }
 .presence.goal-running,.presence.goal-completed { color:#159b27; }
 .presence.goal-paused { color:var(--muted); }
 .presence .presence-spinner { animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
 .presence:is(.goal-running,.goal-retrying) .goal-outer-ring { transform-box:view-box; transform-origin:center; animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
 @keyframes presence-spin { to { transform:rotate(360deg); } }
 .presence.away { background:#eba916; border-color:#eba916; color:white; }
-.presence.offline,.presence.waking,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
+.presence.offline,.presence.waking,.presence.browser-cooldown,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
 .presence.offline { background:#fff; }
 #conversations .presence.offline { visibility:hidden; }
 .presence.waiting,.presence.goal-blocked,.presence.error,.presence.retrying,.presence.goal-retrying { color:#c4313b; }

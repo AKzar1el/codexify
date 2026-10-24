@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.15] - 2026-10-24
+
+### Fixed
+
+- Show the spinning browser-cooldown hourglass in gray in light and dark mode.
+- Update the saved model and effort shown in the conversation picker after a
+  confirmed fallback, including effort-only downgrades, while preserving newer
+  manual selections and leaving unsent attempts unchanged.
+- Keep fallback usage attribution tied to the confirmed model and effort, and
+  preserve the original send time when duplicate events or snapshots arrive.
+
 ## [2.3.14] - 2026-10-24
 
 ### Fixed

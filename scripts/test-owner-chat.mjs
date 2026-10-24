@@ -566,7 +566,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     const cooldownIcon=icons.nth(14);
     assert.equal(await cooldownIcon.isVisible(),true,'cooldown waits stay visible while the agent is offline');
     assert.equal(await cooldownIcon.getAttribute('aria-label'),'Waiting for browser cooldown');
-    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)');
+    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(133, 137, 141)');
     assert.equal(await cooldownIcon.locator('path').getAttribute('d'),'M6 2h12v5l-6 5 6 5v5H6v-5l6-5-6-5ZM4 2h16M4 22h16');
     const spinSettings=node=>{
       const css=getComputedStyle(node);return [css.animationName,css.animationDuration,css.animationTimingFunction,css.animationIterationCount];
@@ -621,7 +621,7 @@ test(`${engineName}: sidebar goal states and spinners leave header presence unch
     assert.equal(await icons.nth(1).locator("path:not(.goal-outer-ring)").evaluate(node=>getComputedStyle(node).transform),"none");
     assert.equal(await icons.nth(5).locator(".goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
     await page.emulateMedia({colorScheme:"dark"});
-    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(21, 155, 39)','browser cooldowns stay green in dark mode');
+    assert.equal(await cooldownIcon.evaluate(node=>getComputedStyle(node).color),'rgb(133, 137, 141)','browser cooldowns stay gray in dark mode');
     assert.equal(await icons.nth(5).evaluate(node=>getComputedStyle(node).color),"rgb(255, 133, 142)");
     assert.equal(await icons.nth(11).evaluate(node=>getComputedStyle(node).color),await icons.nth(7).evaluate(node=>getComputedStyle(node).color),'completed offline goals match the offline gray in dark mode');
     await page.emulateMedia({colorScheme:"light"});
@@ -920,13 +920,14 @@ test(`${engineName}: project grouping, transcript search, and persistent names`,
   } finally { await browser.close(); }
 });
 
-test(`${engineName}: model selectors retain per-chat preferences and readable cached labels`, {timeout:30000}, async()=>{
+test(`${engineName}: model selectors retain per-chat preferences, cached labels and confirmed fallbacks`, {timeout:30000}, async()=>{
  const browser=await engine.launch();
  try {
   const page=await ownerTestPage(browser);page.setDefaultTimeout(5000);
   const now=Date.now(),chats=['b','c'].map((n,i)=>({id:n.repeat(64),title:`Model preference ${i}`,workspace:'test',lastEntryEnd:0,lastEntryAtMs:now-i,totalToolCalls:0}));
   const selections=new Map(chats.map((chat,i)=>[chat.id,{model:'gpt-5.6-sol',effort:i?'medium':'max'}]));
   const model={id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:[{id:'medium',label:'Medium',available:true},{id:'high',label:'High',available:true},{id:'max',label:'Pro',available:true}]};
+  const catalogModels=[model,{id:'gpt-6-astra',label:'GPT-6 Astra',efforts:[{id:'max',label:'Pro',available:true}]}];
   let catalogReady=false,authenticated=true;const operations=[],errors=[];
   page.on('pageerror',error=>errors.push(error.message));
   await routeOwner(page,'http://127.0.0.1:43224/**',async route=>{
@@ -934,7 +935,7 @@ test(`${engineName}: model selectors retain per-chat preferences and readable ca
    if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:ownerHtml});
    if(url.pathname==='/api/chats')return route.fulfill({json:{chats,serverTimeMs:Date.now()}});
    if(url.pathname.endsWith('/automation/selection')){const body=request.postDataJSON();operations.push(body);selections.set(id,{model:body.model,effort:body.effort});return route.fulfill({json:{selection:selections.get(id)}});}
-   if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},selection:selections.get(id),goal:null,action:{status:'idle'},companion:{authenticated,status:authenticated?'idle':'unavailable',catalogContext:authenticated?'account-one':null},catalog:catalogReady&&authenticated?{models:[model]}:null,serverTimeMs:Date.now()}});
+   if(url.pathname.endsWith('/automation'))return route.fulfill({json:{enabled:true,pairing:{status:'verified'},selection:selections.get(id),goal:null,action:{status:'idle'},companion:{authenticated,status:authenticated?'idle':'unavailable',catalogContext:authenticated?'account-one':null},catalog:catalogReady&&authenticated?{models:catalogModels}:null,serverTimeMs:Date.now()}});
    assert(!url.pathname.endsWith('/capabilities'),'opening a chat must not discover models');
    return route.fulfill({json:{_meta:{[META]:{chat_file:`/test/${id}/CHAT.md`,revision:'0',delivered_through:0,read_through:0,total_tool_calls:0,server_time_ms:Date.now(),messages:[],has_more:false,unchanged:false}}}});
   });
@@ -949,6 +950,14 @@ test(`${engineName}: model selectors retain per-chat preferences and readable ca
   await effort.locator('option[value="high"]:disabled').waitFor({state:'attached'});assert.equal(await effort.inputValue(),'high','availability changes do not silently select another effort');
   authenticated=false;await host.locator('#automation-effort:disabled').waitFor();assert.equal(await effort.locator('option:checked').textContent(),'High');
   await page.reload();await picker.waitFor();assert.equal(await picker.locator('option:checked').textContent(),'GPT-5.6 Sol');assert.equal(await effort.locator('option:checked').textContent(),'High');
+  authenticated=true;selections.set(chats[0].id,{model:'gpt-6-astra',effort:'max'});
+  await page.waitForFunction(()=>document.querySelector('#chat-host .chat-shell').shadowRoot.querySelector('#automation-model').value==='gpt-6-astra');
+  selections.set(chats[0].id,{model:'gpt-5.6-sol',effort:'max'});
+  await page.waitForFunction(()=>{const root=document.querySelector('#chat-host .chat-shell').shadowRoot;return root.querySelector('#automation-model').value==='gpt-5.6-sol'&&root.querySelector('#automation-effort').value==='max';});
+  assert.equal(await picker.locator('option:checked').textContent(),'GPT-5.6 Sol');assert.equal(await effort.locator('option:checked').textContent(),'Pro');
+  selections.set(chats[0].id,{model:'gpt-5.6-sol',effort:'medium'});
+  await page.waitForFunction(()=>document.querySelector('#chat-host .chat-shell').shadowRoot.querySelector('#automation-effort').value==='medium');
+  assert.equal(await effort.locator('option:checked').textContent(),'Medium','an effort-only fallback also updates the picker');
   assert.equal(operations.length,1,'only the explicit user change saves a selection');assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });

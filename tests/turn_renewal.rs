@@ -18,6 +18,10 @@ struct Executor {
     sent: Mutex<Vec<AutomationExecution>>,
     fail: AtomicBool,
     ambiguous: AtomicBool,
+    snapshot_only: AtomicBool,
+    verified_only: AtomicBool,
+    actual_selection: Mutex<Option<CompanionSelection>>,
+    before_send: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 #[async_trait]
 impl AutomationExecutor for Executor {
@@ -38,29 +42,52 @@ impl AutomationExecutor for Executor {
                 failure_status: None,
             });
         }
-        events
-            .send(CompanionEvent {
-                sequence: 1,
-                action_id: e.request.action_id.clone(),
-                at_ms: 90_000,
-                kind: CompanionEventKind::ModelVerified {
+        let selected =
+            self.actual_selection
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(CompanionSelection {
                     model: "gpt-5.6-sol".into(),
                     effort: "max".into(),
-                },
-            })
-            .unwrap();
-        events
-            .send(CompanionEvent {
-                sequence: 2,
-                action_id: e.request.action_id.clone(),
-                at_ms: match self.accepted_at_ms.load(Ordering::SeqCst) {
-                    0 => 100_000,
-                    at => at,
-                },
-                kind: CompanionEventKind::SendAccepted,
-            })
-            .unwrap();
-        Ok(serde_json::from_value(serde_json::json!({"protocolVersion":1,"build":format!("test{}",PROTOCOL_BUILD_SUFFIX),"actionId":e.request.action_id,"state":"idle","sendAccepted":true,"canonicalUrl":e.request.url,"selected":{"model":"gpt-5.6-sol","effort":"max"},"lastEventSequence":2,"attention":null})).unwrap())
+                });
+        if !self.snapshot_only.load(Ordering::SeqCst) {
+            events
+                .send(CompanionEvent {
+                    sequence: 1,
+                    action_id: e.request.action_id.clone(),
+                    at_ms: 90_000,
+                    kind: CompanionEventKind::ModelVerified {
+                        model: selected.model.clone(),
+                        effort: selected.effort.clone(),
+                    },
+                })
+                .unwrap();
+            if self.verified_only.load(Ordering::SeqCst) {
+                return Err(AutomationExecutionError {
+                    message: "Model verified, but nothing was sent".into(),
+                    send_accepted: false,
+                    failure_status: None,
+                });
+            }
+        }
+        if let Some(change) = self.before_send.lock().unwrap().take() {
+            change();
+        }
+        if !self.snapshot_only.load(Ordering::SeqCst) {
+            events
+                .send(CompanionEvent {
+                    sequence: 2,
+                    action_id: e.request.action_id.clone(),
+                    at_ms: match self.accepted_at_ms.load(Ordering::SeqCst) {
+                        0 => 100_000,
+                        at => at,
+                    },
+                    kind: CompanionEventKind::SendAccepted,
+                })
+                .unwrap();
+        }
+        Ok(serde_json::from_value(serde_json::json!({"protocolVersion":1,"build":format!("test{}",PROTOCOL_BUILD_SUFFIX),"actionId":e.request.action_id,"state":"idle","sendAccepted":true,"canonicalUrl":e.request.url,"selected":{"model":selected.model,"effort":selected.effort},"lastEventSequence":2,"attention":null})).unwrap())
     }
 }
 struct Fixture {
@@ -162,6 +189,168 @@ fn wall_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[tokio::test]
+async fn accepted_fallback_updates_saved_picker_and_statistics_with_or_without_events() {
+    for (kind, preferred, actual, snapshot_only) in [
+        (
+            AutomationActionKind::OfflineChat,
+            ("gpt-6-astra", "max"),
+            ("gpt-5.6-sol", "max"),
+            false,
+        ),
+        (
+            AutomationActionKind::OfflineGoal,
+            ("gpt-6-astra", "max"),
+            ("gpt-5.6-sol", "max"),
+            true,
+        ),
+        (
+            AutomationActionKind::OfflineCombined,
+            ("gpt-6-sol", "xhigh"),
+            ("gpt-6-sol", "high"),
+            false,
+        ),
+    ] {
+        let f = fixture(false).await;
+        let now = wall_ms();
+        f.store
+            .set_selection(&f.task, preferred.0, preferred.1, "catalog", "account", now)
+            .unwrap();
+        *f.executor.actual_selection.lock().unwrap() = Some(CompanionSelection {
+            model: actual.0.into(),
+            effort: actual.1.into(),
+        });
+        f.executor
+            .snapshot_only
+            .store(snapshot_only, Ordering::SeqCst);
+        f.executor.accepted_at_ms.store(now, Ordering::SeqCst);
+        if kind != AutomationActionKind::OfflineChat {
+            let goal = f
+                .store
+                .set_goal(&f.task, "Complete the work", now - 60_000)
+                .unwrap();
+            f.store
+                .run_goal(&f.task, goal.revision, now - 60_000)
+                .unwrap();
+        }
+        if kind != AutomationActionKind::OfflineGoal {
+            f.chat
+                .append_user("fallback-request".into(), "Continue the task".into())
+                .await
+                .unwrap();
+        }
+        f.supervisor.scan_once(now).await.unwrap();
+        assert_eq!(f.supervisor.next_queued_kind().await, Some(kind));
+        f.supervisor.run_next(now).await.unwrap();
+        let state = f.store.load(&f.task).unwrap();
+        assert_eq!(
+            (
+                state.selection.model.as_deref(),
+                state.selection.effort.as_deref()
+            ),
+            (Some(actual.0), Some(actual.1))
+        );
+        let send = state.turn_renewal.send.unwrap();
+        assert_eq!(
+            (send.model.as_deref(), send.effort.as_deref()),
+            (Some(actual.0), Some(actual.1))
+        );
+        assert_eq!(
+            AgentAutomationStore::for_config(&f.config)
+                .unwrap()
+                .load(&f.task)
+                .unwrap()
+                .selection,
+            state.selection,
+            "the picker must stay on the fallback after restart"
+        );
+
+        let analytics = f
+            .store
+            .task_directory(&f.task)
+            .unwrap()
+            .join("usage-analytics.json");
+        let expected_key = format!("{}\u{1f}{}", actual.0, actual.1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(7);
+        loop {
+            if let Ok(bytes) = std::fs::read(&analytics) {
+                let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let days = data["days"].as_object().unwrap();
+                let turns: u64 = days
+                    .values()
+                    .filter_map(|day| day[&expected_key]["turns"].as_u64())
+                    .sum();
+                if turns == 1 {
+                    assert_eq!(
+                        days.values()
+                            .flat_map(|day| day.as_object().unwrap().values())
+                            .map(|totals| totals["turns"].as_u64().unwrap())
+                            .sum::<u64>(),
+                        1,
+                        "event and snapshot proof must count one turn"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fallback turn was not attributed to {expected_key}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn fallback_proof_does_not_replace_a_newer_manual_selection_or_an_unsent_choice() {
+    for manual_change in [false, true] {
+        let f = fixture(false).await;
+        let now = wall_ms();
+        f.executor.accepted_at_ms.store(now, Ordering::SeqCst);
+        if manual_change {
+            let store = f.store.clone();
+            let task = f.task.clone();
+            *f.executor.before_send.lock().unwrap() = Some(Box::new(move || {
+                store
+                    .set_selection(&task, "gpt-6-sol", "high", "catalog", "account", now + 1)
+                    .unwrap();
+            }));
+        } else {
+            f.executor.verified_only.store(true, Ordering::SeqCst);
+        }
+        f.chat
+            .queue_user_message(
+                "fallback-request".into(),
+                "Continue the task".into(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        f.supervisor.scan_once(now).await.unwrap();
+        let result = f.supervisor.run_next(now).await;
+        let state = f.store.load(&f.task).unwrap();
+        if manual_change {
+            result.unwrap();
+            assert_eq!(
+                (
+                    state.selection.model.as_deref(),
+                    state.selection.effort.as_deref()
+                ),
+                (Some("gpt-6-sol"), Some("high"))
+            );
+            assert_eq!(
+                state.turn_renewal.send.unwrap().model.as_deref(),
+                Some("gpt-5.6-sol"),
+                "statistics still use the actual send, independently of the next user selection"
+            );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(state.selection.model.as_deref(), Some("gpt-6-astra"));
+            assert_eq!(state.turn_renewal.send.unwrap().action_id, "original");
+        }
+    }
 }
 
 #[test]
@@ -379,7 +568,10 @@ async fn no_goal_renewal_waits_for_final_report_and_sends_once_without_queue() {
             .unwrap()
             .is_none()
     );
-    // Pro fallback gets 115 minutes even though the saved preference is Astra.
+    let selection = f.store.load(&f.task).unwrap().selection;
+    assert_eq!(selection.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(selection.effort.as_deref(), Some("max"));
+    // Renewal and the saved picker selection both follow the actual fallback.
     assert!(
         f.store
             .turn_renewal_notice(&f.task, 100_000 + 115 * 60_000)

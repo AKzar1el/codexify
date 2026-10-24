@@ -744,6 +744,50 @@ mod tests {
         assert_eq!(t.data.days[&date(BASE).unwrap()].len(), 2);
     }
     #[test]
+    fn fallback_turns_tools_time_and_goals_use_actual_model_and_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = dir.path().join("CHAT.md");
+        std::fs::write(
+            dir.path().join("automation.json"),
+            serde_json::json!({
+                "selection":{"model":"gpt-6-astra","effort":"max"},
+                "turnRenewal":{"send":{"model":"gpt-5.6-sol","effort":"max"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut t = tracker();
+        let mut sent = send("fallback", BASE, Some("gpt-5.6-sol"));
+        if let Event::Sent(send) = &mut sent.event {
+            send.effort = Some("max".into());
+        }
+        sent.chat = chat.clone();
+        t.apply(&sent);
+        let mut work = tool("work", BASE + 60_000, false);
+        work.chat = chat.clone();
+        t.apply(&work);
+        t.apply(&end("work", BASE + 120_000));
+        let mut completed = p(
+            BASE + 120_001,
+            Event::Goal {
+                id: "finished".into(),
+            },
+        );
+        completed.chat = chat;
+        t.apply(&completed);
+        let day = &t.data.days[&date(BASE).unwrap()];
+        assert_eq!(
+            day.len(),
+            1,
+            "the saved preference must not receive fallback usage"
+        );
+        let actual = &day[&model_key("gpt-5.6-sol", "max")];
+        assert_eq!(actual.turns, 1);
+        assert_eq!(actual.tool_calls, 1);
+        assert_eq!(actual.active_ms, 120_000);
+        assert_eq!(actual.goals, 1);
+    }
+    #[test]
     fn late_model_proof_reattributes_a_turn_instead_of_counting_it_twice() {
         let mut t = tracker();
         t.apply(&send("one", BASE, None));

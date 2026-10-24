@@ -214,14 +214,31 @@ impl AgentAutomationStore {
         task: &ConversationIdentity,
         send: TurnSend,
     ) -> Result<(), String> {
-        let analytics_send = send.clone();
+        self.record_turn_send_inner(task, send, None)
+    }
+
+    pub(super) fn record_browser_turn_send(
+        &self,
+        task: &ConversationIdentity,
+        send: TurnSend,
+        execution: &super::AutomationExecution,
+    ) -> Result<(), String> {
+        self.record_turn_send_inner(task, send, Some(execution))
+    }
+
+    fn record_turn_send_inner(
+        &self,
+        task: &ConversationIdentity,
+        send: TurnSend,
+        execution: Option<&super::AutomationExecution>,
+    ) -> Result<(), String> {
         let result = self.mutate(task, |state| {
             if state.action.id.as_deref() != Some(send.action_id.as_str())
                 || state.action.kind == Some(AutomationActionKind::PairVerify)
                 || state.pairing.generation != send.pairing_generation
                 || state.pairing.verified_owner_generation != Some(send.owner_generation)
             {
-                return Ok(false);
+                return Ok(None);
             }
             if let Some(saved) = &mut state.turn_renewal.send
                 && saved.action_id == send.action_id
@@ -233,23 +250,54 @@ impl AgentAutomationStore {
                     saved.model = send.model;
                     saved.effort = send.effort;
                 }
-                return Ok(true);
+            } else {
+                let resume_wait_until_ms = state.turn_renewal.handoff.as_ref().map(|_| {
+                    send.at_ms
+                        .saturating_add(crate::markdown_chat::OFFLINE_AFTER_MS)
+                });
+                state.turn_renewal = TurnRenewalState {
+                    send: Some(send),
+                    handoff: None,
+                    resume_wait_until_ms,
+                };
             }
-            let resume_wait_until_ms = state.turn_renewal.handoff.as_ref().map(|_| {
-                send.at_ms
-                    .saturating_add(crate::markdown_chat::OFFLINE_AFTER_MS)
-            });
-            state.turn_renewal = TurnRenewalState {
-                send: Some(send),
-                handoff: None,
-                resume_wait_until_ms,
-            };
-            Ok(true)
+            let confirmed = state
+                .turn_renewal
+                .send
+                .as_ref()
+                .expect("recorded turn send");
+            if let Some(execution) = execution
+                && state.selection.model == execution.request.model
+                && state.selection.effort == execution.request.effort
+                && state.selection.catalog_revision.as_deref()
+                    == Some(execution.catalog_revision.as_str())
+                && state.selection.account_fingerprint.as_deref()
+                    == Some(execution.account_fingerprint.as_str())
+                && let (Some(model), Some(effort)) = (&confirmed.model, &confirmed.effort)
+                && super::model_fallback::selection_allowed(
+                    execution.request.model.as_deref(),
+                    execution.request.effort.as_deref(),
+                    &super::CompanionSelection {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                    },
+                )
+            {
+                // Adopt only accepted, verified selections. A manual choice made
+                // during the browser action takes precedence over its older request.
+                state.selection.model = Some(model.clone());
+                state.selection.effort = Some(effort.clone());
+            }
+            Ok(Some(confirmed.clone()))
         });
-        if matches!(result, Ok(true))
+        if let Ok(Some(analytics_send)) = &result
             && let Ok(path) = self.task_directory(task)
         {
-            crate::usage_analytics::sent(&self.usage_options, path.join("CHAT.md"), analytics_send);
+            crate::usage_analytics::sent(
+                &self.usage_options,
+                path.join("CHAT.md"),
+                analytics_send.clone(),
+            );
         }
         result.map(|_| ())
     }
