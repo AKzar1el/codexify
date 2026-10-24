@@ -812,10 +812,10 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const inlineRetry = byId("automation-retry-inline");
       inlineRetry.hidden = !retryMode;
       inlineRetry.disabled = !retryMode;
-      inlineRetry.textContent = retryMode === "continue_goal" ? "Continue" : "Retry";
-      inlineRetry.setAttribute("aria-label", retryMode === "continue_goal" ? "Continue goal now" : "Retry now");
-      inlineRetry.title = retryMode === "continue_goal" ? "Continue without resending previously submitted messages" : "Retry now instead of waiting";
-      const retryLabel = retryMode === "continue_goal" ? "Continue goal" : "Retry failed action";
+      inlineRetry.textContent = waitingForBrowser ? "Do now" : retryMode === "continue_goal" ? "Continue" : "Retry";
+      inlineRetry.setAttribute("aria-label", waitingForBrowser ? "Do now" : retryMode === "continue_goal" ? "Continue goal now" : "Retry now");
+      inlineRetry.title = waitingForBrowser ? "Run now without waiting for the shared browser cooldown" : retryMode === "continue_goal" ? "Continue without resending previously submitted messages" : "Retry now instead of waiting";
+      const retryLabel = waitingForBrowser ? "Do now" : retryMode === "continue_goal" ? "Continue goal" : "Retry failed action";
       byId("goal-retry").hidden = !goalNeedsAttention || Boolean(retryMode);
       byId("goal-retry").disabled = !retryMode && (state.action?.kind === "pair_verify" ? nodes.pair.disabled : nodes.reveal.disabled);
       byId("goal-retry").textContent = retryMode === "continue_goal" ? "Continue" : retryMode ? "Retry" : state.action?.kind === "pair_verify" ? "Pair again" : "ChatGPT";

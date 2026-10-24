@@ -11,6 +11,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Show the spinning browser-cooldown hourglass in gray in light and dark mode.
+- Label the manual override for a queued browser-cooldown wait as "Do now",
+  while retaining "Retry" for failed actions.
 - Update the saved model and effort shown in the conversation picker after a
   confirmed fallback, including effort-only downgrades, while preserving newer
   manual selections and leaving unsent attempts unchanged.

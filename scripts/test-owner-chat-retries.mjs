@@ -305,6 +305,9 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   await page.goto(`${origin}/?chat=${id}#queued-wait-token`);
   const host=page.locator('#chat-host'),notice=host.locator('#automation-error');
   await notice.getByText(/available in 164s/).waitFor();
+  const doNow=host.getByRole('button',{name:'Do now',exact:true});
+  assert.equal(await doNow.textContent(),'Do now');
+  assert.match(await doNow.getAttribute('title'),/shared browser cooldown/);
   assert.match(await notice.textContent(),/^Conversation loading available in 164s \(position in queue: 2\)\./);
   for(const width of [320,390,600,1280]){
    await page.setViewportSize({width,height:820});
@@ -341,9 +344,12 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser (position in queue: 1).',{exact:true}).waitFor();
   assert.doesNotMatch(await notice.textContent(),/elapsed|\b0s\b|retry \d|…|\.\.\./);
   assert.deepEqual(writes,[],'waiting for the clock never posts a browser action from the UI');
-  await host.locator('#automation-retry-inline').click();
+  await doNow.click();
   await notice.waitFor({state:'hidden'});
   assert.deepEqual(writes,[`/api/chats/${id}/automation/action/retry`]);
+  action={id:'actual-failure',kind:'offline_goal',status:'failed',lastError:'Browser action failed',sendAccepted:false,retryMode:'retry'};
+  await page.clock.fastForward(2000);await notice.getByText(/Browser action failed/).waitFor();
+  assert.equal(await host.getByRole('button',{name:'Retry now',exact:true}).textContent(),'Retry','actual failures retain their retry label');
   assert.deepEqual(errors,[]);
  }finally{await browser.close();}
 });
