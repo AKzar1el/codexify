@@ -8,8 +8,8 @@ const META='io.github.devnoname120/codexify/markdown-chat';
 const id='a'.repeat(64),base='http://127.0.0.1:43314';
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function until(predicate){for(let i=0;i<100;i++){if(await predicate())return;await pause(40);}assert.fail('Expected state did not arrive');}
-async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[],inputRequired=false,waiting=false,completedWaiting=false}={}){
- const context=await browser.newContext({viewport:{width,height:900}});
+async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queued=[],inputRequired=false,waiting=false,completedWaiting=false,touch=false}={}){
+ const context=await browser.newContext({viewport:{width,height:900},hasTouch:touch});
  await context.addInitScript(platform=>Object.defineProperty(navigator,'platform',{value:platform}),platform);
  const page=await context.newPage();page.setDefaultTimeout(6000);
  const errors=[],calls=[],messages=[{id:'agent-progress',role:'agent',markdown:'The current request is still running.',start:0,end:100,created_at_ms:Date.now(),tool_call_count:1}];
@@ -36,6 +36,7 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
   if(path.endsWith('/automation'))return route.fulfill({json:{enabled:false,goal:null,pairing:{status:'unpaired'},action:{status:'idle'},selection:{},catalog:{models:[]},companion:{authenticated:false,status:'idle'},presence:{lastAgentCallAtMs:Date.now()},serverTimeMs:Date.now()}});
   if(path===`/api/chats/${id}/send`){
    const body=request.postDataJSON();calls.push({path,body});
+   if(body.stop_agent)return route.fulfill({json:{_meta:{[META]:{stopped:true,goal:null}}}});
    if(body.message_mode==='queue'){
     let entry=backend.queue.find(e=>e.id===body.request_id);
     if(!entry){entry={id:body.request_id,revision:1,markdown:body.message,attachment_ids:[],attachments:[],created_at_ms:Date.now()};backend.queue.push(entry);}
@@ -58,6 +59,73 @@ async function fixture(browser,{platform='MacIntel',width=1280,mode='steer',queu
  return{page,context,host,backend,calls,errors,messages};
 }
 for(const[engineName,engine]of[['Chromium',chromium],['WebKit',webkit]]){
+ test(`${engineName}: holding Send offers one-message Steer and Queue actions without sending on release`,{timeout:30000},async()=>{
+  const browser=await engine.launch();
+  try {
+   for(const touch of [false,true])for(const mode of ['steer','queue']) {
+    const f=await fixture(browser,{width:touch?390:1280,mode,touch}),{page,host,calls,backend,errors}=f;
+    const input=host.locator('#draft'),send=host.locator('#send'),menu=host.getByRole('menu',{name:'Send message as'});
+    await input.fill('Choose how to send this draft');await input.focus();
+    const box=await send.boundingBox();
+    if(touch)await send.dispatchEvent('pointerdown',{pointerId:17,pointerType:'touch',isPrimary:true,button:0,clientX:box.x+box.width/2,clientY:box.y+box.height/2});
+    else {await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();}
+    await menu.waitFor();
+    assert.equal(calls.filter(call=>call.path.endsWith('/send')).length,0);
+    assert.equal(await input.evaluate(node=>node.getRootNode().activeElement===node),true,'holding Send preserves the draft focus/keyboard');
+    if(touch){await send.dispatchEvent('pointerup',{pointerId:17,pointerType:'touch',isPrimary:true,button:0});await send.dispatchEvent('click',{detail:1});}
+    else await page.mouse.up();
+    assert.equal(await menu.isVisible(),true,'release keeps the choice open instead of submitting the default');
+    assert.equal(calls.filter(call=>call.path.endsWith('/send')).length,0);
+    assert.equal(await menu.locator('[data-default="true"]').textContent(),mode==='steer'?'Steer':'Queue');
+    if(touch){await page.setViewportSize({width:390,height:470});await page.waitForTimeout(50);}
+    const bounds=await menu.boundingBox(),button=await send.boundingBox();
+    assert(bounds.x>=0&&bounds.x+bounds.width<=(touch?390:1280)&&bounds.y>=0&&bounds.y+bounds.height<=button.y,'the menu stays above Send and inside the visible viewport');
+    await page.screenshot({path:`/tmp/send-menu-${engineName.toLowerCase()}-${touch?'touch':'mouse'}-${mode}.png`});
+    const override=mode==='steer'?'queue':'steer';
+    if(touch)await menu.getByRole('menuitem',{name:override==='steer'?'Steer':'Queue',exact:true}).tap();
+    else await menu.getByRole('menuitem',{name:override==='steer'?'Steer':'Queue',exact:true}).click();
+    await until(()=>calls.some(call=>call.path.endsWith('/send')));
+    assert.equal(calls.filter(call=>call.path.endsWith('/send')).length,1);
+    assert.equal(calls.at(-1).body.message_mode,override);assert.equal(backend.mode,mode);
+    assert.equal(await menu.isHidden(),true);await input.fill('A normal tap still uses the saved default');
+    if(touch)await send.tap();else await send.click();
+    await until(()=>calls.filter(call=>call.path.endsWith('/send')).length===2);
+    assert.equal(calls.at(-1).body.message_mode,mode);assert(!calls.some(call=>call.path==='/api/settings'),'one-off choices must not change settings');
+    await until(async()=>await send.getAttribute('data-mode')==='stop');
+    if(touch)await send.tap();else await send.click();
+    await until(()=>calls.some(call=>call.body.stop_agent===true));
+    assert.deepEqual(errors,[]);await f.context.close();
+   }
+  }finally{await browser.close();}
+ });
+ test(`${engineName}: send menu supports dismissal, movement cancellation and keyboard choices`,{timeout:25000},async()=>{
+  const browser=await engine.launch();
+  try {
+   const f=await fixture(browser,{mode:'queue',inputRequired:true,width:390,touch:true}),{page,host,calls,errors}=f;
+   const input=host.locator('#draft'),send=host.locator('#send'),menu=host.getByRole('menu',{name:'Send message as'});
+   await input.fill('Keep this draft until I choose');
+   await send.dispatchEvent('pointerdown',{pointerId:3,pointerType:'touch',button:0,clientX:10,clientY:10});
+   await send.dispatchEvent('pointermove',{pointerId:3,pointerType:'touch',clientX:35,clientY:10});
+   await send.dispatchEvent('pointercancel',{pointerId:3,pointerType:'touch'});await page.waitForTimeout(550);
+   assert.equal(await menu.isHidden(),true);assert.equal(calls.length,0);
+   await send.dispatchEvent('contextmenu');await menu.waitFor();
+   assert.equal(await menu.locator('[data-default="true"]').textContent(),'Steer','answer waits retain their direct-send default');
+   const queueItem=host.locator('#send-mode-menu [data-mode="queue"]');
+   await queueItem.dispatchEvent('pointerdown',{pointerId:5,pointerType:'touch',button:0});
+   await queueItem.dispatchEvent('pointerup',{pointerId:5,pointerType:'touch',clientX:-20,clientY:-20});
+   assert.equal(calls.length,0,'dragging away from an option must not submit it');
+   await input.press('Escape');assert.equal(await menu.isHidden(),true);assert.equal(await input.inputValue(),'Keep this draft until I choose');
+   await send.dispatchEvent('contextmenu');await menu.waitFor();await host.locator('#messages').click();assert.equal(await menu.isHidden(),true);
+   await send.focus();await send.press('Shift+F10');await menu.waitFor();
+   await menu.getByRole('menuitem',{name:'Steer',exact:true}).press('ArrowDown');
+   assert.equal(await menu.getByRole('menuitem',{name:'Queue',exact:true}).evaluate(node=>node.getRootNode().activeElement===node),true);
+   await menu.getByRole('menuitem',{name:'Queue',exact:true}).press('Enter');
+   await until(()=>calls.some(call=>call.path.endsWith('/send')));assert.equal(calls.at(-1).body.message_mode,'queue');
+   await input.fill('');await until(async()=>await send.getAttribute('data-mode')==='stop');
+   await send.dispatchEvent('contextmenu');await page.waitForTimeout(550);assert.equal(await menu.isHidden(),true,'the Stop button never offers send choices');
+   assert.equal(await send.getAttribute('aria-haspopup'),null);assert.deepEqual(errors,[]);await f.context.close();
+  }finally{await browser.close();}
+ });
  test(`${engineName}: completed waits show a static waiting sidebar icon without treating the next request as an answer`,{timeout:25000},async()=>{
   const browser=await engine.launch();
   try {

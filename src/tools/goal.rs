@@ -41,6 +41,7 @@ struct FinishArgs {
     status: FinishStatus,
     summary: Option<String>,
     reason: Option<String>,
+    next_steps: String,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +84,7 @@ impl Tool for GoalTool {
                 "Resume the exact current paused or blocked standalone agent-chat goal without changing its text, revision, elapsed time, or turn count. An already active goal remains active. A completed goal requires goal_set to create a new revision. Use a fresh requestId for each operation and reuse it only to retry identical arguments."
             }
             Self::Finish => {
-                "Mark the exact current standalone agent-chat goal revision completed or blocked. A blocked goal requires a concrete reason; an ordinary final answer does not finish a goal."
+                "NON-TERMINAL TOOL. Mark the exact current goal revision completed or blocked and publish its report inline for the user. For completed, summary MUST describe work performed, results and verification; nextSteps MUST describe suggested follow-up (explicitly say none if none is needed). For blocked, reason MUST explain the concrete blocker and nextSteps MUST explain exactly what input, action or external change will unblock it. Never block merely for a timeout or rejected command. This finishes only the goal, NEVER the assistant turn: no normal ChatGPT final answer. After completed call turn_completed repeatedly to wait for requests; after blocked call chat_await repeatedly for the needed input, then goal_resume only once the blocker is resolved. Follow returned user input first. Do not stop because of elapsed time or an anticipated timeout."
             }
         }
         .into()
@@ -165,16 +166,31 @@ impl Tool for GoalTool {
                     },
                     "summary": {
                         "type": "string",
+                        "minLength": 1,
                         "maxLength": MAX_GOAL_RESULT_BYTES,
+                        "description": "Required when status is completed: overview of work done, results and verification. Together with nextSteps, the formatted report must fit within 4096 UTF-8 bytes.",
                         "writeOnly": true
                     },
                     "reason": {
                         "type": "string",
+                        "minLength": 1,
                         "maxLength": MAX_GOAL_RESULT_BYTES,
+                        "description": "Required when status is blocked: concrete explanation of why work cannot proceed.",
+                        "writeOnly": true
+                    },
+                    "nextSteps": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_GOAL_RESULT_BYTES,
+                        "description": "Mandatory for both outcomes. Blocked: exact input, action or external change needed to unblock. Completed: suggested next steps, or explicitly state none are needed. Included in the inline report; combined formatted report limit is 4096 UTF-8 bytes.",
                         "writeOnly": true
                     }
                 },
-                "required": ["expectedRevision", "status"],
+                "required": ["expectedRevision", "status", "nextSteps"],
+                "anyOf": [
+                    {"properties": {"status": {"const": "completed"}}, "required": ["summary"]},
+                    {"properties": {"status": {"const": "blocked"}}, "required": ["reason"]}
+                ],
                 "additionalProperties": false
             }),
         }
@@ -214,7 +230,9 @@ impl Tool for GoalTool {
                         { "type": "null" }
                     ]
                 },
-                "terminal": { "type": "boolean" }
+                "terminal": { "type": "boolean", "description": "Terminal goal receipt only; never permission to end the assistant turn." },
+                "assistant_turn_may_end": { "type": "boolean", "const": false },
+                "required_next_action": { "type": "string", "enum": ["continue_work", "turn_completed", "chat_await", "chat_read"] }
             },
             "required": [
                 "content",
@@ -224,7 +242,9 @@ impl Tool for GoalTool {
                 "markdown",
                 "summary",
                 "blockedReason",
-                "terminal"
+                "terminal",
+                "assistant_turn_may_end",
+                "required_next_action"
             ],
             "additionalProperties": false
         }))
@@ -330,35 +350,9 @@ impl Tool for GoalTool {
                     Ok(args) => args,
                     Err(error) => return *error,
                 };
-                let finish = match args.status {
-                    FinishStatus::Completed => {
-                        if args
-                            .reason
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
-                        {
-                            return ToolResult::error(
-                                "A completed agent-chat goal accepts summary, not reason.",
-                            );
-                        }
-                        GoalFinish::Completed {
-                            summary: args.summary,
-                        }
-                    }
-                    FinishStatus::Blocked => {
-                        if args
-                            .summary
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
-                        {
-                            return ToolResult::error(
-                                "A blocked agent-chat goal accepts reason, not summary.",
-                            );
-                        }
-                        GoalFinish::Blocked {
-                            reason: args.reason.unwrap_or_default(),
-                        }
-                    }
+                let finish = match finish_report(&args) {
+                    Ok(finish) => finish,
+                    Err(error) => return ToolResult::error(error),
                 };
                 let chat = match store.task_directory(task).and_then(|path| {
                     context
@@ -380,7 +374,7 @@ impl Tool for GoalTool {
                     Some(calls),
                 ) {
                     Ok(goal) => {
-                        if let Err(error) = chat.record_goal_completion(&goal).await {
+                        if let Err(error) = chat.record_goal_finish(&goal).await {
                             return ToolResult::error(error);
                         }
                         // Notify the durable terminal receipt immediately; the supervisor also
@@ -407,7 +401,7 @@ impl Tool for GoalTool {
                             match released {
                                 Ok(pending) if !pending.text.is_empty() => {
                                     let content = format!(
-                                        "Goal revision {} is completed. Another user request is ready. Acknowledge it with chat_read, then handle it before calling turn_completed.",
+                                        "Goal revision {} is completed. Another user request is ready. Call chat_read now, then acknowledge it with chat_write and handle it before calling turn_completed. Do not send a normal ChatGPT final answer or end the assistant turn.",
                                         goal.revision
                                     );
                                     terminal_result.content =
@@ -415,6 +409,7 @@ impl Tool for GoalTool {
                                     if let Some(value) = terminal_result.structured_content.as_mut()
                                     {
                                         value["terminal"] = json!(false);
+                                        value["required_next_action"] = json!("chat_read");
                                         value["content"] = json!(content);
                                     }
                                     terminal_result.new_chat_message_from_user = Some(pending.text);
@@ -461,6 +456,61 @@ fn task_store(
     Ok((task, store))
 }
 
+// Keep the complete report in the existing terminal text fields, so old task
+// records and timeline/notification readers remain compatible after upgrades.
+fn finish_report(args: &FinishArgs) -> Result<GoalFinish, String> {
+    let next = args.next_steps.trim();
+    if next.is_empty() {
+        return Err("goal_finish requires non-empty nextSteps: how to unblock, or suggested follow-up after completion. Correct the arguments and retry goal_finish; do not end the assistant turn.".into());
+    }
+    let (detail, heading, next_heading) = match args.status {
+        FinishStatus::Completed => {
+            if args
+                .reason
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err("A completed goal accepts summary, not reason. Correct the arguments and retry goal_finish.".into());
+            }
+            (
+                args.summary.as_deref().unwrap_or("").trim(),
+                "Work completed",
+                "Suggested next steps",
+            )
+        }
+        FinishStatus::Blocked => {
+            if args
+                .summary
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err("A blocked goal accepts reason, not summary. Correct the arguments and retry goal_finish.".into());
+            }
+            (
+                args.reason.as_deref().unwrap_or("").trim(),
+                "Why blocked",
+                "To unblock",
+            )
+        }
+    };
+    if detail.is_empty() {
+        return Err(match args.status {
+            FinishStatus::Completed => "A completed goal requires a non-empty summary of work done, results and verification. Correct the arguments and retry goal_finish; do not end the assistant turn.",
+            FinishStatus::Blocked => "A blocked goal requires a concrete reason explaining why work cannot proceed. Correct the arguments and retry goal_finish; do not end the assistant turn.",
+        }.into());
+    }
+    let report = format!("### {heading}\n\n{detail}\n\n### {next_heading}\n\n{next}");
+    if report.len() > MAX_GOAL_RESULT_BYTES {
+        return Err("Goal report including headings must fit within 4096 UTF-8 bytes. Shorten the report and retry goal_finish; do not end the assistant turn.".into());
+    }
+    Ok(match args.status {
+        FinishStatus::Completed => GoalFinish::Completed {
+            summary: Some(report),
+        },
+        FinishStatus::Blocked => GoalFinish::Blocked { reason: report },
+    })
+}
+
 fn goal_result(goal: Option<&GoalRecord>, terminal_receipt: bool) -> ToolResult {
     let (content, status, revision, markdown, summary, blocked_reason, terminal) = match goal {
         None => (
@@ -484,11 +534,11 @@ fn goal_result(goal: Option<&GoalRecord>, terminal_receipt: bool) -> ToolResult 
                     goal.revision
                 ),
                 GoalStatus::Completed => format!(
-                    "Agent-chat goal revision {} is completed. This browser-driven turn may end without another chat_await.",
+                    "Agent-chat goal revision {} is completed and its report is visible inline. Required next call: turn_completed. On timeout or cancellation without input, call turn_completed again. Do not send a normal ChatGPT final answer or end the assistant turn, including near an anticipated timeout.",
                     goal.revision
                 ),
                 GoalStatus::Blocked => format!(
-                    "Agent-chat goal revision {} is blocked. This browser-driven turn may end without another chat_await.",
+                    "Agent-chat goal revision {} is blocked and its explanation and unblock steps are visible inline. Required next call: chat_await. On timeout or cancellation without input, call chat_await again. Once the blocker is resolved, call goal_resume before continuing goal work. Do not send a normal ChatGPT final answer or end the assistant turn, including near an anticipated timeout.",
                     goal.revision
                 ),
                 GoalStatus::Error => format!(
@@ -516,7 +566,14 @@ fn goal_result(goal: Option<&GoalRecord>, terminal_receipt: bool) -> ToolResult 
         "markdown": markdown,
         "summary": summary,
         "blockedReason": blocked_reason,
-        "terminal": terminal
+        "terminal": terminal,
+        "assistant_turn_may_end": false,
+        "required_next_action": match goal.map(|goal| goal.status) {
+            Some(GoalStatus::Completed) => "turn_completed",
+            Some(GoalStatus::Blocked | GoalStatus::Configured) => "chat_await",
+            Some(GoalStatus::Active) => "continue_work",
+            _ => "continue_work",
+        }
     }));
     result.audit.sensitive_output = true;
     result
@@ -542,6 +599,7 @@ mod tests {
         let schema = GoalTool::Finish.input_schema();
         assert_eq!(schema["properties"]["summary"]["writeOnly"], true);
         assert_eq!(schema["properties"]["reason"]["writeOnly"], true);
+        assert_eq!(schema["properties"]["nextSteps"]["writeOnly"], true);
         assert_eq!(
             GoalTool::Set.input_schema()["properties"]["markdown"]["writeOnly"],
             true

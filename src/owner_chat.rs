@@ -9,6 +9,7 @@ mod schema_refresh;
 pub(crate) use schema_refresh::start as start_schema_refresh;
 mod readiness;
 mod settings;
+mod wake;
 
 use std::io::{Read, Write};
 use std::path::{Path as FilePath, PathBuf};
@@ -670,6 +671,7 @@ struct ChatListing {
     automation_error: Option<String>,
     automation_retrying: bool,
     automation_waiting_for_browser: bool,
+    automation_wake: Option<wake::WakeStatus>,
     total_tool_calls: u64,
 }
 
@@ -780,24 +782,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             .chats
             .chat_at_path(located.path.clone(), true)
             .map_err(internal_error)?;
-        let OwnerChatSummary {
-            title,
-            custom_title,
-            pinned_at_ms,
-            archived_at_ms,
-            owner_read_through,
-            last_entry_end,
-            last_incoming_entry_end,
-            last_entry_at_ms,
-            last_user_entry_end,
-            last_user_entry_at_ms,
-            last_agent_call_at_ms,
-            agent_waiting_until_ms,
-            agent_idle_until_ms,
-            agent_presence_until_ms,
-            total_tool_calls,
-            ..
-        } = match chat.owner_summary().await {
+        let summary = match chat.owner_summary().await {
             Ok(summary) => summary,
             Err(error) => {
                 tracing::warn!("owner chat transcript unavailable: {error}");
@@ -827,6 +812,25 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
                 }
             }
         };
+        let wake_activity = wake::Activity::from(&summary);
+        let OwnerChatSummary {
+            title,
+            custom_title,
+            pinned_at_ms,
+            archived_at_ms,
+            owner_read_through,
+            last_entry_end,
+            last_incoming_entry_end,
+            last_entry_at_ms,
+            last_user_entry_end,
+            last_user_entry_at_ms,
+            last_agent_call_at_ms,
+            agent_waiting_until_ms,
+            agent_idle_until_ms,
+            agent_presence_until_ms,
+            total_tool_calls,
+            ..
+        } = summary;
         if title.to_lowercase().contains(&query.to_lowercase())
             && let Some(matched) = matched.as_mut()
         {
@@ -882,6 +886,15 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         });
         let automation_waiting_for_browser =
             automation_error.is_none() && automation.browser_cooldown_until_ms().is_some();
+        let now = crate::markdown_chat::now_ms();
+        let enabled = state.config.markdown_chat.automation.enabled;
+        let pending_queue = if enabled && automation_error.is_none() && wake_activity.offline(now) {
+            chat.has_queued_messages().await.unwrap_or(false)
+        } else {
+            false
+        };
+        let automation_wake =
+            wake::status(&automation, &wake_activity, pending_queue, enabled, now);
         let goal = automation.goal;
         let goal_status = goal.as_ref().map(|goal| goal.status);
         let goal_completion_dismissed = goal.as_ref().is_some_and(|goal| {
@@ -925,6 +938,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
             automation_error,
             automation_retrying,
             automation_waiting_for_browser,
+            automation_wake,
             total_tool_calls,
         });
     }
@@ -1096,12 +1110,11 @@ async fn chat_state(
         .map_err(internal_error)?;
     let task = ConversationIdentity::from_stable_keys(located.owner.clone(), located.owner)
         .ok_or_else(|| internal_error("Conversation has an invalid stable task identity"))?;
-    if let Some(goal) = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
+    let automation = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
         .and_then(|store| store.load(&task))
-        .map_err(internal_error)?
-        .goal
-    {
-        chat.record_goal_completion(&goal)
+        .map_err(internal_error)?;
+    if let Some(goal) = automation.goal.as_ref() {
+        chat.record_goal_finish(goal)
             .await
             .map_err(internal_error)?;
     }
@@ -1110,9 +1123,16 @@ async fn chat_state(
         .await
         .map_err(internal_error)?;
     let mut page = serde_json::to_value(page).expect("chat page");
-    page["queued_messages"] =
-        serde_json::to_value(chat.queued_messages().await.map_err(internal_error)?)
-            .expect("queued messages");
+    let queued = chat.queued_messages().await.map_err(internal_error)?;
+    let summary = chat.owner_summary().await.map_err(internal_error)?;
+    page["wake_status"] = json!(wake::status(
+        &automation,
+        &wake::Activity::from(&summary),
+        !queued.is_empty(),
+        state.config.markdown_chat.automation.enabled,
+        crate::markdown_chat::now_ms()
+    ));
+    page["queued_messages"] = serde_json::to_value(queued).expect("queued messages");
     page["input_required"] = json!(chat.queue_input_required().await.map_err(internal_error)?);
     page["default_message_mode"] =
         json!(crate::global_settings::default_message_mode(&state.config).map_err(internal_error)?);
@@ -1861,6 +1881,29 @@ fn public_pairing(pairing: &crate::agent_automation::PairingState, owner_generat
     })
 }
 
+async fn wake_status_for_chat(
+    state: &OwnerState,
+    located: &LocatedChat,
+    chat: &Arc<crate::markdown_chat::ChatFile>,
+    queued: bool,
+) -> Option<wake::WakeStatus> {
+    if !state.config.markdown_chat.automation.enabled {
+        return None;
+    }
+    let task = automation_task(located).ok()?;
+    let automation = AgentAutomationStore::for_state_root(&state.config, &located.state_root)
+        .and_then(|store| store.load(&task))
+        .ok()?;
+    let summary = chat.owner_summary().await.ok()?;
+    wake::status(
+        &automation,
+        &wake::Activity::from(&summary),
+        queued,
+        true,
+        crate::markdown_chat::now_ms(),
+    )
+}
+
 async fn chat_send(
     State(state): State<OwnerState>,
     Path(id): Path<String>,
@@ -1931,14 +1974,17 @@ async fn chat_send(
             if mode == crate::markdown_chat::MessageMode::Queue {
                 let chat = state
                     .chats
-                    .chat_at_path(located.path, true)
+                    .chat_at_path(located.path.clone(), true)
                     .map_err(internal_error)?;
                 let receipt = chat
                     .queue_user_message(body.request_id, message, body.attachment_ids)
                     .await
                     .map_err(internal_error)?;
+                let queued = chat.queued_messages().await.map_err(internal_error)?;
+                let wake_status =
+                    wake_status_for_chat(&state, &located, &chat, !queued.is_empty()).await;
                 return Ok(wrap(
-                    json!({"queue_receipt":receipt,"queued_messages":chat.queued_messages().await.map_err(internal_error)?}),
+                    json!({"queue_receipt":receipt,"queued_messages":queued,"wake_status":wake_status}),
                 ));
             }
             let automation = if state.config.markdown_chat.automation.enabled {
@@ -1948,7 +1994,7 @@ async fn chat_send(
             };
             let chat = state
                 .chats
-                .chat_at_path(located.path, true)
+                .chat_at_path(located.path.clone(), true)
                 .map_err(internal_error)?;
             let sent = chat
                 .append_user_with_attachments(body.request_id, message, body.attachment_ids)
@@ -1967,7 +2013,10 @@ async fn chat_send(
             if let Some(supervisor) = state.automation.as_ref() {
                 supervisor.notify();
             }
-            Ok(wrap(json!({"sent": sent, "organization": organization})))
+            let wake_status = wake_status_for_chat(&state, &located, &chat, false).await;
+            Ok(wrap(
+                json!({"sent": sent, "organization": organization, "wake_status":wake_status}),
+            ))
         }
         OwnerMessage::Goal(command) => {
             if matches!(
@@ -2399,7 +2448,10 @@ fn router(state: OwnerState) -> Router {
             "/api/settings/refresh-connector",
             post(settings::refresh_connector),
         )
-        .route("/api/chats", get(list_chats).post(creation::create_chat))
+        .route(
+            "/api/chats",
+            get(list_chats).post(creation::create_chat_response),
+        )
         .route("/api/new-chat", post(creation::prepare_chat))
         .route("/api/new-chat/login", post(creation::login))
         .route(

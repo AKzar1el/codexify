@@ -340,7 +340,7 @@ To reuse one server across several independent projects, point it at their commo
 cargo run --release -- --work-dir /path/to/projects --multi-project
 ```
 
-Here `--work-dir` is an **access root**, not the active project. In ChatGPT, call `set_project_root` directly when the exact relative/absolute path, an HTTPS/SSH Git repository URL ending in `.git`, or a supported GitHub repository, branch, pull-request, or commit URL is known. Repository URLs reuse an unambiguous matching checkout already below the access root, or run `git clone` in the configured project clone directory before binding. GitHub branch, PR, and commit URLs select their exact targets without switching an unrelated source checkout. When per-conversation setup is enabled and the intended project is ambiguous, the setup card loads `list_projects` into a searchable chooser and keeps **Chat without a project** above the search and results; that choice creates a private scratch workspace outside the access root. Codexify keys the resulting project or scratch binding from ChatGPT's `_meta["openai/session"]` conversation identifier and persists it outside the repository, so later turns in the same chat recover the active workspace after an MCP reconnect or Codexify restart. A new chat starts unselected. An existing chat can reopen selection through the explicit **Switch to another project** action in the setup widget. Clients that do not provide `openai/session` fall back to a one-time MCP transport-session binding. The binding is forgotten when the transport ends, but its scratch directory and files remain on disk.
+Here `--work-dir` is an **access root**, not the active project. In ChatGPT, call `set_project_root` directly when the exact relative/absolute path, an HTTPS/SSH Git repository URL with or without `.git`, or a supported GitHub repository, branch, pull-request, or commit URL is known. Repository URLs reuse an unambiguous matching checkout already below the access root, or run `git clone` in the configured project clone directory before binding. GitHub branch, PR, and commit URLs select their exact targets without switching an unrelated source checkout. When per-conversation setup is enabled and the intended project is ambiguous, the setup card loads `list_projects` into a searchable chooser and keeps **Chat without a project** above the search and results; that choice creates a private scratch workspace outside the access root. Codexify keys the resulting project or scratch binding from ChatGPT's `_meta["openai/session"]` conversation identifier and persists it outside the repository, so later turns in the same chat recover the active workspace after an MCP reconnect or Codexify restart. A new chat starts unselected. An existing chat can reopen selection through the explicit **Switch to another project** action in the setup widget. Clients that do not provide `openai/session` fall back to a one-time MCP transport-session binding. The binding is forgotten when the transport ends, but its scratch directory and files remain on disk.
 
 ### Optional per-conversation authorization
 
@@ -1632,7 +1632,7 @@ For example:
 
 Metadata overlays are merged by canonical path. Explicit entries are operator-authored providers in their own right, so they may include a path that native Codex marks untrusted or does not record; they cannot widen the access-root boundary. Aliases are deduplicated case-insensitively, and aliases shared by different projects produce a warning because they make intent matching ambiguous. Catalogue construction never opens a candidate's README, source, `.codex/`, or `AGENTS.md`; project contents remain unread until the conversation has selected that project.
 
-Git URL selection is separate from catalogue listing. Before cloning, Codexify checks the normal destination, catalogue candidates, and immediate child directories of `projectCloneDir`, then compares normalized remotes at each Git top level. Exactly one match is reused; multiple matches are rejected as ambiguous so the caller can pass an explicit path. Provider-agnostic repository selection accepts HTTPS URLs such as `https://gitlab.com/group/repository.git`, SSH URLs such as `ssh://git@gitlab.com/group/repository.git`, and SCP-style SSH URLs such as `git@gitlab.com:group/repository.git`. Non-GitHub selections must end in `.git`, which avoids treating arbitrary provider web pages as repositories; an already-cloned matching remote may omit that suffix. GitHub additionally accepts repository-root URLs without `.git` plus HTTPS branch (`/tree/<branch>`), pull-request (`/pull/<number>`), and commit (`/commit/<sha>`) URLs. For branch URLs, everything after `/tree/` is interpreted as the branch ref, including `/` characters. Commit URLs require the full 40-character hexadecimal object ID and normalize it to lowercase. Credential-bearing HTTPS URLs, query strings, fragments, `file://`, HTTP, `git://`, and other transports are rejected.
+Git URL selection is separate from catalogue listing. Before cloning, Codexify checks the normal destination, catalogue candidates, and immediate child directories of `projectCloneDir`, then compares normalized remotes at each Git top level. Exactly one match is reused; multiple matches are rejected as ambiguous so the caller can pass an explicit path. Provider-agnostic repository selection accepts HTTPS URLs such as `https://gitlab.com/group/repository.git`, SSH URLs such as `ssh://git@gitlab.com/group/repository.git`, and SCP-style SSH URLs such as `git@gitlab.com:group/repository.git`. Non-GitHub URLs without `.git` are probed with non-interactive `git ls-remote` before cloning, with a 15-second timeout per attempt. If the original URL fails, Codexify probes it again with `.git` appended and clones using the working URL; if both fail, no checkout is created. Matching existing checkouts are reused without a network probe. GitHub additionally accepts repository-root URLs without `.git` plus HTTPS branch (`/tree/<branch>`), pull-request (`/pull/<number>`), and commit (`/commit/<sha>`) URLs. For branch URLs, everything after `/tree/` is interpreted as the branch ref, including `/` characters. Commit URLs require the full 40-character hexadecimal object ID and normalize it to lowercase. Credential-bearing HTTPS URLs, query strings, fragments, `file://`, HTTP, `git://`, and other transports are rejected.
 
 The `openaiTunnel`/`openaiTunnels` choice, `allowedHosts` array, and `mcpServers` map are covered under [Native OpenAI tunnel](#manual-native-openai-tunnel-setup), [Host allowlist](#host-allowlist), and [Bridging other MCP servers](#bridging-other-mcp-servers).
 
@@ -1705,7 +1705,7 @@ changes only the project tools' effective work directory.
 Each conversation makes exactly one workspace choice through [`set_project_root`](#tools): attach a project/repository target or choose `withoutProject: true` for a private scratch workspace. When neither an exact path nor an exact supported Git repository URL is known, [`list_projects`](#tools) provides a project-independent enumeration step. With per-conversation setup enabled, the setup card presents those results as a searchable chooser:
 
 - The path is relative to the access root or absolute, but its canonical target must be an existing directory inside that root. Traversal (`..`) and symlink escapes are rejected *after* canonicalisation, so a link pointing outside the root cannot smuggle a selection past the check.
-- A Git repository URL is normalized into a conservative remote identity. Non-GitHub selections accept HTTPS/SSH URLs ending in `.git`; conventional hosting-service SSH remotes such as `git@host:group/repository.git` match their HTTPS equivalent, while arbitrary SSH users and custom-port endpoints remain distinct. GitHub repository roots retain their existing shorthand forms and may also carry an exact branch, PR, or commit target. Codexify first reuses an unambiguous matching local Git top level. Otherwise it serializes concurrent requests for that repository, runs non-interactive `git clone` into a private temporary directory below `projectCloneDir`, verifies the resulting remote, and publishes it at `<projectCloneDir>/<repository-name>`. Name collisions fail rather than overwrite data.
+- A Git repository URL is normalized into a conservative remote identity. Non-GitHub selections accept HTTPS/SSH URLs with or without `.git`; conventional hosting-service SSH remotes such as `git@host:group/repository.git` match their HTTPS equivalent, while arbitrary SSH users and custom-port endpoints remain distinct. GitHub repository roots retain their existing shorthand forms and may also carry an exact branch, PR, or commit target. Codexify first reuses an unambiguous matching local Git top level. Otherwise it serializes concurrent requests for that repository, probes non-GitHub URLs without `.git` with a bounded non-interactive `git ls-remote` (retrying with `.git` appended on failure), runs non-interactive `git clone` into a private temporary directory below `projectCloneDir`, verifies the resulting remote, and publishes it at `<projectCloneDir>/<repository-name>`. Name collisions fail rather than overwrite data.
 - Branch URLs fetch `refs/heads/<branch>`; PR URLs fetch GitHub's `refs/pull/<number>/head`; commit URLs fetch the exact full object ID. A fresh branch clone checks out the named branch, while fresh PR and commit clones detach at the selected commit. For an existing checkout, target fetching does not switch, reset, or otherwise move its `HEAD`.
 - The binding belongs to the **ChatGPT conversation**, keyed from `_meta["openai/session"]` (the raw identifier is hashed, never stored), so simultaneous chats can hold different projects or scratch workspaces and a later turn recovers its own root after MCP reconnects or a server restart. A client that sends no ChatGPT conversation metadata falls back to a binding that lasts only the current MCP transport session.
 - With the default worktree mode and no explicit selection override, the first conversation selecting a Git project uses the source checkout directly. Once that logical project is already assigned, another conversation receives a detached managed worktree under the configured Codex worktree location, preventing concurrent chats from editing the same checkout. A branch, PR, or commit URL also receives a detached worktree when the existing source checkout is on another commit. `always` isolates every selection; `never` uses the source directly and therefore rejects a targeted URL unless that source is already at the requested commit.
@@ -1879,6 +1879,13 @@ rules as the setup widget, including scratch, Git/PR/branch/commit URLs, and sav
 worktrees. The picker discovers model and effort choices from a fresh ChatGPT
 chat at its destination before creation.
 
+While the workspace is being prepared, the picker shows the current step, a
+progress bar, elapsed time, and time since the last progress update. Repository
+probing, cloning, fetching, worktree creation, included-file copying, and optional
+project setup report their actual phase. Git percentages and per-file copy bytes
+drive the bar when available; other steps use an indeterminate bar. Preparation
+errors restore the controls, and retrying keeps the same new-chat request identity.
+
 Project paths may be ordinary folders or Git repositories without commits. These
 are used directly, even when Create a worktree is selected; Git worktrees require
 an existing commit. No Git initialization or initial commit is performed.
@@ -1948,7 +1955,7 @@ restarts an idle companion when its request policy changed. CLI users can run
 only to Codexify's dedicated browser, whose profile and sign-in are preserved.
 
 The five model-visible tools (`automation_verify_pairing`, `goal_read`, `goal_set`,
-`goal_resume`, and `goal_finish`) and the `+agent-automation-v2` marker are advertised whenever
+`goal_resume`, and `goal_finish`) and the `+agent-automation-v3` marker are advertised whenever
 `agentChat.enabled` is true, independent of the local automation toggle. Therefore
 turning `agentChat.automation.enabled` on or off does not itself change the cached
 connector schema. Upgrading from a release that predates these tools still requires
@@ -2223,6 +2230,30 @@ Only `goal_finish` can mark that exact revision `completed` or `blocked`, and a
 blocked transition requires a concrete explanation. Goal evaluation is part of
 the same offline wake-up rather than a second judging prompt.
 
+`goal_finish` requires `expectedRevision`, `status`, and non-empty `nextSteps`.
+For `completed`, `summary` is also mandatory: explain the work performed, results,
+and verification. `nextSteps` describes suggested follow-up, or explicitly says
+none is needed. For `blocked`, `reason` is mandatory: explain why work cannot
+proceed; `nextSteps` specifies the exact input, action, or external change needed
+to unblock it. Blank reports are rejected before goal state changes. The formatted
+report, including headings, is limited to 4096 UTF-8 bytes and saved in the existing
+summary/blocker text fields for compatibility with historical task records.
+
+Both outcomes create durable, idempotent inline timeline entries with their report
+expanded by default. Blocked entries use a red goal icon; completed entries use
+green. Users can collapse a report, and polling preserves that choice. Reports
+remain in history after a goal resumes or is replaced. Existing blocker reasons
+are backfilled; historical completion entries without summaries stay compact.
+
+A terminal goal receipt ends only the goal, never the assistant turn. Results
+include `assistant_turn_may_end: false` and `required_next_action`: `turn_completed`
+after completion, `chat_await` after blocking, or `chat_read` when a pending request
+is returned. Wait timeouts/cancellations without input must repeat the appropriate
+wait. The brief, browser wake prompt, tool descriptions, and replies all prohibit
+ordinary final answers because of elapsed time or an anticipated timeout. The
+separate, explicitly enabled server turn-renewal protocol remains an automatic
+handoff followed by continuation; it is never inferred from the agent's clock.
+
 The shared agent instructions require rejected vital commands to be diagnosed
 from the checker's reason and hardened in reviewable `safe-script-XXXX.sh`,
 `.py`, or `.js` files before resubmission through the same checker. Language
@@ -2369,8 +2400,17 @@ next action is `chat_write` regardless of the tool's ordinary idle transition.
 
 The Markdown-chat state machine is placed at the start of the agent brief. It
 directs all user-facing output through `chat_write`, makes every successful
-`chat_write` non-terminal, and distinguishes `chat_await` (user input needed) from `turn_completed` (finished and waiting for the next request). A normal
-final response is forbidden unless the user explicitly authorizes ending the turn
+`chat_write` non-terminal, and distinguishes `chat_await` (user input needed) from
+`turn_completed` (finished and waiting for the next request).
+
+A question sent with `chat_write` is also non-terminal. Use `event: "message"`
+when useful work can continue without the answer; continue that work. When the
+answer is needed to proceed, use `event: "input_required"` and immediately call
+`chat_await`, repeating it after timeouts without input. Do not mark the request
+completed or use `turn_completed` just to wait for an answer. Tool descriptions,
+argument guidance, and successful write replies state this explicitly.
+
+A normal final response is forbidden unless the user explicitly authorizes ending the turn
 or a higher-priority instruction requires it. No server-side instruction can
 guarantee that ChatGPT never ends a turn.
 
@@ -2410,6 +2450,10 @@ are bounded and never cut a report in half. Corrupt or incomplete progress files
 are preserved and reported explicitly; they do not undo successful tool operations
 or prevent ordinary chat messages from being delivered. Progress tools do not
 change goal state, complete turns, acknowledge chat input, or expose queued work.
+Their descriptions and replies explicitly prohibit ending the assistant turn;
+read/save replies include `assistant_turn_may_end: false`,
+`required_next_action: continue_work`, and instructions to run the next task tool,
+finish a resolved goal with its report, or use the appropriate repeated wait.
 
 ### Private message queue
 
@@ -2421,6 +2465,13 @@ uses Steer so Return, Cmd+Return/Ctrl+Return, and the send button deliver your
 reply immediately, even when Queue is configured. The saved preference and
 normal modifier shortcut are restored after the reply.
 Shift+Return inserts a newline.
+
+Hold the send button for half a second to open **Steer** and **Queue** actions.
+The menu stays open when the hold is released; choosing an action sends that
+message in the selected mode without changing the saved default. Tapping outside
+or pressing Escape dismisses it and keeps the draft. Right-click, Shift+F10, or
+an arrow key on the focused send button also opens the menu. The Stop button
+does not offer send actions.
 
 Queued messages are stored separately from CHAT.md. Their text and attachments
 are absent from native tool results, agent attachment listings, browser prompts,
@@ -2434,14 +2485,22 @@ input on unfinished work and holds the queue, including after its wait times out
 `chat_write` with `event: "input_required"` starts this hold immediately and
 directs the agent to `chat_await`; `event: "completed"` directs `turn_completed`
 when the request is finished. The offline fallback releases one
-message after five minutes without tool activity. A stopped agent and any goal
-whose status is not completed hold the queue, even when the goal is blocked.
+message after five minutes without tool activity. A blocked goal permits this
+offline fallback, so new instructions can wake the agent without a separate
+Steer action; the goal itself stays blocked. Active or paused goals, explicit
+input waits, manual Stop, and pending turn handoffs keep their queue holds.
 Goal completion releases one eligible message. Steering takes priority over
 queued messages, and queued edits use revisions to reject stale changes.
 
 ### Chat widget
 
 #### Standalone owner chat
+
+When an offline chat is being woken, its header and sidebar show a gray spinner.
+The header distinguishes **Queued to wake**, **Sending to ChatGPT**, and
+**Sent · waiting for agent**. The sent state requires a confirmed ChatGPT send
+receipt; the normal online indicator returns after the agent's first tool call.
+Pending wakeups survive reopening the chat, while errors keep their error state.
 
 With `agentChat.enabled`, the service also starts a separate localhost-only
 owner interface. Run `codexify chat` on that computer and open the printed
@@ -2876,7 +2935,7 @@ Call set_project_root with path "https://github.com/owner/repository", then call
 Task: <what you want done>
 ```
 
-For non-GitHub providers, pass the clone URL ending in `.git`, for example
+For non-GitHub providers, pass an HTTPS or SSH repository URL with or without `.git`, for example
 `https://gitlab.com/group/repository.git` or `git@gitlab.com:group/repository.git`.
 
 To enter an exact branch, PR, or commit instead of the repository's default
@@ -3258,7 +3317,7 @@ Native tunnel mode ignores `allowedHosts` and forces the accepted authorities to
 - **Self-update is an explicit privileged operation**: `self_update` is advertised as destructive and open-world, requires `confirm=true`, and accepts only the standard installed executable. Downloads are bounded and SHA-256-verified against the selected GitHub release before any service interruption. The detached worker is a generated private file with fixed arguments; it retains a rollback executable until replacement validation and service restart complete.
 - **Path traversal prevention**: every filesystem tool — including `apply_patch` and `view_image` — resolves paths through a guard that rejects anything outside the active project or scratch root. In multi-project mode, both catalogue discovery and project selection canonicalize the configured access root and candidate directory, while scratch selection validates a private exact path outside that root. Traversal and symlink escapes cannot turn either mode into structured-tool access to another workspace.
 - **Stable server-config authority**: the implicit config is user-scoped at `~/.codexify/codexify.config.json`, so changing the launch directory does not change command, MCP-server, network, tunnel, or worktree policy. `--config` and `CODEXIFY_CONFIG` are explicit overrides.
-- **Bounded Git cloning and GitHub target fetching**: URL-based project selection accepts provider-agnostic HTTPS/SSH repository URLs ending in `.git`, plus GitHub repository roots and HTTPS branch, PR, and full commit URLs. Normalized remote identity lets conventional hosting-service SSH forms such as `git@host:group/repository.git` reuse their HTTPS checkout while keeping arbitrary SSH users and custom-port endpoints distinct. Credential-bearing HTTPS URLs, local/file transports, HTTP, `git://`, query strings, fragments, and unsupported GitHub subpages are rejected, and interactive Git credential prompts are disabled. The configured clone directory is canonicalized inside the access root at startup and revalidated at use time. Resolution uses per-repository cross-process locks, bounded subprocess timeouts, private temporary clone destinations, remote verification, exact GitHub branch/PR refspecs or full commit object IDs, and collision refusal. Existing source checkouts are fetched without moving `HEAD`; a conversation already bound to another selection is rejected before the network/disk side effect.
+- **Bounded Git cloning and GitHub target fetching**: URL-based project selection accepts provider-agnostic HTTPS/SSH repository URLs with or without `.git`, plus GitHub repository roots and HTTPS branch, PR, and full commit URLs. Normalized remote identity lets conventional hosting-service SSH forms such as `git@host:group/repository.git` reuse their HTTPS checkout while keeping arbitrary SSH users and custom-port endpoints distinct. Credential-bearing HTTPS URLs, local/file transports, HTTP, `git://`, query strings, fragments, and unsupported GitHub subpages are rejected, and interactive Git credential prompts are disabled. The configured clone directory is canonicalized inside the access root at startup and revalidated at use time. Resolution uses per-repository cross-process locks, bounded subprocess timeouts, non-interactive `git ls-remote` probes before cloning non-GitHub URLs without `.git` (original URL first, then `.git` appended if needed), private temporary clone destinations, remote verification, exact GitHub branch/PR refspecs or full commit object IDs, and collision refusal. Existing source checkouts are fetched without moving `HEAD`; a conversation already bound to another selection is rejected before the network/disk side effect.
 - **Host-authorized native-file ingress**: `import_host_file` accepts only ChatGPT's declared native-file object, rejects local source paths, constrains the download URL and every redirect hop to the configurable `artifactIngress.allowedHosts` allowlist (default `"*"`, which admits any public HTTPS host but never a loopback, private, link-local, unique-local, CGNAT, `localhost`, or metadata address), ignores ambient proxy credentials, and enforces whole-request, idle, size and concurrency limits. Its signed URL and file ID are never logged or returned: RMCP debug/trace payload logging is unconditionally suppressed even when `RUST_LOG` requests it. Destination publication uses a capability-confined directory handle, canonical-path and file-identity revalidation, a private partial file, SHA-256, and atomic no-overwrite linking so traversal, moved roots, symlink escapes, partial visibility and replacement races fail closed.
 - **Bounded durable native-file egress**: `export_host_file` accepts only a relative regular-file path inside the active project, opens it through a capability-confined directory handle without following the final symlink/reparse point, rejects traversal and escapes, enforces `artifactEgress.maxFileBytes` before and during streaming, and returns an original SHA-256 receipt plus a standard MCP resource link. The link carries a random 256-bit opaque capability rather than a local path. A private versioned record survives service restarts; eligible immutable snapshots share a global per-user LRU disk budget controlled by `snapshotMaxFileBytes` and `maxSnapshotBytes`. After snapshot eviction, `fallbackToSource` can serve the latest safe file only after revalidating the recorded root and relative path. Audit output records only the number of resource links, never their capabilities or filenames.
 - **Bounded transitive resource egress**: a `resource_link` returned by any bridged MCP tool is never passed downstream with its upstream URI. Codexify replaces it with a random 256-bit `codexify://upstream-resource/...` capability tied to that exact upstream peer and URI. `resources/read` forwards through the existing authenticated MCP transport, propagates downstream cancellation, applies the upstream tool timeout, enforces `artifactEgress.maxFileBytes` against advertised and actual content size, rewrites returned content URIs back to the opaque capability, and expires/evicts mappings according to the configured TTL/reference bounds.

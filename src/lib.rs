@@ -47,6 +47,7 @@ pub mod project_bindings;
 pub mod project_catalog;
 pub mod project_clone;
 pub mod project_doc;
+mod project_progress;
 pub mod quickstart;
 mod redaction;
 pub mod registry;

@@ -1125,7 +1125,7 @@ impl SessionState {
                 Ok(effective)
             }
             ProjectBindingState::Unselected { .. } => Err(format!(
-                "No project root is selected for this MCP transport session. Call `set_project_root` with an existing directory beneath the access root `{}`, an HTTPS/SSH Git repository URL ending in `.git`, or an exact GitHub repository, branch, pull-request, or commit URL. Repository URLs reuse a matching checkout or clone into the configured clone directory. If only a project name or purpose is known, call `list_projects` first. Leave the setup project picker open when intent is unclear or the user only says hello. chat_await can wait without selecting anything. Select `withoutProject=true` ONLY for an explicit user request for scratch; never as a default. Then call `get_agent_brief` before using project tools.",
+                "No project root is selected for this MCP transport session. Call `set_project_root` with an existing directory beneath the access root `{}`, an HTTPS/SSH Git repository URL with or without `.git`, or an exact GitHub repository, branch, pull-request, or commit URL. Repository URLs reuse a matching checkout or clone into the configured clone directory. If only a project name or purpose is known, call `list_projects` first. Leave the setup project picker open when intent is unclear or the user only says hello. chat_await can wait without selecting anything. Select `withoutProject=true` ONLY for an explicit user request for scratch; never as a default. Then call `get_agent_brief` before using project tools.",
                 config.work_dir.display()
             )),
         }

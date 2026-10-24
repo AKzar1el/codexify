@@ -305,7 +305,24 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   await page.goto(`${origin}/?chat=${id}#queued-wait-token`);
   const host=page.locator('#chat-host'),notice=host.locator('#automation-error');
   await notice.getByText(/available in 164s/).waitFor();
-  assert.match(await notice.textContent(),/Waiting for the shared browser \(position in queue: 2\)\./);
+  assert.match(await notice.textContent(),/^Conversation loading available in 164s \(position in queue: 2\)\./);
+  for(const width of [320,390,600,1280]){
+   await page.setViewportSize({width,height:820});
+   const layout=await notice.evaluate(node=>{
+    const box=node.getBoundingClientRect(),text=document.createRange();text.selectNodeContents(node);
+    const lines=[...text.getClientRects()].map(line=>({left:line.left,right:line.right,top:line.top,bottom:line.bottom}));
+    const retry=node.getRootNode().getElementById('automation-retry-inline'),button=retry.getBoundingClientRect();
+    const label=document.createRange();label.selectNodeContents(retry);
+    return {box:{left:box.left,right:box.right,top:box.top,bottom:box.bottom},lines,overflow:node.scrollWidth>node.clientWidth,buttonTop:button.top,labelTop:label.getBoundingClientRect().top};
+   });
+   assert.equal(layout.overflow,false,'the countdown must wrap instead of overflowing');
+   assert(layout.lines.every(line=>line.left>=layout.box.left-1&&line.right<=layout.box.right+1&&line.bottom<=layout.box.bottom+1),'all notice text stays visible');
+   if(width<=600){
+    assert(layout.buttonTop-layout.box.bottom<=3,'actions sit directly below the full notice');
+    assert(layout.labelTop-layout.lines.at(-1).bottom<=12,'text-to-action spacing stays compact');
+   }
+   if(width===390)await page.screenshot({path:`/tmp/browser-wait-layout-${name.toLowerCase()}.png`});
+  }
   assert.equal(await notice.getAttribute('role'),'status');
   assert.match(await notice.getAttribute('class'),/waiting-for-browser/);
   assert.doesNotMatch(await notice.textContent(),/retry \d|Retrying|failed|disabled|not sent/);
@@ -318,11 +335,11 @@ for(const [name,engine]of [['Chromium',chromium],['WebKit',webkit]])test(`${name
   assert.match(await notice.textContent(),/position in queue: 2/,'reopening preserves the reported queue position');
   queue={position:1,total:2};await page.clock.fastForward(2000);await notice.getByText(/position in queue: 1/).waitFor();
   assert.doesNotMatch(await notice.textContent(),/position in queue: 2/,'the position updates as earlier conversations leave the queue');
-  queue=null;await page.clock.fastForward(2000);await notice.getByText(/^Waiting for the shared browser\. Conversation loading/).waitFor();
+  queue=null;await page.clock.fastForward(2000);await notice.getByText(/^Conversation loading available in/).waitFor();
   assert.doesNotMatch(await notice.textContent(),/position in queue/,'an unknown position is not invented');
   queue={position:1,total:1};await page.clock.fastForward(2000);await notice.getByText(/position in queue: 1/).waitFor();
-  serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser (position in queue: 1)…',{exact:true}).waitFor();
-  assert.doesNotMatch(await notice.textContent(),/elapsed|\b0s\b|retry \d/);
+  serverNow+=163000;await page.clock.fastForward(163000);await notice.getByText('Waiting for the shared browser (position in queue: 1).',{exact:true}).waitFor();
+  assert.doesNotMatch(await notice.textContent(),/elapsed|\b0s\b|retry \d|…|\.\.\./);
   assert.deepEqual(writes,[],'waiting for the clock never posts a browser action from the UI');
   await host.locator('#automation-retry-inline').click();
   await notice.waitFor({state:'hidden'});

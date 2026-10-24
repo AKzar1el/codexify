@@ -32,7 +32,7 @@ async function fixture(browser, goalMarkdown='Goal completed: Review and analyze
  if(latest)chats[0].title=latest.title;
  const messages=[
   {id:'before',role:'agent',markdown:'Before completion',start:0,end:100,tool_call_count:1,created_at_ms:now-60000},
-  {id:'goal-completed-1-2',role:'goal',markdown:goalMarkdown,start:100,end:100,tool_call_count:11,created_at_ms:goalTimestamp},
+  {id:'goal-completed-1-2',role:'goal',markdown:goalMarkdown,start:100,end:100,tool_call_count:11,created_at_ms:goalTimestamp,goal_status:browserOptions.goalStatus,goal_report:browserOptions.goalReport},
   {id:'after',role:'agent',markdown:latest?.markdown||'After completion',start:100,end:200,tool_call_count:32,created_at_ms:now-1000},
  ];
  page.on('pageerror',error=>errors.push(error.message));
@@ -199,6 +199,33 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
    }
    await page.emulateMedia({colorScheme:'dark'});await assertCompact();await capture('dark-mobile');
    assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+ });
+ for(const outcome of ['blocked','completed']) test(`${name}: ${outcome} goal reports show their explanation and next steps inline`,{timeout:30000},async()=>{
+  const browser=await engine.launch();
+  try {
+   const detail=outcome==='blocked'?'The **test device** is offline; acceptance could not run.':'Implemented the changes and passed **42 checks**.';
+   const next=outcome==='blocked'?'Reconnect the device, then confirm access in this conversation.':'Review the results; no further implementation is needed.';
+   const report=`### ${outcome==='blocked'?'Why blocked':'Work completed'}\n\n${detail}\n\n### ${outcome==='blocked'?'To unblock':'Suggested next steps'}\n\n${next}`;
+   const {page,errors}=await fixture(browser,`Goal ${outcome}: Verify the deployment`,undefined,null,{goalStatus:outcome,goalReport:report});
+   const host=page.locator('#chat-host'),event=host.locator('.goal-completed-event'),body=event.locator('.markdown');
+   await event.waitFor();assert.equal(await event.getAttribute('open'),'','a report is expanded immediately');
+   assert.equal(await event.locator('.goal-completed-label').textContent(),`Goal ${outcome}`);
+   assert((await body.textContent()).includes(next));assert.equal(await body.locator('h3').count(),2);
+   assert.equal(await event.evaluate(e=>e.classList.contains('goal-blocked-event')),outcome==='blocked');
+   assert.equal(await host.locator('#messages .goal-completed-event').count(),1);
+   for(const width of [390,320]){
+    await page.setViewportSize({width,height:960});
+    assert(await body.isVisible());
+    const bounds=await body.boundingBox();assert(bounds.width>150,'report has room to wrap');
+    assert.equal(await host.locator('#messages').evaluate(e=>e.scrollWidth>e.clientWidth),false,'full report fits mobile width');
+   }
+   if(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS){mkdirSync(process.env.CODEXIFY_UI_POLISH_SCREENSHOTS,{recursive:true});await host.locator('#messages').screenshot({path:`${process.env.CODEXIFY_UI_POLISH_SCREENSHOTS}/${name.toLowerCase()}-goal-report-${outcome}.png`});}
+   await event.locator('summary').click();assert(await body.isHidden());
+   const refreshed=page.waitForResponse(r=>r.url().endsWith('/api/chats'));await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await refreshed;
+   assert(await body.isHidden(),'polling preserves a user-collapsed report');
+   await event.locator('summary').click();assert(await body.isVisible());
+   assert((await body.textContent()).includes(next));assert.deepEqual(errors,[]);
   }finally{await browser.close();}
  });
  test(`${name}: goal timeline, project path editing, inline rename and backdrop dismissal`,{timeout:45000},async()=>{

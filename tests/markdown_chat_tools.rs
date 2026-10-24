@@ -1739,6 +1739,28 @@ async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_d
         }
         let tools = load_tools_for_config(&config);
         let find = |name: &str| tools.iter().find(|t| t.name() == name).unwrap();
+        let continuing_question = find("chat_write")
+            .call_with_context(
+                json!({"message":"Which platform should I target? I can inspect shared code meanwhile.","event":"message"}),
+                &config,
+                &session,
+                &context,
+            )
+            .await;
+        assert!(!continuing_question.is_error);
+        let continuing = continuing_question.structured_content.as_ref().unwrap();
+        assert_eq!(continuing["assistant_turn_may_end"], false);
+        assert_eq!(
+            continuing["required_next_action"],
+            "continue_or_turn_completed"
+        );
+        assert!(
+            continuing_question
+                .joined_text()
+                .contains("continue useful work that does not need the answer")
+        );
+        assert!(!chat.queue_input_required().await.unwrap());
+        assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
         let question = find("chat_write")
             .call_with_context(
                 json!({"message":"Does the app freeze?","event":"input_required"}),
@@ -1748,6 +1770,15 @@ async fn input_required_holds_private_tasks_and_default_queue_sends_the_answer_d
             )
             .await;
         assert!(!question.is_error);
+        assert_eq!(
+            question.structured_content.as_ref().unwrap()["assistant_turn_may_end"],
+            false
+        );
+        assert!(
+            question
+                .joined_text()
+                .contains("Call chat_await now for the needed answer")
+        );
         assert_eq!(
             question.structured_content.as_ref().unwrap()["required_next_action"],
             "chat_await"
@@ -1864,6 +1895,12 @@ async fn completed_waits_repeatedly_when_empty_and_unfinished_goals_hold_input()
         assert_eq!(value["required_next_action"], "turn_completed");
         assert_eq!(value["assistant_turn_may_end"], false);
         assert!(
+            result
+                .joined_text()
+                .contains("Required next call: turn_completed")
+        );
+        assert!(result.joined_text().contains("anticipated timeout"));
+        assert!(
             chat.owner_summary()
                 .await
                 .unwrap()
@@ -1973,6 +2010,17 @@ async fn rollout_tools_use_only_the_current_chat_and_validate_their_public_schem
         &update.output_schema().unwrap(),
         saved.structured_content.as_ref().unwrap()
     ));
+    assert_eq!(
+        saved.structured_content.as_ref().unwrap()["assistant_turn_may_end"],
+        false
+    );
+    assert_eq!(
+        saved.structured_content.as_ref().unwrap()["required_next_action"],
+        "continue_work"
+    );
+    assert!(saved.joined_text().contains("Run the next task tool now"));
+    assert!(saved.joined_text().contains("normal ChatGPT final answer"));
+    assert!(update.description().contains("NON-TERMINAL"));
     let retry = update
         .call_with_context(args, &config, &session, &context)
         .await;
@@ -1988,6 +2036,11 @@ async fn rollout_tools_use_only_the_current_chat_and_validate_their_public_schem
         recent.structured_content.as_ref().unwrap()["report_count"],
         1
     );
+    assert_eq!(
+        recent.structured_content.as_ref().unwrap()["assistant_turn_may_end"],
+        false
+    );
+    assert!(recent.joined_text().contains("Run the next task tool now"));
     assert!(jsonschema::is_valid(
         &read.output_schema().unwrap(),
         recent.structured_content.as_ref().unwrap()

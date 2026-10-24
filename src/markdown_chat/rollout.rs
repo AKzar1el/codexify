@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub const DEFAULT_REMINDER_INTERVAL: u64 = 25;
 pub const REMINDER_FIELD: &str = "rollout_checkpoint_required";
-pub const REMINDER_DESCRIPTION: &str = "A progress checkpoint is due. Append current status, concrete progress and next steps using rollout_update before more work. Omitted when no checkpoint is due.";
+pub const REMINDER_DESCRIPTION: &str = "A progress checkpoint is due. Append current status, concrete progress and next steps using rollout_update before more work, then run the next task tool. A checkpoint never authorizes a final answer or ending the assistant turn. Omitted when no checkpoint is due.";
 pub const RESTORE_GUIDANCE: &str = "Before task work in each new turn, call rollout_read to read up to five recent progress reports from this chat's rollout.md, then use the current goal if one is configured. When the progress journal is enabled (rollout_read reports if disabled), use rollout_update regularly to append status, progress and next steps. Treat reports as history; current instructions and live state take precedence. Setup and pairing verification must finish before task work.";
 pub const ROTATE_BYTES: usize = 256 * 1024;
 pub const RECENT_REPORTS: usize = 5;
@@ -279,7 +279,7 @@ impl ChatFile {
             let mut state=state(dir)?;
             if state.work_calls-state.reported_calls<interval||state.work_calls-state.reminded_calls<interval{return Ok(None);}
             state.reminded_calls=state.work_calls;save_state(dir,&state)?;
-            Ok(Some(format!("Progress checkpoint required: {} agent work tool calls have run since the last report. Before more work, call rollout_update with current status, concrete progress or findings, and next steps. Append to this chat's rollout.md at {}. Use a fresh request_id and reuse it only for an identical retry. This reminder does not change the goal or deliver queued messages.",state.work_calls-state.reported_calls,dir.join("rollout.md").display())))
+            Ok(Some(format!("Progress checkpoint required: {} agent work tool calls have run since the last report. Before more work, call rollout_update with current status, concrete progress or findings, and next steps. Append to this chat's rollout.md at {}. Use a fresh request_id and reuse it only for an identical retry. After the checkpoint, run the next task tool; if input is needed call chat_await, or finish a resolved goal with goal_finish and its report. A checkpoint never authorizes a normal final answer or ending the assistant turn, including near an anticipated timeout. This reminder does not change the goal or deliver queued messages.",state.work_calls-state.reported_calls,dir.join("rollout.md").display())))
         })).await
     }
     pub async fn read_rollout(self: &Arc<Self>) -> Result<RolloutRead, String> {
@@ -655,6 +655,11 @@ mod tests {
     #[tokio::test]
     async fn private_queued_messages_are_not_read_or_released_by_checkpoints() {
         let (_dir, chat) = fixture().await;
+        // Keep the agent online: blocked offline chats intentionally release
+        // queued messages through their ordinary wake-up monitor.
+        chat.record_agent_call(crate::markdown_chat::now_ms())
+            .await
+            .unwrap();
         std::fs::write(
             chat.path().with_file_name("automation.json"),
             r#"{"goal":{"status":"blocked"}}"#,

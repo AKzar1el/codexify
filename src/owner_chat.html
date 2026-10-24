@@ -59,7 +59,7 @@ aside p { margin:5px 0 0; font-size:12px; color:var(--muted); }
 .presence:is(.goal-running,.goal-retrying) .goal-outer-ring { transform-box:view-box; transform-origin:center; animation:presence-spin 2s linear infinite; animation-delay:var(--goal-ring-delay,0s); }
 @keyframes presence-spin { to { transform:rotate(360deg); } }
 .presence.away { background:#eba916; border-color:#eba916; color:white; }
-.presence.offline,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
+.presence.offline,.presence.waking,.presence.goal-completed[data-agent-state="offline"] { color:#85898d; }
 .presence.offline { background:#fff; }
 #conversations .presence.offline { visibility:hidden; }
 .presence.waiting,.presence.goal-blocked,.presence.error,.presence.retrying,.presence.goal-retrying { color:#c4313b; }
@@ -113,6 +113,10 @@ input,select,textarea { font:inherit; }
 #new-chat-projects .new-chat-row button:first-child,#new-chat-worktrees .new-chat-row button:first-child { flex:1; text-align:left; overflow-wrap:anywhere; }
 #new-chat-selection { padding:9px; border-radius:8px; background:var(--selected); overflow-wrap:anywhere; }
 #new-chat-error { color:#ad2d30; }
+#new-chat-progress { margin:12px 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--bg); overflow-wrap:anywhere; }
+#new-chat-progress p { margin:0 0 6px; }
+#new-chat-progress progress { display:block; width:100%; height:10px; accent-color:var(--accent); margin:8px 0; }
+#new-chat-progress [hidden] { display:none; }
 #new-chat-dialog .muted { color:var(--muted); font-size:12px; }
 #new-chat-submit { background:var(--accent) !important; color:var(--panel) !important; }
 #new-chat-dialog button:disabled { opacity:.5; cursor:default; }
@@ -170,6 +174,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   <label for="new-chat-search">Search projects</label><input id="new-chat-search" type="search" autocomplete="off">
   <div id="new-chat-projects"></div><div id="new-chat-worktrees" hidden></div></div>
   <p id="new-chat-selection" hidden></p><p id="new-chat-error" role="alert" hidden></p>
+  <div id="new-chat-progress" hidden aria-label="Workspace preparation">
+    <p id="new-chat-progress-message" role="status"></p>
+    <progress id="new-chat-progress-bar" max="100" aria-label="Workspace creation progress"></progress>
+    <p id="new-chat-progress-detail" class="muted" hidden></p>
+    <p id="new-chat-progress-time" class="muted"></p>
+  </div>
   <div class="new-chat-row"><button type="button" id="new-chat-submit" disabled>Create chat</button></div>
 </dialog>
 <template id="owner-composer-style"><style>
@@ -251,12 +261,12 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
 .automation-field { display:block; margin:10px 0 5px; color:var(--muted); font-size:12px; }
 #automation-url,#automation-goal,#pairing-editor-url,#chat-name { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
 #automation-goal { min-height:90px; resize:vertical; }
-#automation-error { color:var(--error); margin:8px 4px; font-size:12px; }
-#automation-error-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+#automation-error { color:var(--error); margin:4px 4px 2px; font-size:12px; line-height:1.4; white-space:normal; }
+#automation-error-row { display:flex; align-items:center; column-gap:4px; row-gap:0; flex-wrap:wrap; }
 @media(max-width:600px) { #automation-error-row #automation-error { flex-basis:100%; } }
 #automation-error { flex:1; min-width:0; overflow-wrap:anywhere; }
 #automation-error.waiting-for-browser { color:var(--muted); }
-#automation-retry-inline { flex:none; margin:8px 4px; }
+#automation-error-row > .composer-button { flex:none; margin:0; }
 #rename-form { padding:12px 18px; border-bottom:1px solid var(--border); }
 #rename-form.inline-rename { display:inline-flex; flex-wrap:wrap; gap:6px; align-items:center; min-width:0; max-width:100%; padding:0; border:0; font-size:13px; }
 #rename-form.inline-rename input { width:280px; max-width:45vw; min-width:80px; padding:4px 7px; border:1px solid var(--accent); border-radius:6px; color:var(--ink); background:var(--bg); font:inherit; }
@@ -437,7 +447,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       for (const [key, value] of Object.entries({ fill:"none", stroke:"currentColor", "stroke-width":1.6, "stroke-linecap":"round", "stroke-linejoin":"round" })) svg.setAttribute(key, String(value));
       return svg;
     }
-    if (state === "online" || state === "retrying") {
+    if (state === "online" || state === "retrying" || state === "waking") {
       svg.classList.add("presence-spinner");
       svg.innerHTML = '<circle cx="12" cy="12" r="10.5" opacity=".2"/><path d="M12 1.5a10.5 10.5 0 0 1 10.5 10.5"/>';
       for (const [key, value] of Object.entries({ fill:"none", stroke:"currentColor", "stroke-width":2.5, "stroke-linecap":"round" })) svg.setAttribute(key, String(value));
@@ -473,6 +483,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     if (chat.automationError) return "error";
     if (chat.automationWaitingForBrowser === true) return "browser-cooldown";
     const state = presence(chat.lastAgentCallAtMs, now, chat.agentWaitingUntilMs, chat.agentPresenceUntilMs, chat.agentIdleUntilMs);
+    if (state === "offline" && chat.automationWake) return "waking";
     if (chat.goalStatus === "configured") return "goal-paused";
     if (chat.goalStatus === "completed" && !chat.goalCompletionDismissed) return "goal-completed";
     if (chat.goalStatus === "blocked" || chat.goalStatus === "error") return "goal-blocked";
@@ -485,7 +496,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   async function api(path, options = {}, connectorRetried = false) {
     const response = await fetch(path, {
       ...options,
-      headers:{ Authorization:`Bearer ${token}`, ...(options.body ? {"Content-Type":"application/json"} : {}) },
+      headers:{ ...(options.headers || {}), Authorization:`Bearer ${token}`, ...(options.body ? {"Content-Type":"application/json"} : {}) },
       cache:"no-store"
     });
     if (response.status === 428 && !connectorRetried && path !== "/api/settings/connector") {
@@ -817,7 +828,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const retryStatus = automaticRetry ? (goalRetry ? `Retrying the goal automatically in ${retrySeconds}s.` : `Retrying automatically in ${retrySeconds}s (retry ${(state.action.automaticRetryAttempts || 0) + 1} of ${retryLimit}).`) + retryNow : "";
       const cooldownSeconds = waitingForBrowser ? Math.max(0,Math.ceil((state.action.cooldownUntilMs-Date.now()-clockOffset)/1000)) : 0;
       const queuePosition = Number.isSafeInteger(state.queue?.position) && state.queue.position > 0 ? ` (position in queue: ${state.queue.position})` : "";
-      const waitingStatus = cooldownSeconds ? `Waiting for the shared browser${queuePosition}. Conversation loading is available in ${cooldownSeconds}s.` : `Waiting for the shared browser${queuePosition}…`;
+      const waitingStatus = cooldownSeconds ? `Conversation loading available in ${cooldownSeconds}s${queuePosition}.` : `Waiting for the shared browser${queuePosition}.`;
       nodes.liveStatus.textContent = automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
@@ -1176,10 +1187,11 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       lastPresence.set(chat.id,{ state, agentState });
       const icon = textNode("span", `presence ${state}`, "");
       icon.dataset.agentState = agentState;
-      if (["goal-running", "goal-retrying", "online", "retrying", "browser-cooldown"].includes(state)) icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
+      if (["goal-running", "goal-retrying", "online", "retrying", "browser-cooldown", "waking"].includes(state)) icon.style.setProperty("--goal-ring-delay", `${-(performance.now() % 2000)}ms`);
       icon.append(presenceIcon(state));
       icon.title = state === "browser-cooldown" ? "Waiting for browser cooldown" : state === "retrying" || state === "goal-retrying" ? `${state === "goal-retrying" ? "Goal" : "Chat"} retrying automatically${chat.automationError ? ": " + chat.automationError : ""}` : state === "error" ? `Chat error: ${chat.automationError}` : state === "goal-running" ? "Goal running" : state === "goal-completed" ? "Goal completed" : state === "goal-paused" ? "Goal paused" : state === "goal-blocked" ? "Goal blocked" : state === "waiting" ? "Agent is waiting for your message" : `Agent ${state} (based on last tool call)`;
       icon.setAttribute("role", "img"); icon.setAttribute("aria-label", icon.title);
+      if (state === "waking") { icon.title = chat.automationWake.description; icon.setAttribute("aria-label",`${chat.automationWake.label}: ${icon.title}`); }
       const content = textNode("span", "conversation-main", "");
       content.append(textNode("span", "conversation-title", chat.title));
       content.append(textNode("span", "conversation-detail", conversationDetail(chat)));
@@ -1321,6 +1333,11 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
           path += `/file?${new URLSearchParams({href:args.href})}`;
         } else throw new Error("Unknown chat operation");
         const payload = await (await api(path, options)).json();
+        const wake = payload._meta?.[chatMeta];
+        if (name === "chat_ui_send" && wake && Object.hasOwn(wake,"wake_status")) {
+          const chat = chats.find(chat => chat.id === id);
+          if (chat) { chat.automationWake = wake.wake_status; renderList(); }
+        }
         const sent = payload._meta?.["io.github.devnoname120/codexify/markdown-chat"]?.sent;
         if (name === "chat_ui_send" && sent?.id === args.request_id && Number.isSafeInteger(sent.end)) {
           const chat = chats.find(chat => chat.id === id);
@@ -1408,6 +1425,60 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   const newDialog = document.getElementById("new-chat-dialog");
   const newNode = suffix => document.getElementById(`new-chat-${suffix}`);
   let newCatalog = null, newChoice = null, newRequest = null, newBusy = false, newPreparing = false, newEpoch = 0, newSearchEpoch = 0, newWorktreeEdited = false;
+  let newProgressTimer = null, newProgressStarted = 0, newProgressChanged = 0;
+  function newProgressTime() {
+    const elapsed = Math.max(0, Math.floor((Date.now() - newProgressStarted) / 1000));
+    const idle = Math.max(0, Math.floor((Date.now() - newProgressChanged) / 1000));
+    const duration = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+    newNode("progress-time").textContent = `Elapsed ${duration} · Last progress update ${idle}s ago`;
+  }
+  function newProgress(progress) {
+    newProgressChanged = Date.now();
+    newNode("progress-message").textContent = progress.message || "Preparing workspace…";
+    newNode("progress-detail").textContent = progress.detail || "";
+    newNode("progress-detail").hidden = !progress.detail;
+    const bar = newNode("progress-bar");
+    if (typeof progress.percent === "number" && Number.isFinite(progress.percent)) bar.value = Math.max(0, Math.min(100, progress.percent));
+    else bar.removeAttribute("value");
+    bar.setAttribute("aria-valuetext", `${progress.message || "Preparing workspace"}${bar.hasAttribute("value") ? `: ${bar.value}%` : ""}`);
+    newProgressTime();
+  }
+  function startNewProgress(message) {
+    clearInterval(newProgressTimer); newProgressStarted = Date.now();
+    newNode("progress").hidden = false;
+    newProgress({message});
+    newProgressTimer = setInterval(newProgressTime, 1000);
+    newNode("progress").scrollIntoView({block:"nearest"});
+  }
+  function stopNewProgress() {
+    clearInterval(newProgressTimer); newProgressTimer = null; newNode("progress").hidden = true;
+  }
+  async function readNewChat(response) {
+    if (!response.headers.get("content-type")?.includes("application/x-ndjson")) return response.json();
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let pending = "", result = null;
+    function frame(line) {
+      if (!line.trim()) return;
+      const event = JSON.parse(line);
+      if (event.type === "progress") newProgress(event.progress);
+      else if (event.type === "error") throw new Error(event.message || "Workspace preparation failed");
+      else if (event.type === "result") result = event.result;
+    }
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        pending += decoder.decode(chunk.value, {stream:!chunk.done});
+        let newline;
+        while ((newline = pending.indexOf("\n")) >= 0) {
+          frame(pending.slice(0, newline)); pending = pending.slice(newline + 1);
+        }
+        if (chunk.done) break;
+      }
+      if (pending.trim()) frame(pending);
+      if (!result) throw new Error("The connection ended before workspace preparation finished. Retry to check the same request.");
+      return result;
+    } finally { reader.releaseLock(); }
+  }
   function newError(message) { newNode("error").hidden = !message; newNode("error").textContent = message || ""; }
   function newWorkspaceChoice() {
     const path = newNode("url").value.trim();
@@ -1502,6 +1573,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     try { if (!await ensureConnectorName()) return; }
     catch (error) { showError(error.message); return; }
     newChoice=null;newCatalog=null;newBusy=false;newWorktreeEdited=false;newRequest=requestId("create-chat");const epoch=++newEpoch;
+    stopNewProgress();
     for(const name of ["url","search","project-name"])newNode(name).value="";
     newNode("project-creation").hidden=true;newNode("new-project").setAttribute("aria-expanded","false");newNode("project-root").textContent="";
     for(const name of ["model","effort"]) {newNode(name).replaceChildren();newNode(name).disabled=true;}
@@ -1522,13 +1594,14 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   newNode("project-name").addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();newNode("create-project").click();}});
   newNode("create-project").addEventListener("click",async()=>{
     if(newNode("create-project").disabled)return;newBusy=true;newReady();newError("");
+    startNewProgress("Creating project folder…");
     try {
       const project=await(await api("/api/projects",{method:"POST",body:JSON.stringify({name:newNode("project-name").value.trim()})})).json();
       newNode("url").value=project.path;newWorktreeEdited=true;newNode("worktree").checked=false;
       chooseNew({path:project.path},project.path);
       newNode("project-creation").hidden=true;newNode("new-project").setAttribute("aria-expanded","false");
     }catch(error){newError(error.message);}
-    finally{newBusy=false;newReady();}
+    finally{stopNewProgress();newBusy=false;newReady();}
   });
   newNode("url").addEventListener("input",newReady);
   newNode("use-url").addEventListener("click",()=>{if(newNode("url").value.trim())chooseNew(null,newNode("url").value.trim());});
@@ -1536,13 +1609,14 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   newNode("submit").addEventListener("click",async()=>{
     const choice = newWorkspaceChoice();
     if(newNode("submit").disabled || !choice)return;newBusy=true;newReady();newError("");
+    startNewProgress("Preparing workspace…");
     try {
       const body={requestId:newRequest,...choice,model:newNode("model").value,effort:newNode("effort").value,catalogRevision:newCatalog.catalogRevision};
       if(choice.path && (!choice.worktreePath || newNode("worktree").checked))body.createWorktree=newNode("worktree").checked;
-      const result=await(await api("/api/chats",{method:"POST",body:JSON.stringify(body)})).json();
+      const result=await readNewChat(await api("/api/chats",{method:"POST",headers:{Accept:"application/x-ndjson"},body:JSON.stringify(body)}));
       newDialog.close();search.value="";++listRequest;pendingList=null;await refresh();select(result.id);
     }catch(error){newError(error.message);}
-    finally{newBusy=false;newReady();}
+    finally{stopNewProgress();newBusy=false;newReady();}
   });
   bindBackdrop(newDialog, () => { if (!newBusy) newDialog.close(); });
   startOwnerPwa({bindBackdrop});

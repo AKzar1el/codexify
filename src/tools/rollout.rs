@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const CONTINUE_AFTER_CHECKPOINT: &str = "NON-TERMINAL: this progress operation does not finish the request or authorize a normal ChatGPT final answer. Run the next task tool now. If an active goal is completed or cannot proceed, call goal_finish with its required report; after completion wait with turn_completed, after blocking wait with chat_await. If unfinished work or an already blocked goal needs user input, call chat_await; if a request without a goal is finished, call turn_completed. Repeat the appropriate wait after every timeout or cancellation. Do not stop because of elapsed time or an anticipated timeout.";
+
 pub enum RolloutTool {
     Read,
     Update,
@@ -40,8 +42,8 @@ impl Tool for RolloutTool {
     }
     fn description(&self) -> String {
         match self {
-  Self::Read=>"Read up to five recent progress reports from this chat's rollout.md, bounded to 64 KiB and spanning rotated archives when necessary. Call at the start of each new turn and after context loss, before task work. Use the current goal too, if configured. This does not read queued messages or acknowledge CHAT.md.",
-  Self::Update=>"Append to this chat's chronological activity timeline in rollout.md. Record what was done or learned, what is underway, and what comes next or is blocked. Reports may reference supporting files. Update regularly and whenever rollout_checkpoint_required appears in a tool result. Use a fresh request_id for each report; reuse it only for an identical retry. Reports rotate automatically at 256 KiB or 50 reports. This does not change the goal, send a chat message, complete a turn, or expose queued messages."
+  Self::Read=>"NON-TERMINAL TOOL. Read up to five recent progress reports from this chat's rollout.md, bounded to 64 KiB and spanning rotated archives when necessary. Call at the start of each new turn and after context loss, before task work. Use the current goal too, if configured. This does not read queued messages or acknowledge CHAT.md. After reading, run the next task tool; if work needs user input call chat_await, or if the request is finished call turn_completed (finish an active goal with goal_finish first). Never send a normal final ChatGPT answer or stop near an anticipated timeout.",
+  Self::Update=>"NON-TERMINAL TOOL. Append to this chat's chronological activity timeline in rollout.md. Record what was done or learned, what is underway, and what comes next or is blocked. Reports may reference supporting files. Update regularly and whenever rollout_checkpoint_required appears in a tool result. Use a fresh request_id for each report; reuse it only for an identical retry. Reports rotate automatically at 256 KiB or 50 reports. This does not change the goal, send a chat message, complete a turn, or expose queued messages. Saving a checkpoint is NEVER permission to stop: run the next task tool, goal_finish with a report if the goal is completed or blocked, chat_await for needed input, or turn_completed for a finished request without an unfinished goal. Repeat waits after timeout or cancellation. Never send a normal ChatGPT final answer or end the assistant turn, including near an anticipated timeout."
  }.into()
     }
     fn behavior(&self) -> ToolBehavior {
@@ -75,14 +77,27 @@ impl Tool for RolloutTool {
         }
     }
     fn output_schema(&self) -> Option<Value> {
-        Some(match self {
+        let mut schema = match self {
             Self::Read => {
                 json!({"type":"object","properties":{"rollout_file":{"type":"string"},"report_count":{"type":"integer","minimum":0},"content":{"type":"string"},"archive_count":{"type":"integer","minimum":0}},"required":["rollout_file","report_count","content","archive_count"],"additionalProperties":false})
             }
             Self::Update => {
                 json!({"type":"object","properties":{"rollout_file":{"type":"string"},"request_id":{"type":"string"},"created_at_ms":{"type":"integer","minimum":0},"already_recorded":{"type":"boolean"},"rotated_archive":{"type":["string","null"]}},"required":["rollout_file","request_id","created_at_ms","already_recorded","rotated_archive"],"additionalProperties":false})
             }
-        })
+        };
+        schema["properties"]["instructions"] = json!({"type":"string"});
+        schema["properties"]["required_next_action"] =
+            json!({"type":"string","const":"continue_work"});
+        schema["properties"]["assistant_turn_may_end"] = json!({"type":"boolean","const":false});
+        schema["required"]
+            .as_array_mut()
+            .expect("required")
+            .extend([
+                json!("instructions"),
+                json!("required_next_action"),
+                json!("assistant_turn_may_end"),
+            ]);
+        Some(schema)
     }
     async fn call(&self, _: Value, _: &AppConfig, _: &SessionState) -> ToolResult {
         ToolResult::error("Progress reports require chat context.")
@@ -107,8 +122,13 @@ impl Tool for RolloutTool {
             };
         if !crate::global_settings::rollout_enabled(config).unwrap_or(false) {
             return match self {
-                Self::Read=>ToolResult::text("Progress journal is disabled.").with_structured(json!({"rollout_file":"", "report_count":0,"archive_count":0,"content":"Progress journal is disabled. Continue using the current task and goal; no progress checkpoint is required."})),
-                Self::Update=>ToolResult::error("Progress journal is disabled; continue without progress checkpoints."),
+                Self::Read => progress_result(
+                    "Progress journal is disabled. Continue using the current task and goal; no progress checkpoint is required.",
+                    json!({"rollout_file":"", "report_count":0,"archive_count":0,"content":"Progress journal is disabled. Continue using the current task and goal; no progress checkpoint is required."}),
+                ),
+                Self::Update => ToolResult::error(
+                    "Progress journal is disabled; continue without progress checkpoints.",
+                ),
             };
         }
         let result = match self {
@@ -132,11 +152,22 @@ impl Tool for RolloutTool {
         };
         match result {
             Ok(value) => {
-                let mut result=ToolResult::text(match self {Self::Read=>value["content"].as_str().filter(|s|!s.is_empty()).unwrap_or("No progress reports yet. Start with the user's current request and goal."),Self::Update=>"Progress checkpoint saved. Continue with the current request and next steps."}).with_structured(value);
+                let content = match self {
+                    Self::Read => value["content"].as_str().filter(|s| !s.is_empty()).unwrap_or("No progress reports yet. Start with the user's current request and goal."),
+                    Self::Update => "Progress checkpoint saved. Continue with the current request and next steps.",
+                }.to_owned();
+                let mut result = progress_result(&content, value);
                 result.audit.sensitive_output = true;
                 result
             }
             Err(e) => ToolResult::error(e),
         }
     }
+}
+
+fn progress_result(content: &str, mut value: Value) -> ToolResult {
+    value["instructions"] = json!(CONTINUE_AFTER_CHECKPOINT);
+    value["required_next_action"] = json!("continue_work");
+    value["assistant_turn_may_end"] = json!(false);
+    ToolResult::text(format!("{content}\n\n{CONTINUE_AFTER_CHECKPOINT}")).with_structured(value)
 }

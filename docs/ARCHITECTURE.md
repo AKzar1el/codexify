@@ -155,7 +155,7 @@ Five integration surfaces are exposed to the client:
 7. `set_project_root` accepts exactly one project selector or
    `withoutProject: true`. The project path canonicalizes an existing directory
    below the configured access root, parses a provider-agnostic HTTPS/SSH Git
-   repository URL ending in `.git`, or parses a supported GitHub repository,
+   repository URL with or without `.git`, or parses a supported GitHub repository,
    branch, pull-request, or commit URL.
    URL resolution first looks for a matching local Git top level; when none exists,
    it clones beneath `projectCloneDir` and verifies the resulting remote. A branch
@@ -306,9 +306,13 @@ same lock, so concurrent choices have one winner and dual records fail closed.
 ### Git project resolution (`project_clone.rs`)
 `ProjectReference` distinguishes ordinary filesystem selectors from HTTPS/SSH Git
 repository URLs and GitHub's richer branch, pull-request, or commit URL forms.
-Provider-agnostic selections require a repository-root URL ending in `.git`, which
-keeps arbitrary provider web pages out of the clone surface; existing matching
-remotes may omit that suffix. HTTPS, `ssh://`, and SCP-style SSH forms are accepted,
+Provider-agnostic selections accept repository-root URLs with or without `.git`.
+Before cloning a URL without that suffix, a non-interactive `git ls-remote` probe
+checks Git access with a 15-second timeout per attempt. If the original URL fails,
+it probes again with `.git` appended and clones using the working URL. If both
+fail, no checkout is created. An existing matching checkout is reused without a
+network probe.
+HTTPS, `ssh://`, and SCP-style SSH forms are accepted,
 while embedded HTTPS credentials, local/file transports, HTTP, `git://`, queries,
 fragments, and other transports are rejected. Generic repository identity is
 host/path based and preserves the provider path's case. HTTPS is considered

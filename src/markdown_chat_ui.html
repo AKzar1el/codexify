@@ -24,6 +24,7 @@ h1 { display:flex; align-items:center; flex-wrap:wrap; gap:9px; font-size:15px; 
 #chat-title { min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #presence { display:inline-flex; align-items:center; gap:4px; color:var(--muted); font-size:11px; font-weight:400; }
 .presence-symbol { width:14px; height:14px; flex:none; }
+.presence-symbol.wake-spinner { animation:stop-spin 2s linear infinite; transform-origin:center; }
 #presence[data-state="waiting"] { color:var(--waiting); }
 #tool-total { color:var(--muted); font-size:11px; font-weight:400; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .subtitle { font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -59,6 +60,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 .goal-completed-preview { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .goal-completed-event .markdown { min-width:0; padding:5px 24px 12px; color:var(--ink); font-size:13px; line-height:1.55; }
 .goal-completed-event svg { width:16px; height:16px; flex:none; color:#159b27; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.goal-blocked-event svg { color:var(--danger,#c23b46); }
 .goal-completed-event .receipt { flex:none; min-height:0; margin:0 0 0 auto; white-space:nowrap; font-size:11px; color:var(--muted); }
 @media(max-width:480px) { .goal-completed-preview { display:none; } .goal-completed-row { gap:6px; } }
 .author { font-size:11px; font-weight:650; margin-bottom:3px; color:var(--muted); }
@@ -107,13 +109,18 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
 .queued-attachments .attachment-name,.queued-attachments .attachment-size { display:none; }
 #retained-sends { margin:0 0 9px; color:var(--muted); font-size:11px; }
 #retained-sends p { margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
-#composer { display:flex; gap:8px; align-items:flex-end; }
+#composer { position:relative; display:flex; gap:8px; align-items:flex-end; }
 #draft { flex:1; width:0; min-width:0; max-height:150px; resize:none; border:1px solid var(--border); border-radius:19px; background:var(--bg); color:var(--ink); padding:9px 13px; line-height:1.4; }
 #chat[data-awaiting="true"] #draft { border-color:var(--waiting); box-shadow:0 0 0 1px var(--waiting); }
 #chat[data-awaiting="true"] #draft:focus-visible { outline-color:var(--waiting); }
 #awaiting-hint { margin:0 4px 8px; color:var(--waiting); font-size:12px; font-weight:500; }
 #retired-hint { margin:0 4px 8px; color:var(--error); font-size:12px; font-weight:500; }
 #send { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:50%; background:var(--accent); color:var(--bg); padding:9px; }
+#send { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; touch-action:manipulation; }
+#send-mode-menu { position:absolute; z-index:30; right:0; width:190px; max-width:calc(100% - 8px); padding:5px; border:1px solid var(--border); border-radius:16px; background:var(--bg); color:var(--ink); box-shadow:0 8px 30px #0002; }
+#send-mode-menu button { display:flex; align-items:center; gap:10px; width:100%; min-height:42px; padding:9px 12px; border:0; border-radius:11px; background:transparent; color:inherit; font:inherit; text-align:left; touch-action:manipulation; }
+#send-mode-menu button:is(:hover,:focus-visible),#send-mode-menu button[data-default="true"] { background:var(--surface); }
+#send-mode-menu svg { width:19px; height:19px; flex:none; }
 .draft-attachments,.message-attachments { display:flex; gap:10px; overflow-x:auto; padding:4px 2px; min-width:0; }
 .draft-attachments { flex:1 0 100%; grid-column:1/-1; grid-row:1; }
 #composer:has(.draft-attachments:not([hidden])) { flex-wrap:wrap; }
@@ -168,6 +175,10 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       <form id="composer">
         <textarea id="draft" rows="1" aria-label="Message the agent" placeholder="Message the agent..." spellcheck="true"></textarea>
         <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button>
+        <div id="send-mode-menu" role="menu" aria-label="Send message as" hidden>
+          <button type="button" role="menuitem" data-mode="steer" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v7h15m-5-5 5 5-5 5"/></svg><span>Steer</span></button>
+          <button type="button" role="menuitem" data-mode="queue" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6M4 8h6M4 12v3h15m-4-4 4 4-4 4"/></svg><span>Queue</span></button>
+        </div>
       </form>
       <div id="status" role="status"><span id="status-text">Enter to send. Shift + Enter for a new line.</span><button id="refresh" hidden>Retry connection</button></div>
     </div>
@@ -191,12 +202,15 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   let revision = null, before = null, hasMore = false, delivered = 0, readThrough = 0, chatFile = null, failures = 0, snapshotEnd = 0;
   let lastAgentCall = null, totalToolCalls = null, clockOffset = 0, presenceTimer = null;
   let waitingForPresenceRefresh = false;
+  let wakeStatus = null, wakeVersion = 0;
   let agentWaitingUntil = null, agentPresenceUntil = null, waitingReplyEnd = 0, inputRequired = false;
   let agentStopped = false, stopping = false, stopRequestId = null;
   let messageClockTimer = null;
   let hostCapabilities = {};
   let queuedMessages = [], defaultMessageMode = "steer", messageModeVersion = 0, queueVersion = 0, submitMode = null;
   let queueEdit = null;
+  const sendMenu = el("send-mode-menu");
+  let sendPress = null, suppressSendClick = false, sendMenuFocus = null, menuTouchSelection = false;
   const queueNodes = new Map(), queueBusy = new Set();
   const primaryModifier = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "metaKey" : "ctrlKey";
   const modifierLabel = primaryModifier === "metaKey" ? "Cmd" : "Ctrl";
@@ -416,13 +430,18 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       send.replaceChildren(svg); send.dataset.mode = mode;
       send.setAttribute("aria-label", label); send.title = label;
     }
-    if(mode==="send") {const messageMode=composerMessageMode(),label=messageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=awaitingAnswer()?`${label}. ${modifierLabel}+Enter also sends your answer immediately.`:`${label}. ${modifierLabel}+Enter uses the other mode for this message.`;send.dataset.messageMode=messageMode;}
+    if(mode==="send") {const messageMode=composerMessageMode(),label=messageMode==="queue"?"Queue message":"Send message";send.setAttribute("aria-label",label);send.title=(awaitingAnswer()?`${label}. ${modifierLabel}+Enter also sends your answer immediately.`:`${label}. ${modifierLabel}+Enter uses the other mode for this message.`)+" Hold for Steer or Queue.";send.dataset.messageMode=messageMode;}
     send.disabled = startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || (mode === "send" && (attachments?.blocked() || (!input.value.trim() && !attachments?.count())));
+    if (mode === "send") { send.setAttribute("aria-haspopup","menu"); send.setAttribute("aria-controls","send-mode-menu"); }
+    else send.removeAttribute("aria-haspopup");
+    if (send.disabled || mode !== "send") { clearSendPress(); closeSendMenu(); }
+    if (mode !== "send") { send.removeAttribute("aria-controls"); send.removeAttribute("aria-expanded"); }
     attachments?.update();
     list.scrollTop = atBottom ? list.scrollHeight : historyTop;
     size();
   }
   function size() {
+    positionSendMenu();
     if (bridge && !tornDown) { bridge.reportSize(); return; }
     if (initialized && !tornDown) post({ method:"ui/notifications/size-changed", params:{ width:document.documentElement.clientWidth, height:el("chat").offsetHeight } });
   }
@@ -462,13 +481,16 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   function updatePresence() {
     clearTimeout(presenceTimer);
     if (document.hidden || waitingForPresenceRefresh) return;
-    const { state, label, delay } = stopping ? { state:"online", label:"online", delay:null } : presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil);
+    const actual = stopping ? { state:"online", label:"online", delay:null } : presenceDetails(lastAgentCall, Date.now() + clockOffset, agentWaitingUntil, agentPresenceUntil);
+    const wake = actual.state === "offline" ? (sending ? {label:"Saving message",description:"Saving your message."} : wakeStatus) : null;
+    const { state, label, delay } = wake ? {state:"waking",label:wake.label,delay:actual.delay} : actual;
     const node = el("presence");
     const changed = node.dataset.state !== state, waiting = state === "waiting";
     if (changed) {
-      const svg = icon(waiting ? ["M20 16a9.5 9.5 0 1 0-4 4l6 2-2-6Z"] : state === "online" ? ["m6.5 12 3.5 3.5 7.5-8"] : state === "away" ? ["M12 5.5V12l5.6 3.2"] : ["m8 8 8 8", "m8 16 8-8"], "presence-symbol");
+      const waking = state === "waking";
+      const svg = icon(waking ? ["M12 1.5a10.5 10.5 0 0 1 10.5 10.5"] : waiting ? ["M20 16a9.5 9.5 0 1 0-4 4l6 2-2-6Z"] : state === "online" ? ["m6.5 12 3.5 3.5 7.5-8"] : state === "away" ? ["M12 5.5V12l5.6 3.2"] : ["m8 8 8 8", "m8 16 8-8"], `presence-symbol${waking ? " wake-spinner" : ""}`);
       svg.setAttribute("viewBox", "0 0 24 24");
-      svg.setAttribute("style", `stroke:${waiting ? "var(--waiting)" : state === "offline" ? "#85898d" : "#fff"};stroke-width:${waiting ? 2 : 3}`);
+      svg.setAttribute("style", `stroke:${waiting ? "var(--waiting)" : state === "offline" || waking ? "#85898d" : "#fff"};stroke-width:${waiting ? 2 : waking ? 2.5 : 3}`);
       if (waiting) {
         svg.querySelector("path").setAttribute("fill", "currentColor");
         for (const cx of [7, 12, 17]) {
@@ -478,7 +500,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
         }
       } else {
         const circle = document.createElementNS(svg.namespaceURI, "circle");
-        for (const [key, value] of Object.entries({ cx:12, cy:12, r:10.5, fill:state === "online" ? "#159b27" : state === "away" ? "#eba916" : "#fff", stroke:state === "offline" ? "#85898d" : "none" })) circle.setAttribute(key, String(value));
+        for (const [key, value] of Object.entries({ cx:12, cy:12, r:10.5, fill:waking ? "none" : state === "online" ? "#159b27" : state === "away" ? "#eba916" : "#fff", stroke:state === "offline" || waking ? "#85898d" : "none", ...(waking ? {opacity:.2} : {}) })) circle.setAttribute(key, String(value));
         svg.prepend(circle);
       }
       node.replaceChildren(svg, make("span", "presence-label"));
@@ -489,7 +511,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       resizeInput();
     }
     node.querySelector(".presence-label").textContent = label;
-    node.title = agentStopped ? "Stopped by you. The goal stays paused until you press Play." : waiting ? "The agent is waiting for your message. Kept briefly between unanswered waits." : lastAgentCall === null ? "No agent tool call recorded for this task." : "Based on this task's last agent tool call, not a live connection or proof of ongoing work.";
+    node.title = wake ? wake.description : agentStopped ? "Stopped by you. The goal stays paused until you press Play." : waiting ? "The agent is waiting for your message. Kept briefly between unanswered waits." : lastAgentCall === null ? "No agent tool call recorded for this task." : "Based on this task's last agent tool call, not a live connection or proof of ongoing work.";
     if (!tornDown && !document.hidden && delay !== null) presenceTimer = setTimeout(updatePresence, Math.max(1, delay));
   }
   function markdown(container, text) {
@@ -648,8 +670,13 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
           const summary = make("summary"), row = make("span", "goal-completed-row");
           const mark = icon(["M22 12a10 10 0 1 1-10-10","M17 12a5 5 0 1 1-5-5","M22 2 12 12m0-5v5h5"]);
           mark.setAttribute("viewBox", "0 0 24 24");
-          row.append(mark, make("span", "goal-completed-label", "Goal completed"), make("span", "goal-completed-preview"), make("span", "receipt"));
+          const blocked = message.goal_status === "blocked";
+          if (blocked) node.classList.add("goal-blocked-event");
+          row.append(mark, make("span", "goal-completed-label", blocked ? "Goal blocked" : "Goal completed"), make("span", "goal-completed-preview"), make("span", "receipt"));
           summary.append(row); node.append(summary, make("div", "markdown"));
+          // New reports explain the result immediately. Legacy objective-only
+          // events retain their compact presentation. Polls preserve user toggles.
+          node.open = Boolean(message.goal_report);
         } else {
           node.append(make("div", "author", message.role === "user" ? "You" : "Agent"), make("div", "markdown"), make("div", "message-attachments"), make("div", "receipt"));
         }
@@ -667,12 +694,13 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
         }
         nodes.set(message.id, node);
       }
-      if (node._markdown !== message.markdown || node._generation !== generation) {
+      if (node._markdown !== message.markdown || node._report !== message.goal_report || node._generation !== generation) {
         const body = node.querySelector(".markdown"); body.replaceChildren();
-        const content = message.role === "goal" ? message.markdown.replace(/^Goal completed:\s*/, "") : message.markdown;
-        markdown(body, content);
-        if (message.role === "goal") node.querySelector(".goal-completed-preview").textContent = body.textContent.replace(/\s+/g, " ").trim();
-        node._markdown = message.markdown; node._generation = generation;
+        const objective = message.role === "goal" ? message.markdown.replace(/^Goal (?:completed|blocked):\s*/, "") : message.markdown;
+        markdown(body, message.goal_report || objective);
+        if (message.role === "goal" && message.goal_report && !node._report) node.open = true;
+        if (message.role === "goal") node.querySelector(".goal-completed-preview").textContent = objective.replace(/\s+/g, " ").trim();
+        node._markdown = message.markdown; node._report = message.goal_report; node._generation = generation;
       }
       if (message.role !== "warning" && message.role !== "goal") {
         const files=node.querySelector(".message-attachments");
@@ -706,7 +734,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     scheduleMessageClock();
     size();
   }
-  function applyPage(page, history = false, modeVersion = messageModeVersion, expectedQueueVersion = queueVersion) {
+  function applyPage(page, history = false, modeVersion = messageModeVersion, expectedQueueVersion = queueVersion, expectedWakeVersion = wakeVersion) {
     const pendingCount = pendingSends.size;
     if (typeof page.chat_file !== "string" || !Number.isSafeInteger(page.delivered_through)) throw new Error("Invalid chat state from connector.");
     if (page.retired !== undefined && typeof page.retired !== "boolean") throw new Error("Invalid chat retirement state from connector.");
@@ -718,6 +746,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     delivered = Math.max(delivered, page.delivered_through);
     if (Number.isSafeInteger(page.read_through)) readThrough = Math.max(readThrough, page.read_through);
     if (!history) {
+      if (expectedWakeVersion === wakeVersion && !sending && Object.hasOwn(page,"wake_status")) wakeStatus = page.wake_status;
       lastAgentCall = Number.isSafeInteger(page.last_agent_call_at_ms) ? page.last_agent_call_at_ms : null;
       agentStopped = page.agent_stop_requested === true;
       agentPresenceUntil = Number.isSafeInteger(page.agent_presence_until_ms) ? page.agent_presence_until_ms : null;
@@ -809,6 +838,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     chatFile = null; revision = null; before = null; hasMore = false; failures = 0; snapshotEnd = 0;
     delivered = 0; readThrough = 0; lastAgentCall = null; totalToolCalls = null; clockOffset = 0;
     agentWaitingUntil = null; agentPresenceUntil = null; waitingReplyEnd = 0; inputRequired = false; pageRetired = false;
+    wakeStatus = null; wakeVersion++;
     records.clear(); queuedMessages=[];queueEdit=null;queueVersion++;renderQueue();
     for (const node of nodes.values()) node.remove();
     for (const node of markerNodes.values()) node.remove();
@@ -827,12 +857,12 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   }
   async function refresh() {
     if (!available || refreshing || tornDown || !visible || document.hidden) return;
-    const origin = generation, modeVersion=messageModeVersion, expectedQueueVersion=queueVersion;
+    const origin = generation, modeVersion=messageModeVersion, expectedQueueVersion=queueVersion, expectedWakeVersion=wakeVersion;
     refreshing = true;
     try {
       const page = await call("chat_ui_state", { ...requestDestination(), ...(revision ? { revision } : {}) });
       if (!currentGeneration(origin)) return;
-      applyPage(page,false,modeVersion,expectedQueueVersion); failures = 0;
+      applyPage(page,false,modeVersion,expectedQueueVersion,expectedWakeVersion); failures = 0;
       if (statusKind !== "action") status(isReadOnly() ? "This chat is read-only here." : messageHint(), false, "normal");
     } catch (error) { if (currentGeneration(origin)) { if(startupBlocked()){failures=0;status(messageHint(),false,"normal");}else{failures++;status(error.message || "Connection unavailable. Messages are retained.", true, "connection");workspaceMismatch(error);} } }
     finally { if (currentGeneration(origin)) { refreshing = false; schedule(); } }
@@ -841,12 +871,17 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     if (startupBlocked() || !available || isReadOnly() || !chatFile || message.chat_file !== chatFile || sending || stopping || tornDown) return;
     const origin = generation;
     sending = true; message.failed = false; message.pending = true;
+    wakeVersion++; updatePresence();
     pendingSends.set(message.id, message); render(); resizeInput(); save();
     try {
       const args = { request_id:message.id, message:message.markdown, expected_chat_file:message.chat_file, message_mode:message.message_mode||"steer",
         ...(message.attachments?.length ? {attachment_ids:message.attachments.map(a=>a.id)} : {}) };
       if (message.workspace_path) args.expected_workspace = message.workspace_path;
       const payload = await call("chat_ui_send", args);
+      if (currentGeneration(origin)) {
+        wakeVersion++;
+        if (Object.hasOwn(payload,"wake_status")) wakeStatus = payload.wake_status;
+      }
       if(message.message_mode==="queue"&&payload.queue_receipt){
         pendingSends.delete(message.id);
         if(!currentGeneration(origin))return;
@@ -869,7 +904,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       if (!currentGeneration(origin) || !records.has(message.id)) { message.failed = true; message.pending = false; pendingSends.set(message.id, message); }
       if (currentGeneration(origin)) { status(error.message || "Message delivery is unconfirmed. Retry without duplicating it.", true); workspaceMismatch(error); }
     } finally {
-      if (currentGeneration(origin)) { sending = false; render(); resizeInput(); }
+      if (currentGeneration(origin)) { sending = false; updatePresence(); render(); resizeInput(); }
       else if (!tornDown) renderRetainedSends();
       save();
     }
@@ -885,6 +920,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       await new Promise(resolve => setTimeout(resolve, 3000));
       if (!currentGeneration(origin)) return;
       agentStopped = true; lastAgentCall = null; agentWaitingUntil = null; agentPresenceUntil = null; stopRequestId = null;
+      wakeStatus = null; wakeVersion++;
       status("Stop requested. The goal stays paused until you press Play.");
       revision = null; void refresh();
     } catch (error) {
@@ -893,13 +929,116 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       if (currentGeneration(origin)) { stopping = false; updatePresence(); resizeInput(); input.focus(); }
     }
   }
+  function clearSendPress() {
+    if (sendPress) clearTimeout(sendPress.timer);
+    sendPress = null;
+  }
+  function closeSendMenu(restoreFocus = false) {
+    const open = !sendMenu.hidden;
+    sendMenu.hidden = true; send.setAttribute("aria-expanded","false");
+    if (open && restoreFocus && sendMenuFocus?.isConnected) sendMenuFocus.focus({preventScroll:true});
+  }
+  function positionSendMenu() {
+    if (sendMenu.hidden) return;
+    const button = send.getBoundingClientRect(), composer = el("composer").getBoundingClientRect(), chat = el("chat").getBoundingClientRect();
+    const viewportTop = window.visualViewport?.offsetTop || 0;
+    const top = Math.max(chat.top + 4, viewportTop + 4, button.top - sendMenu.offsetHeight - 8);
+    sendMenu.style.top = `${top - composer.top}px`;
+    sendMenu.style.right = `${Math.max(4, composer.right - button.right)}px`;
+  }
+  function openSendMenu(keyboard = false) {
+    if (send.disabled || send.dataset.mode !== "send" || tornDown) return;
+    clearSendPress();
+    if (sendMenu.hidden) sendMenuFocus = scope.activeElement || document.activeElement;
+    menuTouchSelection = false;
+    sendMenu.hidden = false; send.setAttribute("aria-expanded","true");
+    const items = [...sendMenu.querySelectorAll("button")];
+    for (const item of items) item.dataset.default = String(item.dataset.mode === composerMessageMode());
+    positionSendMenu();
+    if (keyboard) (items.find(item => item.dataset.mode === composerMessageMode()) || items[0]).focus({preventScroll:true});
+  }
+  send.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    if (send.disabled || send.dataset.mode !== "send") {suppressSendClick=false;clearSendPress();return;}
+    // Keep the draft focused so a touch hold does not dismiss the keyboard.
+    event.preventDefault();
+    suppressSendClick = !sendMenu.hidden;
+    if (!sendMenu.hidden) { closeSendMenu(); return; }
+    clearSendPress();
+    sendPress = {id:event.pointerId,x:event.clientX,y:event.clientY,timer:setTimeout(() => {
+      suppressSendClick = true; openSendMenu();
+    },500)};
+  });
+  const sendPointerMove = event => {
+    if (sendPress?.id === event.pointerId && Math.hypot(event.clientX-sendPress.x,event.clientY-sendPress.y)>10) {
+      suppressSendClick = true; clearSendPress();
+    }
+  };
+  const sendPointerEnd = event => {
+    if (sendPress?.id !== event.pointerId) return;
+    clearSendPress();
+    if(event.type === "pointercancel")suppressSendClick=true;
+    else if(event.pointerType === "touch" && event.composedPath().includes(send) && !suppressSendClick) {
+      // WebKit can omit the compatibility click when pointerdown kept the
+      // keyboard focused. Activate a short tap once, then consume that click.
+      event.preventDefault();send.click();suppressSendClick=true;
+    }
+  };
+  const dismissSendMenu = event => {
+    if (!sendMenu.hidden && !event.composedPath().includes(sendMenu) && !event.composedPath().includes(send)) closeSendMenu();
+  };
+  const sendMenuEscape = event => {
+    if (event.key === "Escape" && !sendMenu.hidden) { event.preventDefault();event.stopPropagation();closeSendMenu(true); }
+  };
+  const blurSendMenu = () => { clearSendPress(); closeSendMenu(); };
+  document.addEventListener("pointermove",sendPointerMove);
+  document.addEventListener("pointerup",sendPointerEnd);
+  document.addEventListener("pointercancel",sendPointerEnd);
+  document.addEventListener("pointerdown",dismissSendMenu);
+  document.addEventListener("keydown",sendMenuEscape,true);
+  window.addEventListener("resize",positionSendMenu);
+  window.visualViewport?.addEventListener("resize",positionSendMenu);
+  window.visualViewport?.addEventListener("scroll",positionSendMenu);
+  window.addEventListener("blur",blurSendMenu);
+  send.addEventListener("contextmenu",event=>{if(!send.disabled&&send.dataset.mode==="send"){event.preventDefault();suppressSendClick=true;openSendMenu();}});
+  send.addEventListener("keydown",event=>{
+    if (["ArrowDown","ArrowUp","ContextMenu"].includes(event.key) || event.key === "F10" && event.shiftKey) {event.preventDefault();openSendMenu(true);}
+  });
+  sendMenu.addEventListener("keydown",event=>{
+    const items=[...sendMenu.querySelectorAll("button")],index=items.indexOf(scope.activeElement || document.activeElement);
+    if (["ArrowDown","ArrowUp","Home","End"].includes(event.key)) {
+      event.preventDefault(); const next=event.key==="Home"?0:event.key==="End"?items.length-1:(index+(event.key==="ArrowDown"?1:-1)+items.length)%items.length;
+      items[next].focus({preventScroll:true});
+    } else if(event.key === "Tab") closeSendMenu(true);
+  });
+  for (const item of sendMenu.querySelectorAll("button")) {
+    const choose = () => {
+      if(sendMenu.hidden||send.disabled||send.dataset.mode!=="send")return;
+      closeSendMenu();suppressSendClick=false;submitMode=item.dataset.mode;
+      try { el("composer").requestSubmit(); } finally { submitMode=null; }
+    };
+    item.addEventListener("pointerdown",event=>{menuTouchSelection=false;event.preventDefault();});
+    item.addEventListener("pointerup",event=>{
+      if(event.pointerType === "touch") {
+        const bounds=item.getBoundingClientRect();event.preventDefault();
+        if(event.clientX>=bounds.left&&event.clientX<=bounds.right&&event.clientY>=bounds.top&&event.clientY<=bounds.bottom){menuTouchSelection=true;choose();}
+      }
+    });
+    item.addEventListener("click",event=>{
+      if(menuTouchSelection) {menuTouchSelection=false;event.preventDefault();return;}
+      choose();
+    });
+  }
   send.addEventListener("click", event => {
+    if (suppressSendClick && event.detail !== 0 || !sendMenu.hidden) {event.preventDefault();suppressSendClick=false;return;}
+    suppressSendClick=false;
     if (send.dataset.mode === "stop") { event.preventDefault(); void stopAgent(); }
   });
   el("composer").addEventListener("submit", event => {
     event.preventDefault();
     if (startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || (!input.value.trim() && !attachments?.count())) return;
     if (attachments?.blocked()) {status("Wait for uploads to finish, or remove failed attachments.",true,"action",false);return;}
+    clearSendPress();closeSendMenu();
     const message = { id:crypto.randomUUID(), role:"user", message_mode:submitMode||composerMessageMode(), markdown:input.value, attachments:attachments?.consume() || [], pending:true, failed:false, created_at_ms:Date.now(), tool_call_count:totalToolCalls, chat_file:chatFile, workspace_path:workspace || null };
     input.value = ""; resizeInput(); void deliver(message); input.focus(); list.scrollTop = list.scrollHeight;
   });
@@ -924,6 +1063,16 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
   if (canCopyChat) el("copy-chat").addEventListener("click", () => { void copyWholeChat(); });
   el("refresh").addEventListener("click", () => { revision = null; void refresh(); });
   function teardown() {
+    clearSendPress();closeSendMenu();
+    document.removeEventListener("pointermove",sendPointerMove);
+    document.removeEventListener("pointerup",sendPointerEnd);
+    document.removeEventListener("pointercancel",sendPointerEnd);
+    document.removeEventListener("pointerdown",dismissSendMenu);
+    document.removeEventListener("keydown",sendMenuEscape,true);
+    window.removeEventListener("resize",positionSendMenu);
+    window.visualViewport?.removeEventListener("resize",positionSendMenu);
+    window.visualViewport?.removeEventListener("scroll",positionSendMenu);
+    window.removeEventListener("blur",blurSendMenu);
     save();
     attachments?.close();
     clearCopyFeedback();

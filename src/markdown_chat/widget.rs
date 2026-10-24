@@ -9,15 +9,19 @@ const MAX_CLEAN_TRANSCRIPT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GOAL_EVENTS_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
-struct GoalCompletionEvent {
+struct GoalEvent {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<String>,
+    #[serde(default)]
+    blocked: bool,
     markdown: String,
     offset: u64,
     created_at_ms: u64,
     tool_call_count: Option<u64>,
 }
 
-fn goal_events(chat: &ChatFile) -> Result<Vec<GoalCompletionEvent>, String> {
+fn goal_events(chat: &ChatFile) -> Result<Vec<GoalEvent>, String> {
     let path = chat.path.with_file_name("goal-events.json");
     if !path.try_exists().map_err(io_error)? {
         return Ok(Vec::new());
@@ -41,6 +45,10 @@ pub struct WidgetMessage {
     pub end: u64,
     pub created_at_ms: Option<u64>,
     pub tool_call_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_status: Option<crate::agent_automation::GoalStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_report: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<super::super::attachments::Attachment>,
 }
@@ -343,6 +351,8 @@ fn widget_message(
         end: span.end,
         created_at_ms: span.created_at_ms,
         tool_call_count: span.tool_call_count,
+        goal_status: None,
+        goal_report: None,
         attachments,
     }))
 }
@@ -685,7 +695,14 @@ impl ChatFile {
                     page.before = Some(message.start);
                     page.messages.push(message);
                 }
-                let first = page.messages.last().map_or(0, |message| message.start);
+                // An event can precede the first transcript message (including an
+                // otherwise silent goal finish). Include that boundary on the
+                // oldest page rather than dropping the report after a later send.
+                let first = if page.has_more {
+                    page.messages.last().map_or(0, |message| message.start)
+                } else {
+                    0
+                };
                 for event in goal_events(chat)?.into_iter().filter(|event| {
                     event.offset >= first
                         && event.offset <= length
@@ -699,6 +716,12 @@ impl ChatFile {
                         end: event.offset,
                         created_at_ms: Some(event.created_at_ms),
                         tool_call_count: event.tool_call_count,
+                        goal_status: Some(if event.blocked {
+                            crate::agent_automation::GoalStatus::Blocked
+                        } else {
+                            crate::agent_automation::GoalStatus::Completed
+                        }),
+                        goal_report: event.report,
                         attachments: Vec::new(),
                     });
                 }
@@ -710,41 +733,76 @@ impl ChatFile {
         .await
     }
 
-    pub async fn record_goal_completion(
+    pub async fn record_goal_finish(
         self: &Arc<Self>,
         goal: &crate::agent_automation::GoalRecord,
     ) -> Result<(), String> {
-        if goal.status != crate::agent_automation::GoalStatus::Completed {
+        use crate::agent_automation::GoalStatus;
+        if !matches!(goal.status, GoalStatus::Completed | GoalStatus::Blocked) {
             return Ok(());
         }
         let Some(created_at_ms) = goal.finished_at_ms else {
             return Ok(());
         };
-        let Some(offset) = goal.completed_chat_end else {
-            return Ok(());
-        };
-        let event = GoalCompletionEvent {
-            id: format!("goal-completed-{}-{}", goal.created_at_ms, goal.revision),
-            markdown: format!("Goal completed: {}", goal.markdown),
-            offset,
-            created_at_ms,
-            tool_call_count: goal.completed_tool_call_count,
-        };
+        let blocked = goal.status == GoalStatus::Blocked;
+        let report = if blocked {
+            &goal.blocked_reason
+        } else {
+            &goal.summary
+        }
+        .clone();
+        let goal_created_at = goal.created_at_ms;
+        let revision = goal.revision;
+        let markdown = format!(
+            "Goal {}: {}",
+            if blocked { "blocked" } else { "completed" },
+            goal.markdown
+        );
+        let offset = goal.completed_chat_end;
+        let tool_call_count = goal.completed_tool_call_count;
         self.run(move |chat| {
             chat.with_cursor(|_, file| {
+                // Older blocked receipts have no transcript boundary. Backfill them
+                // once at the current end; new finishes persist the exact boundary.
+                let offset = match offset {
+                    Some(offset) => offset,
+                    None if blocked => file.metadata().map_err(io_error)?.len(),
+                    None => return Ok(()),
+                };
+                let event = GoalEvent {
+                    id: if blocked {
+                        format!("goal-blocked-{goal_created_at}-{revision}-{created_at_ms}")
+                    } else {
+                        format!("goal-completed-{goal_created_at}-{revision}")
+                    },
+                    markdown,
+                    report,
+                    blocked,
+                    offset,
+                    created_at_ms,
+                    tool_call_count,
+                };
                 let mut events = goal_events(chat)?;
                 if let Some(saved) = events.iter_mut().find(|saved| saved.id == event.id) {
-                    if saved.tool_call_count.is_some() || event.tool_call_count.is_none() {
+                    // A polling reader may have backfilled a legacy receipt before
+                    // goal_finish publishes its report and exact counter snapshot.
+                    let mut changed = false;
+                    if saved.tool_call_count.is_none() && event.tool_call_count.is_some() {
+                        saved.tool_call_count = event.tool_call_count;
+                        changed = true;
+                    }
+                    if saved.report.is_none() && event.report.is_some() {
+                        saved.report = event.report;
+                        changed = true;
+                    }
+                    if !changed {
                         return Ok(());
                     }
-                    // A polling reader may have backfilled the terminal receipt
-                    // before goal_finish published its exact counter snapshot.
-                    saved.tool_call_count = event.tool_call_count;
                 } else {
                     events.push(event);
                 }
                 if offset > file.metadata().map_err(io_error)?.len() {
-                    return Err("Goal completion is outside this chat.".into());
+                    return Err("Goal report is outside this chat.".into());
                 }
                 let bytes = serde_json::to_vec(&events).map_err(|error| error.to_string())?;
                 if bytes.len() as u64 > MAX_GOAL_EVENTS_BYTES {
@@ -1539,11 +1597,11 @@ mod tests {
         let old_page = chat.widget_page(None, None).await.unwrap();
         let mut legacy_receipt = goal.clone();
         legacy_receipt.completed_tool_call_count = None;
-        chat.record_goal_completion(&legacy_receipt).await.unwrap();
-        chat.record_goal_completion(&goal).await.unwrap();
+        chat.record_goal_finish(&legacy_receipt).await.unwrap();
+        chat.record_goal_finish(&goal).await.unwrap();
         assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
         chat.record_agent_call(3000).await.unwrap();
-        chat.record_goal_completion(&goal).await.unwrap();
+        chat.record_goal_finish(&goal).await.unwrap();
         let reopened = Arc::new(ChatFile::new(path, true));
         let page = reopened
             .widget_page(None, Some(old_page.revision))
@@ -1569,6 +1627,50 @@ mod tests {
         assert_eq!(
             reopened.unread_snapshot().await.unwrap().messages,
             unread.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_blocker_is_backfilled_once_and_legacy_completion_stays_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("CHAT.md");
+        let chat = Arc::new(ChatFile::new(path.clone(), true));
+        chat.append("Prior progress".into()).await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let legacy = serde_json::json!([{
+            "id":"goal-completed-1-1", "markdown":"Goal completed: Old objective",
+            "offset":0, "created_at_ms":2, "tool_call_count":null
+        }]);
+        std::fs::write(
+            path.with_file_name("goal-events.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let goal = serde_json::from_value(serde_json::json!({
+            "revision":2,"markdown":"Current objective","status":"blocked", "createdAtMs":3,
+            "updatedAtMs":4,"finishedAtMs":4,"summary":null,"blockedReason":"Need device access"
+        }))
+        .unwrap();
+        chat.record_goal_finish(&goal).await.unwrap();
+        chat.append("Later progress".into()).await.unwrap();
+        let reopened = Arc::new(ChatFile::new(path, true));
+        reopened.record_goal_finish(&goal).await.unwrap();
+        let page = reopened.widget_page(None, None).await.unwrap();
+        let events = page
+            .messages
+            .iter()
+            .filter(|m| m.role == "goal")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].goal_report.is_none());
+        assert_eq!(
+            events[1].start, offset,
+            "backfill position must remain fixed"
+        );
+        assert_eq!(events[1].goal_report.as_deref(), Some("Need device access"));
+        assert_eq!(
+            events[1].goal_status,
+            Some(crate::agent_automation::GoalStatus::Blocked)
         );
     }
 

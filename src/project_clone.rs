@@ -137,7 +137,7 @@ pub fn repository_url_matches(url: &str, repository: &GitRepository) -> bool {
 }
 
 fn remote_url_matches(url: &str, repository: &GitRepository) -> bool {
-    parse_git_remote(url, false)
+    parse_git_repository(url)
         .map(|candidate| candidate.same_identity(repository))
         .unwrap_or(false)
 }
@@ -162,6 +162,7 @@ pub async fn resolve_git_project(
     access_root: &Path,
     repository: &GitRepository,
 ) -> Result<ResolvedGitProject, String> {
+    crate::project_progress::phase("Looking for an existing checkout");
     let clone_dir = canonical_clone_dir(config, access_root)?;
     let target = clone_dir.join(repository.name());
     let mut warnings = Vec::new();
@@ -184,6 +185,7 @@ pub async fn resolve_git_project(
         return Err(destination_collision(&target, repository));
     }
 
+    crate::project_progress::phase("Waiting for repository preparation");
     let _lock = acquire_clone_lock(&clone_dir, repository).await?;
 
     let (matches, discovery_warnings) =
@@ -245,10 +247,6 @@ fn looks_like_scp_remote(input: &str) -> bool {
 }
 
 fn parse_git_repository(input: &str) -> Result<GitRepository, String> {
-    parse_git_remote(input, true)
-}
-
-fn parse_git_remote(input: &str, require_dot_git: bool) -> Result<GitRepository, String> {
     if input.chars().any(char::is_control) {
         return Err("Git repository URL contains control characters".to_string());
     }
@@ -260,7 +258,7 @@ fn parse_git_remote(input: &str, require_dot_git: bool) -> Result<GitRepository,
         return parse_github_repository(input);
     }
 
-    parse_generic_git_repository(input, require_dot_git)
+    parse_generic_git_repository(input)
 }
 
 fn looks_like_github_remote(input: &str) -> bool {
@@ -338,10 +336,7 @@ fn parse_github_repository(input: &str) -> Result<GitRepository, String> {
     }
 }
 
-fn parse_generic_git_repository(
-    input: &str,
-    require_dot_git: bool,
-) -> Result<GitRepository, String> {
+fn parse_generic_git_repository(input: &str) -> Result<GitRepository, String> {
     if let Some((scheme, remainder)) = input.split_once("://") {
         let transport = match scheme.to_ascii_lowercase().as_str() {
             "https" => CloneTransport::Https,
@@ -362,7 +357,7 @@ fn parse_generic_git_repository(
             return Err("Git repository URL is missing a repository path".to_string());
         }
         let clone_url = format!("{}://{authority}/{path}", scheme.to_ascii_lowercase());
-        return generic_repository_from_parts(&remote_authority, path, clone_url, require_dot_git);
+        return generic_repository_from_parts(&remote_authority, path, clone_url);
     }
 
     let Some((authority, path)) = input.split_once(':') else {
@@ -393,12 +388,7 @@ fn parse_generic_git_repository(
         ssh_user: Some(user.to_string()),
         scp_style: true,
     };
-    generic_repository_from_parts(
-        &remote_authority,
-        path,
-        format!("{authority}:{path}"),
-        require_dot_git,
-    )
+    generic_repository_from_parts(&remote_authority, path, format!("{authority}:{path}"))
 }
 
 fn parse_generic_authority(
@@ -504,7 +494,6 @@ fn generic_repository_from_parts(
     authority: &GenericRemoteAuthority,
     path: &str,
     clone_url: String,
-    require_dot_git: bool,
 ) -> Result<GitRepository, String> {
     if path.contains('\\') {
         return Err("Git repository URL path must use forward slashes".to_string());
@@ -520,12 +509,6 @@ fn generic_repository_from_parts(
 
     let last = components.last().copied().unwrap_or_default();
     let without_dot_git = strip_dot_git(last);
-    if require_dot_git && without_dot_git.is_none() {
-        return Err(
-            "Non-GitHub repository URLs must end in .git so Codexify can distinguish repository roots from arbitrary web pages"
-                .to_string(),
-        );
-    }
     let repository_component = without_dot_git.unwrap_or(last);
     if repository_component.is_empty() {
         return Err("Git repository URL has an empty repository name".to_string());
@@ -930,6 +913,7 @@ async fn materialize_existing_repository(
     source_project_root: PathBuf,
     repository: &GitRepository,
 ) -> Result<MaterializedRepository, String> {
+    crate::project_progress::phase("Using the existing checkout");
     let checkout_commit = if repository.has_explicit_checkout() {
         let fetch_source = matching_remote_source(config, &source_project_root, repository)
             .await?
@@ -983,11 +967,35 @@ async fn clone_repository_from(
     repository: &GitRepository,
     clone_source: &str,
 ) -> Result<MaterializedRepository, String> {
+    let mut effective_clone_source = clone_source.to_string();
+    let mut effective_clone_url = repository.clone_url().to_string();
+    crate::project_progress::phase("Checking repository URL");
+    if strip_dot_git(repository.clone_url()).is_none()
+        && let Err(first_error) = probe_git_remote(config, clone_dir, clone_source).await
+    {
+        effective_clone_source.push_str(".git");
+        effective_clone_url.push_str(".git");
+        crate::project_progress::phase("Checking repository URL with .git appended");
+        probe_git_remote(config, clone_dir, &effective_clone_source)
+            .await
+            .map_err(|second_error| {
+                format!(
+                    "Could not access {} as a Git repository: original URL: {first_error}; with .git appended: {second_error}",
+                    repository.web_url()
+                )
+            })?;
+    }
+    let clone_source = effective_clone_source.as_str();
+
+    crate::project_progress::phase("Cloning repository");
     let staging = temporary_clone_path(clone_dir, repository)?;
     let temporary = staging.join("repository");
 
     let mut command = Command::new("git");
     command.args(["clone", "--no-recurse-submodules"]);
+    if crate::project_progress::active() {
+        command.arg("--progress");
+    }
     if let GitCheckout::Branch(branch) = &repository.checkout {
         command.args(["--branch", branch]);
     }
@@ -1002,7 +1010,12 @@ async fn clone_repository_from(
         .kill_on_drop(true);
     scrub_untrusted_child_env(&mut command, config);
 
-    let output = match timeout(GIT_CLONE_TIMEOUT, command.output()).await {
+    let output = match timeout(
+        GIT_CLONE_TIMEOUT,
+        crate::project_progress::command_output(&mut command),
+    )
+    .await
+    {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             let _ = fs::remove_dir_all(&staging);
@@ -1029,6 +1042,7 @@ async fn clone_repository_from(
         ));
     }
 
+    crate::project_progress::phase("Verifying repository");
     let checkout_commit =
         match prepare_cloned_checkout(config, &temporary, repository, clone_source).await {
             Ok(commit) => commit,
@@ -1038,7 +1052,7 @@ async fn clone_repository_from(
             }
         };
 
-    if clone_source != repository.clone_url() {
+    if clone_source != effective_clone_url {
         let output = match git_output(
             config,
             &temporary,
@@ -1046,7 +1060,7 @@ async fn clone_repository_from(
                 OsString::from("remote"),
                 OsString::from("set-url"),
                 OsString::from("origin"),
-                OsString::from(repository.clone_url()),
+                OsString::from(&effective_clone_url),
             ],
             GIT_INSPECTION_TIMEOUT,
         )
@@ -1092,6 +1106,7 @@ async fn clone_repository_from(
         return Err(destination_collision(target, repository));
     }
 
+    crate::project_progress::phase("Finishing repository clone");
     if let Err(error) = publish_clone_no_replace(&temporary, target) {
         let _ = fs::remove_dir_all(&staging);
         if let Some(project_root) =
@@ -1134,6 +1149,27 @@ async fn clone_repository_from(
         source_matches_checkout: true,
         cloned: true,
     })
+}
+
+async fn probe_git_remote(config: &AppConfig, cwd: &Path, url: &str) -> Result<(), String> {
+    let output = git_output(
+        config,
+        cwd,
+        &[
+            OsString::from("ls-remote"),
+            OsString::from("--quiet"),
+            OsString::from("--"),
+            OsString::from(url),
+            OsString::from("HEAD"),
+        ],
+        GIT_INSPECTION_TIMEOUT,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(bounded_output(&output))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1267,6 +1303,7 @@ async fn fetch_checkout_commit(
     repository: &GitRepository,
     fetch_source: &str,
 ) -> Result<String, String> {
+    crate::project_progress::phase("Fetching the requested revision");
     let source_spec = match &repository.checkout {
         GitCheckout::DefaultBranch => {
             return Err("Internal error: default-branch selection has no explicit ref".to_string());
@@ -1455,8 +1492,12 @@ async fn git_output(
     duration: Duration,
 ) -> Result<Output, String> {
     let mut command = Command::new("git");
+    if crate::project_progress::active() && args.first().is_some_and(|arg| arg == "fetch") {
+        command.arg("fetch").arg("--progress").args(&args[1..]);
+    } else {
+        command.args(args);
+    }
     command
-        .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
@@ -1464,16 +1505,19 @@ async fn git_output(
         .kill_on_drop(true);
     scrub_untrusted_child_env(&mut command, config);
 
-    timeout(duration, command.output())
-        .await
-        .map_err(|_| {
-            format!(
-                "Git command in {} timed out after {} seconds",
-                cwd.display(),
-                duration.as_secs()
-            )
-        })?
-        .map_err(|error| format!("Could not run Git in {}: {error}", cwd.display()))
+    timeout(
+        duration,
+        crate::project_progress::command_output(&mut command),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Git command in {} timed out after {} seconds",
+            cwd.display(),
+            duration.as_secs()
+        )
+    })?
+    .map_err(|error| format!("Could not run Git in {}: {error}", cwd.display()))
 }
 
 fn bounded_output(output: &Output) -> String {
@@ -1809,12 +1853,33 @@ mod tests {
             "https://gitlab.com/acme/platform/widget",
             &https
         ));
+        for url in [
+            "https://gitlab.com/acme/platform/widget",
+            "ssh://git@gitlab.com/acme/platform/widget",
+            "git@gitlab.com:acme/platform/widget",
+        ] {
+            let ProjectReference::Git(repository) = ProjectReference::parse(url).unwrap() else {
+                panic!("expected Git reference");
+            };
+            assert!(https.same_identity(&repository), "{url}");
+            assert_eq!(repository.clone_url(), url);
+        }
+
+        let url = "https://gitee.com/cnkker/photopea.com";
+        let ProjectReference::Git(repository) = ProjectReference::parse(url).unwrap() else {
+            panic!("expected Git reference");
+        };
+        assert_eq!(repository.name(), "photopea.com");
+        assert_eq!(repository.clone_url(), url);
+        assert!(repository_url_matches(
+            "https://gitee.com/cnkker/photopea.com.git",
+            &repository
+        ));
     }
 
     #[test]
     fn rejects_unsafe_transports_credentials_and_unsupported_pages() {
         for input in [
-            "https://gitlab.com/openai/codex",
             "https://token@gitlab.com/openai/codex.git",
             "http://gitlab.com/openai/codex.git",
             "git://gitlab.com/openai/codex.git",
@@ -1914,6 +1979,173 @@ mod tests {
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>(),
             [std::ffi::OsString::from("widget")]
+        );
+    }
+
+    #[tokio::test]
+    async fn probes_suffixless_git_urls_and_accepts_empty_repositories() {
+        for empty in [false, true] {
+            let root = TempDir::new().unwrap();
+            let clone_dir = root.path().join("projects");
+            let source = root.path().join("source");
+            fs::create_dir_all(&clone_dir).unwrap();
+            initialize_repository(&source);
+            if !empty {
+                commit_file(&source, "README.md", "fixture", "fixture");
+            }
+            let repository =
+                parse_git_repository("https://git.example/group/photopea.com").unwrap();
+            let config = default_config(clone_dir.clone());
+            let target = clone_dir.join(repository.name());
+
+            let cloned = clone_repository_from(
+                &config,
+                &fs::canonicalize(&clone_dir).unwrap(),
+                &fs::canonicalize(&clone_dir).unwrap(),
+                &target,
+                &repository,
+                source.to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+
+            assert!(cloned.cloned);
+            assert_eq!(
+                cloned.source_project_root,
+                fs::canonicalize(&target).unwrap()
+            );
+            assert_eq!(
+                git_text(&target, &["remote", "get-url", "origin"]),
+                repository.clone_url()
+            );
+            assert_eq!(target.join("README.md").exists(), !empty);
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_suffixless_probe_with_dot_git_and_keeps_the_working_remote() {
+        let root = TempDir::new().unwrap();
+        let clone_dir = root.path().join("projects");
+        let source = root.path().join("source");
+        fs::create_dir_all(&clone_dir).unwrap();
+        initialize_repository(&source);
+        commit_file(&source, "README.md", "fallback fixture", "fixture");
+        git(&source, &["update-server-info"]);
+        let git_dir = source.join(".git");
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let git_dir = git_dir.clone();
+            async move {
+                let Some(relative) = uri.path().strip_prefix("/source.git/") else {
+                    return (axum::http::StatusCode::NOT_FOUND, Vec::new());
+                };
+                match fs::read(git_dir.join(relative)) {
+                    Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                    Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clone_source = format!("http://{}/source", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let repository = parse_git_repository("https://git.example/group/photopea.com").unwrap();
+        let config = default_config(clone_dir.clone());
+        let target = clone_dir.join(repository.name());
+
+        let (progress, updates) = tokio::sync::watch::channel(
+            crate::project_progress::Progress::new("Preparing repository"),
+        );
+        let cloned = crate::project_progress::scope(
+            progress,
+            clone_repository_from(
+                &config,
+                &fs::canonicalize(&clone_dir).unwrap(),
+                &fs::canonicalize(&clone_dir).unwrap(),
+                &target,
+                &repository,
+                &clone_source,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(cloned.cloned);
+        assert_eq!(updates.borrow().message, "Finishing repository clone");
+        assert_eq!(
+            fs::read_to_string(target.join("README.md")).unwrap(),
+            "fallback fixture"
+        );
+        assert_eq!(
+            git_text(&target, &["remote", "get-url", "origin"]),
+            "https://git.example/group/photopea.com.git"
+        );
+        assert!(
+            project_matches_repository(&config, &target, &repository)
+                .await
+                .unwrap()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_suffixless_probe_does_not_create_a_clone() {
+        let root = TempDir::new().unwrap();
+        let clone_dir = root.path().join("projects");
+        let source = root.path().join("not-a-repository");
+        fs::create_dir_all(&clone_dir).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let repository = parse_git_repository("https://git.example/group/widget").unwrap();
+        let config = default_config(clone_dir.clone());
+
+        let error = clone_repository_from(
+            &config,
+            &fs::canonicalize(&clone_dir).unwrap(),
+            &fs::canonicalize(&clone_dir).unwrap(),
+            &clone_dir.join(repository.name()),
+            &repository,
+            source.to_str().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.contains("Could not access https://git.example/group/widget as a Git repository"),
+            "{error}"
+        );
+        assert!(error.contains("original URL:"), "{error}");
+        assert!(error.contains("with .git appended:"), "{error}");
+        assert_eq!(fs::read_dir(&clone_dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reuses_suffixless_repository_without_a_network_probe() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("widget");
+        initialize_repository(&source);
+        git(
+            &source,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.example/group/widget.git",
+            ],
+        );
+        let repository = parse_git_repository("https://git.example/group/widget").unwrap();
+        let mut config = default_config(root.path().to_path_buf());
+        config.project_catalog.codex_config.enabled = false;
+
+        let resolved = resolve_git_project(
+            &config,
+            &fs::canonicalize(root.path()).unwrap(),
+            &repository,
+        )
+        .await
+        .unwrap();
+
+        assert!(!resolved.cloned);
+        assert_eq!(
+            resolved.source_project_root,
+            fs::canonicalize(&source).unwrap()
         );
     }
 

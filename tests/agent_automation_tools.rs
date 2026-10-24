@@ -133,7 +133,7 @@ async fn goal_finish_notifies_once_and_filters_blocked_and_completed_independent
         f.automation
             .run_goal(&f.task, goal.revision, now_ms())
             .unwrap();
-        let mut args = json!({"expectedRevision":goal.revision,"status":terminal});
+        let mut args = json!({"expectedRevision":goal.revision,"status":terminal,"nextSteps":"Review the report and provide any needed input"});
         args[if terminal == "blocked" {
             "reason"
         } else {
@@ -177,7 +177,7 @@ async fn goal_finish_notifies_once_and_filters_blocked_and_completed_independent
         f.automation
             .run_goal(&f.task, goal.revision, now_ms())
             .unwrap();
-        let mut args = json!({"expectedRevision":goal.revision,"status":terminal});
+        let mut args = json!({"expectedRevision":goal.revision,"status":terminal,"nextSteps":"Review the report and provide any needed input"});
         args[if terminal == "blocked" {
             "reason"
         } else {
@@ -598,7 +598,8 @@ async fn goal_read_and_finish_use_the_exact_stable_task_revision() {
     let finish_args = json!({
         "expectedRevision": goal.revision,
         "status": "completed",
-        "summary": "Implemented and verified"
+        "summary": "Implemented and verified",
+        "nextSteps": "Deploy after review"
     });
     let finished = GoalTool::Finish
         .call_with_context(
@@ -610,7 +611,29 @@ async fn goal_read_and_finish_use_the_exact_stable_task_revision() {
         .await;
     assert!(!finished.is_error, "{}", finished.joined_text());
     assert_eq!(payload(&finished)["status"], "completed");
-    assert_eq!(payload(&finished)["summary"], "Implemented and verified");
+    assert!(
+        payload(&finished)["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Implemented and verified")
+    );
+    assert!(
+        payload(&finished)["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Deploy after review")
+    );
+    assert_eq!(payload(&finished)["assistant_turn_may_end"], false);
+    assert_eq!(payload(&finished)["required_next_action"], "turn_completed");
+    assert!(
+        finished
+            .joined_text()
+            .contains("Required next call: turn_completed")
+    );
+    assert!(jsonschema::is_valid(
+        &GoalTool::Finish.output_schema().unwrap(),
+        payload(&finished)
+    ));
     assert_eq!(payload(&finished)["terminal"], true);
 
     let replay = GoalTool::Finish
@@ -626,7 +649,7 @@ async fn goal_read_and_finish_use_the_exact_stable_task_revision() {
 
     let stale = GoalTool::Finish
         .call_with_context(
-            json!({"expectedRevision":goal.revision + 1,"status":"completed"}),
+            json!({"expectedRevision":goal.revision + 1,"status":"completed","summary":"Done","nextSteps":"None","nextSteps":"None"}),
             &fixture.config,
             &fixture.session,
             &fixture.context,
@@ -658,8 +681,8 @@ async fn blocked_goal_requires_a_concrete_reason() {
         .unwrap();
 
     for args in [
-        json!({"expectedRevision":goal.revision,"status":"blocked"}),
-        json!({"expectedRevision":goal.revision,"status":"blocked","reason":"   "}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","nextSteps":"Connect the device"}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","reason":"   ","nextSteps":"Connect the device"}),
     ] {
         let result = GoalTool::Finish
             .call_with_context(args, &fixture.config, &fixture.session, &fixture.context)
@@ -673,7 +696,8 @@ async fn blocked_goal_requires_a_concrete_reason() {
             json!({
                 "expectedRevision":goal.revision,
                 "status":"blocked",
-                "reason":"The required device is not connected"
+                "reason":"The required device is not connected",
+                "nextSteps":"Connect the device and confirm it is reachable"
             }),
             &fixture.config,
             &fixture.session,
@@ -682,11 +706,141 @@ async fn blocked_goal_requires_a_concrete_reason() {
         .await;
     assert!(!blocked.is_error, "{}", blocked.joined_text());
     assert_eq!(payload(&blocked)["status"], "blocked");
-    assert_eq!(
-        payload(&blocked)["blockedReason"],
-        "The required device is not connected"
+    let report = payload(&blocked)["blockedReason"].as_str().unwrap();
+    assert!(report.contains("The required device is not connected"));
+    assert!(report.contains("Connect the device and confirm it is reachable"));
+    assert_eq!(payload(&blocked)["assistant_turn_may_end"], false);
+    assert_eq!(payload(&blocked)["required_next_action"], "chat_await");
+    assert!(
+        blocked
+            .joined_text()
+            .contains("Required next call: chat_await")
     );
+    assert!(jsonschema::is_valid(
+        &GoalTool::Finish.output_schema().unwrap(),
+        payload(&blocked)
+    ));
     assert_eq!(payload(&blocked)["terminal"], true);
+}
+
+#[tokio::test]
+async fn goal_finish_requires_complete_reports_before_changing_state_and_keeps_them_inline() {
+    let f = fixture("goal-reports");
+    let chat = f
+        .context
+        .markdown_chat
+        .chat(&f.config, Some(&f.task), &f.session)
+        .unwrap();
+    chat.ensure().await.unwrap();
+    chat.record_agent_call(now_ms()).await.unwrap();
+    chat.append_user("pending-report".into(), "Keep this unread".into())
+        .await
+        .unwrap();
+    let unread = chat.unread_snapshot().await.unwrap();
+    let goal = f
+        .automation
+        .set_goal(&f.task, "Verify the deployment", now_ms())
+        .unwrap();
+    f.automation
+        .run_goal(&f.task, goal.revision, now_ms())
+        .unwrap();
+    let schema = GoalTool::Finish.input_schema();
+    for args in [
+        json!({"expectedRevision":goal.revision,"status":"completed","nextSteps":"Review"}),
+        json!({"expectedRevision":goal.revision,"status":"completed","summary":"Done"}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","reason":"Device offline"}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","nextSteps":"Connect device"}),
+        json!({"expectedRevision":goal.revision,"status":"completed","summary":"   ","nextSteps":"Review"}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","reason":"Device offline","nextSteps":"   "}),
+        json!({"expectedRevision":goal.revision,"status":"completed","summary":"x".repeat(4096),"nextSteps":"Review"}),
+        json!({"expectedRevision":goal.revision,"status":"blocked","reason":"x".repeat(4096),"nextSteps":"Connect device"}),
+        json!({"expectedRevision":goal.revision,"status":"completed","summary":"Done","reason":"Wrong field","nextSteps":"Review"}),
+    ] {
+        let result = GoalTool::Finish
+            .call_with_context(args, &f.config, &f.session, &f.context)
+            .await;
+        assert!(result.is_error, "invalid report was accepted");
+        assert_eq!(
+            f.automation.load(&f.task).unwrap().goal.unwrap().status,
+            GoalStatus::Active
+        );
+        assert!(
+            !chat
+                .widget_page(None, None)
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.role == "goal")
+        );
+    }
+    for (outcome, field, detail, next) in [
+        (
+            "blocked",
+            "reason",
+            "Device is offline",
+            "Reconnect the device",
+        ),
+        (
+            "blocked",
+            "reason",
+            "Need a test account",
+            "Supply a test account",
+        ),
+        (
+            "completed",
+            "summary",
+            "Deployed and passed all checks",
+            "None; deployment is ready",
+        ),
+    ] {
+        // A resumed revision can block again; each distinct finish stays visible.
+        f.automation
+            .run_goal(&f.task, goal.revision, now_ms())
+            .unwrap();
+        let mut args = json!({"expectedRevision":goal.revision,"status":outcome,"nextSteps":next});
+        args[field] = json!(detail);
+        assert!(jsonschema::is_valid(&schema, &args));
+        let result = GoalTool::Finish
+            .call_with_context(args.clone(), &f.config, &f.session, &f.context)
+            .await;
+        assert!(!result.is_error, "{}", result.joined_text());
+        assert_eq!(payload(&result)["assistant_turn_may_end"], false);
+        let retry = GoalTool::Finish
+            .call_with_context(args, &f.config, &f.session, &f.context)
+            .await;
+        assert!(!retry.is_error, "{}", retry.joined_text());
+        assert_eq!(payload(&result), payload(&retry));
+        assert_eq!(chat.unread_snapshot().await.unwrap(), unread);
+        // Guarantee a distinct transition timestamp without relying on millisecond timing.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let reopened = codexify::markdown_chat::MarkdownChatStore::default()
+        .chat(&f.config, Some(&f.task), &f.session)
+        .unwrap();
+    let page = reopened.widget_page(None, None).await.unwrap();
+    let events = page
+        .messages
+        .iter()
+        .filter(|m| m.role == "goal")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 3, "retry receipts must not duplicate reports");
+    for (event, text, next) in [
+        (events[0], "Device is offline", "Reconnect the device"),
+        (events[1], "Need a test account", "Supply a test account"),
+        (
+            events[2],
+            "Deployed and passed all checks",
+            "None; deployment is ready",
+        ),
+    ] {
+        let report = event.goal_report.as_deref().unwrap();
+        assert!(report.contains(text) && report.contains(next));
+        assert_eq!(event.start, unread.end);
+        assert_eq!(event.tool_call_count, Some(1));
+    }
+    assert_eq!(events[0].goal_status, Some(GoalStatus::Blocked));
+    assert_eq!(events[2].goal_status, Some(GoalStatus::Completed));
 }
 
 #[tokio::test]
@@ -999,7 +1153,7 @@ async fn completed_goal_releases_one_private_message_and_blocked_goal_releases_n
     }
     let blocked = GoalTool::Finish
         .call_with_context(
-            json!({"expectedRevision":goal.revision,"status":"blocked","reason":"Need input"}),
+            json!({"expectedRevision":goal.revision,"status":"blocked","reason":"Need input","nextSteps":"Provide the missing input"}),
             &f.config,
             &f.session,
             &f.context,
@@ -1013,7 +1167,7 @@ async fn completed_goal_releases_one_private_message_and_blocked_goal_releases_n
         .unwrap();
     let finished = GoalTool::Finish
         .call_with_context(
-            json!({"expectedRevision":goal.revision,"status":"completed","summary":"Done"}),
+            json!({"expectedRevision":goal.revision,"status":"completed","summary":"Done","nextSteps":"None"}),
             &f.config,
             &f.session,
             &f.context,
@@ -1021,6 +1175,8 @@ async fn completed_goal_releases_one_private_message_and_blocked_goal_releases_n
         .await;
     assert!(!finished.is_error, "{}", finished.joined_text());
     assert_eq!(payload(&finished)["terminal"], false);
+    assert_eq!(payload(&finished)["required_next_action"], "chat_read");
+    assert_eq!(payload(&finished)["assistant_turn_may_end"], false);
     assert!(
         finished
             .new_chat_message_from_user

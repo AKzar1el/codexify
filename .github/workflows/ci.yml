@@ -155,7 +155,7 @@ jobs:
         run: node --test scripts/test-message-queue.mjs scripts/test-connector-name.mjs
 
       - name: Test settings, update progress, and startup readiness
-        run: node --test --test-concurrency=1 scripts/test-global-settings.mjs scripts/test-update-progress.mjs
+        run: node --test --test-concurrency=1 scripts/test-global-settings.mjs scripts/test-update-progress.mjs scripts/test-new-chat-progress.mjs scripts/test-chat-wakeup.mjs
 
       - name: Test usage analytics dashboard
         run: node --test --test-concurrency=1 scripts/test-usage-analytics.mjs scripts/test-analytics-share.mjs scripts/test-statistics-extras.mjs

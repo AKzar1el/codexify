@@ -127,6 +127,7 @@ pub async fn create_managed_worktree_at(
     source_project_root: &Path,
     requested_commit: Option<&str>,
 ) -> Result<ManagedWorktree, String> {
+    crate::project_progress::phase("Preparing worktree");
     let source_project_root = fs::canonicalize(source_project_root).map_err(|error| {
         format!(
             "Could not resolve project root {} before creating a worktree: {error}",
@@ -169,10 +170,10 @@ pub async fn create_managed_worktree_at(
     let filter_overrides = safe_attribute_filter_overrides(config, &source_git_root).await?;
 
     let creation = async {
+        crate::project_progress::phase("Creating worktree");
         let mut args = filter_overrides;
+        args.extend([OsString::from("worktree"), OsString::from("add")]);
         args.extend([
-            OsString::from("worktree"),
-            OsString::from("add"),
             OsString::from("--detach"),
             worktree_git_root.as_os_str().to_owned(),
             OsString::from(starting_commit),
@@ -212,6 +213,7 @@ pub async fn create_managed_worktree_at(
             &worktrees_root,
         )
         .await?;
+        crate::project_progress::phase("Finishing worktree");
         fs::create_dir_all(&project_root).map_err(|error| {
             format!(
                 "Could not create selected workspace directory {} in the worktree: {error}",
@@ -231,6 +233,7 @@ pub async fn create_managed_worktree_at(
                 prepare_local_environment(config, &source_git_root, &worktree_git_root, &shard_root)
                     .await?
         {
+            crate::project_progress::phase("Running project setup");
             run_setup_script(
                 config,
                 &environment_path,
@@ -714,6 +717,7 @@ async fn refresh_upstream(
     }
 
     let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    crate::project_progress::phase("Updating repository before creating worktree");
     let env = [
         (OsString::from("GIT_CONFIG"), OsString::from(null_config)),
         (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
@@ -842,6 +846,7 @@ async fn copy_ignored_agent_overrides(
         paths,
         "ignored AGENTS.override.md",
     )
+    .await
 }
 
 async fn copy_worktree_includes(
@@ -906,13 +911,38 @@ async fn copy_worktree_includes(
         selected,
         ".worktreeinclude",
     )
+    .await
 }
 
-fn copy_relative_files(
+async fn copy_relative_files(
     source_git_root: &Path,
     worktree_git_root: &Path,
     worktrees_root: &Path,
     paths: impl IntoIterator<Item = PathBuf>,
+    label: &str,
+) -> Result<(), String> {
+    let source_git_root = source_git_root.to_owned();
+    let worktree_git_root = worktree_git_root.to_owned();
+    let worktrees_root = worktrees_root.to_owned();
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let label = label.to_owned();
+    crate::project_progress::blocking(move || {
+        copy_relative_files_inner(
+            &source_git_root,
+            &worktree_git_root,
+            &worktrees_root,
+            paths,
+            &label,
+        )
+    })
+    .await?
+}
+
+fn copy_relative_files_inner(
+    source_git_root: &Path,
+    worktree_git_root: &Path,
+    worktrees_root: &Path,
+    paths: Vec<PathBuf>,
     label: &str,
 ) -> Result<(), String> {
     let excluded_managed_root = worktrees_root
@@ -920,7 +950,8 @@ fn copy_relative_files(
         .ok()
         .map(Path::to_path_buf);
 
-    for relative in paths {
+    let count = paths.len();
+    for (index, relative) in paths.into_iter().enumerate() {
         validate_relative_git_path(&relative, label)?;
         if excluded_managed_root
             .as_ref()
@@ -930,6 +961,11 @@ fn copy_relative_files(
         }
         let source = source_git_root.join(&relative);
         let destination = worktree_git_root.join(&relative);
+        crate::project_progress::phase(format!(
+            "Copying file {} of {count}: {}",
+            index + 1,
+            relative.display()
+        ));
         copy_regular_file(&source, &destination, worktree_git_root, label)?;
     }
     Ok(())
@@ -1000,7 +1036,7 @@ fn copy_regular_file(
             ));
         }
     };
-    std::io::copy(&mut input, &mut output).map_err(|error| {
+    crate::project_progress::copy(&mut input, &mut output, metadata.len()).map_err(|error| {
         format!(
             "Could not copy {} to {}: {error}",
             source.display(),
@@ -1074,6 +1110,7 @@ async fn prepare_local_environment(
     worktree_git_root: &Path,
     shard_root: &Path,
 ) -> Result<Option<PathBuf>, String> {
+    crate::project_progress::phase("Preparing project environment");
     let Some(configured) = git_config_value(config, source_git_root, LOCAL_ENVIRONMENT_CONFIG_KEY)
         .await?
         .filter(|value| value != NO_LOCAL_ENVIRONMENT)
@@ -1131,12 +1168,14 @@ async fn prepare_local_environment(
             .create_new(true)
             .open(&target)
             .map_err(|error| format!("Could not copy {}: {error}", source.display()))?;
-        std::io::copy(&mut input, &mut output).map_err(|error| {
-            format!(
-                "Could not copy selected Codex environment {}: {error}",
-                source.display()
-            )
-        })?;
+        crate::project_progress::copy(&mut input, &mut output, metadata.len()).map_err(
+            |error| {
+                format!(
+                    "Could not copy selected Codex environment {}: {error}",
+                    source.display()
+                )
+            },
+        )?;
         target
     };
 
@@ -1436,16 +1475,19 @@ async fn git_output(
         .envs(env.iter().cloned())
         .kill_on_drop(true);
     scrub_untrusted_child_env(&mut command, config);
-    timeout(duration, command.output())
-        .await
-        .map_err(|_| {
-            format!(
-                "Git command in {} timed out after {} seconds",
-                cwd.display(),
-                duration.as_secs()
-            )
-        })?
-        .map_err(|error| format!("Could not run Git in {}: {error}", cwd.display()))
+    timeout(
+        duration,
+        crate::project_progress::command_output(&mut command),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Git command in {} timed out after {} seconds",
+            cwd.display(),
+            duration.as_secs()
+        )
+    })?
+    .map_err(|error| format!("Could not run Git in {}: {error}", cwd.display()))
 }
 
 fn bounded_output(output: &Output) -> String {

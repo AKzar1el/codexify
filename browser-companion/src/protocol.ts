@@ -164,9 +164,9 @@ function unreadClause(messages: readonly CompanionUnreadMessage[]): string {
 
 const goalClause = [
   "This task also has an active Codexify goal. Call `goal_read` for the current",
-  "revision. If it is complete, call `goal_finish` with status `completed`. If work",
+  "revision. If it is complete, call `goal_finish` with status `completed`, a summary of work/results/verification, and nextSteps (explicitly none if appropriate). If work",
   "cannot proceed, call `goal_finish` with status `blocked` and explain the concrete",
-  "blocker. Otherwise continue working toward the goal. Do not request a separate",
+  "blocker in reason and the exact action/input/change needed in nextSteps. Both reports appear inline. After completed call `turn_completed`; after blocked call `chat_await`. Repeat waits on timeout/cancellation without input; never end the assistant turn or write a normal final answer merely because of elapsed time. Otherwise continue working toward the goal. Do not request a separate",
   "turn merely to evaluate goal status.",
 ].join(" ");
 

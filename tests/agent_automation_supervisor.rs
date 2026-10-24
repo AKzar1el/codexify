@@ -1211,6 +1211,86 @@ async fn an_online_message_read_after_queueing_is_not_sent_to_chatgpt() {
 }
 
 #[tokio::test]
+async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_steering() {
+    use codexify::agent_automation::{AutomationActionKind, OwnerGoalCommand};
+    let f = fixture().await;
+    let goal = f
+        .store
+        .apply_owner_goal_command(
+            &f.task,
+            "blocked-queue-goal",
+            OwnerGoalCommand::Set {
+                markdown: "Continue the project".into(),
+            },
+            1000,
+        )
+        .unwrap()
+        .goal
+        .unwrap();
+    f.store
+        .finish_goal(
+            &f.task,
+            goal.revision,
+            GoalFinish::Blocked {
+                reason: "Waiting for new user instructions".into(),
+            },
+            1001,
+        )
+        .unwrap();
+    f.chat
+        .queue_user_message(
+            "first".into(),
+            "New instructions for the blocked goal".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    f.chat
+        .queue_user_message("second".into(), "A separate later task".into(), vec![])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if f.chat.queued_messages().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.chat.queued_messages().await.unwrap()[0].id, "second");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    f.supervisor.scan_once(now).await.unwrap();
+    assert_eq!(
+        f.supervisor.next_queued_kind().await,
+        Some(AutomationActionKind::OfflineChat)
+    );
+    f.supervisor.run_next(now + 1).await.unwrap().unwrap();
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1);
+    let executions = f.executor.executions.lock().unwrap().clone();
+    let ActionPrompt::OfflineChat { messages, .. } = &executions[0].request.prompt else {
+        panic!("expected a chat message wakeup")
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "first");
+    assert_eq!(
+        f.store.load(&f.task).unwrap().goal.unwrap().status,
+        GoalStatus::Blocked
+    );
+    f.supervisor.scan_once(now + 2).await.unwrap();
+    assert_eq!(
+        f.supervisor.queued_count().await,
+        0,
+        "accepted delivery must not be replayed"
+    );
+    assert_eq!(f.chat.queued_messages().await.unwrap()[0].id, "second");
+}
+
+#[tokio::test]
 async fn offline_unread_messages_enqueue_without_a_goal_and_remain_unread() {
     let fixture = fixture().await;
     fixture.chat.record_agent_call(1_000).await.unwrap();

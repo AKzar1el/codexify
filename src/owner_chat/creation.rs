@@ -217,6 +217,80 @@ fn selected_root(selection: WorkspaceSelection) -> PathBuf {
     }
 }
 
+pub(super) async fn create_chat_response(
+    State(state): State<OwnerState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CreateBody>,
+) -> Response {
+    if headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/x-ndjson")
+    {
+        return create_chat(State(state), Json(body)).await.into_response();
+    }
+    // Keep the normal precondition response so the owner UI can request setup.
+    if let Err(error) = require_connector_name(&state.config) {
+        return error.into_response();
+    }
+    if let Err(error) = creation_identity(&state.config, &body.request_id) {
+        return error.into_response();
+    }
+    stream_creation(create_chat(State(state), Json(body)))
+}
+
+fn stream_creation(
+    operation: impl std::future::Future<Output = ApiResult> + Send + 'static,
+) -> Response {
+    use tokio::io::AsyncWriteExt;
+    let (sender, mut progress) = tokio::sync::watch::channel(
+        crate::project_progress::Progress::new("Waiting to prepare workspace"),
+    );
+    let (reader, mut writer) = tokio::io::duplex(16 * 1024);
+    let mut operation = tokio::spawn(crate::project_progress::scope(sender, operation));
+    tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        let mut observing = true;
+        loop {
+            let (event, finished) = tokio::select! {
+                result = &mut operation => {
+                    let event = match result {
+                        Ok(Ok(Json(result))) => json!({"type":"result","result":result}),
+                        Ok(Err((code, message))) => json!({"type":"error","code":code.as_u16(),"message":message}),
+                        Err(_) => json!({"type":"error","message":"Workspace preparation stopped unexpectedly. Retry to check the same request."}),
+                    };
+                    (event, true)
+                },
+                changed = progress.changed(), if observing => {
+                    if changed.is_err() { observing = false; continue }
+                    let value = progress.borrow_and_update().clone();
+                    (json!({"type":"progress","progress":value}), false)
+                },
+                _ = heartbeat.tick() => (json!({"type":"heartbeat"}), false),
+            };
+            let mut bytes = serde_json::to_vec(&event).expect("serializable creation progress");
+            bytes.push(b'\n');
+            if writer.write_all(&bytes).await.is_err() || finished {
+                break;
+            }
+        }
+        // Dropping the JoinHandle leaves preparation running if the browser
+        // disconnects; retrying the same request retains the existing identity.
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store, no-transform"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response()
+}
+
 pub(super) async fn create_chat(
     State(state): State<OwnerState>,
     Json(body): Json<CreateBody>,
@@ -228,7 +302,9 @@ pub(super) async fn create_chat(
         ));
     }
     let task = creation_identity(&state.config, &body.request_id)?;
+    crate::project_progress::phase("Waiting for other workspace preparation");
     let _guard = state.creation_lock.lock().await;
+    crate::project_progress::phase("Checking ChatGPT model selection");
     // Model discovery for New chat must be performed on its actual ChatGPT destination.
     let client = companion_client(&state)?;
     let health = client
@@ -268,6 +344,7 @@ pub(super) async fn create_chat(
             .map_err(internal_error)?;
     }
     let config = selection_config(&state.config, body.create_worktree);
+    crate::project_progress::phase("Preparing workspace");
     let root = if let Some(worktree) = &body.worktree_path {
         if body.without_project.is_some() || body.resume_path.is_some() {
             return Err(internal_error(
@@ -323,6 +400,7 @@ pub(super) async fn create_chat(
         }
     };
     let mut effective = state.config.as_ref().clone();
+    crate::project_progress::phase("Creating local chat");
     effective.work_dir = root.clone();
     let chat = state
         .chats
@@ -339,6 +417,7 @@ pub(super) async fn create_chat(
         .map_err(internal_error)?;
     let previous = store.load(&task).map_err(internal_error)?;
     if previous.action.id.is_none() {
+        crate::project_progress::phase("Queuing the new ChatGPT conversation");
         queue_creation(
             &state,
             &task,
@@ -609,6 +688,183 @@ mod tests {
             effort: "adaptive-choice".into(),
             catalog_revision: "creation-catalog".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn creation_progress_streams_before_completion_and_preserves_the_result() {
+        let (advance, wait) = tokio::sync::oneshot::channel::<()>();
+        let wait = Arc::new(Mutex::new(Some(wait)));
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let wait = wait.lock().unwrap().take().unwrap();
+                async move {
+                    stream_creation(async move {
+                        crate::project_progress::phase("Cloning repository");
+                        crate::project_progress::detail(
+                            "Receiving objects: 42% (42/100)",
+                            Some(42),
+                        );
+                        wait.await.unwrap();
+                        Ok(Json(json!({"id":"created-chat","queued":true})))
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut response = crate::tls::client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&bytes).contains("Receiving objects") {
+                bytes.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("created-chat"));
+        advance.send(()).unwrap();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            bytes.extend_from_slice(&chunk);
+        }
+        let events = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["progress"]["percent"] == 42)
+        );
+        assert_eq!(
+            events.last().unwrap()["result"],
+            json!({"id":"created-chat","queued":true})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streamed_creation_errors_are_terminal_and_keep_authentication_preconditions() {
+        let response = stream_creation(async {
+            Err((
+                StatusCode::CONFLICT,
+                "Clone destination already exists".into(),
+            ))
+        });
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let events = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.last().unwrap()["type"], "error");
+        assert_eq!(
+            events.last().unwrap()["message"],
+            "Clone destination already exists"
+        );
+
+        let (_temp, mut state, _, server) = fixture().await;
+        Arc::make_mut(&mut state.config)
+            .markdown_chat
+            .automation
+            .connector_name
+            .clear();
+        let headers = axum::http::HeaderMap::from_iter([(
+            header::ACCEPT,
+            "application/x-ndjson".parse().unwrap(),
+        )]);
+        let response = create_chat_response(
+            State(state),
+            headers,
+            Json(body("missing-connector-stream", true)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streamed_creation_builds_a_worktree_and_copies_included_files() {
+        let (temp, mut state, _, server) = fixture().await;
+        Arc::make_mut(&mut state.config).worktrees.root = temp.path().join("worktrees");
+        let source = state.config.work_dir.join("repo");
+        std::fs::write(source.join(".gitignore"), "*.bin\n").unwrap();
+        std::fs::write(source.join(".worktreeinclude"), "*.bin\n").unwrap();
+        std::fs::write(source.join("cache.bin"), vec![7; 600_000]).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", ".gitignore", ".worktreeinclude"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&source)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let _ = prepare_chat(State(state.clone()), Json(Default::default()))
+            .await
+            .unwrap();
+        let mut request = body("streamed-worktree", false);
+        request.create_worktree = Some(true);
+        let headers = axum::http::HeaderMap::from_iter([(
+            header::ACCEPT,
+            "application/x-ndjson".parse().unwrap(),
+        )]);
+        let response = create_chat_response(State(state.clone()), headers, Json(request)).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let events = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.last().unwrap()["type"], "result", "{events:?}");
+        assert!(events.iter().any(|event| event["type"] == "progress"));
+        let task = creation_identity(&state.config, "streamed-worktree").unwrap();
+        let selected = state
+            .project_bindings
+            .selected_project_root(&state.config, &task)
+            .unwrap()
+            .unwrap();
+        assert_ne!(selected, source);
+        assert_eq!(
+            std::fs::read(selected.join("cache.bin")).unwrap(),
+            vec![7; 600_000]
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -893,6 +1149,103 @@ mod tests {
                     )
                     .is_err()
             );
+
+            // Owner status reads must show the same durable wakeup phase in
+            // the chat header and sidebar without launching browser work.
+            use tower::ServiceExt;
+            let response = router(state.clone()).oneshot(
+                axum::http::Request::post(format!("/api/chats/{}/send", created["id"].as_str().unwrap()))
+                    .header("host", "127.0.0.1:3120")
+                    .header("authorization", "Bearer owner-test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"request_id":"wake-queued","message":"Please continue","message_mode":"queue"}"#)).unwrap(),
+            ).await.unwrap();
+            let payload: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 32 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                payload["_meta"][CHAT_WIDGET_META]["wake_status"]["phase"],
+                "queued"
+            );
+            let sent_at = crate::markdown_chat::now_ms();
+            context
+                .store
+                .queue_action(
+                    &identity,
+                    "visible-wake",
+                    crate::agent_automation::AutomationActionKind::OfflineChat,
+                    verified.generation,
+                    None,
+                    sent_at,
+                )
+                .unwrap();
+            context
+                .store
+                .record_turn_send(
+                    &identity,
+                    crate::agent_automation::turn_renewal::TurnSend {
+                        action_id: "visible-wake".into(),
+                        at_ms: sent_at,
+                        model: None,
+                        effort: None,
+                        pairing_generation: verified.generation,
+                        owner_generation: 1,
+                    },
+                )
+                .unwrap();
+            context
+                .store
+                .update_action_status(
+                    &identity,
+                    "visible-wake",
+                    crate::agent_automation::AutomationActionStatus::Idle,
+                    None,
+                    None,
+                    sent_at,
+                )
+                .unwrap();
+            let page = chat_state(
+                State(state.clone()),
+                Path(created["id"].as_str().unwrap().into()),
+                Query(PageQuery {
+                    before: None,
+                    revision: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(
+                page["_meta"][CHAT_WIDGET_META]["wake_status"]["phase"],
+                "waiting"
+            );
+            let listed = list_chats(State(state.clone()), Query(ListQuery::default()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(listed["chats"][0]["automationWake"]["phase"], "waiting");
+            context.chat.record_agent_call(sent_at + 1).await.unwrap();
+            let page = chat_state(
+                State(state.clone()),
+                Path(created["id"].as_str().unwrap().into()),
+                Query(PageQuery {
+                    before: None,
+                    revision: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(page["_meta"][CHAT_WIDGET_META]["wake_status"].is_null());
+            let listed = list_chats(State(state.clone()), Query(ListQuery::default()))
+                .await
+                .unwrap()
+                .0;
+            assert!(listed["chats"][0]["automationWake"].is_null());
+            assert_eq!(executor.executions.lock().unwrap().len(), 1);
             server.abort();
         }
     }

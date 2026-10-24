@@ -13,7 +13,7 @@ pub const KEEP_WAITING: &str = "Markdown chat is still active. The required next
 
 const NEXT_CONTINUE_OR_COMPLETED: &str = "continue_or_turn_completed";
 const NEXT_TURN_COMPLETED: &str = "turn_completed";
-const KEEP_COMPLETED_WAITING: &str = "The request is complete. Call turn_completed again to wait for the next user request. Do not end the assistant turn.";
+const KEEP_COMPLETED_WAITING: &str = "The request is complete, but the assistant turn MUST remain active. Required next call: turn_completed. Repeat turn_completed after every timeout or cancellation without user input. Never send a normal ChatGPT final answer or stop merely because time has elapsed or a timeout is approaching.";
 const NEXT_CHAT_WRITE: &str = "chat_write";
 const NEXT_CHAT_AWAIT: &str = "chat_await";
 
@@ -110,6 +110,28 @@ fn result(
     notification: NotificationState,
     required_next_action: &'static str,
 ) -> ToolResult {
+    let next = match required_next_action {
+        NEXT_CHAT_WRITE => {
+            "Required next call: chat_write to acknowledge the new user input, then continue handling it."
+        }
+        NEXT_CHAT_AWAIT => {
+            "Required next call: chat_await for the needed user input; repeat it after timeout or cancellation without input."
+        }
+        NEXT_TURN_COMPLETED => {
+            "Required next call: turn_completed to wait for the next request; repeat it after timeout or cancellation without input."
+        }
+        _ => {
+            "Run the next task tool if work remains; call goal_finish with its report when a goal is completed or blocked; otherwise call turn_completed when finished or chat_await for needed input."
+        }
+    };
+    // A server-issued renewal already contains its explicit protocol override.
+    let content = if content.starts_with("TURN RENEWAL REQUIRED.") {
+        content
+    } else {
+        format!(
+            "{content} {next} Do not send a normal ChatGPT final answer or end the assistant turn, including near an anticipated timeout."
+        )
+    };
     ToolResult::text(content.clone()).with_structured(json!({
         "status": status,
         "content": content,
@@ -170,9 +192,9 @@ impl Tool for ChatTool {
     fn description(&self) -> String {
         match self {
             Self::Read => "NON-TERMINAL TOOL. Read and acknowledge all new user text in this Codexify task's CHAT.md, without truncation. Prefer this over direct file reads. After handling all newly read messages, continue useful work if any remains; otherwise call turn_completed when the request is finished, or chat_await when you need the user to answer a question and MUST NOT end the assistant turn. Whenever the user posts a new message, prioritize answering or acknowledging it with chat_write.",
-            Self::Write => "NON-TERMINAL TOOL. Append a Markdown message to this Codexify task's CHAT.md and optionally notify the user through configured notification services. This is the only supported way for the agent to write this file. You MUST NOT end the assistant turn after a successful chat_write. If new_chat_message_from_user is returned, answer or acknowledge it with chat_write before other work. Otherwise continue useful work if any remains; if finished, your next action MUST be turn_completed; use chat_await only when user input is required. A completion report is still non-terminal.",
-            Self::Completed => "NON-TERMINAL TOOL. Call only when the current user request is complete. Deliver exactly one oldest eligible queued request, or wait for the next request when none is ready. Queued requests remain private while a goal is unfinished or blocked. Handle the returned request and report using chat_write before completing another request. On timeout call turn_completed again. Use chat_await instead when you need the user's answer to continue the current request.",
-            Self::Await => "Wait only when the current request needs the user's input; this does not complete the request or release queued requests. Use turn_completed when the request is finished. Never substitute a normal assistant final response for chat_await. Wait for new user text in this Codexify task's CHAT.md, then return and acknowledge it in full without truncation. The server config controls the wait deadline; no tool argument can change it. If a user message is returned, answer or acknowledge it with chat_write. After a timeout or cancellation without a user message, call chat_await again unless the user explicitly authorized ending this turn or a higher-priority instruction requires it.",
+            Self::Write => "NON-TERMINAL TOOL. Append a Markdown message to this Codexify task's CHAT.md and optionally notify the user through configured notification services. This is the only supported way for the agent to write this file. You MUST NOT end the assistant turn after a successful chat_write, including when asking a question. If new_chat_message_from_user is returned, answer or acknowledge it with chat_write before other work. For a question, use event=message and continue useful work that does not need the answer; when the answer is needed to proceed, use event=input_required and call chat_await repeatedly until the user replies. Do not call turn_completed while this request needs an answer. Otherwise continue useful work if any remains; if finished, your next action MUST be turn_completed. A completion report is still non-terminal, including near an anticipated timeout.",
+            Self::Completed => "NON-TERMINAL TOOL. Call only when the current user request is complete. Deliver exactly one oldest eligible queued request, or wait for the next request when none is ready. Queued requests remain private while a goal is unfinished or blocked. Handle the returned request and report using chat_write before completing another request. After every timeout or cancellation without input, your next call MUST be turn_completed again. Never send a normal ChatGPT final answer or end the assistant turn, including near an anticipated timeout. Use chat_await instead when you need the user's answer to continue the current request.",
+            Self::Await => "NON-TERMINAL TOOL. Wait only when the current request needs the user's input; this does not complete the request or release queued requests. Use turn_completed when the request is finished. Never substitute a normal assistant final response for chat_await. Wait for new user text in this Codexify task's CHAT.md, then return and acknowledge it in full without truncation. The server config controls the wait deadline; no tool argument can change it. If a user message is returned, answer or acknowledge it with chat_write. After a timeout or cancellation without a user message, call chat_await again unless the user explicitly authorized ending this turn or a higher-priority instruction requires it.",
         }.into()
     }
 
@@ -197,7 +219,7 @@ impl Tool for ChatTool {
 
     fn input_schema(&self) -> Value {
         if matches!(self, Self::Write) {
-            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."},"event":{"type":"string","enum":["message","completed","input_required"],"default":"message","description":"Use completed for a finished chat request, input_required for a question that needs the user's reply, and message for progress or ordinary messages. input_required holds queued tasks and makes the next user message a direct reply. completed makes one queued task eligible when no goal holds it. After input_required call chat_await; after completed call turn_completed. Neither event ends the assistant turn or changes goal status; use goal_finish for a goal."}}, "required":["message"], "additionalProperties":false})
+            json!({"type":"object", "properties":{"message":{"type":"string", "minLength":1, "writeOnly":true, "description":"Complete Markdown to append and send to the user."},"event":{"type":"string","enum":["message","completed","input_required"],"default":"message","description":"Use completed for a finished chat request, input_required when you must wait for the user's answer, and message for progress or a question while useful work can continue without its answer. Asking a question never ends the assistant turn; continue useful work or call chat_await, and never use completed merely to wait for an answer. input_required holds queued tasks and makes the next user message a direct reply. completed makes one queued task eligible when no goal holds it. After input_required call chat_await; after completed call turn_completed. Neither event ends the assistant turn or changes goal status; use goal_finish for a goal."}}, "required":["message"], "additionalProperties":false})
         } else {
             empty_object_schema()
         }
@@ -322,7 +344,7 @@ impl Tool for ChatTool {
             match chat.queue_goal_holds().await {
                 Ok(true) => {
                     return ToolResult::error(
-                        "The goal is unfinished. Continue its work and mark it complete with goal_finish before completing this turn. If the goal needs the user's input, call chat_await; queued requests remain private.",
+                        "The goal is unfinished. Continue its work and mark it complete with goal_finish before waiting for the next request using turn_completed. If the goal needs the user's input, call chat_await repeatedly; queued requests remain private. Do not send a normal ChatGPT final answer or end the assistant turn.",
                     );
                 }
                 Err(error) => return ToolResult::error(error),
@@ -431,8 +453,18 @@ impl Tool for ChatTool {
                 "Message appended to CHAT.md. {}",
                 notification::description(state)
             );
+            if receipt.user_text.is_empty() {
+                if event == notification::NotificationEvent::InputRequired {
+                    content.push_str(" Your question does not complete the request or end the assistant turn. Call chat_await now for the needed answer, then repeat it after timeouts without input.");
+                } else if event == notification::NotificationEvent::Message {
+                    content.push_str(" If you asked a question, continue useful work that does not need the answer; when the answer is needed to proceed, call chat_await. Asking a question never authorizes ending the assistant turn or calling turn_completed while the request needs that answer.");
+                }
+            }
             if let Some(warning) = receipt.cursor_warning.or(notification_warning) {
                 content.push_str(&format!(" The append succeeded, but cursor/notification persistence failed: {warning}. Do not send the same message again merely to retry persistence."));
+            }
+            if !receipt.user_text.is_empty() {
+                next_action = NEXT_CHAT_WRITE;
             }
             return with_message(
                 result("written", content, chat.path(), state, next_action),

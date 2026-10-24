@@ -329,7 +329,7 @@ impl ProjectBindingStore {
             }
             None => {
                 return Err(format!(
-                    "No project root is selected for this ChatGPT conversation. Call `set_project_root` with an existing directory beneath the access root `{}`, an HTTPS/SSH Git repository URL ending in `.git`, or an exact GitHub repository, branch, pull-request, or commit URL. Repository URLs reuse a matching checkout or clone into the configured clone directory. If only a project name or purpose is known, call `list_projects` first. Leave the setup project picker open when intent is unclear or the user only says hello. chat_await can wait without selecting anything. Select `withoutProject=true` ONLY for an explicit user request for scratch; never as a default. Then call `get_agent_brief` before using project tools. The selection is stored by ChatGPT conversation ID and will survive MCP reconnects and server restarts.",
+                    "No project root is selected for this ChatGPT conversation. Call `set_project_root` with an existing directory beneath the access root `{}`, an HTTPS/SSH Git repository URL with or without `.git`, or an exact GitHub repository, branch, pull-request, or commit URL. Repository URLs reuse a matching checkout or clone into the configured clone directory. If only a project name or purpose is known, call `list_projects` first. Leave the setup project picker open when intent is unclear or the user only says hello. chat_await can wait without selecting anything. Select `withoutProject=true` ONLY for an explicit user request for scratch; never as a default. Then call `get_agent_brief` before using project tools. The selection is stored by ChatGPT conversation ID and will survive MCP reconnects and server restarts.",
                     config.work_dir.display()
                 ));
             }
@@ -413,6 +413,7 @@ impl ProjectBindingStore {
         input: &str,
         base: Option<&Path>,
     ) -> Result<ProjectRootSelection, String> {
+        crate::project_progress::phase("Checking workspace selection");
         let mut reference = ProjectReference::parse(input)?;
         let mut base = base.map(Path::to_owned);
         if base.is_none()
@@ -549,6 +550,7 @@ impl ProjectBindingStore {
             None
         };
 
+        crate::project_progress::phase("Saving workspace selection");
         let resolved = resolved_from_managed(
             &source_project_root,
             managed.as_ref(),

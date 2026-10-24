@@ -6,6 +6,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.13] - 2026-10-24
+
+### Added
+
+- Show live progress text, progress bars, elapsed time, and the latest update
+  while cloning, copying, creating a worktree, or preparing a new chat.
+- Hold the send button to choose Steer or Queue for one message without changing
+  the saved default; support touch, mouse, and keyboard interaction.
+- Require an explanation and unblock steps for blocked goals, or a work summary
+  and suggested next steps for completed goals. Display both as persistent,
+  expanded inline reports in conversation history.
+
+### Changed
+
+- Goal, chat, and progress-journal descriptions and replies explicitly require
+  continued work or repeated waits rather than ending the assistant turn.
+  Questions direct the agent to continue useful work or await the needed answer.
+- Advance the goal-tool schema marker so cached older definitions can be detected.
+
+### Fixed
+
+- Probe repository URLs without a `.git` suffix, including non-GitHub hosts, and
+  retry with `.git` appended when the initial probe fails.
+- Show whether an offline chat is queued to wake, sending to ChatGPT, or waiting
+  for the agent's first tool call after a confirmed send.
+- Release queued user messages through the normal wake-up flow when a goal is
+  blocked and its agent is offline, without requiring manual steering or resuming
+  the blocked goal.
+- Keep browser-wait countdowns readable on mobile and reduce the gap above Retry
+  and Dismiss controls.
+- Preserve goal reports that precede the first ordinary transcript message.
+
 ## [2.3.12] - 2026-10-23
 
 ### Added
@@ -1046,7 +1078,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.12...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.13...HEAD
+[2.3.13]: https://github.com/devnoname120/codexify/compare/v2.3.12...v2.3.13
 [2.3.12]: https://github.com/devnoname120/codexify/compare/v2.3.11...v2.3.12
 [2.3.11]: https://github.com/devnoname120/codexify/compare/v2.3.10...v2.3.11
 [2.3.10]: https://github.com/devnoname120/codexify/compare/v2.3.9...v2.3.10

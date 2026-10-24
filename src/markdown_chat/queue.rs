@@ -163,6 +163,10 @@ fn with_queue<T>(
     op(&mut state)
 }
 fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
+    goal_holds_queue_for_release(chat, false)
+}
+
+fn goal_holds_queue_for_release(chat: &ChatFile, offline: bool) -> Result<bool, String> {
     let path = chat.path.with_file_name("automation.json");
     if !path.try_exists().map_err(io_error)? {
         return Ok(false);
@@ -190,6 +194,7 @@ fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
         None | Some(serde_json::Value::Null) => Ok(false),
         Some(goal) => match goal.get("status").and_then(|s| s.as_str()) {
             Some("completed") => Ok(false),
+            Some("blocked") if offline => Ok(false),
             Some(_) => Ok(true),
             None => Err("Goal status is unavailable; queued messages remain private".into()),
         },
@@ -198,6 +203,25 @@ fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
 fn repair_pending(
     chat: &ChatFile,
     state: &mut QueueState,
+) -> Result<Option<UserSendReceipt>, String> {
+    repair_pending_at(chat, state, None)
+}
+
+fn queue_offline(cursor: &Cursor, now_ms: u64) -> bool {
+    cursor.agent_presence_until_ms.map_or_else(
+        || {
+            cursor
+                .last_agent_call_at_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= OFFLINE_AFTER_MS)
+        },
+        |until| now_ms >= until,
+    )
+}
+
+fn repair_pending_at(
+    chat: &ChatFile,
+    state: &mut QueueState,
+    now_ms: Option<u64>,
 ) -> Result<Option<UserSendReceipt>, String> {
     let Some(pending) = &state.pending else {
         return Ok(None);
@@ -214,7 +238,10 @@ fn repair_pending(
         if mode == MessageMode::Queue
             && !existing
             && (state.input_waiting
-                || goal_holds_queue(chat)?
+                || goal_holds_queue_for_release(
+                    chat,
+                    now_ms.is_some_and(|now| queue_offline(cursor, now)),
+                )?
                 || cursor.agent_stop_requested
                 || !snapshot(chat, file, cursor)?.text.is_empty())
         {
@@ -410,6 +437,13 @@ impl ChatFile {
         }
         result
     }
+    /// Read the atomically published queue without starting its monitor or
+    /// creating queue/automation lock files just to render a sidebar indicator.
+    pub(crate) async fn has_queued_messages(self: &Arc<Self>) -> Result<bool, String> {
+        self.run(|chat| load(chat).map(|state| !state.messages.is_empty()))
+            .await
+    }
+
     pub async fn queued_messages(self: &Arc<Self>) -> Result<Vec<QueuedMessage>, String> {
         let result = self
             .run(|chat| with_queue(chat, false, |state| Ok(state.messages.clone())))
@@ -583,14 +617,17 @@ impl ChatFile {
         }
         self.run(move |chat| {
             with_queue(chat, true, |state| {
-                if let Some(sent) = repair_pending(chat, state)? {
+                if let Some(sent) = repair_pending_at(chat, state, Some(now_ms))? {
                     return Ok(Some(sent));
                 }
-                if state.messages.is_empty() || state.input_waiting || goal_holds_queue(chat)? {
+                if state.messages.is_empty() || state.input_waiting {
                     return Ok(None);
                 }
                 let ready = chat.with_cursor(|cursor, file| {
-                    if cursor.agent_stop_requested || !snapshot(chat, file, cursor)?.text.is_empty()
+                    let offline = queue_offline(cursor, now_ms);
+                    if goal_holds_queue_for_release(chat, offline)?
+                        || cursor.agent_stop_requested
+                        || !snapshot(chat, file, cursor)?.text.is_empty()
                     {
                         return Ok(false);
                     }
@@ -601,14 +638,6 @@ impl ChatFile {
                     {
                         return Ok(false);
                     }
-                    let offline = cursor.agent_presence_until_ms.map_or_else(
-                        || {
-                            cursor
-                                .last_agent_call_at_ms
-                                .is_none_or(|last| now_ms.saturating_sub(last) >= OFFLINE_AFTER_MS)
-                        },
-                        |until| now_ms >= until,
-                    );
                     Ok(state.completed_waiting || offline)
                 })?;
                 if !ready {
@@ -620,7 +649,7 @@ impl ChatFile {
                 });
                 state.completed_waiting = false;
                 persist(chat, state)?;
-                repair_pending(chat, state)
+                repair_pending_at(chat, state, Some(now_ms))
             })
         })
         .await
@@ -790,10 +819,10 @@ mod tests {
         assert_eq!(chat.queued_messages().await.unwrap().len(), 2);
     }
     #[tokio::test]
-    async fn all_unfinished_goal_states_hold_queue_and_only_completed_unlocks_it() {
+    async fn active_paused_and_unknown_goals_hold_queue_until_completed() {
         let (_root, chat) = fixture().await;
         enqueue(&chat, "first").await;
-        for value in ["active", "blocked", "paused", "configured", "unknown"] {
+        for value in ["active", "paused", "configured", "unknown"] {
             goal(&chat, value);
             chat.queue_turn_completed().await.unwrap();
             assert!(
@@ -818,6 +847,115 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(text(&chat).await.contains("private first"));
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_releases_one_message_only_after_the_agent_is_offline() {
+        let (_root, chat) = fixture().await;
+        let last = chat
+            .owner_summary()
+            .await
+            .unwrap()
+            .last_agent_call_at_ms
+            .unwrap();
+        goal(&chat, "blocked");
+        enqueue(&chat, "first").await;
+        enqueue(&chat, "second").await;
+        with_queue(&chat, false, |state| {
+            state.pending = Some(PendingSubmission {
+                id: "first".into(),
+                mode: MessageMode::Queue,
+            });
+            persist(&chat, state)
+        })
+        .unwrap();
+        let chat = Arc::new(ChatFile::new(chat.path.clone(), true));
+        chat.queue_monitor_started.store(true, Ordering::Release);
+        chat.queue_turn_completed().await.unwrap();
+        assert!(
+            chat.release_queued_message(last + OFFLINE_AFTER_MS - 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(text(&chat).await.is_empty());
+        let sent = chat
+            .release_queued_message(last + OFFLINE_AFTER_MS)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.id, "first");
+        assert!(
+            chat.release_queued_message(last + OFFLINE_AFTER_MS + 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(chat.queued_messages().await.unwrap()[0].id, "second");
+        assert_eq!(
+            std::fs::read_to_string(chat.path.with_file_name("automation.json")).unwrap(),
+            serde_json::json!({"goal":{"status":"blocked"}}).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_goal_release_keeps_input_stop_and_handoff_holds() {
+        for hold in ["input", "stop", "handoff", "resume"] {
+            let (_root, chat) = fixture().await;
+            goal(&chat, "blocked");
+            enqueue(&chat, "first").await;
+            match hold {
+                "input" => chat.queue_agent_work(false).await.unwrap(),
+                "stop" => chat.request_agent_stop("stop".into()).await.unwrap(),
+                _ => {
+                    let renewal = if hold == "handoff" {
+                        serde_json::json!({"handoff":{}})
+                    } else {
+                        serde_json::json!({"resumeWaitUntilMs":crate::markdown_chat::now_ms()+60_000})
+                    };
+                    std::fs::write(
+                        chat.path.with_file_name("automation.json"),
+                        serde_json::json!({"goal":{"status":"blocked"},"turnRenewal":renewal})
+                            .to_string(),
+                    )
+                    .unwrap();
+                }
+            }
+            assert!(
+                chat.release_queued_message(u64::MAX)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{hold}"
+            );
+            assert!(text(&chat).await.is_empty(), "{hold}");
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_releases_a_blocked_goals_message_without_an_open_widget() {
+        let root = tempfile::tempdir().unwrap();
+        let chat = Arc::new(ChatFile::new(root.path().join("chats/one/CHAT.md"), true));
+        chat.ensure().await.unwrap();
+        chat.queue_monitor_started.store(true, Ordering::Release);
+        goal(&chat, "blocked");
+        enqueue(&chat, "first").await;
+        enqueue(&chat, "second").await;
+        chat.queue_monitor_started.store(false, Ordering::Release);
+        chat.start_queue_monitor();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if chat.queued_messages().await.unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(text(&chat).await.contains("private first"));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(chat.queued_messages().await.unwrap()[0].id, "second");
     }
     #[tokio::test]
     async fn malformed_goal_or_queue_fails_closed_without_losing_messages() {
@@ -1038,7 +1176,7 @@ mod tests {
         assert!(text(&chat).await.contains("attachment request"));
     }
     #[tokio::test]
-    async fn restart_and_journal_repair_never_duplicate_or_bypass_goal_hold() {
+    async fn restart_and_journal_repair_preserve_goal_holds_and_never_duplicate() {
         let (_root, chat) = fixture().await;
         enqueue(&chat, "first").await;
         enqueue(&chat, "second").await;
@@ -1057,7 +1195,7 @@ mod tests {
             .store(true, Ordering::Release);
         assert!(
             reopened
-                .release_queued_message(u64::MAX)
+                .release_queued_message(crate::markdown_chat::now_ms())
                 .await
                 .unwrap()
                 .is_none()

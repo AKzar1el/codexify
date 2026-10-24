@@ -56,6 +56,7 @@ pub struct GoalRecord {
     pub timer_until_ms: Option<u64>,
     #[serde(default = "initial_goal_turn")]
     pub turn_count: u64,
+    // Historical field names; these anchor both completed and blocked reports.
     #[serde(default)]
     pub completed_chat_end: Option<u64>,
     // The durable count lives in the timeline journal. Keep automation.json
@@ -1479,20 +1480,18 @@ impl AgentAutomationStore {
                         goal.status = GoalStatus::Completed;
                         goal.summary = summary.clone();
                         goal.blocked_reason = None;
-                        goal.completed_tool_call_count = tool_call_count;
-                        goal.completed_chat_end = std::fs::metadata(&transcript)
-                            .ok()
-                            .filter(|metadata| metadata.is_file())
-                            .map(|metadata| metadata.len());
                     }
                     GoalFinish::Blocked { reason } => {
                         goal.status = GoalStatus::Blocked;
                         goal.summary = None;
                         goal.blocked_reason = Some(reason.clone());
-                        goal.completed_chat_end = None;
-                        goal.completed_tool_call_count = None;
                     }
                 }
+                goal.completed_tool_call_count = tool_call_count;
+                goal.completed_chat_end = std::fs::metadata(&transcript)
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .map(|metadata| metadata.len());
                 goal.updated_at_ms = now_ms;
                 goal.finished_at_ms = Some(now_ms);
                 goal.clone()
