@@ -2485,9 +2485,13 @@ input on unfinished work and holds the queue, including after its wait times out
 `chat_write` with `event: "input_required"` starts this hold immediately and
 directs the agent to `chat_await`; `event: "completed"` directs `turn_completed`
 when the request is finished. The offline fallback releases one
-message after five minutes without tool activity. A blocked goal permits this
-offline fallback, so new instructions can wake the agent without a separate
-Steer action; the goal itself stays blocked. Active or paused goals, explicit
+message after five minutes without tool activity. For a blocked goal, only new
+messages submitted while that exact goal transition was already blocked qualify
+for this fallback. Messages queued before the blocker stay private, even if a
+newer eligible message wakes the agent. The oldest eligible new message can pass
+those held requests; the goal itself stays blocked. Repeating or editing an older
+submission does not make it new, and eligibility survives restarts. A later goal
+resume and block does not reuse an earlier block's permission. Active or paused goals, explicit
 input waits, manual Stop, and pending turn handoffs keep their queue holds.
 Goal completion releases one eligible message. Steering takes priority over
 queued messages, and queued edits use revisions to reject stale changes.

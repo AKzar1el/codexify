@@ -40,11 +40,35 @@ pub enum QueueSubmission {
 struct QueueState {
     version: u32,
     messages: Vec<QueuedMessage>,
+    // Only submissions made during this exact blocked transition may wake it.
+    // Older queue files have no receipts and remain private while blocked.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    blocked_goal_submissions: BTreeMap<String, BlockedGoal>,
     receipts: BTreeMap<String, String>,
     completed_waiting: bool,
     input_waiting: bool,
     pending: Option<PendingSubmission>,
     in_flight: Option<QueueFlight>,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockedGoal {
+    revision: u64,
+    created_at_ms: u64,
+    finished_at_ms: u64,
+}
+
+fn blocked_goal(value: &serde_json::Value) -> Option<BlockedGoal> {
+    let goal = value.get("goal")?;
+    if goal.get("status")?.as_str()? != "blocked" {
+        return None;
+    }
+    let revision = goal.get("revision")?.as_u64()?;
+    (revision > 0).then_some(BlockedGoal {
+        revision,
+        created_at_ms: goal.get("createdAtMs")?.as_u64()?,
+        finished_at_ms: goal.get("finishedAtMs")?.as_u64()?,
+    })
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +123,13 @@ fn load(chat: &ChatFile) -> Result<QueueState, String> {
         {
             return Err("Message queue has inconsistent identities".into());
         }
+    }
+    if state
+        .blocked_goal_submissions
+        .iter()
+        .any(|(id, goal)| !ids.contains(id) || goal.revision == 0)
+    {
+        return Err("Message queue has inconsistent blocked-goal receipts".into());
     }
     Ok(state)
 }
@@ -163,20 +194,37 @@ fn with_queue<T>(
     op(&mut state)
 }
 fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
-    goal_holds_queue_for_release(chat, false)
+    goal_holds_queue_for_release(chat, false, None)
 }
 
-fn goal_holds_queue_for_release(chat: &ChatFile, offline: bool) -> Result<bool, String> {
+fn automation_state(chat: &ChatFile) -> Result<Option<serde_json::Value>, String> {
     let path = chat.path.with_file_name("automation.json");
     if !path.try_exists().map_err(io_error)? {
-        return Ok(false);
+        return Ok(None);
     }
     let file = open_regular(&path, false)?;
     if file.metadata().map_err(io_error)?.len() > 1024 * 1024 {
         return Err("Goal state is oversized; queued messages remain private".into());
     }
-    let value: serde_json::Value = serde_json::from_reader(file.take(1024 * 1024 + 1))
-        .map_err(|_| "Goal state cannot be read; queued messages remain private")?;
+    serde_json::from_reader(file.take(1024 * 1024 + 1))
+        .map(Some)
+        .map_err(|_| "Goal state cannot be read; queued messages remain private".into())
+}
+
+fn goal_holds_queue_for_release(
+    chat: &ChatFile,
+    offline: bool,
+    submission: Option<&BlockedGoal>,
+) -> Result<bool, String> {
+    goal_holds_queue_in(automation_state(chat)?.as_ref(), offline, submission)
+}
+
+fn goal_holds_queue_in(
+    value: Option<&serde_json::Value>,
+    offline: bool,
+    submission: Option<&BlockedGoal>,
+) -> Result<bool, String> {
+    let Some(value) = value else { return Ok(false) };
     if value
         .pointer("/turnRenewal/resumeWaitUntilMs")
         .and_then(serde_json::Value::as_u64)
@@ -194,7 +242,13 @@ fn goal_holds_queue_for_release(chat: &ChatFile, offline: bool) -> Result<bool, 
         None | Some(serde_json::Value::Null) => Ok(false),
         Some(goal) => match goal.get("status").and_then(|s| s.as_str()) {
             Some("completed") => Ok(false),
-            Some("blocked") if offline => Ok(false),
+            Some("blocked")
+                if offline
+                    && submission
+                        .is_some_and(|receipt| blocked_goal(value).as_ref() == Some(receipt)) =>
+            {
+                Ok(false)
+            }
             Some(_) => Ok(true),
             None => Err("Goal status is unavailable; queued messages remain private".into()),
         },
@@ -241,6 +295,7 @@ fn repair_pending_at(
                 || goal_holds_queue_for_release(
                     chat,
                     now_ms.is_some_and(|now| queue_offline(cursor, now)),
+                    state.blocked_goal_submissions.get(&entry.id),
                 )?
                 || cursor.agent_stop_requested
                 || !snapshot(chat, file, cursor)?.text.is_empty())
@@ -259,6 +314,7 @@ fn repair_pending_at(
     })?;
     let Some(sent) = sent else { return Ok(None) };
     state.messages.retain(|m| m.id != entry.id);
+    state.blocked_goal_submissions.remove(&entry.id);
     state.pending = None;
     state.completed_waiting = false;
     if mode == MessageMode::Queue {
@@ -345,7 +401,7 @@ impl ChatFile {
         validate(&id, &markdown, &attachment_ids)?;
         let result = self
             .run(move |chat| {
-                with_queue(chat, false, |state| {
+                with_queue(chat, true, |state| {
                     let digest = format!(
                         "{:x}",
                         Sha256::digest(
@@ -421,6 +477,11 @@ impl ChatFile {
                         created_at_ms: crate::markdown_chat::now_ms(),
                         revision: 1,
                     };
+                    if let Ok(Some(automation)) = automation_state(chat)
+                        && let Some(blocked) = blocked_goal(&automation)
+                    {
+                        state.blocked_goal_submissions.insert(id.clone(), blocked);
+                    }
                     state.receipts.insert(id, digest);
                     state.messages.push(entry.clone());
                     persist(chat, state)?;
@@ -439,9 +500,25 @@ impl ChatFile {
     }
     /// Read the atomically published queue without starting its monitor or
     /// creating queue/automation lock files just to render a sidebar indicator.
-    pub(crate) async fn has_queued_messages(self: &Arc<Self>) -> Result<bool, String> {
-        self.run(|chat| load(chat).map(|state| !state.messages.is_empty()))
-            .await
+    pub(crate) async fn has_wakeable_queued_messages(self: &Arc<Self>) -> Result<bool, String> {
+        self.run(|chat| {
+            let state = load(chat)?;
+            if state.messages.is_empty() || state.input_waiting {
+                return Ok(false);
+            }
+            let automation = automation_state(chat)?;
+            for message in &state.messages {
+                if !goal_holds_queue_in(
+                    automation.as_ref(),
+                    true,
+                    state.blocked_goal_submissions.get(&message.id),
+                )? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
     }
 
     pub async fn queued_messages(self: &Arc<Self>) -> Result<Vec<QueuedMessage>, String> {
@@ -527,6 +604,7 @@ impl ChatFile {
                     }
                     QueueSubmission::Trash => {
                         state.messages.remove(index);
+                        state.blocked_goal_submissions.remove(&id);
                         if state.pending.as_ref().is_some_and(|p| p.id == id) {
                             state.pending = None;
                         }
@@ -623,28 +701,39 @@ impl ChatFile {
                 if state.messages.is_empty() || state.input_waiting {
                     return Ok(None);
                 }
-                let ready = chat.with_cursor(|cursor, file| {
+                let next = chat.with_cursor(|cursor, file| {
                     let offline = queue_offline(cursor, now_ms);
-                    if goal_holds_queue_for_release(chat, offline)?
-                        || cursor.agent_stop_requested
-                        || !snapshot(chat, file, cursor)?.text.is_empty()
+                    if cursor.agent_stop_requested || !snapshot(chat, file, cursor)?.text.is_empty()
                     {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     if state
                         .in_flight
                         .as_ref()
                         .is_some_and(|f| !f.progressed || cursor.offset < f.end)
                     {
-                        return Ok(false);
+                        return Ok(None);
                     }
-                    Ok(state.completed_waiting || offline)
+                    if !state.completed_waiting && !offline {
+                        return Ok(None);
+                    }
+                    let automation = automation_state(chat)?;
+                    for message in &state.messages {
+                        if !goal_holds_queue_in(
+                            automation.as_ref(),
+                            offline,
+                            state.blocked_goal_submissions.get(&message.id),
+                        )? {
+                            return Ok(Some(message.id.clone()));
+                        }
+                    }
+                    Ok(None)
                 })?;
-                if !ready {
+                let Some(id) = next else {
                     return Ok(None);
-                }
+                };
                 state.pending = Some(PendingSubmission {
-                    id: state.messages[0].id.clone(),
+                    id,
                     mode: MessageMode::Queue,
                 });
                 state.completed_waiting = false;
@@ -724,7 +813,7 @@ mod tests {
     fn goal(chat: &ChatFile, value: &str) {
         std::fs::write(
             chat.path.with_file_name("automation.json"),
-            serde_json::json!({"goal":{"status":value}}).to_string(),
+            serde_json::json!({"goal":{"status":value,"revision":1,"createdAtMs":1,"finishedAtMs":if value == "blocked" {Some(2)} else {None}}}).to_string(),
         )
         .unwrap();
     }
@@ -858,12 +947,16 @@ mod tests {
             .unwrap()
             .last_agent_call_at_ms
             .unwrap();
+        goal(&chat, "active");
+        enqueue(&chat, "older").await;
         goal(&chat, "blocked");
+        let blocked_state =
+            std::fs::read_to_string(chat.path.with_file_name("automation.json")).unwrap();
         enqueue(&chat, "first").await;
         enqueue(&chat, "second").await;
         with_queue(&chat, false, |state| {
             state.pending = Some(PendingSubmission {
-                id: "first".into(),
+                id: "older".into(),
                 mode: MessageMode::Queue,
             });
             persist(&chat, state)
@@ -891,10 +984,120 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(chat.queued_messages().await.unwrap()[0].id, "second");
+        let queued = chat.queued_messages().await.unwrap();
+        assert_eq!(
+            queued.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["older", "second"]
+        );
+        assert!(
+            !std::fs::read_to_string(chat.path())
+                .unwrap()
+                .contains("private older")
+        );
         assert_eq!(
             std::fs::read_to_string(chat.path.with_file_name("automation.json")).unwrap(),
-            serde_json::json!({"goal":{"status":"blocked"}}).to_string()
+            blocked_state
+        );
+    }
+
+    #[tokio::test]
+    async fn old_submissions_stay_private_after_block_even_when_retried_or_edited() {
+        let (_root, chat) = fixture().await;
+        goal(&chat, "active");
+        enqueue(&chat, "older").await;
+        goal(&chat, "blocked");
+        // Repeating an HTTP submission or editing its text is not a new message.
+        enqueue(&chat, "older").await;
+        chat.update_queued_message(
+            "older".into(),
+            1,
+            QueueSubmission::Edit,
+            Some("edited old request".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            chat.release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!chat.has_wakeable_queued_messages().await.unwrap());
+        enqueue(&chat, "newer").await;
+        assert!(chat.has_wakeable_queued_messages().await.unwrap());
+        let sent = chat
+            .release_queued_message(u64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.id, "newer");
+        assert_eq!(chat.queued_messages().await.unwrap()[0].id, "older");
+        assert!(!text(&chat).await.contains("edited old request"));
+        // Even after handling the new message, blocking is not completion of the
+        // original goal and must not drain requests that were queued beforehand.
+        chat.queue_agent_work(true).await.unwrap();
+        assert!(
+            chat.release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        goal(&chat, "completed");
+        chat.queue_turn_completed().await.unwrap();
+        assert_eq!(
+            chat.release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "older"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_and_previous_block_receipts_cannot_wake_a_new_blocked_transition() {
+        let (_root, chat) = fixture().await;
+        goal(&chat, "blocked");
+        enqueue(&chat, "previous-block").await;
+        enqueue(&chat, "legacy").await;
+        with_queue(&chat, false, |state| {
+            state.blocked_goal_submissions.remove("legacy");
+            persist(&chat, state)
+        })
+        .unwrap();
+        // The same revision was resumed and blocked again. Its old queued input
+        // predates this transition and cannot inherit a new wake-up permission.
+        let path = chat.path.with_file_name("automation.json");
+        let mut automation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        automation["goal"]["finishedAtMs"] = serde_json::json!(3);
+        std::fs::write(&path, automation.to_string()).unwrap();
+        let reopened = Arc::new(ChatFile::new(chat.path.clone(), true));
+        reopened
+            .queue_monitor_started
+            .store(true, Ordering::Release);
+        assert!(
+            reopened
+                .release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        enqueue(&reopened, "current-block").await;
+        assert_eq!(
+            reopened
+                .release_queued_message(u64::MAX)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "current-block"
+        );
+        assert_eq!(reopened.queued_messages().await.unwrap().len(), 2);
+        let delivered = text(&reopened).await;
+        assert!(delivered.contains("private current-block"));
+        assert!(
+            !delivered.contains("private previous-block") && !delivered.contains("private legacy")
         );
     }
 
@@ -913,12 +1116,11 @@ mod tests {
                     } else {
                         serde_json::json!({"resumeWaitUntilMs":crate::markdown_chat::now_ms()+60_000})
                     };
-                    std::fs::write(
-                        chat.path.with_file_name("automation.json"),
-                        serde_json::json!({"goal":{"status":"blocked"},"turnRenewal":renewal})
-                            .to_string(),
-                    )
-                    .unwrap();
+                    let path = chat.path.with_file_name("automation.json");
+                    let mut automation: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    automation["turnRenewal"] = renewal;
+                    std::fs::write(path, automation.to_string()).unwrap();
                 }
             }
             assert!(

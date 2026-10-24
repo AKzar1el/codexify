@@ -889,7 +889,7 @@ async fn list_chats(State(state): State<OwnerState>, Query(query): Query<ListQue
         let now = crate::markdown_chat::now_ms();
         let enabled = state.config.markdown_chat.automation.enabled;
         let pending_queue = if enabled && automation_error.is_none() && wake_activity.offline(now) {
-            chat.has_queued_messages().await.unwrap_or(false)
+            chat.has_wakeable_queued_messages().await.unwrap_or(false)
         } else {
             false
         };
@@ -1128,7 +1128,9 @@ async fn chat_state(
     page["wake_status"] = json!(wake::status(
         &automation,
         &wake::Activity::from(&summary),
-        !queued.is_empty(),
+        chat.has_wakeable_queued_messages()
+            .await
+            .map_err(internal_error)?,
         state.config.markdown_chat.automation.enabled,
         crate::markdown_chat::now_ms()
     ));
@@ -1885,7 +1887,6 @@ async fn wake_status_for_chat(
     state: &OwnerState,
     located: &LocatedChat,
     chat: &Arc<crate::markdown_chat::ChatFile>,
-    queued: bool,
 ) -> Option<wake::WakeStatus> {
     if !state.config.markdown_chat.automation.enabled {
         return None;
@@ -1895,6 +1896,7 @@ async fn wake_status_for_chat(
         .and_then(|store| store.load(&task))
         .ok()?;
     let summary = chat.owner_summary().await.ok()?;
+    let queued = chat.has_wakeable_queued_messages().await.ok()?;
     wake::status(
         &automation,
         &wake::Activity::from(&summary),
@@ -1981,8 +1983,7 @@ async fn chat_send(
                     .await
                     .map_err(internal_error)?;
                 let queued = chat.queued_messages().await.map_err(internal_error)?;
-                let wake_status =
-                    wake_status_for_chat(&state, &located, &chat, !queued.is_empty()).await;
+                let wake_status = wake_status_for_chat(&state, &located, &chat).await;
                 return Ok(wrap(
                     json!({"queue_receipt":receipt,"queued_messages":queued,"wake_status":wake_status}),
                 ));
@@ -2013,7 +2014,7 @@ async fn chat_send(
             if let Some(supervisor) = state.automation.as_ref() {
                 supervisor.notify();
             }
-            let wake_status = wake_status_for_chat(&state, &located, &chat, false).await;
+            let wake_status = wake_status_for_chat(&state, &located, &chat).await;
             Ok(wrap(
                 json!({"sent": sent, "organization": organization, "wake_status":wake_status}),
             ))

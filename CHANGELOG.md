@@ -31,9 +31,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retry with `.git` appended when the initial probe fails.
 - Show whether an offline chat is queued to wake, sending to ChatGPT, or waiting
   for the agent's first tool call after a confirmed send.
-- Release queued user messages through the normal wake-up flow when a goal is
-  blocked and its agent is offline, without requiring manual steering or resuming
-  the blocked goal.
+- Wake a blocked, offline goal for new messages submitted after it became blocked,
+  without requiring manual steering or resuming the goal. Keep messages queued
+  before the blocker private, including across retries and restarts.
 - Keep browser-wait countdowns readable on mobile and reduce the gap above Retry
   and Dismiss controls.
 - Preserve goal reports that precede the first ordinary transcript message.

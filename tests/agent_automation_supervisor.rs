@@ -1227,6 +1227,14 @@ async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_st
         .unwrap()
         .goal
         .unwrap();
+    f.chat
+        .queue_user_message(
+            "older".into(),
+            "An older task that must remain private".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
     f.store
         .finish_goal(
             &f.task,
@@ -1251,7 +1259,7 @@ async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_st
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if f.chat.queued_messages().await.unwrap().len() == 1 {
+            if f.chat.queued_messages().await.unwrap().len() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1259,7 +1267,16 @@ async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_st
     })
     .await
     .unwrap();
-    assert_eq!(f.chat.queued_messages().await.unwrap()[0].id, "second");
+    assert_eq!(
+        f.chat
+            .queued_messages()
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["older", "second"]
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1277,6 +1294,10 @@ async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_st
     };
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, "first");
+    assert!(!messages.iter().any(|m| {
+        m.markdown
+            .contains("An older task that must remain private")
+    }));
     assert_eq!(
         f.store.load(&f.task).unwrap().goal.unwrap().status,
         GoalStatus::Blocked
@@ -1287,7 +1308,16 @@ async fn a_blocked_offline_goal_releases_and_sends_one_queued_message_without_st
         0,
         "accepted delivery must not be replayed"
     );
-    assert_eq!(f.chat.queued_messages().await.unwrap()[0].id, "second");
+    assert_eq!(
+        f.chat
+            .queued_messages()
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["older", "second"]
+    );
 }
 
 #[tokio::test]
