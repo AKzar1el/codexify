@@ -74,7 +74,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
     const permissionBeforeCached=permissionVisits;visits.length=0;
     await driver.refreshConnector('Fixture connector');expect(visits).toEqual(['/settings/plugins-settings/plugin_asdk_app_fixture','/c/original']);
     expect(permissionVisits).toBe(permissionBeforeCached);expect(refreshes).toBe(5);
-    // Completion waits beyond the UI deadline without retaining browser access.
+    // Completion can outlast one UI phase, while retaining exclusive ownership.
     const coordinator=new SingleWindowCoordinator(driver,protocolBuild('queued-refresh-test'),{operationMs:1500,cleanupMs:100,hardStopMs:100});
     refreshDelay=2200;
     const pendingRefresh=coordinator.refreshConnector('Fixture connector');
@@ -82,14 +82,22 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
     const waitStarted=async()=>{const started=Date.now();while(owned||!await page.evaluate(()=>document.querySelector('#refresh')?.matches(':disabled')===true)){if(Date.now()-started>1500)throw Error('Refresh did not start');await new Promise(resolve=>setTimeout(resolve,20));}};
     await waitStarted();await duplicate;
     await expectFailure(coordinator.refreshConnector('Other connector'),'busy');
-    expect(owned).toBeFalse();expect((await coordinator.health()).status).toBe('idle');
-    await coordinator.reveal(null); // Another UI transaction finishes while refresh is pending.
+    expect(owned).toBeFalse();expect((await coordinator.health()).status).toBe('busy');
+    const readsBeforeRefresh=billingReads;
+    let planSettled=false,revealSettled=false;
+    const queuedPlan=coordinator.accountPlan('during-refresh').then(value=>{planSettled=true;return value;});
+    const queuedReveal=coordinator.reveal(null).then(()=>{revealSettled=true;});
+    await new Promise(resolve=>setTimeout(resolve,100));
+    expect(planSettled).toBeFalse();expect(revealSettled).toBeFalse();expect(billingReads).toBe(readsBeforeRefresh);
+    expect(page.url()).toContain('/settings/plugins-settings/');
     await pendingRefresh;expect(page.url()).toBe(original);
+    expect((await queuedPlan).label).toBe('Pro 20x');await queuedReveal;
+    expect(billingReads).toBe(readsBeforeRefresh+1);expect(page.url()).toBe(original);
     const interrupted=coordinator.refreshConnector('Fixture connector');
     const failure=expectFailure(interrupted,'another browser action');
     await waitStarted();
-    await coordinator.reveal('https://chatgpt.com/c/other');
-    await failure;expect(page.url()).toBe('https://chatgpt.com/c/other'); // Never restore over that action.
+    await page.goto('https://chatgpt.com/c/other'); // A human navigation can still interrupt maintenance.
+    await failure;expect(page.url()).toBe('https://chatgpt.com/c/other'); // Never restore over the user's navigation.
     await page.goto(original);
     const cancel=new AbortController(),cancelled=coordinator.refreshConnector('Fixture connector',cancel.signal);
     const cancellation=expectFailure(cancelled,'cancelled');await waitStarted();cancel.abort();await cancellation;

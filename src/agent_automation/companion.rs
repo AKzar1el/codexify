@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
+    "6387026e06e437edb53caa5fe7e15f613c1303d6071ada224f3b0cbeff078e68";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.83866bd3defe7552a905f5cceef027c1ec53de18de1fc4832da49fb18aeba627";
+    "+protocol.6387026e06e437edb53caa5fe7e15f613c1303d6071ada224f3b0cbeff078e68";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;

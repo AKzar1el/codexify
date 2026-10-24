@@ -2067,15 +2067,21 @@ translated button labels. Allow all is verified from the checked option in the
 four-choice permission group. Its summary is then remembered for that account
 and connector; matching the verified summary avoids a permissions visit. A
 different summary, including a UI language change, requires a new verification.
-Unknown identities are discovered once
-from an existing connector link or mention, with a separate bounded transaction
-as a fallback. The UI lease ends after clicking; observing this refresh's loading
-state for up to 60 seconds holds no browser ownership. Other actions can navigate
-normally during that wait. Maintenance restores the existing tab only if another
-action has not changed it; if it changed, refresh completion is left unconfirmed.
+Unknown identities are discovered once from an existing connector link or mention,
+with a bounded discovery step as a fallback. A connector refresh retains exclusive
+ownership of the shared browser through all preparation steps, up to 60 seconds
+of loading-state observation, and restoration of the original page. Subscription
+checks, capability discovery, new-chat preparation, navigation, and sends wait
+behind that transaction. Health checks stay responsive and report the browser as
+busy. Each UI step retains its 30-second deadline; the full refresh is bounded to
+120 seconds. Cancellation permits bounded restoration before queued work resumes;
+an uncooperative driver is retired before its tab can be reused. A human navigation
+can still interrupt the refresh, and maintenance never restores over that change.
 Account identity is rechecked before tool refresh and permission changes. Updates
 record a pending refresh and perform it automatically after the replacement server
-becomes healthy.
+becomes healthy. Exclusive refresh ownership is included in the companion build
+fingerprint, preventing post-update maintenance from reusing a companion that
+still releases the browser while refresh is pending.
 
 Pairing is explicit. In the standalone page, paste the exact ChatGPT conversation
 URL and choose **Pair**. Codexify stores it as an unverified candidate and queues a

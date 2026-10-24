@@ -39,6 +39,9 @@ export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_o
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
+// Refresh confirmation can take 60 seconds after its bounded UI steps. Keep
+// ownership through observation and restoration, below the client's 150s limit.
+const CONNECTOR_REFRESH_TIMEOUT_MS = 120_000;
 const BROWSER_CLEANUP_GRACE_MS = 5_000;
 const BROWSER_HARD_STOP_MS = 2_000;
 const MAX_RETIRED_ACTIONS = 1024;
@@ -222,6 +225,7 @@ export class SingleWindowCoordinator {
   private retired = false;
   private driverClosed = false;
   private windowOperationActive = false;
+  private connectorRefreshPending = false;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string,
     private readonly timeouts = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS }) {
@@ -311,20 +315,21 @@ export class SingleWindowCoordinator {
   }
 
   async refreshConnector(name:string, signal?: AbortSignal) {
-    if (this.driver.refreshConnectorSteps) return this.driver.refreshConnectorSteps(name,
-      async (operation,parent) => {
-        // Give already queued UI work a turn between independent maintenance steps.
-        await new Promise<void>(resolve=>setImmediate(resolve));
-        return this.withWindowOperation(async operationSignal=>{
-          if(this.activeActionId)throw new BrowserCompanionError("Browser companion is busy with an active action");
-          return operation(operationSignal);
-        },parent);
-      },signal);
-    return this.withWindowOperation(async operationSignal=>{
-      if(this.activeActionId)throw new Error("Browser companion is busy with an active action");
-      if(!this.driver.refreshConnector)throw new Error("Connector maintenance is unavailable");
-      return this.driver.refreshConnector(name, operationSignal);
-    }, signal);
+    if(this.connectorRefreshPending)throw new BrowserCompanionError("Browser companion is busy with a connector refresh");
+    this.connectorRefreshPending = true;
+    try {
+      return await this.withWindowOperation(async operationSignal=>{
+        if(this.activeActionId)throw new BrowserCompanionError("Browser companion is busy with an active action");
+        if(this.driver.refreshConnectorSteps)return this.driver.refreshConnectorSteps(name,
+          // Normal phases inherit operationSignal. Restoration deliberately
+          // supplies no parent so it can finish under its own cleanup deadline.
+          (operation,parent)=>this.bounded(operation,parent),operationSignal);
+        if(!this.driver.refreshConnector)throw new Error("Connector maintenance is unavailable");
+        return this.driver.refreshConnector(name,operationSignal);
+      },signal,false,this.driver.refreshConnectorSteps?CONNECTOR_REFRESH_TIMEOUT_MS:this.timeouts.operationMs);
+    } finally {
+      this.connectorRefreshPending = false;
+    }
   }
 
   async reveal(url: string | null, signal?: AbortSignal): Promise<{ protocolVersion:number; build:string; revealed:boolean; activeActionId:string | null }> {
@@ -504,7 +509,7 @@ export class SingleWindowCoordinator {
     }, undefined, true);
   }
 
-  private async withWindowOperation<T>(operation: (signal:AbortSignal) => Promise<T>, signal?:AbortSignal, closing=false): Promise<T> {
+  private async withWindowOperation<T>(operation: (signal:AbortSignal) => Promise<T>, signal?:AbortSignal, closing=false, timeoutMs=this.timeouts.operationMs): Promise<T> {
     let release!: () => void;
     const previous = this.windowOperationTail;
     this.windowOperationTail = new Promise<void>(resolve => { release = resolve; });
@@ -512,7 +517,7 @@ export class SingleWindowCoordinator {
     try {
       if (this.retired && !closing) throw new BrowserCompanionError("Browser operation recovery is required; restart the browser companion", "failed");
       this.windowOperationActive=true;
-      return await this.bounded(operation, signal);
+      return await this.bounded(operation, signal,()=>false,timeoutMs);
     } finally {
       this.windowOperationActive=false;
       release();
@@ -520,12 +525,12 @@ export class SingleWindowCoordinator {
   }
 
   private async bounded<T>(operation:(signal:AbortSignal,progress:()=>void)=>Promise<T>, parent?:AbortSignal,
-    mayHaveSent:()=>boolean=()=>false):Promise<T> {
+    mayHaveSent:()=>boolean=()=>false,timeoutMs=this.timeouts.operationMs):Promise<T> {
     const abort = new AbortController();
     const cancel = () => abort.abort(new BrowserCompanionError("Browser action was cancelled", "cancelled"));
     if (parent?.aborted) cancel(); else parent?.addEventListener("abort",cancel,{once:true});
     const timer = setTimeout(() => abort.abort(new BrowserCompanionError(
-      `Browser operation timed out after ${this.timeouts.operationMs / 1000} seconds without progress`, "failed")), this.timeouts.operationMs);
+      `Browser operation timed out after ${timeoutMs / 1000} seconds without progress`, "failed")), timeoutMs);
     timer.unref?.();
     let onAbort!:()=>void;
     const interrupted = new Promise<{interrupted:true}>(resolve => {

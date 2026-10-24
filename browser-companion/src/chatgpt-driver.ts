@@ -543,8 +543,8 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         if(current?.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
         return beginConnectorToolRefresh(page,appId,name,account.fingerprint,operationSignal);
       });
-      // Waiting on this refresh's result performs no UI work and owns no lease.
-      // Other browser actions may navigate normally; the observer then stops.
+      // The coordinator retains the shared window through confirmation and the
+      // restoration below; other operations must not navigate away mid-refresh.
       const refreshObserved=await Promise.race([observation.wait(waitSignal),interrupted]);
       return {appId,permissionChanged,refreshObserved,schemaVerified:false as const};
     }finally {

@@ -932,7 +932,7 @@ test('a driver that ignores cancellation is retired before its tab can be reused
  await coordinator.close();expect(closed).toBe(1);
 });
 
-test('multi-step maintenance yields the UI lease to already queued work between steps',async()=>{
+test('connector maintenance retains the UI lease across steps and restoration',async()=>{
  const driver=new DeferredDriver(),order:string[]=[];let entered!:()=>void,release!:()=>void;
  const started=new Promise<void>(resolve=>{entered=resolve;}),gate=new Promise<void>(resolve=>{release=resolve;});
  const original=driver.capabilities.bind(driver);
@@ -947,9 +947,61 @@ test('multi-step maintenance yields the UI lease to already queued work between 
  expect((await coordinator.health()).status).toBe('busy');
  const other=coordinator.capabilities();release();
  await refresh;await other;
- expect(order).toEqual(['first-step','other-operation','second-step']);
+ expect(order).toEqual(['first-step','second-step','other-operation']);
  expect((await coordinator.health()).status).toBe('idle');await coordinator.close();
 });
+
+test('refresh observation and restoration exclude plan checks, navigation and submissions',async()=>{
+ const driver=new DeferredDriver(),order:string[]=[];
+ let observing!:()=>void,confirm!:()=>void,restoring!:()=>void,restored!:()=>void;
+ const observationStarted=new Promise<void>(resolve=>{observing=resolve;});
+ const confirmation=new Promise<void>(resolve=>{confirm=resolve;});
+ const restorationStarted=new Promise<void>(resolve=>{restoring=resolve;});
+ const restoration=new Promise<void>(resolve=>{restored=resolve;});
+ (driver as BrowserDriver).refreshConnectorSteps=async(_name,run,signal)=>{
+  await run(async()=>{order.push('prepare-refresh');},signal);
+  observing();await confirmation;order.push('confirmed');
+  await run(async()=>{restoring();await restoration;order.push('restored');});
+  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false};
+ };
+ (driver as BrowserDriver).accountPlan=async()=>{order.push('plan');return {accountFingerprint:'account-1',kind:'pro',label:'Pro 20x',sourceLabel:'ChatGPT Pro 200'};};
+ const capabilities=driver.capabilities.bind(driver);
+ driver.capabilities=async()=>{order.push('capabilities');return capabilities();};
+ driver.reveal=async()=>{order.push('navigate');};
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{operationMs:500,cleanupMs:100,hardStopMs:100});
+ const refresh=coordinator.refreshConnector('Fixture connector');await observationStarted;
+ const plan=coordinator.accountPlan('startup'),catalog=coordinator.capabilities(),navigation=coordinator.reveal('https://chatgpt.com/c/next'),submission=coordinator.execute(request('after-refresh'));
+ await Bun.sleep(600); // Longer than a UI phase's watchdog; confirmation has its own deadline.
+ expect(order).toEqual(['prepare-refresh']);expect(driver.runs).toEqual([]);
+ expect((await coordinator.health()).status).toBe('busy');
+ confirm();await restorationStarted;
+ expect(order).toEqual(['prepare-refresh','confirmed']);expect(driver.runs).toEqual([]);
+ restored();await refresh;await Promise.all([plan,catalog,navigation,submission]);
+ expect(order).toEqual(['prepare-refresh','confirmed','restored','plan','capabilities','navigate']);
+ while(!driver.releases.has('after-refresh'))await Bun.sleep(1);
+ driver.releases.get('after-refresh')!();await collect(coordinator,'after-refresh');
+ await coordinator.close();
+},3000);
+
+test('cancelled refresh restores its page before queued account work can run',async()=>{
+ const driver=new DeferredDriver(),order:string[]=[];let observing!:()=>void,restoring!:()=>void,restored!:()=>void;
+ const observationStarted=new Promise<void>(resolve=>{observing=resolve;});
+ const restorationStarted=new Promise<void>(resolve=>{restoring=resolve;});
+ const restoration=new Promise<void>(resolve=>{restored=resolve;});
+ (driver as BrowserDriver).refreshConnectorSteps=async(_name,run,signal)=>{
+  await run(async()=>{},signal);observing();
+  try {await new Promise<void>((_resolve,reject)=>signal!.addEventListener('abort',()=>reject(signal!.reason),{once:true}));}
+  finally {await run(async cleanupSignal=>{expect(cleanupSignal.aborted).toBeFalse();restoring();await restoration;order.push('restored');});}
+  throw Error('unreachable');
+ };
+ (driver as BrowserDriver).accountPlan=async()=>{order.push('plan');return {accountFingerprint:'account-1',kind:'pro',label:'Pro 20x',sourceLabel:'ChatGPT Pro 200'};};
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{operationMs:500,cleanupMs:100,hardStopMs:100});
+ const cancellation=new AbortController(),refresh=coordinator.refreshConnector('Fixture connector',cancellation.signal);
+ const rejected=refresh.then(()=>{throw Error('Expected refresh cancellation');},error=>{expect(error.message).toContain('cancelled');});await observationStarted;
+ const plan=coordinator.accountPlan('queued');cancellation.abort();await restorationStarted;
+ expect(order).toEqual([]);expect((await coordinator.health()).status).toBe('busy');
+ restored();await rejected;await plan;expect(order).toEqual(['restored','plan']);await coordinator.close();
+},2000);
 
 test("liveness checks browser responsiveness without inspecting account sessions", async () => {
   class LivenessDriver extends DeferredDriver {

@@ -144,6 +144,8 @@
       "name": "exact connector display name"
     },
     "completion": "observed refresh control busy/idle cycle and Allow all tools selected",
+    "ownership": "exclusive shared browser transaction through preparation, confirmation and original-page restoration; other browser UI operations wait",
+    "deadlineMs": 120000,
     "schemaVerified": false
   },
   "conversationApproval": {

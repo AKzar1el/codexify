@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.14] - 2026-10-24
+
+### Fixed
+
+- Keep connector refresh exclusive from preparation through completion and
+  restoration of the original page. Subscription checks, model discovery,
+  navigation, and message submission wait instead of interrupting the refresh.
+- Report the shared browser as busy while refresh completion is being observed,
+  and retain bounded step deadlines, cancellation cleanup, and a two-minute
+  overall refresh deadline.
+- Advance the browser companion compatibility fingerprint so post-update
+  maintenance cannot reuse an older companion with the interrupted-refresh bug.
+
 ## [2.3.13] - 2026-10-24
 
 ### Added
@@ -1078,7 +1091,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drained through bounded head/tail buffers, while component-only `_meta` remains
   outside the model-visible limit.
 
-[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.13...HEAD
+[Unreleased]: https://github.com/devnoname120/codexify/compare/v2.3.14...HEAD
+[2.3.14]: https://github.com/devnoname120/codexify/compare/v2.3.13...v2.3.14
 [2.3.13]: https://github.com/devnoname120/codexify/compare/v2.3.12...v2.3.13
 [2.3.12]: https://github.com/devnoname120/codexify/compare/v2.3.11...v2.3.12
 [2.3.11]: https://github.com/devnoname120/codexify/compare/v2.3.10...v2.3.11
