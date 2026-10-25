@@ -219,6 +219,43 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
 
 #[tokio::test]
 #[ignore = "requires CODEXIFY_TEST_BROWSER_COMPANION_BUN; exercised explicitly by CI"]
+async fn slow_preflight_is_acknowledged_before_the_rust_transport_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = start_fixture_mode(root.path(), "slow-preflight");
+    let client = BrowserCompanionClient::from_descriptor_path_with_timeouts(
+        &fixture.descriptor,
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    let request = contract_request("slow-preflight", "slow-preflight-execute");
+    let accepted = client.execute(&request, &cancellation).await.unwrap();
+    assert_eq!(accepted.state, CompanionActionState::Queued);
+    assert!(!accepted.send_accepted);
+    let replay = client.execute(&request, &cancellation).await.unwrap();
+    assert_eq!(replay.last_event_sequence, accepted.last_event_sequence);
+    let mut sends = 0;
+    client
+        .stream_action_events(&request.action_id, 0, &cancellation, |event| {
+            if matches!(event.kind, CompanionEventKind::SendAccepted) {
+                sends += 1;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(sends, 1);
+    let terminal = client
+        .action(&request.action_id, &cancellation)
+        .await
+        .unwrap();
+    assert_eq!(terminal.state, CompanionActionState::Idle);
+    assert!(terminal.send_accepted);
+}
+
+#[tokio::test]
+#[ignore = "requires CODEXIFY_TEST_BROWSER_COMPANION_BUN; exercised explicitly by CI"]
 async fn rust_client_round_trips_the_real_typescript_protocol() {
     let root = tempfile::tempdir().unwrap();
     let fixture = start_fixture(root.path());

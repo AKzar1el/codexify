@@ -288,7 +288,8 @@ test("only an explicitly manual action bypasses navigation cooldown and still re
   expect(loads).toEqual(["https://chatgpt.com/c/existing",manual.url]);
   const after=request("cooldown-after");await coordinator.execute(after);
   expect((await collect(coordinator,after.actionId)).some(event=>event.type==="waiting")).toBe(true);
-  await expect(coordinator.execute({...request("cooldown-wrong-account"),expectedAccountFingerprint:"other",bypassConversationCooldown:true})).rejects.toThrow("account changed");
+  await coordinator.execute({...request("cooldown-wrong-account"),expectedAccountFingerprint:"other",bypassConversationCooldown:true});
+  expect((await collect(coordinator,"cooldown-wrong-account")).at(-1)).toMatchObject({type:"failed",message:expect.stringContaining("account changed")});
   expect(loads).toHaveLength(2);
 });
 
@@ -321,6 +322,7 @@ test("concurrent execute preflights cannot acquire the single window twice", asy
   try {
     expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+    while (!driver.runs.length) await Bun.sleep(1);
     expect(driver.maxActiveHealthCalls).toBe(1);
     expect(driver.runs).toHaveLength(1);
   } finally {
@@ -335,6 +337,7 @@ test("execute is idempotent but an action ID cannot be rebound to another reques
   expect((await coordinator.execute(submitted)).actionId).toBe("same");
   expect((await coordinator.execute(structuredClone(submitted))).actionId).toBe("same");
   await expect(coordinator.execute({ ...submitted, effort:"medium" })).rejects.toThrow("different request");
+  while (!driver.releases.has("same")) await Bun.sleep(1);
   driver.releases.get("same")?.();
   await collect(coordinator, "same");
   expect(driver.runs).toEqual(["same"]);
@@ -355,15 +358,15 @@ test("cancellation is idempotent and never starts another action", async () => {
   expect(driver.runs).toEqual(["cancel"]);
 });
 
-test("a manually busy shared window is rejected before navigation or queue ownership", async () => {
+test("a manually busy shared window produces a retained failure before navigation", async () => {
   const driver = new DeferredDriver();
   driver.status = "busy";
   const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);
 
-  await expect(coordinator.execute(request("manual-busy"))).rejects.toThrow("not idle");
-
+  await coordinator.execute(request("manual-busy"));
+  expect((await collect(coordinator,"manual-busy")).at(-1)).toMatchObject({type:"failed",message:expect.stringContaining("not idle")});
   expect(driver.runs).toEqual([]);
-  expect(await coordinator.action("manual-busy")).toBeUndefined();
+  expect(await coordinator.action("manual-busy")).toMatchObject({state:"failed",sendAccepted:false});
   expect((await coordinator.health()).status).toBe("busy");
 });
 
@@ -645,8 +648,8 @@ test("pairing and default conversation actions allow an omitted connector and st
   for (let attempt=0;attempt<20;attempt++) {snapshot=await coordinator.action(pair.actionId);if(snapshot?.state==="idle")break;await Bun.sleep(5);}
   expect(snapshot?.sendAccepted).toBeTrue();expect(snapshot?.selected).toBeNull();
   const wrongAccount = {...pair,actionId:"wrong-account-pair",idempotencyKey:"wrong-account-idem",expectedAccountFingerprint:"different-account"};
-  let failure: unknown;try {await coordinator.execute(wrongAccount);} catch(error){failure=error;}
-  expect((failure as Error).message).toContain("account changed");
+  await coordinator.execute(wrongAccount);
+  expect((await collect(coordinator,wrongAccount.actionId)).at(-1)).toMatchObject({type:"failed",message:expect.stringContaining("account changed")});
   expect(driver.runs).toEqual(["no-model-pair"]);
   await coordinator.close();
 });
@@ -748,8 +751,11 @@ test("ordinary sends still require model verification before connector verificat
 test("a stopped browser is not reported as a ChatGPT authentication failure",async()=>{
   const driver=new DeferredDriver();driver.authenticated=false;driver.status="unavailable";
   const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
-  const failure=await coordinator.execute(request("browser-closed")).then(()=>undefined,error=>error);
-  expect(failure).toBeInstanceOf(Error);expect(failure.message).not.toContain("authentication");expect(driver.runs).toEqual([]);
+  await coordinator.execute(request("browser-closed"));
+  const failure=(await collect(coordinator,"browser-closed")).at(-1);
+  expect(failure).toMatchObject({type:"failed"});
+  expect(failure?.type==="failed" && failure.message.includes("authentication")).toBeFalse();
+  expect(driver.runs).toEqual([]);
 });
 
 test("passive approval checks yield to active sends and never start another action",async()=>{
@@ -930,6 +936,20 @@ test('a driver that ignores cancellation is retired before its tab can be reused
  await expect(coordinator.capabilities()).rejects.toThrow('recovery is required');
  expect(driver.capabilityCalls).toBe(0);
  await coordinator.close();expect(closed).toBe(1);
+});
+
+test('a stalled admitted preflight records a definite unsent failure and retires its driver',async()=>{
+ const driver=new DeferredDriver();let closed=0;
+ driver.health=async()=>new Promise(()=>{});
+ (driver as BrowserDriver).close=async()=>{closed++;};
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
+ await coordinator.execute(request('stalled-preflight'));
+ const events=await collect(coordinator,'stalled-preflight');
+ expect(events.at(-1)).toMatchObject({type:'failed',message:expect.stringContaining('timed out')});
+ expect(await coordinator.action('stalled-preflight')).toMatchObject({state:'failed',sendAccepted:false});
+ expect(driver.runs).toEqual([]);expect(closed).toBe(1);
+ expect((await coordinator.health()).status).toBe('unavailable');
+ await coordinator.close();
 });
 
 test('connector maintenance retains the UI lease across steps and restoration',async()=>{

@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25";
+    "06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25";
+    "+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -1029,6 +1029,9 @@ impl BrowserCompanionClient {
             message,
             may_have_reached_companion: false,
         })?;
+        // Only static operation labels are logged/displayed: never the loopback
+        // endpoint, bearer, action IDs, query strings, or raw reqwest error URL.
+        let operation = companion_operation(&method, path);
         let mut request = self
             .http
             .request(method, url)
@@ -1058,9 +1061,21 @@ impl BrowserCompanionClient {
                 message: cancelled_error(),
                 may_have_reached_companion: true,
             }),
-            response = request.send() => response.map_err(|error| RequestFailure {
-                message: "Browser companion request failed before a verified response".to_string(),
-                may_have_reached_companion: !error.is_connect() && !error.is_builder(),
+            response = request.send() => response.map_err(|error| {
+                let reason = if error.is_timeout() && error.is_connect() {
+                    format!("connection timed out after {}s", self.request_timeout.min(Duration::from_secs(10)).as_secs_f64())
+                } else if error.is_timeout() {
+                    timeout.map_or_else(|| "timed out".to_string(), |limit| format!("timed out after {}s", limit.as_secs_f64()))
+                } else if error.is_connect() {
+                    "could not connect".to_string()
+                } else {
+                    "connection interrupted".to_string()
+                };
+                tracing::warn!(operation, reason, "Browser companion request failed");
+                RequestFailure {
+                    message: format!("Browser companion request failed before a verified response ({operation}: {reason})"),
+                    may_have_reached_companion: !error.is_connect() && !error.is_builder(),
+                }
             }),
         }
     }
@@ -1097,6 +1112,29 @@ impl BrowserCompanionClient {
         self.endpoint
             .join(path.trim_start_matches('/'))
             .map_err(|_| "Browser companion request path is invalid".to_string())
+    }
+}
+
+fn companion_operation(method: &Method, path: &str) -> &'static str {
+    match (method.as_str(), path.split('?').next().unwrap_or_default()) {
+        ("GET", "/v1/liveness") => "checking browser liveness",
+        ("GET", "/v1/health") => "checking browser account/session",
+        ("POST", "/v1/actions/execute") => "admitting browser action",
+        ("POST", "/v1/actions/cancel") => "cancelling browser action",
+        ("GET", route) if route.starts_with("/v1/actions/") && route.ends_with("/events") => {
+            "reading browser action events"
+        }
+        ("GET", route) if route.starts_with("/v1/actions/") => "reading browser action status",
+        ("POST", "/v1/account/plan") => "checking subscription tier",
+        ("POST", "/v1/connectors/refresh") => "refreshing connector",
+        ("POST", "/v1/turns/handoff") => "checking turn handoff",
+        ("POST", "/v1/approvals/conversation") => "checking conversation approval",
+        ("POST", "/v1/session/capabilities" | "/v1/new-chat/capabilities") => {
+            "reading model catalog"
+        }
+        ("POST", "/v1/session/login") => "opening browser login",
+        ("POST", "/v1/window/reveal") => "showing browser window",
+        _ => "browser operation",
     }
 }
 

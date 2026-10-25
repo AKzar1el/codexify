@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25";
+    "test-build-v1+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -759,6 +759,50 @@ async fn action_attention_uses_the_protocol_delta_bound() {
         .unwrap();
     assert_eq!(snapshot.attention.unwrap().message.unwrap().len(), 5400);
     task.abort();
+}
+
+#[tokio::test]
+async fn transport_errors_identify_operation_and_timeout_without_private_details() {
+    async fn slow_health() -> Response {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        StatusCode::OK.into_response()
+    }
+    let (endpoint, task) = spawn_fake(Router::new().route("/v1/health", get(slow_health))).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path_with_timeout(
+        &path,
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let error = client.health(&CancellationToken::new()).await.unwrap_err();
+    assert!(
+        error.contains("checking browser account/session: timed out after 0.1s"),
+        "{error}"
+    );
+    assert!(!error.contains(&endpoint));
+    assert!(!error.contains(TOKEN));
+    task.abort();
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let unavailable = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let path = private_descriptor(root.path(), &unavailable, TOKEN, std::process::id(), BUILD);
+    let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+    let error = client
+        .action("private-action-id", &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("reading browser action status: could not connect"),
+        "{error}"
+    );
+    assert!(!error.contains(&unavailable));
+    assert!(!error.contains("private-action-id"));
+    assert!(!error.contains(TOKEN));
 }
 
 #[tokio::test]

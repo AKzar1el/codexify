@@ -13,6 +13,7 @@ if (!descriptorPath) throw new Error("descriptor path is required");
 
 class ContractDriver implements BrowserDriver {
   async health() {
+    if (mode === "slow-preflight") await Bun.sleep(1_500);
     return {
       authenticated:true,
       accountFingerprint:"contract-account",

@@ -1,19 +1,19 @@
 {
-  "schemaHash": "153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
-  "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+  "schemaHash": "06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
+  "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
   "descriptor": {
     "version": 1,
     "kind": "codexify-browser-companion",
     "pid": 1234,
     "endpoint": "http://127.0.0.1:43123",
     "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "createdAt": "2026-10-09T12:00:00Z"
   },
   "health": {
     "protocolVersion": 1,
     "kind": "codexify-browser-companion",
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "status": "idle",
     "authenticated": true,
     "accountFingerprint": "fixture-account",
@@ -21,7 +21,7 @@
   },
   "capabilities": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "accountFingerprint": "fixture-account",
     "catalogRevision": "fixture-catalog",
     "models": [
@@ -50,7 +50,7 @@
   },
   "revealReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "revealed": true,
     "activeActionId": null
   },
@@ -151,7 +151,7 @@
   ],
   "actionSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "actionId": "fixture-action",
     "state": "generating",
     "sendAccepted": true,
@@ -165,7 +165,7 @@
   },
   "waitingSnapshot": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "actionId": "fixture-waiting",
     "state": "waiting",
     "sendAccepted": false,
@@ -181,7 +181,7 @@
   },
   "cancelReceipt": {
     "protocolVersion": 1,
-    "build": "fixture+protocol.153c7198ee6ed545006b66ee293cbb7d2729182fab74c4eb54e99cf763f64b25",
+    "build": "fixture+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8",
     "actionId": "fixture-action",
     "state": "ambiguous",
     "cancelled": true

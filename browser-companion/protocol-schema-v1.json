@@ -175,5 +175,10 @@
     "completionProof": "Same account and conversation; latest assistant final begins with the exact handoff ID, has completion controls, no generation and stable content across two observations. Rechecked before continuation Send.",
     "continuation": "Continue.",
     "sendClock": "First confirmed Send acceptance, actual selected model and effort; pairing sends excluded."
+  },
+  "actionAdmission": {
+    "receipt": "Record and acknowledge a queued action before waiting for browser ownership or account preflight; Send is not accepted by admission.",
+    "reconciliation": "Idempotent execute and action status remain available during preflight; preflight failures and cancellation are retained unsent terminal events.",
+    "ownership": "One admitted action at a time; preflight waits behind earlier browser maintenance, verifies account and idle state before execution, and outlives the receipt connection."
   }
 }
