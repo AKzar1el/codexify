@@ -10,7 +10,7 @@ import {navigatePage,recordConversationAvailable} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
-import { asCompanionError, BrowserCompanionError } from "./errors";
+import { asCompanionError, BrowserCompanionError,browserStage } from "./errors";
 import { uiLabelPattern } from "./ui-localization";
 import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
@@ -469,7 +469,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       throw new BrowserCompanionError("Sign in to ChatGPT before refreshing browser capabilities", "authentication_required", { cause:error });
     }
     const account = await readChatGptAccount(page);
-    const capabilities = await detectChatGptAccountCapabilities(page,{signal});
+    const capabilities = await browserStage("capability_discovery","ChatGPT capability discovery failed",()=>detectChatGptAccountCapabilities(page,{signal}));
     const planKind = this.planCache?.plan.accountFingerprint === account.fingerprint
       ? this.planCache.plan.kind : classifyPlan(account.planType).kind;
     const catalog = buildCapabilityCatalog(capabilities, account.fingerprint, this.build, planKind);
@@ -757,6 +757,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       const preferredModel = execution.request.model, preferredEffort = execution.request.effort;
       if (!creating && execution.request.prompt.kind !== "pair_verify"
         && preferredModel !== null && preferredEffort !== null) {
+        step("selecting model and effort");
         selected = await prepareBeforeSend(()=>selectAvailableModelAndEffort(
           page,
           preferredModel,
@@ -768,6 +769,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
       }
       if (creating || execution.request.prompt.kind === "pair_verify") {
+        step("selecting pairing Medium");
         pairingSelection = await selectPairingMedium(page, execution.signal);
       }
       try {

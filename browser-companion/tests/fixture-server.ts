@@ -3,6 +3,7 @@ import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } fro
 import { startControlServer } from "../src/control-server";
 import { protocolBuild, validateProtocolBuild } from "../src/protocol";
 import { ConversationCooldownError } from "../src/errors";
+import {BrowserCompanionError} from "../src/errors";
 
 const descriptorPath = process.argv[2];
 const build = process.argv[3]
@@ -23,6 +24,7 @@ class ContractDriver implements BrowserDriver {
   }
   async login() { return this.health(); }
   async capabilities(): Promise<CapabilityCatalog> {
+    if(mode==="picker-error")throw new BrowserCompanionError("ChatGPT did not expose one owned model/effort control","selector_drift",{phase:"effort_control_lookup"});
     return {
       protocolVersion:1,
       build,

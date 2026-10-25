@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
+    "test-build-v1+protocol.51f4333338d08ded8d8e49baebb3bbe0c73cd466b9d1bf79840f4e8a568913ef";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -759,6 +759,54 @@ async fn action_attention_uses_the_protocol_delta_bound() {
         .unwrap();
     assert_eq!(snapshot.attention.unwrap().message.unwrap().len(), 5400);
     task.abort();
+}
+
+#[tokio::test]
+async fn controlled_picker_failures_survive_http_without_exposing_unvalidated_response_bodies() {
+    for variant in [
+        "valid",
+        "wrong-build",
+        "unknown-phase",
+        "unknown-code",
+        "extra-field",
+    ] {
+        let mut body = json!({"protocolVersion":PROTOCOL_VERSION,"build":BUILD,"error":{"code":"selector_drift","phase":"model_options","message":"ChatGPT did not expose its model options"}});
+        match variant {
+            "wrong-build" => body["build"] = json!("untrusted-build"),
+            "unknown-phase" => body["error"]["phase"] = json!("private-browser-page"),
+            "unknown-code" => body["error"]["code"] = json!("private-browser-code"),
+            "extra-field" => body["error"]["privatePrompt"] = json!("private page text"),
+            _ => {}
+        }
+        let app = Router::new().route(
+            "/v1/session/capabilities",
+            post(move || async move { (StatusCode::CONFLICT, axum::Json(body)) }),
+        );
+        let (endpoint, task) = spawn_fake(app).await;
+        let root = tempfile::tempdir().unwrap();
+        let path = private_descriptor(root.path(), &endpoint, TOKEN, std::process::id(), BUILD);
+        let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
+        let error = client
+            .capabilities(&CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        if variant == "valid" {
+            assert!(
+                error.contains("ChatGPT did not expose its model options"),
+                "{error}"
+            );
+            assert!(error.contains("model_options"));
+            assert!(error.contains("selector_drift"));
+        } else {
+            assert_eq!(
+                error,
+                "Browser companion rejected the operation because its state changed"
+            );
+        }
+        assert!(!error.contains("private"));
+        task.abort();
+    }
 }
 
 #[tokio::test]

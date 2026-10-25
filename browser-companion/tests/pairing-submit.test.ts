@@ -35,9 +35,10 @@ let quietGenerationMs = 0;
 let generatingOnLoad = false;
 let acceptsStop:boolean|number|"reload" = true;
 let stopFinishDelayMs=200;
-let fixtureLanguage:"en"|"el"|"it"="en";
+let fixtureLanguage:"en"|"el"|"it"|"ja"="en";
 const fixtureUi={
   en:{send:"Send",stop:"Stop",counter:"of",efforts:["Instant","Medium","High","Extra High","Pro"]},
+  ja:{send:"送信",stop:"停止",counter:"of",efforts:["Instant","中","高","非常に高い","Pro"]},
   el:{send:"Αποστολή",stop:"Διακοπή",counter:"από",efforts:["Γρήγορο","Μεσαίο","Υψηλό","Πολύ υψηλό","Pro"]},
   it:{send:"Invia",stop:"Interrompi",counter:"di",efforts:["Immediato","Medio","Alto","Molto alto","Pro"]},
 } as const;
@@ -136,7 +137,7 @@ async function installFixtureRoutes(){
         window.renderModel=()=>{
           const model=window.definitions[window.family],index=model.value-model.min;
           range.innerHTML='<div data-model-reasoning-effort-slider><span role="slider" aria-valuemin="'+model.min+'" aria-valuemax="'+(model.min+model.labels.length-1)+'" aria-valuenow="'+model.value+'"></span>'+model.labels.map((label,i)=>'<span data-selected="'+(i===index)+'" data-locked="'+model.locked.includes(i)+'" aria-label="'+(${hideEffortLabels}?'':label)+'"></span>').join('')+'</div>';
-          document.querySelector('#effort-description').textContent=window.family+' '+model.labels[index]+', '+(index+1)+${JSON.stringify(" "+fixtureUi[fixtureLanguage].counter+" ")}+model.labels.length+'.';
+          document.querySelector('#effort-description').textContent=${fixtureLanguage==="ja" ? "model.labels[index]+'、'+model.labels.length+'件中'+(index+1)+'件目。'" : "window.family+' '+model.labels[index]+', '+(index+1)+"+JSON.stringify(" "+fixtureUi[fixtureLanguage].counter+" ")+"+model.labels.length+'.'"};
           control.textContent=model.labels[index];document.body.dataset.family=window.family;document.body.dataset.effort=model.labels[index];
           document.querySelectorAll('[data-family]').forEach(row=>row.setAttribute('aria-checked',String(row.dataset.family===window.family)));
         };
@@ -455,7 +456,9 @@ test.skipIf(!native)("whitespace-only drafts are removed from the submitted text
 
 test.skipIf(!native)("model discovery preserves an unsent draft and waits for an empty composer",async()=>{
   const driver=await fixture('Keep this model-picker draft');
-  await expect(driver.capabilities()).rejects.toThrow('requires an empty composer');
+  const failure=await driver.capabilities().catch(error=>error);
+  expect(failure.message).toContain('requires an empty composer');
+  expect(failure.phase).toBe('capability_discovery');
   expect(await composerText(await activeComposer(page))).toBe('Keep this model-picker draft');
   expect(await page.locator('body').getAttribute('data-sends')).toBe('0');
 },20_000);
@@ -1378,3 +1381,39 @@ test.skipIf(!native)("a created conversation URL is retained when applying the s
  expect((await coordinator.action(create.actionId))?.sendAccepted).toBeTrue();
  expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('1');
 },20_000);
+
+
+async function lazyJapanesePicker() {
+  await page.evaluate(()=>{
+    const script=document.createElement('script');script.textContent=`(()=>{
+      const view=document.querySelector('[data-model-picker-view]');
+      view.querySelector('[data-family="5.5"]')?.remove();
+      const rows=[...view.querySelectorAll('[role="menuitemradio"]')];
+      rows.forEach(row=>row.remove());view.dataset.modelPickerView='simple';
+      const toggle=document.createElement('button');toggle.type='button';toggle.setAttribute('role','menuitem');
+      toggle.setAttribute('aria-expanded','false');toggle.textContent='Instant ›';view.append(toggle);
+      const close=()=>{rows.forEach(row=>row.remove());toggle.setAttribute('aria-expanded','false');view.dataset.modelPickerView='simple';};
+      toggle.onclick=()=>{view.append(...rows);toggle.setAttribute('aria-expanded','true');view.dataset.modelPickerView='advanced';window.renderModel();};
+      rows.forEach(row=>row.addEventListener('click',close));
+      document.addEventListener('keydown',event=>{if(event.key==='Escape')close();});
+      for(const family of ['6','5.6'])Object.assign(window.definitions[family],{labels:['Instant','中','高'],value:2,locked:[]});
+      document.querySelector('#effort').removeAttribute('data-testid');window.renderModel();
+    })();`;document.body.append(script);
+  });
+}
+
+for(const creating of [false,true])test.skipIf(!native)(`Japanese lazy picker ${creating?'creates a new chat':'pairs an existing chat'} with one Medium send`,async()=>{
+  const driver=await fixture('',true,connector,0,false,true,{family:'6',value:2,locked:[]});
+  fixtureLanguage='ja';await syncFixture();await lazyJapanesePicker();
+  if(creating)await page.evaluate(()=>history.replaceState({},'','/'));
+  const catalog=await driver.capabilities();
+  expect(catalog.models.map(model=>model.id)).toEqual(['gpt-6-sol','gpt-5.6-sol']);
+  const submitted:ExecuteActionRequest=creating?{...request,url:'https://chatgpt.com/new',expectedUrl:'https://chatgpt.com/new',model:'gpt-6-sol',effort:'high',prompt:{kind:'create_chat',reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}}:request;
+  const coordinator=new SingleWindowCoordinator(driver,build);
+  await executeCoordinatorFixture(coordinator,submitted);const events=[];
+  for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+  expect(events.at(-1)?.type).toBe('submission_complete');
+  expect(events.filter(event=>event.type==='send_accepted')).toHaveLength(1);
+  expect(await page.evaluate(()=>[document.body.dataset.sends,document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.family,document.body.dataset.effort])).toEqual(['1','6','中','6','高']);
+  await coordinator.close();
+},30_000);

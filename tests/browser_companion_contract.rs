@@ -219,6 +219,23 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
 
 #[tokio::test]
 #[ignore = "requires CODEXIFY_TEST_BROWSER_COMPANION_BUN; exercised explicitly by CI"]
+async fn rust_client_retains_the_typescript_picker_failure_stage() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = start_fixture_mode(root.path(), "picker-error");
+    let client = BrowserCompanionClient::from_descriptor_path(&fixture.descriptor).unwrap();
+    let error = client
+        .capabilities(&CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("one owned model/effort control"), "{error}");
+    assert!(error.contains("effort_control_lookup"));
+    assert!(error.contains("selector_drift"));
+    assert!(!error.contains("state changed"));
+}
+
+#[tokio::test]
+#[ignore = "requires CODEXIFY_TEST_BROWSER_COMPANION_BUN; exercised explicitly by CI"]
 async fn slow_preflight_is_acknowledged_before_the_rust_transport_deadline() {
     let root = tempfile::tempdir().unwrap();
     let fixture = start_fixture_mode(root.path(), "slow-preflight");

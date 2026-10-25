@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.17] - 2026-10-25
+
+### Fixed
+
+- Discover models and verify pairing when ChatGPT mounts its model list only
+  after expanding the effort picker's submenu, including inline and portaled
+  lists. Retain the original model and effort while inspecting capabilities.
+- Recognize uniquely owned localized effort controls, including Japanese labels,
+  and borrow Medium for pairing without assuming fixed slider positions.
+- Report the failed picker stage for discovery and pairing instead of reducing
+  every browser conflict to "state changed". Keep raw page and request data out
+  of diagnostic responses.
+- Acknowledge queued browser actions before waiting for browser ownership or
+  account preflight, so slow preparation remains observable and repeat requests
+  cannot submit another copy of the message.
+- Identify the operation and timeout or connection cause in transport failures,
+  and require the updated browser companion compatibility fingerprint.
+
 ## [2.3.16] - 2026-10-25
 
 ### Fixed

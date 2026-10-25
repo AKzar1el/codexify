@@ -7,6 +7,7 @@ import type { CapabilityCatalog, ConversationApprovalRequest, ExecuteActionReque
 import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } from "../src/browser-window";
 import { startControlServer } from "../src/control-server";
 import { protocolBuild } from "../src/protocol";
+import {browserStage} from "../src/errors";
 
 const TEST_BUILD = protocolBuild("test-build");
 
@@ -65,6 +66,25 @@ class PrivateFailureDriver extends ImmediateDriver {
     );
   }
 }
+
+test("controlled picker failures return a structured diagnosis instead of an unexplained conflict",async()=>{
+  class PickerFailureDriver extends ImmediateDriver {
+    override async capabilities():Promise<CapabilityCatalog> {
+      return browserStage("model_options","ChatGPT did not expose its model options",async()=>{
+        throw new Error("private page text at https://chatgpt.com/c/private-conversation");
+      });
+    }
+  }
+  const root=await mkdtemp(join(tmpdir(),"picker-error-control-"));
+  const server=await startControlServer(new SingleWindowCoordinator(new PickerFailureDriver(),TEST_BUILD),join(root,"descriptor.json"));
+  try {
+    const response=await fetch(`${server.endpoint}/v1/session/capabilities`,{method:"POST",headers:{Authorization:`Bearer ${server.token}`,"Content-Type":"application/json"},body:"{}"});
+    expect(response.status).toBe(409);
+    const value=await response.json();
+    expect(value).toEqual({protocolVersion:1,build:TEST_BUILD,error:{code:"selector_drift",phase:"model_options",message:"ChatGPT did not expose its model options (step: model_options)"}});
+    expect(JSON.stringify(value)).not.toContain("private");
+  }finally{await server.close();}
+});
 
 function executeBody(): ExecuteActionRequest {
   return {

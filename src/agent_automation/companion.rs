@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
+    "51f4333338d08ded8d8e49baebb3bbe0c73cd466b9d1bf79840f4e8a568913ef";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.06582e005dbe1a92916f8a8c765f4404f81c2bdb6b747ecdae479c0da736a7a8";
+    "+protocol.51f4333338d08ded8d8e49baebb3bbe0c73cd466b9d1bf79840f4e8a568913ef";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -441,7 +441,7 @@ impl BrowserCompanionClient {
             return Ok(None);
         }
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         let value: Liveness = self.decode_json_response(response, cancellation).await?;
         if value.protocol_version != PROTOCOL_VERSION || value.build != self.build.as_ref() {
@@ -538,7 +538,7 @@ impl BrowserCompanionClient {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         self.decode_json_response(response, cancellation).await
     }
@@ -558,7 +558,7 @@ impl BrowserCompanionClient {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         self.decode_json_response(response, cancellation).await
     }
@@ -595,7 +595,7 @@ impl BrowserCompanionClient {
             )
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         let catalog: CapabilityCatalog = self.decode_json_response(response, cancellation).await?;
         validate_catalog(&catalog)?;
@@ -756,7 +756,7 @@ impl BrowserCompanionClient {
             .send_json_with_timeout::<Value>(Method::GET, &path, None, cancellation, None)
             .await?;
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         let content_type = response
             .headers()
@@ -864,16 +864,19 @@ impl BrowserCompanionClient {
                     },
                 }
             }
-            Ok(response) => ExecuteAttempt::Failed {
-                message: status_error(response.status()),
-                retryable_if_absent: matches!(
-                    response.status(),
-                    StatusCode::BAD_GATEWAY
-                        | StatusCode::SERVICE_UNAVAILABLE
-                        | StatusCode::GATEWAY_TIMEOUT
-                ),
-                ambiguous_if_unreconciled: false,
-            },
+            Ok(response) => {
+                let code = response.status();
+                ExecuteAttempt::Failed {
+                    message: self.response_status_error(response, cancellation).await,
+                    retryable_if_absent: matches!(
+                        code,
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    ),
+                    ambiguous_if_unreconciled: false,
+                }
+            }
             Err(error) => ExecuteAttempt::Failed {
                 message: error.message,
                 retryable_if_absent: !cancellation.is_cancelled(),
@@ -896,7 +899,7 @@ impl BrowserCompanionClient {
             return Ok(None);
         }
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         let snapshot = self
             .decode_json_response::<CompanionActionSnapshot>(response, cancellation)
@@ -973,7 +976,7 @@ impl BrowserCompanionClient {
     {
         let response = self.send_json(method, path, body, cancellation).await?;
         if !response.status().is_success() {
-            return Err(status_error(response.status()));
+            return Err(self.response_status_error(response, cancellation).await);
         }
         self.decode_json_response(response, cancellation).await
     }
@@ -1078,6 +1081,67 @@ impl BrowserCompanionClient {
                 }
             }),
         }
+    }
+
+    async fn response_status_error(
+        &self,
+        response: reqwest::Response,
+        cancellation: &CancellationToken,
+    ) -> String {
+        let fallback = status_error(response.status());
+        if response.status() != StatusCode::CONFLICT {
+            return fallback;
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Failure {
+            protocol_version: u32,
+            build: String,
+            error: Detail,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Detail {
+            code: String,
+            phase: String,
+            message: String,
+        }
+        let Ok(value) = self
+            .decode_json_response::<Failure>(response, cancellation)
+            .await
+        else {
+            return fallback;
+        };
+        const PHASES: &[&str] = &[
+            "composer_lookup",
+            "effort_control_lookup",
+            "picker_open",
+            "model_options",
+            "model_identity",
+            "effort_selection",
+            "effort_restore",
+            "capability_discovery",
+        ];
+        const CODES: &[&str] = &[
+            "selector_drift",
+            "model_unavailable",
+            "external_interference",
+            "cancelled",
+            "failed",
+        ];
+        if self
+            .validate_envelope(value.protocol_version, &value.build)
+            .is_err()
+            || !PHASES.contains(&value.error.phase.as_str())
+            || !CODES.contains(&value.error.code.as_str())
+            || validate_visible(&value.error.message, 4096, "browser failure message").is_err()
+        {
+            return fallback;
+        }
+        format!(
+            "{} [{}; {}]",
+            value.error.message, value.error.phase, value.error.code
+        )
     }
 
     async fn decode_json_response<T>(

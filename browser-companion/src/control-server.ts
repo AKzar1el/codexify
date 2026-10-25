@@ -14,7 +14,7 @@ import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { SingleWindowCoordinator } from "./browser-window";
 import {validateNewChatProjectUrl} from "./new-chat";
-import { asCompanionError } from "./errors";
+import { asCompanionError,type BrowserStage,type BrowserFailureCode } from "./errors";
 import {
   COMPANION_KIND,
   chatGptUrlSchema,
@@ -85,7 +85,7 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 }
 
 class ClientError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string,readonly detail?:{code:BrowserFailureCode;phase:BrowserStage;message:string}) {
     super(message);
     this.name = "ClientError";
   }
@@ -97,7 +97,8 @@ function httpError(error: unknown): ClientError {
   if (error instanceof Error && error.message === "Browser action was not found") {
     return new ClientError(404, "Browser action was not found");
   }
-  return new ClientError(409, asCompanionError(error).message);
+  const failure=asCompanionError(error);
+  return new ClientError(409,failure.message,failure.phase?{code:failure.code,phase:failure.phase,message:failure.message}:undefined);
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {
@@ -270,7 +271,8 @@ export async function startControlServer(
         return;
       }
       const failure = httpError(error);
-      text(response, failure.status, failure.message);
+      if(failure.detail)json(response,failure.status,{protocolVersion:PROTOCOL_VERSION,build:coordinator.build,error:failure.detail});
+      else text(response, failure.status, failure.message);
     });
   });
   server.requestTimeout = 0;

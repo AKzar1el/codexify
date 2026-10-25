@@ -2,9 +2,11 @@
 // src/chatgpt-session.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 // Keep selector and verification changes structurally reviewable against upstream.
 import type { Locator, Page } from "patchright";
-import {parseEffortAnnouncement,uiLabels} from "./ui-localization";
+import {parseEffortAnnouncement,uiLabels,uiLabelPattern} from "./ui-localization";
 import { composerText } from "./composer";
-import { browserEffortIdFromLabel, readModelOptionRows, modelsFromDiscoveredEfforts, type AccountCapabilities, type BrowserModelFamily, type DiscoveredBrowserEffort } from "./models";
+import {BrowserCompanionError,browserStage} from "./errors";
+import {withChatGptModelOptions} from "./model-picker";
+import { browserEffortIdFromLabel, modelsFromDiscoveredEfforts, type AccountCapabilities, type BrowserModelFamily, type DiscoveredBrowserEffort } from "./models";
 import { selectChatGptModelFamily } from "./model-selection";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
@@ -22,8 +24,40 @@ export const CHATGPT_COMPOSER_SELECTOR = [
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
-  'button[data-codex-intelligence-trigger="true"][data-composer-navigation-target="reasoning"][aria-haspopup="menu"]',
+  'button[data-composer-navigation-target="reasoning"][aria-haspopup="menu"]',
 ].join(", ");
+const effortControlMessages=["effortInstant","effortMedium","effortHigh","effortExtraHigh","effortPro"] as const;
+const effortControlLabel=new RegExp(effortControlMessages.map(key=>uiLabelPattern(key).source).join("|"),"iu");
+
+/** A fallback still belongs to this form and names a known localized effort. */
+export async function chatGptEffortControls(form:Locator):Promise<Locator> {
+  const known=form.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({visible:true});
+  if(await known.evaluateAll(nodes=>nodes.length))return known;
+  const candidates=form.locator('button[aria-haspopup="menu"][aria-controls]');
+  await candidates.evaluateAll((buttons,pattern)=>{
+    const label=new RegExp(pattern,"iu");
+    for(const button of buttons) {
+      button.removeAttribute("data-browser-effort-control");
+      const text=(button.textContent??"").normalize("NFKC").replace(/\p{Cf}/gu,"").replace(/\s+/g," ").trim();
+      if(label.test(text))button.setAttribute("data-browser-effort-control","true");
+    }
+  },effortControlLabel.source);
+  return form.locator('button[data-browser-effort-control="true"]').filter({visible:true});
+}
+
+export async function requireChatGptEffortControl(form:Locator,signal?:AbortSignal,timeoutMs=10_000):Promise<Locator> {
+  return browserStage("effort_control_lookup","ChatGPT did not expose one owned model/effort control",async()=>{
+    const deadline=Date.now()+timeoutMs;
+    do {
+      signal?.throwIfAborted();
+      const controls=await chatGptEffortControls(form),count=await controls.evaluateAll(nodes=>nodes.length);
+      if(count===1)return controls.first();
+      if(count>1)throw new BrowserCompanionError("ChatGPT exposed multiple model/effort controls in its composer","selector_drift");
+      await new Promise(resolve=>setTimeout(resolve,50));
+    }while(Date.now()<deadline);
+    throw new Error("Model/effort control was not found");
+  });
+}
 export const CHATGPT_EFFORT_MENU_SELECTOR = [
   '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
   '[role="menu"]:has([role="menuitemradio"], [data-model-reasoning-effort-slider])',
@@ -378,14 +412,17 @@ export async function detectChatGptAccountCapabilities(
   const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
   const composer = composers;
   const composerForm = composer.locator("xpath=ancestor::form[1]");
-  const effortButton = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible: true });
+  let effortButton = await chatGptEffortControls(composerForm);
   const deadline = Date.now() + (options.selectorTimeoutMs ?? 30_000);
   const stableAbsenceMs = options.stableAbsenceMs ?? 3_000;
   let absenceSince: number | undefined;
   let presenceObservations = 0;
   while (true) {
     options.signal?.throwIfAborted();
-    const effortVisible = await effortButton.isVisible();
+    effortButton=await chatGptEffortControls(composerForm);
+    const effortCount=await effortButton.evaluateAll(nodes=>nodes.length);
+    if(effortCount>1)throw new BrowserCompanionError("ChatGPT exposed multiple model/effort controls in its composer","selector_drift",{phase:"effort_control_lookup"});
+    const effortVisible = effortCount===1;
     if (effortVisible) {
       presenceObservations += 1;
       absenceSince = undefined;
@@ -406,30 +443,30 @@ export async function detectChatGptAccountCapabilities(
       // ChatGPT can mount a usable composer before the account's model list arrives.
       // A short absence is not a capability result; use the complete inspection budget.
       if (absenceSince !== undefined && Date.now() - absenceSince >= stableAbsenceMs) {
-        throw new Error("ChatGPT did not expose discoverable model and effort controls");
+        throw new BrowserCompanionError("ChatGPT did not expose discoverable model and effort controls","selector_drift",{phase:"effort_control_lookup"});
       }
-      throw new Error("ChatGPT account capability probe did not reach a stable composer state");
+      throw new BrowserCompanionError("ChatGPT account capability probe did not reach a stable composer state","selector_drift",{phase:"composer_lookup"});
     }
     await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
   }
   if ((await composerText(composer)).trim()) throw new Error("ChatGPT capability discovery requires an empty composer");
-  let menu = await activateChatGptEffortMenu(page, effortButton,{signal:options.signal});
+  let menu = await browserStage("picker_open","ChatGPT did not open its effort picker",()=>activateChatGptEffortMenu(page, effortButton,{signal:options.signal}));
   let originalFamily: BrowserModelFamily | undefined;
   let originalValue: number | undefined;
   try {
-    const rows = await readModelOptionRows(menu.menu);
+    const {value:rows} = await withChatGptModelOptions(menu,()=>activateChatGptEffortMenu(page,effortButton,{signal:options.signal}),async(_scope,rows)=>rows,{signal:options.signal});
     const modelFamilies = [...new Set(rows.flatMap(row=>row.family?[row.family]:[]))];
-    if (modelFamilies.length === 0) throw new Error("ChatGPT model picker did not expose a supported model family");
-    const checked=rows.filter(row=>row.checked);
+    if (modelFamilies.length === 0) throw new BrowserCompanionError("ChatGPT model picker did not expose a supported model family","model_unavailable",{phase:"model_identity"});
+    const checked=rows.filter(row=>row.checked&&row.family);
     originalFamily=checked.length===1?checked[0]!.family:undefined;
-    if (!originalFamily) throw new Error("ChatGPT did not identify its selected model family");
+    if (!originalFamily) throw new BrowserCompanionError("ChatGPT did not identify its selected model family","model_unavailable",{phase:"model_identity"});
     originalValue = (await readChatGptEffortSnapshot(menu.sliderContainer)).value;
     const models: AccountCapabilities["models"][number][] = [];
     for (const family of modelFamilies) {
       options.signal?.throwIfAborted();
       menu = await selectChatGptModelFamily(menu, family, () => activateChatGptEffortMenu(page, effortButton,{signal:options.signal}),options.signal);
-      const familyLabel=(await readModelOptionRows(menu.menu)).find(row=>row.family===family)?.label;
-      models.push(...modelsFromDiscoveredEfforts(family, await discoverChatGptEfforts(menu,options.signal),familyLabel));
+      const familyLabel=rows.find(row=>row.family===family)?.label;
+      models.push(...modelsFromDiscoveredEfforts(family, await browserStage("effort_selection","ChatGPT could not inspect the model's effort range",()=>discoverChatGptEfforts(menu,options.signal)),familyLabel));
     }
     return { models };
   } finally {
