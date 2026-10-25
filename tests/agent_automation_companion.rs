@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.51f4333338d08ded8d8e49baebb3bbe0c73cd466b9d1bf79840f4e8a568913ef";
+    "test-build-v1+protocol.0ebf0a030a30444ba65d726f70148fb7a4cce47c6ca7424e410480eeedeb8437";
 
 #[derive(Clone, Default)]
 struct FakeState {

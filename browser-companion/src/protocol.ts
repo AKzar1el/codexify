@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const COMPANION_KIND = "codexify-browser-companion" as const;
-export const PROTOCOL_SCHEMA_HASH = "51f4333338d08ded8d8e49baebb3bbe0c73cd466b9d1bf79840f4e8a568913ef" as const;
+export const PROTOCOL_SCHEMA_HASH = "0ebf0a030a30444ba65d726f70148fb7a4cce47c6ca7424e410480eeedeb8437" as const;
 export const PROTOCOL_BUILD_SUFFIX = `+protocol.${PROTOCOL_SCHEMA_HASH}` as const;
 export const MAX_DESCRIPTOR_BYTES = 8 * 1024;
 export const MAX_JSON_BYTES = 1024 * 1024;

@@ -25,19 +25,16 @@ export async function withChatGptModelOptions<T>(
         const toggle=menu.menu.locator('[data-model-picker-view-toggle="true"]:not([aria-hidden="true"])').filter({visible:true});
         const trigger=await toggle.count()?toggle:menu.menu.locator('[role="menuitem"][aria-expanded]:not([aria-hidden="true"])').filter({visible:true});
         if(await trigger.count()!==1)throw new BrowserCompanionError("ChatGPT model submenu control was missing or ambiguous","selector_drift");
-        const submenuId=await trigger.getAttribute("aria-controls");
         const state=await trigger.getAttribute("aria-expanded");
         const simple=await view.count()===1&&await view.getAttribute("data-model-picker-view")==="simple";
         if(simple||state!=="true") {await trigger.click({timeout:5_000,signal:options.signal});expanded=true;}
-        if(submenuId) {
-          const owned=menu.menu.page().locator(`[id=${JSON.stringify(submenuId)}]`);
-          await owned.waitFor({state:"visible",timeout:5_000,signal:options.signal});
-          // aria-controls proves ownership even when Radix portals the submenu.
-          scope=owned;
-        }
         const deadline=Date.now()+5_000;
         do {
           options.signal?.throwIfAborted();
+          // Some submenu triggers publish aria-controls only once opened. Read
+          // it during hydration, rather than assuming the closed trigger has it.
+          const submenuId=await trigger.evaluateAll(nodes=>nodes.length===1?nodes[0]!.getAttribute("aria-controls"):null);
+          if(submenuId)scope=menu.menu.page().locator(`[id=${JSON.stringify(submenuId)}]`);
           rows=await readModelOptionRows(scope);
           if(await usable())break;
           await new Promise(resolve=>setTimeout(resolve,50));

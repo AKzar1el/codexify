@@ -13,7 +13,7 @@ beforeAll(async()=>{
  context=await browser.newContext();page=await context.newPage();
 },30_000);
 afterAll(async()=>{const browser=context?.browser();await context?.close();await browser?.close();});
-type Layout="inline"|"portal"|"power";
+type Layout="inline"|"portal"|"late-portal"|"power";
 async function fixture(layout:Layout="inline",value=2,control:"known"|"localized"|"reasoning"="known",family="6") {
  await page.setContent(`<!doctype html><meta charset="utf-8"><style>#prompt-textarea{min-height:30px}[data-model-reasoning-effort-slider]{height:24px;min-width:240px}</style>
  <form id="composer"><div id="prompt-textarea" role="textbox" contenteditable="true"></div>
@@ -28,16 +28,16 @@ async function fixture(layout:Layout="inline",value=2,control:"known"|"localized
  const labels=['Instant','中','高'];let family=${JSON.stringify(family)},values={'6':${value},'5.6':1,'7':${value}};
  document.body.dataset.sends='0';document.body.dataset.clicks='0';
  function render(){const value=values[family];range.innerHTML='<div data-model-reasoning-effort-slider><span role="slider" aria-valuemin="0" aria-valuemax="2" aria-valuenow="'+value+'"></span>'+labels.map((label,i)=>'<span data-selected="'+(value===i)+'" data-locked="false" aria-label="'+label+'"></span>').join('')+'</div>';document.querySelector('#announcement').textContent=labels[value]+'、3件中'+(value+1)+'件目。';control.textContent=labels[value];document.body.dataset.family=family;document.body.dataset.effort=String(value);}
- function closeModels(){document.querySelector('#model-submenu')?.remove();document.querySelector('#model-slot').innerHTML='';toggle.setAttribute('aria-expanded','false');document.querySelector('#view').setAttribute('data-model-picker-view','simple');range.hidden=false;}
+ function closeModels(){document.querySelector('#model-submenu')?.remove();document.querySelector('#model-slot').innerHTML='';toggle.setAttribute('aria-expanded','false');if(layout==='late-portal')toggle.removeAttribute('aria-controls');document.querySelector('#view').setAttribute('data-model-picker-view','simple');range.hidden=false;}
  control.onclick=()=>{document.body.dataset.clicks=String(+document.body.dataset.clicks+1);picker.hidden=false;control.setAttribute('aria-expanded','true');};
- toggle.onclick=()=>{document.body.dataset.clicks=String(+document.body.dataset.clicks+1);toggle.setAttribute('aria-expanded','true');document.querySelector('#view').setAttribute('data-model-picker-view','advanced');let scope=document.querySelector('#model-slot');if(layout==='portal'){scope=document.createElement('div');scope.id='model-submenu';scope.setAttribute('role','menu');document.body.append(scope);range.hidden=true;}
+ toggle.onclick=()=>{document.body.dataset.clicks=String(+document.body.dataset.clicks+1);toggle.setAttribute('aria-expanded','true');document.querySelector('#view').setAttribute('data-model-picker-view','advanced');let scope=document.querySelector('#model-slot');if(layout==='portal'||layout==='late-portal'){scope=document.createElement('div');scope.id='model-submenu';scope.setAttribute('role','menu');document.body.append(scope);toggle.setAttribute('aria-controls','model-submenu');range.hidden=true;}
  const families=family==='7'?['7','6']:['6','5.6'];scope.innerHTML=families.map(f=>'<button role="menuitemradio" data-model-id="gpt-'+f+'-sol" aria-checked="'+(family===f)+'">GPT-'+f+'</button>').join('');scope.querySelectorAll('button').forEach(row=>row.onclick=()=>{family=row.getAttribute('data-model-id').split('-')[1];render();closeModels();});};
  range.onkeydown=event=>{if(event.key==='ArrowLeft'||event.key==='ArrowRight'){values[family]=Math.min(2,Math.max(0,values[family]+(event.key==='ArrowRight'?1:-1)));render();event.preventDefault();}};
  document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(toggle.getAttribute('aria-expanded')==='true')closeModels();else{picker.hidden=true;control.setAttribute('aria-expanded','false');}}});
  document.querySelector('form').onsubmit=event=>{event.preventDefault();document.body.dataset.sends=String(+document.body.dataset.sends+1);};render();
  })();</script>`);
 }
-for(const layout of ["inline","portal","power"] as const)test.skipIf(!native)(`Japanese ${layout} picker discovers lazy models, restores High and verifies a model switch`,async()=>{
+for(const layout of ["inline","portal","late-portal","power"] as const)test.skipIf(!native)(`Japanese ${layout} picker discovers lazy models, restores High and verifies a model switch`,async()=>{
  await fixture(layout);
  const catalog=await detectChatGptAccountCapabilities(page);
  expect(catalog.models.map(model=>model.id)).toEqual(["gpt-6-sol","gpt-5.6-sol"]);
