@@ -217,7 +217,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     if(notice?.guardSettings||notice?.error&&!updateFailure(update))view=notice;
     else if(connectionLost)view={title:'Starting Codexify…',detail:'Waiting for the service and MCP tools to finish loading.',loading:true};
     else if(message)view={title:message[0],detail:message[1],loading:true};
-    else if(readiness?.loading)view={title:readiness.detail||'Loading Codexify…',detail:readiness.phase==='starting_browser'?'The server is back. Messages that need the browser will be available when it is ready.':'Your draft is kept while startup finishes.',loading:true};
+    else if(readiness?.loading)view={title:readiness.detail||'Loading Codexify…',detail:readiness.phase==='starting_browser'?'The server is back. Messages that need the browser will be available when it is ready.':'',loading:true};
     else if(['queued','starting_browser','running'].includes(refresh?.phase))view={title:refresh.phase==='starting_browser'?'Starting the browser companion…':refresh.phase==='running'?'Refreshing ChatGPT connector tools…':'Connector refresh queued…',detail:'Waiting for the browser to finish refreshing the connector tools.',loading:true};
     else if(!maintenance&&updateFailure(update)&&dismissedUpdate!==(update.updateId||update.failureDetail))view={title:update.state==='rolled_back'?'Update rolled back':'Update failed',detail:update.failureDetail||'The update could not complete. Try again or check the service logs.',error:true,dismiss:true,action:'update',label:'Retry update'};
     else if(!maintenance&&readiness&&['browser_stopped','sign_in_required','manual_refresh_required'].includes(readiness.phase))view={title:readiness.detail,action:'browser',label:'Browser settings'};
@@ -544,7 +544,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   }
   async function maintain(kind) {
     if(maintenance||updatePending(global?.update))return;if(rawEdited){message('Save raw configuration changes before continuing.',true);runtimeNotice('Save settings before continuing','Save the unsaved raw configuration in settings before updating or restarting.',true);notice.guardSettings=true;notice.action='settings';notice.label='Open settings';renderRuntime();return;}
-    maintenance=true;maintenanceKind=kind;dismissedUpdate=null;runtimeNotice(kind==='update'?'Downloading and verifying the update…':'Restarting Codexify…',kind==='update'?'Preparing the verified release. Your draft is kept.':'Waiting for the service and MCP tools to finish loading.');
+    maintenance=true;maintenanceKind=kind;dismissedUpdate=null;runtimeNotice(kind==='update'?'Downloading and verifying the update…':'Restarting Codexify…',kind==='update'?'Preparing the verified release.':'Waiting for the service and MCP tools to finish loading.');
     for(const id of ['settings-restart','settings-update','global-update'])byId(id).disabled=true;
     let completed=null;
     try{

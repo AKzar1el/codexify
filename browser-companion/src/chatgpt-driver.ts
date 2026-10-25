@@ -713,12 +713,28 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           throw new BrowserCompanionError("Turn handoff is not complete; continuation was not sent","external_interference");
         }
       };
+      const canStopPrevious = execution.request.prompt.kind !== "pair_verify" && !creating && !renewal;
+      const stopPrevious = async () => {
+        if (canStopPrevious) await stopLingeringResponse(page, execution.signal, { canonicalUrl, accountFingerprint:account.fingerprint }, execution.emit);
+      };
+      const prepareBeforeSend = async <T>(operation:()=>Promise<T>):Promise<T> => {
+        await stopPrevious();
+        try { return await operation(); }
+        catch (error) {
+          // React can open the confirmation after the initial Stop inspection,
+          // while a picker or composer operation is already in progress. Resolve
+          // that exact modal, then retry only this pre-Send preparation step.
+          if (!canStopPrevious || !(await visibleStopDialogs(page)).length) throw error;
+          await stopPrevious();
+          return operation();
+        }
+      };
       await verifyHandoff();
       if (execution.request.prompt.kind === "pair_verify") await this.replacePairingDraft(execution.request);
-      if (execution.request.prompt.kind !== "pair_verify" && !creating && !renewal) {
+      if (canStopPrevious) {
         // Offline actions are dispatched after tool-call inactivity. Stop only
         // while preparing this send; ongoing conversations need no observation.
-        await stopLingeringResponse(page, execution.signal, { canonicalUrl, accountFingerprint:account.fingerprint }, execution.emit);
+        await stopPrevious();
         if (canonicalChatGptConversationUrl(page.url()) !== canonicalUrl) {
           throw new BrowserCompanionError("ChatGPT changed conversations while stopping the previous response", "conversation_unavailable");
         }
@@ -726,7 +742,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         await clearExistingDraft(page,execution.signal);
       }
       const cache = this.capabilitiesCache;
-      await clearExistingDraft(page,execution.signal);
+      await prepareBeforeSend(()=>clearExistingDraft(page,execution.signal));
       execution.emit({ type:"composer_ready" });
       const verifyFallbackDestination=async()=>{
         execution.signal.throwIfAborted();
@@ -738,23 +754,24 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         }
       };
       let selected: Awaited<ReturnType<typeof selectAvailableModelAndEffort>> | null = null;
+      const preferredModel = execution.request.model, preferredEffort = execution.request.effort;
       if (!creating && execution.request.prompt.kind !== "pair_verify"
-        && execution.request.model !== null && execution.request.effort !== null) {
-        selected = await selectAvailableModelAndEffort(
-        page,
-        execution.request.model,
-        execution.request.effort,
-        cache?.accountFingerprint === account.fingerprint ? cache.capabilities : undefined,
-        execution.signal,
-        verifyFallbackDestination,
-      );
-      execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
+        && preferredModel !== null && preferredEffort !== null) {
+        selected = await prepareBeforeSend(()=>selectAvailableModelAndEffort(
+          page,
+          preferredModel,
+          preferredEffort,
+          cache?.accountFingerprint === account.fingerprint ? cache.capabilities : undefined,
+          execution.signal,
+          verifyFallbackDestination,
+        ));
+        execution.emit({ type:"model_verified", model:selected.id, effort:selected.effort });
       }
       if (creating || execution.request.prompt.kind === "pair_verify") {
         pairingSelection = await selectPairingMedium(page, execution.signal);
       }
       try {
-        selectedConnector = await selectConnector(page, execution.request.connectorName, execution.signal);
+        selectedConnector = await prepareBeforeSend(()=>selectConnector(page, execution.request.connectorName, execution.signal));
       } catch(error) {
         // selectConnector has cleared the unsuccessful mention search. A missing
         // menu row does not require another page load or another submission.
@@ -774,7 +791,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       const baseline = await captureSubmissionBaseline(page, execution.renderedPrompt);
       insertionAttempted = true;
       step("inserting prompt");
-      try {await insertExactPrompt(selectedConnector?.composer ?? await activeComposer(page,30_000,execution.signal), execution.renderedPrompt);}
+      try {await prepareBeforeSend(async()=>insertExactPrompt(selectedConnector?.composer ?? await activeComposer(page,30_000,execution.signal), execution.renderedPrompt));}
       catch(error){
         execution.signal.throwIfAborted();
         await throwIfConversationApproval(page);

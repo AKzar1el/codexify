@@ -42,7 +42,7 @@ const fixtureUi={
   it:{send:"Invia",stop:"Interrompi",counter:"di",efforts:["Immediato","Medio","Alto","Molto alto","Pro"]},
 } as const;
 let localizedStopFallback=false;
-let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;captured?:boolean;duplicateSubmit?:boolean;unrelated?:boolean;changeUrl?:boolean;frame?:"url"|"srcdoc"|"nested"|"hidden"|"foreign"}|undefined;
+let stopConfirmation: {delayMs?:number;persists?:boolean;preexisting?:boolean;captured?:boolean;duplicateSubmit?:boolean;unrelated?:boolean;changeUrl?:boolean;afterModelSelection?:boolean;trapFocus?:boolean;frame?:"url"|"srcdoc"|"nested"|"hidden"|"foreign"}|undefined;
 const capturedStopDialogHtml=readFileSync(join(import.meta.dirname,'fixtures/stop-response-dialog.html'),'utf8');
 // Same structural contract as ChatGPT, with localized labels and arbitrary Radix IDs.
 const stopDialogHtml = `<div class="codex-dialog-overlay" style="position:fixed;inset:0;z-index:50;background:#0005"></div>
@@ -150,7 +150,15 @@ async function installFixtureRoutes(){
           if(next>=model.min&&next<model.min+model.labels.length)model.value=next;
           window.renderModel();
         };
-        document.addEventListener('keydown',event=>{if(event.key==='Escape'){picker.hidden=true;control.setAttribute('aria-expanded','false');}});
+        document.addEventListener('keydown',event=>{if(event.key==='Escape'){
+          const closingPicker=control.getAttribute('aria-expanded')==='true';
+          picker.hidden=true;control.setAttribute('aria-expanded','false');
+          if(stopConfirmation?.afterModelSelection&&closingPicker&&!document.body.dataset.lateStopDialog){
+            document.body.dataset.lateStopDialog='true';
+            form.insertAdjacentHTML('beforeend','<button type="button" data-fixture-stop data-testid="stop-button" aria-label="Stop">Stop</button>');
+            showStopDialog(form.querySelector('[data-fixture-stop]'));
+          }
+        }});
         window.renderModel();
         document.body.dataset.effortChanges="0";document.body.dataset.familyChanges="";
         editor.focus();const initialCaret=document.createRange();initialCaret.selectNodeContents(editor);initialCaret.collapse(false);
@@ -163,12 +171,13 @@ async function installFixtureRoutes(){
           const show=(dialogDocument,frame)=>{
             dialogDocument.body.insertAdjacentHTML('beforeend',${JSON.stringify(dialogHtml)});
             const dialog=dialogDocument.querySelector('[role="dialog"]'),dialogForm=dialog.querySelector('form');
+            if(stopConfirmation.trapFocus){form.inert=true;dialogForm.querySelector('[type="submit"]').focus();}
             if(stopConfirmation.unrelated){dialogForm.querySelector('h2').textContent='Delete this conversation?';dialogForm.querySelector('.heading-dialog').textContent='Delete this conversation?';dialogForm.querySelector('[type="submit"]').textContent='Delete';}
             if(stopConfirmation.duplicateSubmit)dialogForm.querySelector('[type="submit"]').after(dialogForm.querySelector('[type="submit"]').cloneNode(true));
             if(stopConfirmation.changeUrl)history.replaceState({},'', 'https://chatgpt.com/c/changed-during-stop');
             dialogForm.addEventListener('submit',event=>{
               event.preventDefault();document.body.dataset.confirmations=String(Number(document.body.dataset.confirmations)+1);document.body.dataset.order+='confirm,';document.body.dataset.confirmedAt=String(Date.now());document.body.dataset.draftOnConfirmation=editor.textContent;
-              if(!stopConfirmation.persists){dialog.remove();dialogDocument.querySelector('.codex-dialog-overlay').remove();frame?.remove();finishStop(stop);}
+              if(!stopConfirmation.persists){dialog.remove();dialogDocument.querySelector('.codex-dialog-overlay').remove();frame?.remove();form.inert=false;editor.focus();finishStop(stop);}
             });
           };
           if(!stopConfirmation.frame){show(document);return;}
@@ -958,6 +967,21 @@ test.skipIf(!native)("offline Stop never confirms unrelated or ambiguous dialogs
     expect(documentLoads).toBe(2);
   }
 },15_000);
+
+test.skipIf(!native)("late Stop dialog during message preparation is confirmed before touching the blocked editor",async()=>{
+  const driver=await fixture();
+  stopConfirmation={captured:true,afterModelSelection:true,trapFocus:true};
+  stopFinishDelayMs=1_200;
+  await syncFixture();const loads=documentLoads;
+  const offline=offlineRequest('gpt-6-sol','high');
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(20_000),emit:()=>{}});
+  expect(await page.locator('body').getAttribute('data-order')).toBe('confirm,stopped,send,');
+  expect(await page.locator('body').getAttribute('data-stops')).toBe('0');
+  expect(await page.locator('body').getAttribute('data-confirmations')).toBe('1');
+  expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+  expect(await page.locator('[role="dialog"]').count()).toBe(0);
+  expect(documentLoads).toBe(loads);
+},25_000);
 
 test.skipIf(!native)("offline Stop confirms dialogs in ChatGPT frames without reloading",async()=>{
   for(const frame of ["url","srcdoc","nested"] as const){

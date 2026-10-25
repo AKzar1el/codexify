@@ -257,7 +257,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     return awaitingAnswer() ? "steer" : defaultMessageMode;
   }
   function messageHint() {
-    if (startupBlocked()) return `${runtimeLoading.detail || "Codexify is starting."} Your draft is kept.`;
+    if (startupBlocked()) return runtimeLoading.detail || "Codexify is starting.";
     if (awaitingAnswer()) return `Enter or ${modifierLabel}+Enter to send your answer. Shift + Enter for a new line.`;
     return composerMessageMode() === "queue" ? `Enter to queue. ${modifierLabel}+Enter to steer. Shift + Enter for a new line.` : `Enter to send. ${modifierLabel}+Enter to queue. Shift + Enter for a new line.`;
   }

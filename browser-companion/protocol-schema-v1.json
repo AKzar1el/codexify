@@ -148,6 +148,11 @@
     "deadlineMs": 120000,
     "schemaVerified": false
   },
+  "responseStop": {
+    "preparation": "offline chat and goal actions inspect Stop and its exact confirmation before composer cleanup, model selection, connector selection and prompt insertion; a late confirmation permits one retry of the interrupted pre-Send step",
+    "settleMs": 20000,
+    "ownership": "confirm only in the verified paired conversation and account; never retry Send or reload an open confirmation"
+  },
   "conversationApproval": {
     "request": ["url", "expectedAccountFingerprint", "connectorName"],
     "response": ["protocolVersion", "build", "approved"],

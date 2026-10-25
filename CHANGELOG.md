@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.16] - 2026-10-25
+
+### Fixed
+
+- Handle Stop confirmations that appear during message preparation, including
+  while selecting a model or connector. Confirm the dialog, allow up to 20 seconds
+  for stopping to finish, then retry only the interrupted pre-Send step without
+  reloading the conversation or duplicating the message.
+- Advance the browser companion compatibility fingerprint so updates cannot
+  reuse a companion that lacks late Stop-confirmation recovery.
+- Remove redundant draft-preservation messages from startup banners and the
+  composer status while retaining the current startup and refresh progress.
+
 ## [2.3.15] - 2026-10-24
 
 ### Fixed
