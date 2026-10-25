@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.18] - 2026-10-25
+
+### Fixed
+
+- Expand ChatGPT’s collapsed model panel before selecting a model. Mounted
+  options inside inert or hidden panels no longer cause model discovery and
+  model switching to time out.
+- Require the updated browser companion so an older running companion cannot
+  retain the collapsed-picker regression after updating.
+
 ## [2.3.17] - 2026-10-25
 
 ### Fixed

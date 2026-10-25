@@ -185,7 +185,8 @@
     "modelOptions": "Discovery, model selection and pairing expose the composer-owned model submenu before requiring model radios, including lazily mounted inline or aria-controls-owned portal lists.",
     "control": "Use a unique composer-owned semantic trigger, or a unique aria-controls trigger bearing a known localized effort label. Never infer model identity from an effort label.",
     "restoration": "Inspection restores the effort view and verifies unchanged range and selection; pairing borrows localized Medium and restores the original model and effort.",
-    "submenuOwnership": "Read aria-controls after expansion and during hydration; a closed trigger need not publish its future portaled menu ID."
+    "submenuOwnership": "Read aria-controls after expansion and during hydration; a closed trigger need not publish its future portaled menu ID.",
+    "clickability": "Mounted model rows are not actionable inside a collapsed simple view or an inert/aria-hidden panel, even when they have layout boxes. Expand the owned model panel and verify active rows before selecting."
   },
   "operationError": {
     "httpStatus": 409,

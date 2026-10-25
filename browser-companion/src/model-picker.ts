@@ -15,8 +15,16 @@ export async function withChatGptModelOptions<T>(
     options.signal?.throwIfAborted();
     let scope=menu.menu,rows=await readModelOptionRows(scope),expanded=false;
     let original:Awaited<ReturnType<typeof readChatGptEffortSnapshot>>|undefined;
-    const usable=async()=>rows.some(row=>row.family)&&(!options.visible
-      || await scope.locator('[role="menuitemradio"][data-browser-model-family]').filter({visible:true}).count()===rows.filter(row=>row.family).length);
+    const usable=async()=>{
+      if(!rows.some(row=>row.family))return false;
+      if(!options.visible)return true;
+      // The collapsed power picker keeps its rows mounted with layout boxes.
+      // Playwright visibility alone does not exclude that inert, covered panel.
+      if(await menu.menu.locator('[data-model-picker-view="simple"]').count())return false;
+      const active=scope.locator('[role="menuitemradio"][data-browser-model-family]').filter({visible:true});
+      return await active.evaluateAll(elements=>elements.filter(element=>!element.closest('[inert], [aria-hidden="true"]')).length)
+        ===rows.filter(row=>row.family).length;
+    };
     try {
       if(!await usable()) {
         original=await readChatGptEffortSnapshot(menu.sliderContainer);
