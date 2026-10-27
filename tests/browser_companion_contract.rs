@@ -332,6 +332,13 @@ async fn rust_client_round_trips_the_real_typescript_protocol() {
         Some("contract-account")
     );
     assert_eq!(health.active_action_id, None);
+    assert_eq!(
+        client
+            .navigation_available_at("https://chatgpt.com/c/fixture", &cancellation)
+            .await
+            .unwrap(),
+        Some(180_000)
+    );
 
     let login = client.login(&cancellation).await.unwrap();
     assert_eq!(login.status, CompanionSessionStatus::Idle);

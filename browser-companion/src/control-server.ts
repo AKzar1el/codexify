@@ -190,6 +190,10 @@ async function route(
     try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal));}
     catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
   }
+  if(request.method==="POST"&&url.pathname==="/v1/navigation/availability") {
+    const body=z.strictObject({url:chatGptUrlSchema}).parse(await readJson(request));
+    json(response,200,await coordinator.navigationAvailability(body.url));return;
+  }
   if(request.method === "POST" && url.pathname === "/v1/turns/handoff") {
     const body=z.strictObject({url:chatGptUrlSchema,expectedAccountFingerprint:opaqueIdSchema,handoffId:z.string().regex(/^renew-[a-f0-9]{64}$/)}).parse(await readJson(request));
     json(response,200,await coordinator.turnHandoffComplete(body.url,body.expectedAccountFingerprint,body.handoffId,operation.signal));return;

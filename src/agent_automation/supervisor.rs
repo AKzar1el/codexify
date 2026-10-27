@@ -1020,6 +1020,76 @@ impl AgentAutomationSupervisor {
         before.saturating_sub(queue.len())
     }
 
+    pub async fn run_queued_action_now(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<super::AutomationActionState, String> {
+        let handle = self
+            .tasks
+            .read()
+            .await
+            .get(task.stable_key())
+            .cloned()
+            .ok_or("Browser automation task is not registered")?;
+        let initial = handle.store.load(task)?;
+        if initial.action.id.as_deref() != Some(expected_action_id) || !initial.can_run_queued_now()
+        {
+            return Err("The queued browser action changed or already started".into());
+        }
+        if self.prepare_schema_rollover(task).await? {
+            self.scan_once(now_ms).await?;
+            self.notify();
+            return Ok(handle.store.load(task)?.action);
+        }
+        let scan_guard = self.scan_lock.lock().await;
+        let mut queue = self.queue.lock().await;
+        let state = handle.store.load(task)?;
+        if state.action.id.as_deref() != Some(expected_action_id) || !state.can_run_queued_now() {
+            return Err("The queued browser action changed or already started".into());
+        }
+        if let Some(position) = queue.iter().position(|execution| {
+            execution.task_key == task.stable_key()
+                && execution.request.action_id == expected_action_id
+        }) {
+            let action = handle
+                .store
+                .run_queued_action_now(task, expected_action_id, now_ms)?;
+            let mut execution = queue.remove(position).expect("queued action position");
+            execution.request.bypass_conversation_cooldown = true;
+            execution.request.agent_ticket = None;
+            let priority = action_priority(execution_kind(&execution));
+            let first = queue
+                .iter()
+                .position(|other| action_priority(execution_kind(other)) >= priority)
+                .unwrap_or(queue.len());
+            queue.insert(first, execution);
+            drop(queue);
+            drop(scan_guard);
+            self.notify();
+            return Ok(action);
+        }
+        if state.browser_cooldown_until_ms().is_none() {
+            return Err("The browser action already started or left the queue".into());
+        }
+        // A cooldown can survive restart without its in-memory request. Exclude
+        // dispatch before rebuilding it, rather than racing a just-popped Send.
+        let run_guard = self
+            .run_lock
+            .try_lock()
+            .map_err(|_| "The browser action already started or left the queue")?;
+        handle
+            .store
+            .reset_failed_action_for_retry(task, expected_action_id, now_ms)?;
+        drop(queue);
+        drop(run_guard);
+        drop(scan_guard);
+        self.scan_once(now_ms).await?;
+        self.notify();
+        Ok(handle.store.load(task)?.action)
+    }
+
     pub async fn cancel_action(
         &self,
         task: &ConversationIdentity,

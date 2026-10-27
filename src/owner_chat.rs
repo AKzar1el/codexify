@@ -1237,6 +1237,7 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
         .then_some("retry")
     });
     public_action["retryMode"] = json!(retry_mode);
+    public_action["canRunNow"] = json!(automation.can_run_queued_now());
     public_action["automaticRetriesEnabled"] = json!(automation.automatic_retries_enabled);
     public_action["canPauseRetries"] = json!(
         !automation.action.automatic_retry_paused
@@ -1264,6 +1265,38 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
         public_action["lastError"] = json!(message);
     }
     let (companion, catalog) = browser_snapshot(&state).await;
+    let wake = wake::status(
+        &automation,
+        &wake::Activity::from(&summary),
+        context
+            .chat
+            .has_wakeable_queued_messages()
+            .await
+            .map_err(internal_error)?,
+        true,
+        crate::markdown_chat::now_ms(),
+    );
+    let available_at = if automation.action.status
+        == crate::agent_automation::AutomationActionStatus::Queued
+        && automation.action.kind != Some(crate::agent_automation::AutomationActionKind::PairVerify)
+        && !automation.action.bypass_conversation_cooldown
+    {
+        if let (Ok(client), Some(url)) = (
+            companion_client(&state),
+            automation.pairing.canonical_url.as_deref(),
+        ) {
+            client
+                .navigation_available_at(url, &CancellationToken::new())
+                .await
+                .ok()
+                .flatten()
+                .or(automation.browser_cooldown_until_ms())
+        } else {
+            automation.browser_cooldown_until_ms()
+        }
+    } else {
+        None
+    };
     Ok(Json(json!({
         "enabled": true,
         "ownerGeneration": context.owner_generation,
@@ -1277,6 +1310,8 @@ async fn automation_state(State(state): State<OwnerState>, Path(id): Path<String
         "action": public_action,
         "live": live,
         "queue": queue,
+        "wake": wake,
+        "waitUntilMs": available_at,
         "companion": companion,
         "catalog": catalog,
         "presence": {
@@ -1629,6 +1664,30 @@ async fn automation_action_cancel(
         .await
         .map(|(position, total)| json!({"position": position, "total": total}));
     Ok(Json(json!({"action": action, "queue": queue})))
+}
+
+async fn automation_action_now(
+    State(state): State<OwnerState>,
+    Path(id): Path<String>,
+    Json(body): Json<ActionMutationBody>,
+) -> ApiResult {
+    require_connector_name(&state.config)?;
+    validate_owner_request_id(&body.request_id)?;
+    let located = selected(&state, &id)?;
+    let context = automation_context(&state, &located).await?;
+    let supervisor = state
+        .automation
+        .as_ref()
+        .ok_or_else(|| internal_error("Browser automation supervisor is unavailable"))?;
+    let action = supervisor
+        .run_queued_action_now(
+            &context.task,
+            &body.action_id,
+            crate::markdown_chat::now_ms(),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({"action":action})))
 }
 
 async fn automation_action_pause_retries(
@@ -2526,6 +2585,10 @@ fn router(state: OwnerState) -> Router {
             "/api/chats/{id}/automation/action/retry",
             post(automation_action_retry),
         )
+        .route(
+            "/api/chats/{id}/automation/action/now",
+            post(automation_action_now),
+        )
         .route("/api/chats/{id}/markdown", get(chat_markdown))
         .route("/api/chats/{id}/send", post(chat_send))
         .route("/api/chats/{id}/project", post(change_project_path))
@@ -2597,7 +2660,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.2f7852fd999d639b18e829bc273b2e38021c40c839ec0feb0ff2c793cfeb9e03";
 
     #[test]
     fn project_groups_resolve_registered_worktrees_without_merging_same_named_projects() {
@@ -4903,6 +4966,11 @@ mod tests {
         config.markdown_chat.default_message_mode = crate::markdown_chat::MessageMode::Steer;
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
+        config.markdown_chat.automation.descriptor_path = temp
+            .path()
+            .join("browser/descriptor.json")
+            .display()
+            .to_string();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
         let identity = ConversationIdentity::from_openai_session("owner-action-api").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
@@ -5063,6 +5131,44 @@ mod tests {
         assert_eq!(retried["action"]["status"], "queued");
         assert_eq!(retried["queue"]["position"], 1);
         let queued_action = retried["action"]["id"].as_str().unwrap().to_string();
+
+        let queued: Value = client
+            .get(format!("{base}/api/chats/{id}/automation"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(queued["goal"].is_null());
+        assert_eq!(queued["action"]["canRunNow"], true);
+        assert_eq!(queued["wake"]["phase"], "queued");
+        assert_eq!(queued["queue"]["position"], 1);
+        let now_body = json!({"requestId":"run-queued-owner-action","actionId":queued_action});
+        assert_eq!(
+            client
+                .post(format!("{base}/api/chats/{id}/automation/action/now"))
+                .json(&now_body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let run_now: Value = client
+            .post(format!("{base}/api/chats/{id}/automation/action/now"))
+            .bearer_auth("test-token")
+            .json(&now_body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(run_now["action"]["id"], queued_action);
+        assert_eq!(run_now["action"]["bypassConversationCooldown"], true);
+        assert!(store.load(&identity).unwrap().goal.is_none());
 
         let cancelled: Value = client
             .post(format!("{base}/api/chats/{id}/automation/action/cancel"))

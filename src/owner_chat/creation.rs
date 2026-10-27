@@ -1294,6 +1294,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_schema_rollover_from_idle_legacy_pairing_queues_and_delivers_the_wake() {
+        let (_temp, state, executor, server, _created, context, _source) = schema_source().await;
+        let supervisor = state.automation.as_ref().unwrap();
+        let path = context.chat.path().with_file_name("automation.json");
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        saved["action"] =
+            serde_json::to_value(crate::agent_automation::AutomationActionState::default())
+                .unwrap();
+        saved["pairing"]["connectorSchemaVersion"] = Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        context
+            .chat
+            .append_user(
+                "idle-schema-message".into(),
+                "Continue from the idle conversation".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            supervisor
+                .prepare_schema_rollover(&context.task)
+                .await
+                .unwrap()
+        );
+        let before = context.store.load(&context.task).unwrap();
+        assert_eq!(before.pairing.generation, 1);
+        assert_eq!(before.action.pairing_generation, None);
+        assert!(before.pairing.schema_rollover_pending);
+
+        let now = crate::markdown_chat::now_ms();
+        supervisor.scan_once(now).await.unwrap();
+        assert_eq!(
+            supervisor.queued_count().await,
+            1,
+            "an idle action must not strand schema rollover"
+        );
+        *executor.created_url.lock().unwrap() =
+            "https://chatgpt.com/c/idle-schema-replacement".into();
+        supervisor.run_next(now + 1).await.unwrap().unwrap();
+        let execution = executor.executions.lock().unwrap()[1].clone();
+        let ActionPrompt::CreateChat {
+            continuation_token,
+            reference,
+            ..
+        } = execution.request.prompt
+        else {
+            panic!("a fresh conversation must precede the wake");
+        };
+        let destination = ConversationIdentity::from_openai_session("idle-schema-owner").unwrap();
+        state
+            .continuations
+            .claim(&destination, &continuation_token, |_, _| Ok(()))
+            .unwrap();
+        context
+            .store
+            .verify_pairing_reference(&context.task, 2, &reference, now + 2)
+            .unwrap();
+        let ready = context.store.load(&context.task).unwrap();
+        assert!(!ready.pairing.schema_rollover_pending);
+        assert_eq!(ready.selection, before.selection);
+        let next = now + crate::agent_automation::PAIRING_VERIFICATION_GRACE_MS + 1_000;
+        supervisor.scan_once(next).await.unwrap();
+        assert_eq!(supervisor.queued_count().await, 1);
+        assert_eq!(
+            supervisor.next_queued_kind().await,
+            Some(crate::agent_automation::AutomationActionKind::OfflineChat)
+        );
+        supervisor.run_next(next + 1).await.unwrap().unwrap();
+        let execution = executor.executions.lock().unwrap()[2].clone();
+        let ActionPrompt::OfflineChat { messages, .. } = execution.request.prompt else {
+            panic!("the original message must wake the replacement conversation");
+        };
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .markdown
+                .contains("Continue from the idle conversation")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn connector_schema_rollover_holds_online_input_until_refresh_and_preserves_owner_data() {
         for mode in [
             crate::markdown_chat::MessageMode::Steer,

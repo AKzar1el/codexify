@@ -18,13 +18,22 @@ impl GlobalRuntime {
     }
     fn record_plan(&mut self, result: Result<Value, String>, now_ms: u64) {
         match result {
-            Ok(plan) => {
+            Ok(plan)
+                if plan["label"]
+                    .as_str()
+                    .is_some_and(|label| !label.trim().is_empty()) =>
+            {
+                let complete = plan["kind"] != "pro" || plan["label"] != "Pro";
                 self.plan = Some(plan);
-                self.plan_attempted = true;
-                self.plan_retry_at_ms = 0;
+                self.plan_attempted = complete;
+                self.plan_retry_at_ms = if complete {
+                    0
+                } else {
+                    now_ms.saturating_add(60_000)
+                };
             }
             Err(error) if error.to_lowercase().contains("busy") || error.contains("423") => {}
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 // Cache successful lookups only; retry transient failures after a cooldown.
                 self.plan_retry_at_ms = now_ms.saturating_add(60_000);
             }
@@ -816,6 +825,30 @@ mod tests {
         runtime.reset_plan();
         assert!(!runtime.plan_attempted);
         assert!(runtime.plan.is_none());
+        assert_eq!(runtime.plan_retry_at_ms, 0);
+    }
+    #[test]
+    fn empty_plan_does_not_become_a_cached_success_or_hide_a_verified_plan() {
+        let mut runtime = GlobalRuntime::default();
+        runtime.record_plan(Ok(json!({"label":"  ","kind":"unknown"})), 1000);
+        assert!(runtime.plan.is_none());
+        assert!(!runtime.plan_attempted);
+        assert_eq!(runtime.plan_retry_at_ms, 61_000);
+        runtime.record_plan(Ok(json!({"label":"Pro 20x","kind":"pro"})), 61_000);
+        runtime.record_plan(Ok(json!({"label":"","kind":"unknown"})), 62_000);
+        assert_eq!(runtime.plan.as_ref().unwrap()["label"], "Pro 20x");
+    }
+
+    #[test]
+    fn basic_pro_remains_visible_while_the_billing_tier_is_retried() {
+        let mut runtime = GlobalRuntime::default();
+        runtime.record_plan(Ok(json!({"label":"Pro","kind":"pro"})), 1000);
+        assert_eq!(runtime.plan.as_ref().unwrap()["label"], "Pro");
+        assert!(!runtime.plan_attempted);
+        assert_eq!(runtime.plan_retry_at_ms, 61_000);
+        runtime.record_plan(Ok(json!({"label":"Pro 20x","kind":"pro"})), 61_000);
+        assert_eq!(runtime.plan.as_ref().unwrap()["label"], "Pro 20x");
+        assert!(runtime.plan_attempted);
         assert_eq!(runtime.plan_retry_at_ms, 0);
     }
     #[test]

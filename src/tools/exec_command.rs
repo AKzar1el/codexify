@@ -195,7 +195,11 @@ impl Tool for ExecCommand {
         };
 
         let started = std::time::Instant::now();
-        let exec_session = match start_exec_session(session, config, &cmd, &cwd, shell.as_deref()) {
+        let exec_session = match crate::audit::stage("exec_spawn", async {
+            start_exec_session(session, config, &cmd, &cwd, shell.as_deref())
+        })
+        .await
+        {
             Ok(s) => s,
             Err(e) => return ToolResult::error(e),
         };

@@ -1,6 +1,7 @@
 import type {BrowserContext, Page} from "patchright";
 import {BrowserCompanionError,ConversationCooldownError} from "./errors";
 import {AsyncLocalStorage} from "node:async_hooks";
+import {canonicalChatGptConversationUrl} from "./protocol";
 
 const cooldownBypass = new AsyncLocalStorage<boolean>();
 export function withConversationCooldownBypass<T>(allowed:boolean, operation:()=>Promise<T>):Promise<T> {
@@ -38,6 +39,16 @@ function navigationBudget(context:BrowserContext):Budget {
 
 function isConversationUrl(url:URL):boolean {
   return url.origin === "https://chatgpt.com" && /^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(url.pathname);
+}
+
+export function conversationLoadAvailableAt(page:Page,url:string):number|null {
+  const target=new URL(url);
+  if(!isConversationUrl(target))return null;
+  try {if(canonicalChatGptConversationUrl(page.url())===canonicalChatGptConversationUrl(url))return null;} catch {}
+  const budget=budgets.get(page.context());
+  if(!budget)return null;
+  const at=Math.max(budget.unavailableUntil??0,budget.blockedUntil,budget.lastLoad===null?0:budget.lastLoad+timings.conversationLoadIntervalSeconds*1_000);
+  return at>Date.now()?at:null;
 }
 
 export function recordConversationUnavailable(page:Page):void {

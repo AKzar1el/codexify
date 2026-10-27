@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.2f7852fd999d639b18e829bc273b2e38021c40c839ec0feb0ff2c793cfeb9e03";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -811,6 +811,72 @@ async fn conversation_approval_honors_disabled_auto_approval_stopped_agents_and_
 
 async fn fixture() -> Fixture {
     fixture_with_queue_limit(64).await
+}
+
+#[tokio::test]
+async fn queued_chat_run_now_prioritizes_one_unsent_request_without_creating_a_goal_or_replaying_it()
+ {
+    let f = fixture().await;
+    let (other, chat) = add_task(&f, "manual-now-other", "https://chatgpt.com/c/other").await;
+    f.chat
+        .append_user("manual-first".into(), "First pending request".into())
+        .await
+        .unwrap();
+    chat.append_user("manual-second".into(), "Second pending request".into())
+        .await
+        .unwrap();
+    f.supervisor.scan_once(1000).await.unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 2);
+    let (target, remaining) = if f.supervisor.queue_position(&f.task).await.unwrap().0 == 2 {
+        (&f.task, &other)
+    } else {
+        (&other, &f.task)
+    };
+    let initial = f.store.load(target).unwrap();
+    let id = initial.action.id.clone().unwrap();
+    assert!(initial.goal.is_none());
+    assert!(initial.can_run_queued_now());
+    assert!(
+        f.supervisor
+            .run_queued_action_now(target, "outdated-action", 1001)
+            .await
+            .is_err()
+    );
+    let action = f
+        .supervisor
+        .run_queued_action_now(target, &id, 1001)
+        .await
+        .unwrap();
+    assert_eq!(action.id.as_deref(), Some(id.as_str()));
+    assert!(action.bypass_conversation_cooldown);
+    assert_eq!(f.supervisor.queue_position(target).await, Some((1, 2)));
+    f.supervisor.run_next(1001).await.unwrap().unwrap();
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1);
+    {
+        let requests = f.executor.executions.lock().unwrap();
+        assert_eq!(
+            requests[0].request.url,
+            f.store.load(target).unwrap().pairing.canonical_url.unwrap()
+        );
+        assert!(requests[0].request.bypass_conversation_cooldown);
+        assert_eq!(requests[0].request.action_id, id);
+    }
+    assert!(f.store.load(target).unwrap().goal.is_none());
+    assert!(
+        f.supervisor
+            .run_queued_action_now(target, &id, 1002)
+            .await
+            .is_err()
+    );
+    let remaining_id = f.store.load(remaining).unwrap().action.id.unwrap();
+    f.supervisor
+        .cancel_action(remaining, &remaining_id, 1003)
+        .await
+        .unwrap();
+    assert_eq!(f.supervisor.queued_count().await, 0);
+    assert!(f.supervisor.run_next(1003).await.unwrap().is_none());
+    assert_eq!(f.executor.calls.load(Ordering::SeqCst), 1);
+    assert!(!chat.unread_snapshot().await.unwrap().messages.is_empty());
 }
 
 async fn fixture_with_queue_limit(max_queued_actions: usize) -> Fixture {
@@ -10111,6 +10177,47 @@ async fn cooldown_survives_restart_and_does_not_block_other_ready_chats() {
     restarted.scan_once(until).await.unwrap();
     restarted.run_next(until).await.unwrap();
     assert_eq!(executor.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn persisted_queued_chat_can_run_now_before_its_cooldown_without_a_goal() {
+    let now = 1000 + AUTOMATION_OFFLINE_AFTER_MS;
+    let (f, supervisor, executor) =
+        waiting_fixture(vec![CooldownOutcome::Wait(now + 180_000)], true).await;
+    f.chat
+        .append_user(
+            "manual-after-restart".into(),
+            "Keep the original request".into(),
+        )
+        .await
+        .unwrap();
+    supervisor.scan_once(now).await.unwrap();
+    supervisor.run_next(now).await.unwrap();
+    let before = f.store.load(&f.task).unwrap();
+    assert!(before.goal.is_none());
+    let restarted =
+        AgentAutomationSupervisor::new(f.config.markdown_chat.automation.clone(), executor.clone());
+    restarted
+        .register_task(AutomationTaskHandle::new(
+            f.task.clone(),
+            0,
+            f.store.clone(),
+            f.chat.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(restarted.queued_count().await, 0);
+    let queued = restarted
+        .run_queued_action_now(&f.task, before.action.id.as_deref().unwrap(), now + 1)
+        .await
+        .unwrap();
+    assert_eq!(queued.status, AutomationActionStatus::Queued);
+    assert!(queued.bypass_conversation_cooldown);
+    restarted.run_next(now + 1).await.unwrap().unwrap();
+    let requests = executor.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].bypass_conversation_cooldown);
+    assert!(f.store.load(&f.task).unwrap().goal.is_none());
 }
 
 #[tokio::test]

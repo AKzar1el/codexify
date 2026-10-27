@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.20] - 2026-10-28
+
+### Added
+
+- Show a persistent waiting bar for queued conversations without a goal, with
+  the remaining browser cooldown, live queue position, Do now, and Cancel.
+  Pending requests can also be cancelled before queue admission, and a stopped
+  browser is identified with a Start browser action instead of an invented ETA.
+
+### Fixed
+
+- Renew outdated connector schemas for idle conversations whose previous action
+  no longer has a pairing generation, preserving the queued message through
+  re-pairing and rejecting stale snapshots.
+- Isolate Windows pipe-based command shells and checkpoint helpers from console
+  windows and control events. Audit actual shell launches and exits separately
+  from Git and filesystem workers to diagnose unexpected service termination.
+- Keep a verified subscription plan when returning from billing is deferred by
+  the shared conversation-loading cooldown, instead of discarding the result
+  and reopening billing on a later retry.
+- Allow billing details time to load, retain a verified base-plan fallback while
+  resolving the Pro tier, and retry empty or incomplete results rather than
+  caching a blank plan indefinitely.
+
 ## [2.3.19] - 2026-10-27
 
 ### Added

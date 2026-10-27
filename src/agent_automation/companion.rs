@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
+    "2f7852fd999d639b18e829bc273b2e38021c40c839ec0feb0ff2c793cfeb9e03";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
+    "+protocol.2f7852fd999d639b18e829bc273b2e38021c40c839ec0feb0ff2c793cfeb9e03";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -548,6 +548,42 @@ impl BrowserCompanionClient {
             return Err(self.response_status_error(response, cancellation).await);
         }
         self.decode_json_response(response, cancellation).await
+    }
+
+    pub async fn navigation_available_at(
+        &self,
+        url: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<u64>, String> {
+        validate_chatgpt_url(url)?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Availability {
+            protocol_version: u32,
+            build: String,
+            available_at_ms: Option<u64>,
+        }
+        let response = self
+            .send_json_with_timeout(
+                Method::POST,
+                "/v1/navigation/availability",
+                Some(&serde_json::json!({"url":url})),
+                cancellation,
+                Some(Duration::from_secs(2)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.response_status_error(response, cancellation).await);
+        }
+        let value: Availability = self.decode_json_response(response, cancellation).await?;
+        self.validate_envelope(value.protocol_version, &value.build)?;
+        if value
+            .available_at_ms
+            .is_some_and(|at| at == 0 || at > 9_007_199_254_740_991)
+        {
+            return Err("Browser availability deadline is invalid".into());
+        }
+        Ok(value.available_at_ms)
     }
 
     pub async fn refresh_connector(

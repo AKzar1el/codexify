@@ -907,7 +907,17 @@ are killed; Unix process groups also terminate their owned filter descendants.
 Checkpoint stdout is bounded at 32 MiB and diagnostics at 64 KiB.
 
 Audit records include `tool_stage` start/finish events and `tool_worker` PIDs,
-linked by call and run IDs. Queue, spawn, filesystem execution/cleanup,
+linked by call and run IDs. `worker_kind` identifies `git`, `filesystem`, or the
+actual `exec` shell.
+Command launches have an `exec_spawn` stage, and `tool_worker_exit` records the
+shell's exit code or wait error, retaining the originating tool call ID even
+when a resident command finishes after its initial tool reply. These lifecycle
+records do not include command arguments or output. On Windows, pipe-based
+command shells, checkpoint Git helpers, and command termination helpers use
+`CREATE_NO_WINDOW`, avoiding visible windows and preventing inheritance of the
+server's console and its control events. A separate headless console can still
+exist in the command process.
+Queue, spawn, filesystem execution/cleanup,
 checkpoint, command-output and upstream waits can be distinguished without
 retaining raw payloads or tickets. `/health` includes filesystem slot/queue
 counts and connected upstream runtime status from memory; it performs no remote

@@ -15,6 +15,7 @@
     "GET /v1/actions/{actionId}/events?after={sequence}",
     "POST /v1/new-chat/capabilities",
     "POST /v1/account/plan",
+    "POST /v1/navigation/availability",
     "POST /v1/connectors/refresh",
     "POST /v1/turns/handoff",
     "POST /v1/approvals/conversation"
@@ -138,7 +139,11 @@
       ],
       "accountFingerprint": "opaque verified account identifier"
     },
-    "cache": "one successful billing inspection per server epoch and account"
+    "cache": "cache verified nonempty plans per server epoch and account; retry a basic Pro fallback after 60 seconds to resolve its billing tier",
+    "deadlineMs": 45000,
+    "billingObservationMs": 5000,
+    "billingNavigationMs": 10000,
+    "restoration": "a conversation-loading cooldown may defer restoring the shared tab but must not discard an already verified plan; it never bypasses the global navigation budget"
   },
   "connectorRefresh": {
     "request": {
@@ -175,6 +180,7 @@
     "policy": "Core calls only while autoApproveToolCalls is enabled; checks yield to browser actions"
   },
   "navigationDeferral": {
+    "availability": "Read-only POST /v1/navigation/availability accepts a ChatGPT url and returns protocolVersion, build and nullable availableAtMs without navigating; reusing the current conversation requires no load",
     "event": {"type":"waiting", "availableAtMs":"positive safe integer absolute deadline"},
     "snapshot": {"state":"waiting", "cooldownUntilMs":"same absolute deadline", "sendAccepted":false},
     "policy":"A local cooldown prevents navigation without failing the action or consuming a retry. The core queues the action until the deadline and releases the shared browser. HTTP 429 received after a real request remains a failure."

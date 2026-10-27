@@ -1,16 +1,16 @@
 import type { Frame, Locator, Page } from "patchright";
 import {completedHandoff} from "./turn-renewal";
-import {classifyPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
+import {classifyPlan,completeAccountPlan,readBillingPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
 import {approveConversationCard,throwIfConversationApproval} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, throwIfConversationLimit, toolApprovalVisible } from "./browser-session";
-import {navigatePage,recordConversationAvailable} from "./navigation";
+import {navigatePage,recordConversationAvailable,conversationLoadAvailableAt} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
-import { asCompanionError, BrowserCompanionError,browserStage } from "./errors";
+import { asCompanionError, BrowserCompanionError,ConversationCooldownError,browserStage } from "./errors";
 import { uiLabelPattern } from "./ui-localization";
 import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./model-selection";
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
@@ -310,7 +310,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   private maintenance?: {page:Page;account:ChatGptAccount};
   private pendingRefresh?: {page:Page;url:string;account:ChatGptAccount};
   private pendingSubmission?: {actionId:string;mayHaveSent:boolean};
-  private planCache?: {epoch:string;plan:AccountPlan};
+  private planCache?: {epoch:string;plan:AccountPlan;expiresAt:number};
   private capabilitiesCache?: {
     accountFingerprint:string;
     capabilities:AccountCapabilities;
@@ -480,12 +480,29 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   async accountPlan(epoch:string, signal?:AbortSignal):Promise<AccountPlan> {
     signal?.throwIfAborted();
     const main=await this.surface.page(),account=await readChatGptAccount(main);
-    if(this.planCache?.epoch===epoch&&this.planCache.plan.accountFingerprint===account.fingerprint)return this.planCache.plan;
-    return this.withMaintenancePage(main,account,async page=>{
-      const plan=await readBillingPlan(page,signal);
-      if(plan.accountFingerprint!==account.fingerprint)throw new Error("ChatGPT account changed during plan inspection");
-      this.planCache={epoch,plan};return plan;
-    },signal,{clearDraft:false});
+    if(this.planCache?.epoch===epoch&&this.planCache.plan.accountFingerprint===account.fingerprint&&Date.now()<this.planCache.expiresAt)return this.planCache.plan;
+    let verifiedPlan:AccountPlan|undefined;
+    const cache=(plan:AccountPlan,retryAt=0)=>{
+      if(!plan.label.trim())throw new BrowserCompanionError("ChatGPT did not expose its subscription plan", "selector_drift");
+      this.planCache={epoch,plan,expiresAt:completeAccountPlan(plan)?Infinity:Math.max(Date.now()+60_000,retryAt)};
+      return plan;
+    };
+    try {
+      return cache(await this.withMaintenancePage(main,account,async page=>{
+        const plan=await readBillingPlan(page,signal,account);
+        if(plan.accountFingerprint!==account.fingerprint)throw new BrowserCompanionError("ChatGPT account changed during plan inspection","authentication_required");
+        verifiedPlan=plan;return plan;
+      },signal,{clearDraft:false}));
+    } catch(error) {
+      // Returning to the conversation obeys the global loading cooldown. That
+      // deferral cannot invalidate subscription data already read and verified.
+      if(error instanceof ConversationCooldownError&&verifiedPlan?.label.trim())return cache(verifiedPlan,error.availableAtMs);
+      throw error;
+    }
+  }
+
+  async navigationAvailability(url:string):Promise<number|null> {
+    return conversationLoadAvailableAt(await this.surface.page(),url);
   }
 
   async refreshConnector(name:string, signal?:AbortSignal) {

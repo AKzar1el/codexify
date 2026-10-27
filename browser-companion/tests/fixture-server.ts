@@ -23,6 +23,7 @@ class ContractDriver implements BrowserDriver {
     };
   }
   async login() { return this.health(); }
+  async navigationAvailability() {return 180_000;}
   async capabilities(): Promise<CapabilityCatalog> {
     if(mode==="picker-error")throw new BrowserCompanionError("ChatGPT did not expose one owned model/effort control","selector_drift",{phase:"effort_control_lookup"});
     return {

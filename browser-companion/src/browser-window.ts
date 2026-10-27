@@ -74,6 +74,7 @@ export interface BrowserDriver {
   capabilities(signal?: AbortSignal): Promise<CapabilityCatalog>;
   prepareNewChat?(projectUrl:string | null, signal?: AbortSignal): Promise<CapabilityCatalog>;
   accountPlan?(epoch:string, signal?: AbortSignal): Promise<import("./account-settings").AccountPlan>;
+  navigationAvailability?(url:string):Promise<number|null>;
   turnHandoffComplete?(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean>;
   refreshConnector?(name:string, signal?: AbortSignal): Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
   refreshConnectorSteps?(name:string,run:BrowserStepRunner,signal?:AbortSignal):Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
@@ -232,7 +233,7 @@ export class SingleWindowCoordinator {
   private pairingWindow: {actionId:string;url:string;generation:number;account:string;connector:string;timer:ReturnType<typeof setTimeout>} | null = null;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string,
-    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS }) {
+    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number;accountPlanMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS, accountPlanMs:45_000 }) {
     validateProtocolBuild(build);
     if (Object.values(timeouts).some(value => !Number.isFinite(value) || value <= 0)) throw new Error("Browser operation deadlines must be positive");
   }
@@ -307,7 +308,12 @@ export class SingleWindowCoordinator {
       if(this.activeActionId)throw new Error("Browser companion is busy with an active action");
       if(!this.driver.accountPlan)throw new Error("Account plan inspection is unavailable");
       return this.driver.accountPlan(epoch, operationSignal);
-    }, signal);
+    }, signal,false,this.timeouts.accountPlanMs??this.timeouts.operationMs);
+  }
+
+  async navigationAvailability(url:string) {
+    const availableAtMs=await this.driver.navigationAvailability?.(url)??null;
+    return {protocolVersion:PROTOCOL_VERSION,build:this.build,availableAtMs};
   }
 
   async turnHandoffComplete(url:string,account:string,handoffId:string,signal?:AbortSignal) {

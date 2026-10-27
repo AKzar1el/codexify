@@ -435,7 +435,7 @@ impl ExecSession {
     /// treats a lone `` (Ctrl-C) written to a non-tty session. Because this
     /// bridge drives processes over plain pipes rather than a PTY, there is no
     /// terminal to raise SIGINT: on Unix we signal the process group directly, and
-    /// on Windows (where a piped child has no console to receive a Ctrl-C event)
+    /// on Windows (without an interactive terminal for these pipe-based sessions)
     /// we fall back to terminating the tree. Returns `false` if the process has
     /// already exited.
     pub fn interrupt(&self) -> bool {
@@ -453,8 +453,8 @@ impl ExecSession {
         }
         #[cfg(windows)]
         {
-            // No console is attached to a piped child, so a graceful Ctrl-C event
-            // cannot be generated; terminate the tree instead.
+            // There is no interactive terminal for delivering Ctrl-C; terminate
+            // the owned tree rather than broadcasting a console control event.
             kill_pid(Some(pid));
         }
         true
@@ -1531,6 +1531,11 @@ pub fn start_exec_session(
     {
         command.process_group(0);
     }
+    // These sessions use pipes, not the server's console. Without this flag
+    // Windows shares the server's console (including a headless service console)
+    // and its control events, or opens a window when the parent has no console.
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     scrub_untrusted_child_env(&mut command, config);
 
     let mut child = command
@@ -1538,6 +1543,8 @@ pub fn start_exec_session(
         .map_err(|e| format!("Failed to start command: {e}"))?;
 
     let pid = child.id();
+    crate::audit::worker_started("exec", pid);
+    let record_exit = crate::audit::worker_exit_observer("exec", pid);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1573,7 +1580,9 @@ pub fn start_exec_session(
     // Waiter reaps the child and records its exit code.
     let exit_for_waiter = exit_code.clone();
     tokio::spawn(async move {
-        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let result = child.wait().await;
+        record_exit(&result);
+        let code = result.ok().and_then(|s| s.code()).unwrap_or(-1);
         *exit_for_waiter.lock().unwrap() = Some(code);
     });
 
@@ -1629,7 +1638,10 @@ pub fn kill_pid(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+
         let _ = std::process::Command::new("taskkill")
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1713,6 +1725,157 @@ mod tests {
     fn wrap_only_powershell() {
         assert_eq!(wrap_for_shell("ls", "bash"), "ls");
         assert!(wrap_for_shell("ls", "powershell").contains("$LASTEXITCODE"));
+    }
+
+    #[cfg(windows)]
+    async fn windows_powershell_output(command: &str) -> (String, i32) {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::config::default_config(root.path().into());
+        let state = SessionState::new();
+        let session = start_exec_session(
+            &state,
+            &config,
+            command,
+            root.path(),
+            Some("powershell.exe"),
+        )
+        .unwrap();
+        windows_wait_for_output(&session).await
+    }
+
+    #[cfg(windows)]
+    async fn windows_wait_for_output(session: &ExecSession) -> (String, i32) {
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let (chunk, finished, _) = session.yield_output_with_metadata(10_000).await;
+                output.push_str(&chunk);
+                if finished {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("PowerShell command did not finish");
+        (output, session.exit_code().unwrap())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_exec_stdio_and_interrupt_work_with_console_isolation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::config::default_config(root.path().into());
+        let state = SessionState::new();
+        let session = start_exec_session(
+            &state,
+            &config,
+            "$line=[Console]::ReadLine(); Write-Output ('ECHO=' + $line)",
+            root.path(),
+            Some("powershell.exe"),
+        )
+        .unwrap();
+        session.write_stdin("PIPE_INPUT_OK\n").await.unwrap();
+        let (output, code) = windows_wait_for_output(&session).await;
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("ECHO=PIPE_INPUT_OK"), "{output}");
+
+        let resident = start_exec_session(
+            &state,
+            &config,
+            "Start-Sleep -Seconds 30",
+            root.path(),
+            Some("powershell.exe"),
+        )
+        .unwrap();
+        assert!(resident.interrupt());
+        let (_, finished, _) = resident.yield_output_with_metadata(15_000).await;
+        assert!(finished, "interrupted command remained alive");
+        assert_ne!(resident.exit_code(), Some(0));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_exec_console_is_isolated_from_server() {
+        // Windows can retain a headless console even with CREATE_NO_WINDOW.
+        // Test membership and visibility, rather than assuming its size is zero.
+        let command = r#"
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ExecConsoleProbe { [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList([Out] uint[] ids, uint size); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window); [DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add); [DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint kind, uint group); }'
+$ids = New-Object uint32[] 16
+$count = [ExecConsoleProbe]::GetConsoleProcessList($ids, 16)
+if ($count -gt $ids.Length) { throw 'Console process buffer was too small' }
+Write-Output ("CONSOLE_SHARED_WITH_SERVER=" + ($ids -contains [uint32]__SERVER_PID__))
+Write-Output ("CONSOLE_VISIBLE=" + [ExecConsoleProbe]::IsWindowVisible([ExecConsoleProbe]::GetConsoleWindow()))
+if ($ids -contains [uint32]__SERVER_PID__) { throw 'Command shares the server console' }
+# Only signal a verified separate console, so even a regression cannot stop
+# the test runner or another process sharing the runner's original console.
+if ($count -gt 0) {
+    [ExecConsoleProbe]::SetConsoleCtrlHandler([IntPtr]::Zero, $true) | Out-Null
+    if (-not [ExecConsoleProbe]::GenerateConsoleCtrlEvent(0, 0)) { throw 'Console event failed' }
+    Start-Sleep -Milliseconds 150
+}
+Write-Output 'AFTER_CONTROL_EVENT_OK'
+"#.replace("__SERVER_PID__", &std::process::id().to_string());
+        let (output, code) = windows_powershell_output(&command).await;
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("CONSOLE_SHARED_WITH_SERVER=False"),
+            "{output}"
+        );
+        assert!(output.contains("CONSOLE_VISIBLE=False"), "{output}");
+        assert!(output.contains("AFTER_CONTROL_EVENT_OK"), "{output}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_exec_powershell_two_pass_byte_array() {
+        // Reporter-provided workload, kept in its own shell process. This also
+        // exercises the noninteractive pipes used by the Windows service.
+        let (output, code) = windows_powershell_output(
+            r#"
+$ErrorActionPreference='Stop'
+[byte[]]$data = New-Object byte[] (1 * 1024 * 1024)
+for ($i=0; $i -lt $data.Length; $i++) { $data[$i] = [byte]($i % 256) }
+[long]$sum=0
+for ($j=0; $j -lt $data.Length; $j++) { $sum += $data[$j] }
+Write-Output "BYTE_WRITE_READ_OK bytes=$($data.Length) sum=$sum"
+"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("BYTE_WRITE_READ_OK bytes=1048576 sum=133693440"),
+            "{output}"
+        );
+        let (next, code) =
+            windows_powershell_output("Write-Output 'AFTER_ARRAY_OK'; exit 37").await;
+        assert_eq!(code, 37, "{next}");
+        assert!(next.contains("AFTER_ARRAY_OK"), "{next}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_exec_powershell_wrapped_file_output() {
+        let (output, code) = windows_powershell_output(
+            r#"
+$start=Get-Date
+$result = & { Write-Output "EXEC_SAFE_OK" } 2>&1
+$ok=$?
+$end=Get-Date
+$exit=if($ok){0}else{1}
+$lines=@()
+$lines += ('START=' + $start.ToString('yyyy-MM-dd HH:mm:ss.fff zzz'))
+$lines += $result
+$lines += ('END=' + $end.ToString('yyyy-MM-dd HH:mm:ss.fff zzz'))
+$lines += ('EXIT_CODE=' + $exit)
+$lines | Set-Content -LiteralPath '.\safe_control_write_output.txt' -Encoding UTF8
+Get-Content -LiteralPath '.\safe_control_write_output.txt'
+exit $exit
+"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("EXEC_SAFE_OK"), "{output}");
+        assert!(output.contains("EXIT_CODE=0"), "{output}");
     }
 
     #[test]

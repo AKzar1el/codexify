@@ -1,6 +1,6 @@
 import {afterEach,expect,setSystemTime,test} from "bun:test";
 import type {BrowserContext,Page} from "patchright";
-import {configureNavigationTimings,navigatePage,recordConversationAvailable,recordConversationUnavailable,withConversationCooldownBypass} from "../src/navigation";
+import {configureNavigationTimings,navigatePage,recordConversationAvailable,recordConversationUnavailable,withConversationCooldownBypass,conversationLoadAvailableAt} from "../src/navigation";
 
 class NavigationPage {
   current="https://chatgpt.com/";
@@ -15,6 +15,17 @@ class NavigationPage {
   asPage=()=>this as unknown as Page;
 }
 afterEach(()=>{setSystemTime();configureNavigationTimings();});
+
+test("passive availability reports the real shared deadline without loading or delaying current-page reuse",async()=>{
+ const page=new NavigationPage(),now=Date.now();setSystemTime(now);
+ expect(conversationLoadAvailableAt(page.asPage(),'https://chatgpt.com/c/first')).toBeNull();
+ await navigatePage(page.asPage(),'https://chatgpt.com/c/first');
+ expect(conversationLoadAvailableAt(page.asPage(),page.current)).toBeNull();
+ expect(conversationLoadAvailableAt(page.asPage(),'https://chatgpt.com/c/second')).toBe(now+180000);
+ setSystemTime(now+30000);expect(conversationLoadAvailableAt(page.asPage(),'https://chatgpt.com/c/second')).toBe(now+180000);
+ expect(page.loads).toEqual(['https://chatgpt.com/c/first']);
+ setSystemTime(now+180000);expect(conversationLoadAvailableAt(page.asPage(),'https://chatgpt.com/c/second')).toBeNull();
+});
 
 test("manual Retry bypasses local cooldowns for its action while automatic loads remain throttled",async()=>{
   const page=new NavigationPage(),now=Date.now();setSystemTime(now);

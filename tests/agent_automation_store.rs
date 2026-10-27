@@ -11,6 +11,49 @@ fn task(name: &str) -> ConversationIdentity {
 }
 
 #[test]
+fn run_now_capability_is_only_for_a_current_confirmed_unsent_queued_action() {
+    use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
+    let mut state = AutomationTaskState::default();
+    state.pairing.generation = 1;
+    state.pairing.verified_owner_generation = Some(0);
+    state.action = AutomationActionState {
+        id: Some("queued-chat".into()),
+        kind: Some(AutomationActionKind::OfflineChat),
+        status: AutomationActionStatus::Queued,
+        pairing_generation: Some(1),
+        send_accepted: Some(false),
+        ..Default::default()
+    };
+    assert!(state.can_run_queued_now());
+    for accepted in [None, Some(true)] {
+        let mut changed = state.clone();
+        changed.action.send_accepted = accepted;
+        assert!(!changed.can_run_queued_now());
+    }
+    for phase in [
+        AutomationActionStatus::Navigating,
+        AutomationActionStatus::Sending,
+        AutomationActionStatus::Idle,
+        AutomationActionStatus::Cancelled,
+    ] {
+        let mut changed = state.clone();
+        changed.action.status = phase;
+        assert!(!changed.can_run_queued_now());
+    }
+    let mut changed = state.clone();
+    changed.action.messages_fenced = true;
+    assert!(!changed.can_run_queued_now());
+    let mut changed = state.clone();
+    changed.action.goal_turn_counted = true;
+    assert!(!changed.can_run_queued_now());
+    let mut changed = state.clone();
+    changed.action.kind = Some(AutomationActionKind::PairVerify);
+    assert!(!changed.can_run_queued_now());
+    state.pairing.generation = 2;
+    assert!(!state.can_run_queued_now());
+}
+
+#[test]
 fn automatic_retry_requires_confirmed_unsent_work_and_an_active_matching_goal() {
     use codexify::agent_automation::{AutomationActionState, AutomationTaskState};
     let mut state = AutomationTaskState::default();

@@ -909,19 +909,19 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
       save();
     }
   }
-  async function stopAgent() {
-    if (startupBlocked() || !available || isReadOnly() || !chatFile || sending || stopping || tornDown) return;
+  async function stopAgent(pendingWake = false) {
+    if ((!pendingWake && startupBlocked()) || !available || isReadOnly() || !chatFile || sending || stopping || tornDown) return;
     const origin = generation;
     stopRequestId ||= crypto.randomUUID();
     stopping = true; resizeInput();
     try {
       const payload = await call("chat_ui_send", { ...requestDestination(), request_id:stopRequestId, message:"Stop the current agent turn.", stop_agent:true });
       if (payload.stopped !== true) throw new Error("The stop request was not confirmed. Retry to check it.");
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      if (!pendingWake) await new Promise(resolve => setTimeout(resolve, 3000));
       if (!currentGeneration(origin)) return;
       agentStopped = true; lastAgentCall = null; agentWaitingUntil = null; agentPresenceUntil = null; stopRequestId = null;
       wakeStatus = null; wakeVersion++;
-      status("Stop requested. The goal stays paused until you press Play.");
+      status(pendingWake ? "Wake-up cancelled. Your message is kept." : "Stop requested. The goal stays paused until you press Play.");
       revision = null; void refresh();
     } catch (error) {
       if (currentGeneration(origin)) { status(error.message || "Could not request a stop. Try again.", true); workspaceMismatch(error); }
@@ -1123,6 +1123,7 @@ svg { display:block; width:100%; height:100%; fill:none; stroke:currentColor; st
     .catch(() => { if (!window.openai?.callTool) status("This host has not connected the chat widget.", true); });
   if (!bridge && window.openai?.callTool) void refresh();
   return {
+    cancelWake:()=>stopAgent(true),
     setAvailable,
     setLoading,
     setReadOnly,

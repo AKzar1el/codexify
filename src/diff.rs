@@ -1434,6 +1434,8 @@ async fn run_git(
     input: Option<&[u8]>,
     timeout_ms: u64,
 ) -> Result<Output, String> {
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -1445,7 +1447,7 @@ async fn run_git(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to run git: {error}"))?;
-    crate::audit::worker_started(child.id());
+    crate::audit::worker_started("git", child.id());
     #[cfg(unix)]
     let mut group = GitProcessGroup(child.id());
     let mut stdin = child.stdin.take();

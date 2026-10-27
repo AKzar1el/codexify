@@ -364,6 +364,24 @@ impl AutomationTaskState {
             .then_some(self.action.cooldown_until_ms)
             .flatten()
     }
+    pub fn can_run_queued_now(&self) -> bool {
+        self.action.status == AutomationActionStatus::Queued
+            && self.action.id.is_some()
+            && matches!(
+                self.action.kind,
+                Some(
+                    AutomationActionKind::OfflineChat
+                        | AutomationActionKind::OfflineCombined
+                        | AutomationActionKind::OfflineGoal
+                        | AutomationActionKind::TurnRenewal
+                )
+            )
+            && self.action.send_accepted == Some(false)
+            && !self.action.messages_fenced
+            && !self.action.goal_turn_counted
+            && self.action.pairing_generation == Some(self.pairing.generation)
+            && self.pairing.verified_owner_generation.is_some()
+    }
     fn can_resume_cancelled_action(&self) -> bool {
         self.action.status == AutomationActionStatus::Cancelled
             && (self.action.send_accepted == Some(false) || self.action.messages_fenced)
@@ -1637,7 +1655,13 @@ impl AgentAutomationStore {
                         state.action.status != AutomationActionStatus::ConversationLimit,
                         |pairing| state.pairing != *pairing,
                     )
-                    || state.pairing.generation != expected.pairing_generation.unwrap_or(0)
+                    // Schema rollover has a full pairing snapshot; an idle or
+                    // cleared action need not carry its pairing generation.
+                    || state.pairing.generation
+                        != expected_pairing
+                            .map(|pairing| pairing.generation)
+                            .or(expected.pairing_generation)
+                            .unwrap_or(0)
                     || state.pairing.verified_owner_generation != owner_generation.checked_sub(1))
             {
                 return Ok(None);
@@ -2460,6 +2484,30 @@ impl AgentAutomationStore {
                 state.action.chatgpt_access_retry_in_progress = false;
             }
             Ok(true)
+        })
+    }
+
+    pub(crate) fn run_queued_action_now(
+        &self,
+        task: &ConversationIdentity,
+        expected_action_id: &str,
+        now_ms: u64,
+    ) -> Result<AutomationActionState, String> {
+        if !valid_opaque(expected_action_id) {
+            return Err("Agent automation action ID is invalid".into());
+        }
+        self.mutate(task, |state| {
+            if state.action.id.as_deref() != Some(expected_action_id) || !state.can_run_queued_now()
+            {
+                return Err("Only an unsent queued browser action can run now".into());
+            }
+            state.action.cooldown_until_ms = None;
+            state.action.bypass_conversation_cooldown = true;
+            state.action.automatic_retry_in_progress = false;
+            state.action.chatgpt_access_retry_in_progress = false;
+            state.suspended_retry = None;
+            state.action.updated_at_ms = Some(now_ms);
+            Ok(state.action.clone())
         })
     }
 
@@ -4286,4 +4334,98 @@ fn valid_opaque(value: &str) -> bool {
 
 fn bounded_private(value: &str) -> bool {
     value.len() <= MAX_PRIVATE_TEXT_BYTES && !value.contains('\0')
+}
+
+#[cfg(test)]
+mod schema_rollover_tests {
+    use super::*;
+
+    fn verified_idle_pairing() -> (
+        tempfile::TempDir,
+        AgentAutomationStore,
+        ConversationIdentity,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+        let task = ConversationIdentity::from_openai_session("idle-schema-rollover").unwrap();
+        let url = "https://chatgpt.com/c/idle-source";
+        let issue = store.issue_pairing(&task, url, 1, 100).unwrap();
+        store
+            .record_pairing_canonical_url(&task, issue.generation, url, 101)
+            .unwrap();
+        store
+            .verify_pairing(&task, issue.generation, 1, &issue.reference, 102)
+            .unwrap();
+        store
+            .mutate(&task, |state| {
+                state.action = AutomationActionState::default();
+                state.pairing.schema_rollover_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        (root, store, task)
+    }
+
+    #[test]
+    fn schema_rollover_uses_the_pairing_snapshot_when_the_action_is_idle() {
+        let (_root, store, task) = verified_idle_pairing();
+        let expected = store.load(&task).unwrap();
+        assert_eq!(expected.action.pairing_generation, None);
+        let issue = store
+            .issue_schema_rollover_pairing(&task, "https://chatgpt.com/new", 2, 200, &expected)
+            .unwrap()
+            .expect("a verified idle pairing must roll over");
+        let replacing = store.load(&task).unwrap();
+        assert_eq!(issue.generation, 2);
+        assert_eq!(
+            replacing.pairing.pending.as_ref().unwrap().owner_generation,
+            2
+        );
+        assert!(replacing.pairing.creating_chat);
+        assert!(replacing.pairing.schema_rollover_pending);
+        assert_eq!(replacing.selection, expected.selection);
+        assert!(
+            store
+                .issue_schema_rollover_pairing(&task, "https://chatgpt.com/new", 2, 201, &expected)
+                .unwrap()
+                .is_none(),
+            "replaying the old snapshot must not create another replacement"
+        );
+    }
+
+    #[test]
+    fn idle_schema_rollover_still_rejects_stale_actions_pairings_and_owners() {
+        for changed in ["action", "pairing", "owner"] {
+            let (_root, store, task) = verified_idle_pairing();
+            let expected = store.load(&task).unwrap();
+            if changed != "owner" {
+                store
+                    .mutate(&task, |state| {
+                        if changed == "action" {
+                            state.action.updated_at_ms = Some(150);
+                        } else {
+                            state.pairing.schema_rollover_pending = false;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let path = store.task_directory(&task).unwrap().join(STATE_FILE);
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                store
+                    .issue_schema_rollover_pairing(
+                        &task,
+                        "https://chatgpt.com/new",
+                        if changed == "owner" { 3 } else { 2 },
+                        200,
+                        &expected
+                    )
+                    .unwrap()
+                    .is_none(),
+                "{changed}"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), before, "{changed}");
+        }
+    }
 }

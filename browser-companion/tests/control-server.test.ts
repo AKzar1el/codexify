@@ -11,6 +11,27 @@ import {browserStage} from "../src/errors";
 
 const TEST_BUILD = protocolBuild("test-build");
 
+test("navigation availability is authenticated and read-only while a browser action owns the tab",async()=>{
+ class AvailabilityDriver extends BlockingDriver {
+  reads:string[]=[];
+  async navigationAvailability(url:string){this.reads.push(url);return 180_000;}
+ }
+ const root=await mkdtemp(join(tmpdir(),"browser-availability-")),driver=new AvailabilityDriver();
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD),server=await startControlServer(coordinator,join(root,"descriptor.json"));
+ try {
+  const headers={Authorization:`Bearer ${server.token}`,"Content-Type":"application/json"},url="https://chatgpt.com/c/next";
+  expect((await fetch(`${server.endpoint}/v1/navigation/availability`,{method:"POST",body:JSON.stringify({url})})).status).toBe(401);
+  await coordinator.execute(executeBody());
+  const deadline=Date.now()+2000;
+  while(!(await coordinator.action("control-action"))?.sendAccepted){expect(Date.now()).toBeLessThan(deadline);await Bun.sleep(1);}
+  const result=await fetch(`${server.endpoint}/v1/navigation/availability`,{method:"POST",headers,body:JSON.stringify({url})});
+  expect(await result.json()).toEqual({protocolVersion:1,build:TEST_BUILD,availableAtMs:180_000});
+  expect(driver.reads).toEqual([url]);expect((await coordinator.health()).activeActionId).toBe("control-action");
+  expect((await fetch(`${server.endpoint}/v1/navigation/availability`,{method:"POST",headers,body:JSON.stringify({url:"http://example.test"})})).status).toBe(400);
+  expect(driver.reads).toEqual([url]);
+ }finally{await server.close();}
+});
+
 class ImmediateDriver implements BrowserDriver {
   async health() {
     return {
