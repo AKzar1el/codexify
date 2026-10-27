@@ -113,6 +113,26 @@ pub(crate) fn schema_versions(config: &AppConfig) -> Result<(String, String), St
 pub(crate) fn schema_revision(config: &AppConfig) -> Result<String, String> {
     schema_versions(config).map(|v| v.0)
 }
+
+/// A replacement must be created after discovery has caught up, including the
+/// debounce window between saving settings and starting the browser refresh.
+pub(crate) fn automation_schema_refresh_ready(config: &AppConfig) -> bool {
+    if config.loaded_config_path.is_none() {
+        return true;
+    }
+    if read_refresh_intent().is_some_and(|intent| {
+        intent["targetVersion"] == env!("CARGO_PKG_VERSION") && intent["phase"] != "completed"
+    }) {
+        return false;
+    }
+    let Some(intent) = read_schema_intent(config) else {
+        return true;
+    };
+    matches!(
+        intent["phase"].as_str(),
+        Some("idle" | "completed" | "cancelled")
+    ) && schema_revision(config).is_ok_and(|revision| intent["observedRevision"] == revision)
+}
 pub(crate) fn schema_intent_path(config: &AppConfig) -> Result<PathBuf, String> {
     Ok(config
         .loaded_config_path

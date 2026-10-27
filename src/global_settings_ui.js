@@ -135,7 +135,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   dialog.innerHTML=`<div class="settings-shell"><header id="settings-toolbar"><button type="button" id="settings-analytics-back" class="settings-icon-button" aria-label="Back to settings" hidden>${icon('arrow')}</button><div class="settings-heading-copy"><h2 id="settings-heading">Codexify settings</h2><p>Changes save automatically. Some settings require a restart.</p></div><button type="button" id="settings-raw-toggle" aria-label="View raw config">${icon('code')}<span>View raw config</span></button><button type="button" id="settings-close" class="settings-icon-button" aria-label="Close settings">${icon('close')}</button></header><div class="settings-body"><nav id="settings-sidebar" aria-label="Settings categories"><label class="settings-search">${icon('search')}<input id="settings-search" type="search" placeholder="Search settings" aria-label="Search settings"></label><div id="settings-nav"></div></nav><main id="settings-main"><h3 id="settings-content-heading"></h3><p id="settings-content-description"></p><div id="settings-form"></div><div id="settings-raw-panel" hidden><p>Edit the complete JSON configuration. Changes are validated before saving.</p><textarea id="settings-raw" aria-label="Raw configuration JSON" spellcheck="false"></textarea><div class="settings-raw-actions"><span id="settings-file"></span><button type="button" id="settings-save-raw" class="settings-primary">Save raw config</button></div></div></main></div><footer class="settings-footer"><p id="settings-save-state" role="status"></p><div class="settings-maintenance"><button type="button" id="settings-reload" hidden>Reload settings</button><button type="button" id="settings-refresh-connector">Refresh connector</button><button type="button" id="settings-update" hidden>Update Codexify</button><button type="button" id="settings-restart">${icon('restart')}Restart Codexify</button></div></footer></div>`;
   document.body.append(dialog);
   const progress=document.createElement('section');progress.id='global-progress';progress.hidden=true;progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');
-  progress.innerHTML='<span class="global-progress-spinner" aria-hidden="true"></span><div id="global-progress-copy"><div id="global-progress-title"></div><div id="global-progress-detail"></div></div><button type="button" id="global-progress-action" hidden></button><button type="button" id="global-progress-close" aria-label="Dismiss update status" hidden>×</button>';
+  progress.innerHTML='<span class="global-progress-spinner" aria-hidden="true"></span><div id="global-progress-copy"><div id="global-progress-title"></div><div id="global-progress-detail"></div></div><button type="button" id="global-progress-start" hidden>Start browser</button><button type="button" id="global-progress-action" hidden></button><button type="button" id="global-progress-close" aria-label="Dismiss update status" hidden>×</button>';
   document.body.prepend(progress);
   const progressSize=typeof ResizeObserver==='function'?new ResizeObserver(()=>{document.documentElement.style.setProperty('--system-progress-height',`${progress.hidden?0:progress.getBoundingClientRect().height}px`);}):null;
   progressSize?.observe(progress);
@@ -227,6 +227,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     onReadiness(blocked);
     progress.hidden=!view;document.body.classList.toggle('system-progress-visible',Boolean(view));
     if(view){byId('global-progress-title').textContent=view.title;byId('global-progress-detail').textContent=view.detail||'';progress.dataset.error=String(Boolean(view.error));progress.querySelector('.global-progress-spinner').hidden=!view.loading;byId('global-progress-close').hidden=!view.dismiss;const action=byId('global-progress-action');action.hidden=!view.action;action.textContent=view.label||'';action.dataset.action=view.action||'';action.disabled=maintenance;}
+    const start=byId('global-progress-start');start.hidden=readiness?.phase!=='browser_stopped'||view?.action!=='browser';start.disabled=maintenance||Boolean(browserOperation);start.textContent=browserOperation==='start'?'Starting…':'Start browser';
     const button=byId('global-update');button.hidden=!global?.latest?.updateAvailable&&!updating&&!updateFailure(update);button.disabled=maintenance||updatePending(update);button.setAttribute('aria-busy',String(updating));button.textContent=updating?'Updating…':updateFailure(update)?'Retry update':'Update';button.title=view&&updating?`${view.title} ${view.detail||''}`:'Update Codexify';
     byId('settings-update').disabled=button.disabled;byId('global-footer').dataset.maintenance=String(busy);
     document.documentElement.style.setProperty('--system-progress-height',`${progress.hidden?0:progress.getBoundingClientRect().height}px`);
@@ -240,6 +241,11 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     if(byId('global-progress-action').dataset.action==='update'){void maintain('update');return;}
     if(byId('global-progress-action').dataset.action==='restart'){void maintain('restart');return;}
     category=byId('global-progress-action').dataset.action==='browser'?'browser':'general';byId('global-settings').click();
+  });
+  byId('global-progress-start').addEventListener('click',async()=>{
+    await controlBrowser('start');
+    if(browserFeedbackError&&browserFeedbackOperation==='start')runtimeNotice('Browser startup failed',browserFeedback,true);
+    else await pollStatus();
   });
   let browser=null,browserOperation=null,browserRevision=0,browserReading=false,browserFeedback='',browserFeedbackError=false,browserFeedbackOperation=null;
   const browserCard=document.createElement('section');browserCard.id='settings-browser';browserCard.className='settings-card';browserCard.setAttribute('aria-labelledby','settings-browser-heading');
@@ -265,7 +271,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   }
   async function controlBrowser(operation){
     if(browserOperation==='stop'||browserOperation&&operation!=='stop')return;
-    const revision=++browserRevision;browserOperation=operation;browserFeedback='';browserFeedbackError=false;browserFeedbackOperation=operation;renderBrowser();
+    const revision=++browserRevision;browserOperation=operation;browserFeedback='';browserFeedbackError=false;browserFeedbackOperation=operation;renderBrowser();renderRuntime();
     try{
       const random=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const result=await(await api(`/api/browser/${operation}`,{method:'POST',body:JSON.stringify({requestId:`browser-${operation}-${random}`,...(operation==='capabilities'?{refresh:true}:{})})})).json();
@@ -273,7 +279,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
       browserFeedback=operation==='capabilities'?'Models refreshed.':operation==='login'?(browser.authenticated?'Signed in.':'Complete sign-in in the browser.') : '';
       window.dispatchEvent(new Event('codexify-browser-change'));
     }catch(error){if(revision===browserRevision){browserFeedback=error.message||'Browser control failed';browserFeedbackError=true;}}
-    finally{if(revision===browserRevision){browserOperation=null;renderBrowser();void refreshBrowser();}}
+    finally{if(revision===browserRevision){browserOperation=null;renderBrowser();renderRuntime();void refreshBrowser();}}
   }
   for(const [key,operation]of [['start','start'],['stop','stop'],['login','login'],['models','capabilities']])browserNodes[key].addEventListener('click',()=>void controlBrowser(operation));
   const browserTimer=setInterval(()=>{if(dialog.open&&!rawMode&&browserCard.isConnected&&!document.hidden)void refreshBrowser();},1500);

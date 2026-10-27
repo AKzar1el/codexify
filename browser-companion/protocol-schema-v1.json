@@ -65,7 +65,8 @@
     ],
     "turn_renewal": [
       "handoffId"
-    ]
+    ],
+    "task_continuation": []
   },
   "fieldLimits": {
     "opaqueIdBytes": 256,
@@ -148,6 +149,20 @@
     "deadlineMs": 120000,
     "schemaVerified": false
   },
+  "pairingWindowReservation": {
+    "requestFields": ["retainPairingWindow", "pairingContinuationOf"],
+    "retentionMs": 90000,
+    "scope": "Successful re-pairing CreateChat submissions retain the shared window for one matching continuation; account, canonical URL, connector and pairing generation must match",
+    "releasePath": "/v1/actions/release-pairing",
+    "expiry": "Timeout, cancellation, superseded pairing or shutdown releases the window without replaying the initialization message"
+  },
+  "browserPromptTicket": {
+    "requestField": "agentTicket",
+    "lengthBytes": 8,
+    "scope": "Host-issued single-use ticket for this task owner; new-conversation initialization may bootstrap setup on an empty chain before continue_task claims the task",
+    "redemption": "First ticketed call waits for any preceding in-flight call, then advances the normal ticket chain; all later calls use the returned new_codexify_ticket",
+    "issuance": "Fresh for each new browser message action, including initialization, retries and renewal; transport retries retain the admitted request unchanged"
+  },
   "responseStop": {
     "preparation": "offline chat and goal actions inspect Stop and its exact confirmation before composer cleanup, model selection, connector selection and prompt insertion; a late confirmation permits one retry of the interrupted pre-Send step",
     "settleMs": 20000,
@@ -169,6 +184,13 @@
   },
   "launchConfiguration": {
     "requestBlockList": "CODEXIFY_BROWSER_REQUEST_BLOCK_LIST: JSON array of RE2 URL patterns; verified browser-wide before navigation"
+  },
+  "conversationLimitRecovery": {
+    "failureCode": "conversation_limit",
+    "detection": "A visible ChatGPT conversation-length alert outside user or assistant message content; verify the same account and requested conversation before reporting it.",
+    "recovery": "Do not retry Send in the exhausted conversation. Create one replacement in the configured project, use continue_task and pairing verification, and retain the existing task workspace, history, goals and unread message cursor.",
+    "acceptance": "A confirmed conversation-length rejection retains its typed cause even after transport Send acceptance; uncertain sends without that rejection remain ambiguous.",
+    "ownership": "Pair the next task owner only; source activity must not revoke its pending creation. Retire the old conversation only after the one-time continuation claim."
   },
   "turnRenewal": {
     "handoffId": "renew-<64 lowercase hexadecimal characters>",

@@ -94,6 +94,7 @@ interface ActionRecord {
   listeners: Set<(event: ActionEvent) => void>;
   abort: AbortController;
   recoverAuthentication: boolean;
+  pairingContinuation: boolean;
   terminal: boolean;
   runSettledPromise: Promise<void>;
   resolveRunSettled(): void;
@@ -227,9 +228,11 @@ export class SingleWindowCoordinator {
   private driverClosed = false;
   private windowOperationActive = false;
   private connectorRefreshPending = false;
+  private closing = false;
+  private pairingWindow: {actionId:string;url:string;generation:number;account:string;connector:string;timer:ReturnType<typeof setTimeout>} | null = null;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string,
-    private readonly timeouts = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS }) {
+    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS }) {
     validateProtocolBuild(build);
     if (Object.values(timeouts).some(value => !Number.isFinite(value) || value <= 0)) throw new Error("Browser operation deadlines must be positive");
   }
@@ -364,7 +367,14 @@ export class SingleWindowCoordinator {
       if (existing.digest !== digest) throw new Error("Browser action ID belongs to a different request");
       return cloneSnapshot(existing.snapshot);
     }
-    if (this.activeActionId || this.pendingActionId) throw new Error("Browser companion is busy with another action");
+    const reservation = this.pairingWindow;
+    const continuing = reservation && request.pairingContinuationOf === reservation.actionId
+      && request.url === reservation.url && request.expectedUrl === reservation.url
+      && request.pairingGeneration === reservation.generation
+      && request.expectedAccountFingerprint === reservation.account
+      && request.connectorName === reservation.connector;
+    if (this.pendingActionId || this.activeActionId && !continuing) throw new Error("Browser companion is busy with another action");
+    if (reservation && request.pairingContinuationOf && !continuing) throw new Error("Browser companion is busy with another action");
     this.pruneActionHistory();
 
     // Acknowledge admission before any browser or account I/O. A slow lease or
@@ -390,6 +400,7 @@ export class SingleWindowCoordinator {
       listeners:new Set(),
       abort:new AbortController(),
       recoverAuthentication:false,
+      pairingContinuation:Boolean(continuing),
       terminal:false,
       runSettledPromise,
       resolveRunSettled,
@@ -397,6 +408,12 @@ export class SingleWindowCoordinator {
     this.actions.set(request.actionId, record);
     this.executeKeys.set(request.idempotencyKey, request.actionId);
     this.pendingActionId = request.actionId;
+    if (continuing) {
+      this.releasePairingWindow(reservation.actionId);
+      // Keep maintenance operations that were already queued from navigating
+      // before this continuation's preflight acquires the window operation lock.
+      this.activeActionId = request.actionId;
+    }
     this.emit(record, { type:"queued" });
     // Enqueue the preflight synchronously so later maintenance/shutdown cannot
     // overtake it. Its lifetime belongs to the action, not the HTTP connection.
@@ -424,7 +441,7 @@ export class SingleWindowCoordinator {
           && await this.driver.replacePairingDraft?.(request, operationSignal)) {
           health = await this.driver.health();
         }
-        if (health.status !== "idle" && request.prompt.kind !== "create_chat" && !recoverAuthentication) {
+        if (health.status !== "idle" && request.prompt.kind !== "create_chat" && !recoverAuthentication && !record.pairingContinuation) {
           throw new BrowserCompanionError(health.detail || `Browser companion window is not idle (${health.status})`);
         }
         record.recoverAuthentication = recoverAuthentication;
@@ -434,9 +451,18 @@ export class SingleWindowCoordinator {
       if (!record.terminal) this.emitFailure(record, asCompanionError(error));
     } finally {
       if (this.pendingActionId === request.actionId) this.pendingActionId = null;
-      if (this.activeActionId === request.actionId) this.activeActionId = null;
+      if (this.activeActionId === request.actionId && this.pairingWindow?.actionId !== request.actionId) this.activeActionId = null;
       record.resolveRunSettled();
     }
+  }
+
+  releasePairingWindow(actionId:string):boolean {
+    const reservation = this.pairingWindow;
+    if (!reservation || reservation.actionId !== actionId) return false;
+    clearTimeout(reservation.timer);
+    this.pairingWindow = null;
+    if (this.activeActionId === actionId) this.activeActionId = null;
+    return true;
   }
 
   async action(actionId: string): Promise<ActionSnapshot | undefined> {
@@ -520,6 +546,8 @@ export class SingleWindowCoordinator {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
+    if (this.pairingWindow) this.releasePairingWindow(this.pairingWindow.actionId);
     await this.withWindowOperation(async () => {
       for (const record of this.actions.values()) record.abort.abort();
       await Promise.all([...this.actions.values()].map(record => record.runSettledPromise));
@@ -630,7 +658,7 @@ export class SingleWindowCoordinator {
         }
         await this.driver.execute({
           request:record.request,
-          renderedPrompt:renderActionPrompt(record.request.prompt as ActionPrompt),
+          renderedPrompt:renderActionPrompt(record.request.prompt as ActionPrompt, record.request.agentTicket),
           signal,
           emit:event => {
             this.emit(record,event);
@@ -655,13 +683,21 @@ export class SingleWindowCoordinator {
     } catch (rawError) {
       if (record.terminal) return;
       const error = asCompanionError(rawError);
-      if (record.snapshot.sendAccepted || error.sendAccepted) {
+      if (error.code!=="conversation_limit"&&(record.snapshot.sendAccepted || error.sendAccepted)) {
         this.emit(record, { type:"ambiguous_send", message:boundedEventMessage(error.message) });
       } else {
         this.emitFailure(record, error);
       }
     } finally {
-      if (this.activeActionId === record.request.actionId) this.activeActionId = null;
+      if (!this.closing && record.request.retainPairingWindow && record.request.prompt.kind === "create_chat"
+        && record.snapshot.state === "idle" && record.snapshot.sendAccepted && !record.snapshot.attention
+        && record.snapshot.canonicalUrl && this.activeActionId === record.request.actionId) {
+        const timer = setTimeout(()=>this.releasePairingWindow(record.request.actionId),this.timeouts.pairingRetentionMs ?? 90_000);
+        timer.unref?.();
+        this.pairingWindow = {actionId:record.request.actionId,url:record.snapshot.canonicalUrl,
+          generation:record.request.pairingGeneration,account:record.request.expectedAccountFingerprint,
+          connector:record.request.connectorName,timer};
+      } else if (this.activeActionId === record.request.actionId) this.activeActionId = null;
       record.resolveRunSettled();
     }
   }
@@ -753,7 +789,7 @@ export class SingleWindowCoordinator {
       && record.request.prompt.kind === "create_chat" && record.request.model !== null && !record.snapshot.selected) {
       throw new BrowserCompanionError("Browser driver completed new-chat pairing before restoring its requested model and effort", "failed", {sendAccepted:true});
     }
-    const normalized: DriverEvent = raw.type === "failed" && record.snapshot.sendAccepted
+    const normalized: DriverEvent = raw.type === "failed" && raw.code!=="conversation_limit" && record.snapshot.sendAccepted
       ? { type:"ambiguous_send", message:raw.message }
       : raw;
     let event = actionEventSchema.parse({

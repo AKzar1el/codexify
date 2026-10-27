@@ -38,6 +38,7 @@ pub mod setup_ui_action;
 pub mod show_diff;
 pub mod skills_list;
 pub mod skills_read;
+pub mod ticket_wait;
 pub mod tree;
 pub mod update_memory_note;
 pub mod update_plan;

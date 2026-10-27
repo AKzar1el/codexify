@@ -266,6 +266,9 @@ impl AgentAutomationStore {
                 .send
                 .as_ref()
                 .expect("recorded turn send");
+            if execution.is_some() {
+                state.pairing.resume_task = false;
+            }
             if let Some(execution) = execution
                 && state.selection.model == execution.request.model
                 && state.selection.effort == execution.request.effort

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const BUILD: &str =
-    "test-build-v1+protocol.53a2df01e3f607a740c232005a0fa624bf5fce59ea20ecee6566fa73845f8bf3";
+    "test-build-v1+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -958,6 +958,9 @@ fn action_request() -> ExecuteActionRequest {
         expected_url: "https://chatgpt.com/c/example".into(),
         auto_approve_tool_calls: false,
         bypass_conversation_cooldown: false,
+        retain_pairing_window: false,
+        pairing_continuation_of: None,
+        agent_ticket: None,
     }
 }
 
@@ -1039,6 +1042,17 @@ async fn invalid_action_data_is_rejected_before_network_access() {
     let client = BrowserCompanionClient::from_descriptor_path(&path).unwrap();
 
     let mut invalid = Vec::new();
+    for ticket in ["short", "invalid!"] {
+        let mut request = action_request();
+        request.agent_ticket = Some(ticket.into());
+        invalid.push(request);
+    }
+    let mut request = action_request();
+    request.retain_pairing_window = true;
+    invalid.push(request);
+    let mut request = action_request();
+    request.pairing_continuation_of = Some(request.action_id.clone());
+    invalid.push(request);
     let mut request = action_request();
     request.url = "http://chatgpt.com/c/example".into();
     invalid.push(request);

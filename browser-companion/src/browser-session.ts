@@ -80,6 +80,23 @@ export async function toolApprovalVisible(page: Page): Promise<boolean> {
     .filter({visible:true}).count().then(count=>count>0).catch(()=>false);
 }
 
+/** A terminal app alert, never a quotation in a user or assistant message. */
+export async function conversationLimitVisible(page:Page):Promise<boolean> {
+  const url=new URL(page.url());
+  if(url.origin!=="https://chatgpt.com"||!/^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(url.pathname))return false;
+  const alerts=page.locator('[role="alert"], [data-testid="conversation-turn-error"], [data-testid="conversation-error"]')
+    .filter({hasText:/The conversation is too long, please start a new one\.|You've reached the maximum length for this conversation, but you can keep talking by starting a new chat\./i}).filter({visible:true});
+  return alerts.evaluateAll(nodes=>nodes.some(node=>{
+    if(node.closest('[data-user-message-bubble], [data-conversation-role="assistant"], [data-message-author-role], pre, code, [hidden], [inert], [aria-hidden="true"]'))return false;
+    for(let parent:Element|null=node;parent;parent=parent.parentElement)if(getComputedStyle(parent).opacity==="0")return false;
+    return true;
+  }));
+}
+
+export async function throwIfConversationLimit(page:Page):Promise<void> {
+  if(await conversationLimitVisible(page))throw new BrowserCompanionError("ChatGPT conversation reached its length limit. Continuing in a new conversation.","conversation_limit");
+}
+
 export async function throwIfSessionAttention(page: Page): Promise<void> {
   if (await expiredSessionAlert(page).isVisible().catch(() => false)) {
     throw new BrowserCompanionError("The ChatGPT session has expired. Sign in again in the browser companion.", "authentication_required");
@@ -90,6 +107,7 @@ export async function throwIfSessionAttention(page: Page): Promise<void> {
   if (await subscriptionFailureAlert(page).isVisible().catch(() => false)) {
     throw new BrowserCompanionError("ChatGPT could not load the current subscription.", "failed");
   }
+  await throwIfConversationLimit(page);
   if (await conversationUnavailableVisible(page)) {
     recordConversationUnavailable(page);
     throw new BrowserCompanionError("ChatGPT conversation temporarily not accessible", "conversation_unavailable");

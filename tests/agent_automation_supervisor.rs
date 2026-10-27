@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const COMPANION_TOKEN: &str = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE";
-const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.53a2df01e3f607a740c232005a0fa624bf5fce59ea20ecee6566fa73845f8bf3";
+const COMPANION_BUILD: &str = "supervisor-fake-build+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
 
 struct FakeExecutor {
     calls: AtomicUsize,
@@ -3357,6 +3357,9 @@ async fn real_executor_defers_only_an_unowned_busy_pairing_window_to_companion_v
                 effort: None,
                 auto_approve_tool_calls: false,
                 bypass_conversation_cooldown: false,
+                retain_pairing_window: false,
+                pairing_continuation_of: None,
+                agent_ticket: None,
                 prompt: if pairing {
                     ActionPrompt::PairVerify {
                         reference: "A".repeat(43),
@@ -3472,6 +3475,9 @@ async fn real_executor_delegates_authentication_recovery_but_rejects_known_accou
                 expected_url: "https://chatgpt.com/c/example".into(),
                 auto_approve_tool_calls: false,
                 bypass_conversation_cooldown: false,
+                retain_pairing_window: false,
+                pairing_continuation_of: None,
+                agent_ticket: None,
             },
         };
         let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3608,6 +3614,9 @@ async fn real_executor_marks_an_unreconciled_execute_receipt_as_ambiguous() {
             expected_url: "https://chatgpt.com/c/ambiguous-execute".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3728,6 +3737,9 @@ async fn successful_execute_receipt_stays_ambiguous_when_status_returns_not_foun
             expected_url: "https://chatgpt.com/c/ambiguous-not-found".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -3859,6 +3871,9 @@ async fn terminal_receipt_without_send_proof(
             expected_url: "https://chatgpt.com/c/idle-without-send".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -4010,6 +4025,9 @@ async fn accepted_execute_with_unreconciled_event_stream_is_ambiguous() {
             expected_url: "https://chatgpt.com/c/unreconciled-stream".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events, _events_rx) = mpsc::unbounded_channel();
@@ -4206,6 +4224,9 @@ async fn real_pair_executor_records_the_candidate_before_the_async_send_receipt(
             expected_url: expected_url.into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events, mut events_rx) = mpsc::unbounded_channel();
@@ -4379,6 +4400,9 @@ async fn real_executor_skips_catalog_refresh_and_reconnects_a_dropped_stream() {
             expected_url: "https://chatgpt.com/c/stream-reconnect".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -4558,6 +4582,9 @@ async fn real_executor_replays_retained_prefix_from_an_idempotent_generating_rec
             expected_url: "https://chatgpt.com/c/generating-replay".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -4713,6 +4740,9 @@ async fn real_executor_reconnects_retained_events_from_an_idempotent_terminal_re
             expected_url: "https://chatgpt.com/c/terminal-replay".into(),
             auto_approve_tool_calls: false,
             bypass_conversation_cooldown: false,
+            retain_pairing_window: false,
+            pairing_continuation_of: None,
+            agent_ticket: None,
         },
     };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -5573,6 +5603,9 @@ async fn real_executor_accepts_chat_id_aliases_but_rejects_different_conversatio
                     expected_url: expected.into(),
                     auto_approve_tool_calls: false,
                     bypass_conversation_cooldown: false,
+                    retain_pairing_window: false,
+                    pairing_continuation_of: None,
+                    agent_ticket: None,
                 },
             };
             let (events, _) = mpsc::unbounded_channel();

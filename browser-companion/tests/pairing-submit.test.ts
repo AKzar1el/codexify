@@ -1417,3 +1417,66 @@ for(const creating of [false,true])test.skipIf(!native)(`Japanese lazy picker ${
   expect(await page.evaluate(()=>[document.body.dataset.sends,document.body.dataset.sentFamily,document.body.dataset.sentEffort,document.body.dataset.family,document.body.dataset.effort])).toEqual(['1','6','中','6','高']);
   await coordinator.close();
 },30_000);
+
+const conversationLimitHtml=readFileSync(new URL('./fixtures/conversation-limit-alert.html',import.meta.url),'utf8');
+test.skipIf(!native)('re-pairing sends the normal prompt in the retained conversation without another load',async()=>{
+ const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build);
+ const create:ExecuteActionRequest={...request,url:'https://chatgpt.com/new',expectedUrl:'https://chatgpt.com/new',retainPairingWindow:true,agentTicket:'FreshT_1',
+   prompt:{kind:'create_chat',reference:newReference,continuationToken:Buffer.alloc(32,2).toString('base64url'),setupReference:null}};
+ await executeCoordinatorFixture(coordinator,create);for await(const _ of coordinator.events(create.actionId,0)){}
+ const canonicalUrl=page.url(),loads=documentLoads;
+ expect(await page.locator('body').getAttribute('data-sent-text')).toContain('FreshT_1');
+ expect((await coordinator.health()).activeActionId).toBe(create.actionId);
+ await expect(coordinator.accountPlan('pairing-test')).rejects.toThrow('busy');
+ await expect(coordinator.execute({...request,actionId:'unrelated',idempotencyKey:'unrelated-key'})).rejects.toThrow('busy');
+ const followUp:ExecuteActionRequest={...request,actionId:'paired-normal',idempotencyKey:'paired-normal-key',url:canonicalUrl,expectedUrl:canonicalUrl,
+   pairingContinuationOf:create.actionId,agentTicket:'FreshT_2',model:'gpt-6-sol',effort:'high',prompt:{kind:'offline_goal',goalRevision:1}};
+ await executeCoordinatorFixture(coordinator,followUp);for await(const _ of coordinator.events(followUp.actionId,0)){}
+ expect(page.url()).toBe(canonicalUrl);
+ expect(documentLoads).toBe(loads);
+ expect(await page.locator('body').getAttribute('data-sends')).toBe('2');
+ expect(await page.locator('body').getAttribute('data-sent-text')).toContain('FreshT_2');
+ expect((await coordinator.health()).activeActionId).toBeNull();
+ await coordinator.close();
+},30_000);
+test.skipIf(!native)('task continuation resumes a fresh conversation without an old handoff marker',async()=>{
+ const driver=await fixture(), events:Array<Parameters<DriverExecution['emit']>[0]>=[];
+ const submitted:ExecuteActionRequest={...request,prompt:{kind:'task_continuation'}};
+ await executeFixture(driver,{request:submitted,renderedPrompt:renderActionPrompt(submitted.prompt),signal:new AbortController().signal,emit:event=>events.push(event)});
+ expect(await page.locator('body').getAttribute('data-sends')).toBe('1');
+ expect(events.filter(event=>event.type==='send_accepted')).toHaveLength(1);
+ expect(events.at(-1)?.type).toBe('submission_complete');
+},20_000);
+for(const stage of ["before","preparation","after"] as const)test.skipIf(!native)(`conversation length limit is reported without retrying Send (stage=${stage})`,async()=>{
+ const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build),submitted=offlineRequest('gpt-6-astra','max');
+ await page.evaluate(({html,stage})=>{
+  const script=document.createElement('script');script.textContent=`(()=>{const html=${JSON.stringify(html)},stage=${JSON.stringify(stage)};let shown=false;const show=()=>{if(!shown){shown=true;document.body.insertAdjacentHTML('beforeend',html);}};if(stage==='after')document.querySelector('form').addEventListener('submit',()=>setTimeout(show,50));else if(stage==='preparation')document.querySelector('form').addEventListener('input',()=>{if(/goal/.test(document.querySelector('[data-composer-markdown]').textContent))show();});else show();document.addEventListener('click',event=>{if(event.target.closest('[role="alert"] button'))document.body.dataset.errorRetries='1';});})();`;document.body.append(script);
+ },{html:conversationLimitHtml,stage});
+ await executeCoordinatorFixture(coordinator,submitted);const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+ expect(events.at(-1)).toMatchObject({type:'failed',code:'conversation_limit'});
+ expect(await page.evaluate(()=>[document.body.dataset.sends,document.body.dataset.errorRetries||'0'])).toEqual([stage==='after'?'1':'0','0']);
+ expect((await coordinator.health()).authenticated).toBeTrue();
+},20_000);
+
+test.skipIf(!native)('quoted or hidden conversation length warnings do not trigger rollover',async()=>{
+ const {conversationLimitVisible}=await import('../src/browser-session');await fixture();
+ for(const attributes of ['data-user-message-bubble','data-conversation-role="assistant"','hidden','inert','aria-hidden="true"','style="opacity:0"']){
+  await page.evaluate(({html,attributes})=>{document.querySelector('#quoted-limit')?.remove();document.body.insertAdjacentHTML('beforeend',`<div id="quoted-limit" ${attributes}>${html}</div>`);},{html:conversationLimitHtml,attributes});
+  expect(await conversationLimitVisible(page)).toBeFalse();
+ }
+},10_000);
+
+test.skipIf(!native)('a changed account cannot authorize a conversation-length rollover',async()=>{
+ const driver=await fixture(),coordinator=new SingleWindowCoordinator(driver,build);await coordinator.health();
+ changeAccountAtRequest=2;await page.locator('body').evaluate((body,html)=>body.insertAdjacentHTML('beforeend',html),conversationLimitHtml);
+ const submitted=offlineRequest('gpt-6-astra','max');await executeCoordinatorFixture(coordinator,submitted);const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+ expect(events.at(-1)?.type).toBe('authentication_required');expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');
+},10_000);
+
+test.skipIf(!native)('a conversation length alert on a redirected chat cannot replace the requested chat',async()=>{
+ await fixture();await page.goto('https://chatgpt.com/c/unrelated-source');
+ const driver=new ChatGptBrowserDriver({...surface,navigate:async()=>{await surface.navigate('https://chatgpt.com/c/wrong-target');await page.locator('body').evaluate((body,html)=>body.insertAdjacentHTML('beforeend',html),conversationLimitHtml);return page;}},build);
+ const coordinator=new SingleWindowCoordinator(driver,build),submitted=offlineRequest('gpt-6-astra','max');
+ await executeCoordinatorFixture(coordinator,submitted);const events=[];for await(const event of coordinator.events(submitted.actionId,0))events.push(event);
+ expect(events.at(-1)?.type).toBe('external_interference');expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');
+},10_000);

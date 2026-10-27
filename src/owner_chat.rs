@@ -1733,6 +1733,12 @@ async fn chat_queue_action(
     } else {
         None
     };
+    if let (Some(supervisor), Some(context)) = (&state.automation, &automation) {
+        supervisor
+            .prepare_schema_rollover(&context.task)
+            .await
+            .map_err(internal_error)?;
+    }
     let chat = state
         .chats
         .chat_at_path(located.path, true)
@@ -1958,6 +1964,17 @@ async fn chat_send(
     };
     match message {
         OwnerMessage::Chat(message) => {
+            let automation = if state.config.markdown_chat.automation.enabled {
+                Some(automation_context(&state, &located).await?)
+            } else {
+                None
+            };
+            if let (Some(supervisor), Some(context)) = (&state.automation, &automation) {
+                supervisor
+                    .prepare_schema_rollover(&context.task)
+                    .await
+                    .map_err(internal_error)?;
+            }
             let mode = match body.message_mode {
                 Some(mode) => mode,
                 None => {
@@ -1988,11 +2005,6 @@ async fn chat_send(
                     json!({"queue_receipt":receipt,"queued_messages":queued,"wake_status":wake_status}),
                 ));
             }
-            let automation = if state.config.markdown_chat.automation.enabled {
-                Some(automation_context(&state, &located).await?)
-            } else {
-                None
-            };
             let chat = state
                 .chats
                 .chat_at_path(located.path.clone(), true)
@@ -2028,6 +2040,17 @@ async fn chat_send(
                 require_connector_name(&state.config)?;
             }
             let context = automation_context(&state, &located).await?;
+            if matches!(
+                &command,
+                crate::agent_automation::OwnerGoalCommand::Set { .. }
+                    | crate::agent_automation::OwnerGoalCommand::Run
+            ) && let Some(supervisor) = &state.automation
+            {
+                supervisor
+                    .prepare_schema_rollover(&context.task)
+                    .await
+                    .map_err(internal_error)?;
+            }
             let mut receipt = context
                 .store
                 .apply_owner_goal_command(
@@ -2574,7 +2597,7 @@ mod tests {
     struct OwnerNoopExecutor;
 
     const OWNER_COMPANION_TOKEN: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.53a2df01e3f607a740c232005a0fa624bf5fce59ea20ecee6566fa73845f8bf3";
+    const OWNER_COMPANION_BUILD: &str = "owner-companion-test-v1+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
 
     #[test]
     fn project_groups_resolve_registered_worktrees_without_merging_same_named_projects() {
@@ -5230,6 +5253,9 @@ mod tests {
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(root.join("metadata").display().to_string());
+        // The worker's pause state must come from this fixture, not the live browser.
+        config.markdown_chat.automation.descriptor_path =
+            root.join("browser/descriptor.json").display().to_string();
         let supervisor =
             AgentAutomationSupervisor::new(config.markdown_chat.automation.clone(), executor);
         OwnerState {

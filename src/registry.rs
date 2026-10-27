@@ -33,6 +33,9 @@ pub fn load_tools_for_config(config: &AppConfig) -> Vec<Box<dyn Tool>> {
         config.ui_widgets,
         config.artifact_ingress.max_concurrent_downloads,
     );
+    if config.experimental.agent_tickets {
+        tools.push(Box::new(tools::ticket_wait::TicketWait));
+    }
     if config.markdown_chat.enabled && config.ui_widgets {
         tools.push(Box::new(tools::markdown_chat_ui::ChatUiTool::Send));
         tools.push(Box::new(tools::markdown_chat_ui::ChatUiTool::State));

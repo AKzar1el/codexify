@@ -223,6 +223,11 @@ async function route(
     json(response, 200, await coordinator.cancel(body));
     return;
   }
+  if (request.method === "POST" && url.pathname === "/v1/actions/release-pairing") {
+    const body=z.strictObject({actionId:opaqueIdSchema}).parse(await readJson(request));
+    json(response,200,{released:coordinator.releasePairingWindow(body.actionId)});
+    return;
+  }
   const match = url.pathname.match(/^\/v1\/actions\/([A-Za-z0-9_.-]{1,256})(?:\/(events))?$/);
   if (request.method === "GET" && match) {
     const actionId = match[1]!;

@@ -235,6 +235,53 @@ impl ConversationContinuationStore {
         ))
     }
 
+    pub(crate) fn physical_owner_for_task(
+        &self,
+        task: &ConversationIdentity,
+        generation: u64,
+    ) -> Result<String, String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Conversation handoff state is unavailable")?;
+        match runtime.stored.tasks.get(task.stable_key()) {
+            Some(owner) if owner.generation == generation => Ok(owner.owner.clone()),
+            None if generation == 0 => Ok(task.stable_key().into()),
+            _ => Err("Conversation ownership changed before browser ticket issuance".into()),
+        }
+    }
+
+    pub(crate) fn issue_token_for_owner(
+        &self,
+        task: &ConversationIdentity,
+        generation: u64,
+        workspace: &Path,
+    ) -> Result<String, String> {
+        let (physical, canonical_task) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| "Conversation handoff state is unavailable")?;
+            match runtime.stored.tasks.get(task.stable_key()) {
+                Some(owner) if owner.generation == generation => (
+                    ConversationIdentity::from_stable_keys(
+                        owner.owner.clone(),
+                        owner.owner.clone(),
+                    )
+                    .ok_or("Invalid conversation owner")?,
+                    ConversationIdentity::from_stable_keys(
+                        task.stable_key().to_owned(),
+                        owner.legacy_key.clone(),
+                    )
+                    .ok_or("Invalid continuation task identity")?,
+                ),
+                None if generation == 0 => (task.clone(), task.clone()),
+                _ => return Err("Conversation ownership changed before continuation".into()),
+            }
+        };
+        self.issue_token(&physical, &canonical_task, workspace)
+    }
+
     pub(crate) fn issue_token(
         &self,
         physical: &ConversationIdentity,
@@ -916,5 +963,35 @@ mod tests {
 
         let active = store.owner_snapshot(&destination).unwrap();
         assert_eq!(active, retired.with_active(true));
+    }
+
+    #[test]
+    fn automatic_handoff_uses_the_current_owner_and_preserves_the_legacy_task_key() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            ConversationContinuationStore::new(root.path().join("continuations.json")).unwrap();
+        let source = identity("automatic-handoff-source");
+        let workspace = root.path().join("workspace");
+        let initial = store.issue_token_for_owner(&source, 0, &workspace).unwrap();
+        let first = identity("first-owner");
+        store.claim(&first, &initial, |_, _| Ok(())).unwrap();
+        let reconstructed = ConversationIdentity::from_stable_keys(
+            source.stable_key().into(),
+            source.stable_key().into(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .issue_token_for_owner(&reconstructed, 0, &workspace)
+                .is_err()
+        );
+        let token = store
+            .issue_token_for_owner(&reconstructed, 1, &workspace)
+            .unwrap();
+        let second = identity("second-owner");
+        let claimed = store.claim(&second, &token, |_, _| Ok(())).unwrap();
+        assert_eq!(claimed.task.legacy_stable_key(), source.legacy_stable_key());
+        assert_active(&store, &second, &source);
+        assert_retired(&store, &first, &source);
     }
 }

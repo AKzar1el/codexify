@@ -2,6 +2,7 @@
 // src/adapters/chatgpt-web/browser-worker.ts at f9ad4ae83a579287105ad822dd0c3e0029b04ef6.
 import type { Locator, Page } from "patchright";
 import {selectorDrift} from "./errors";
+import {throwIfConversationLimit} from "./browser-session";
 import {
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
@@ -149,6 +150,7 @@ export async function waitForSubmissionAcceptance(
 ): Promise<SubmissionEvidence> {
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
+    await throwIfConversationLimit(page);
     const state = await readTurnDomState(page);
     const evidence = submissionEvidence({ ...state, initialTurnIdentities:baseline.initialTurnIdentities });
     if (evidence === "user_turn") {

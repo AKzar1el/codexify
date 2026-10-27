@@ -45,9 +45,27 @@ async fn refresh_saved_connector(
     client: &BrowserCompanionClient,
 ) -> Result<Value, String> {
     let name = require_connector_name(&state.config).map_err(|(_, error)| error)?;
-    client
+    let schema = state
+        .automation
+        .as_ref()
+        .and_then(|automation| automation.current_schema_version());
+    let revisions = crate::global_settings::schema_versions(&state.config).ok();
+    let result = client
         .refresh_connector(&name, &CancellationToken::new())
-        .await
+        .await?;
+    if let (Some(schema), Some((revision, structural))) = (schema, revisions)
+        && state
+            .automation
+            .as_ref()
+            .and_then(|automation| automation.current_schema_version())
+            .as_deref()
+            == Some(&schema)
+        && crate::global_settings::schema_versions(&state.config).ok()
+            == Some((revision.clone(), structural.clone()))
+    {
+        super::schema_refresh::record_completed(&state.config, &schema, &revision, &structural)?;
+    }
+    Ok(result)
 }
 
 pub(super) fn start(state: OwnerState) {
@@ -1019,7 +1037,7 @@ mod tests {
         )
         .unwrap();
         Arc::make_mut(&mut state.config).loaded_config_path = Some(path.clone());
-        crate::owner_chat::start_schema_refresh(state.config.clone());
+        crate::owner_chat::start_schema_refresh(state.config.clone(), state.automation.clone());
         tokio::time::timeout(Duration::from_secs(2), async {
             while crate::global_settings::read_schema_intent(&state.config).is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1103,7 +1121,7 @@ mod tests {
         assert_eq!(intent["requiresRestart"], true);
         intent["dueAtMs"] = json!(0);
         crate::global_settings::write_schema_intent(&state.config, &intent).unwrap();
-        crate::owner_chat::start_schema_refresh(state.config.clone());
+        crate::owner_chat::start_schema_refresh(state.config.clone(), state.automation.clone());
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
         // Simulate the new worker after Restart: its PID differs from the writer.

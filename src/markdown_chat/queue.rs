@@ -197,7 +197,7 @@ fn goal_holds_queue(chat: &ChatFile) -> Result<bool, String> {
     goal_holds_queue_for_release(chat, false, None)
 }
 
-fn automation_state(chat: &ChatFile) -> Result<Option<serde_json::Value>, String> {
+pub(super) fn automation_state(chat: &ChatFile) -> Result<Option<serde_json::Value>, String> {
     let path = chat.path.with_file_name("automation.json");
     if !path.try_exists().map_err(io_error)? {
         return Ok(None);

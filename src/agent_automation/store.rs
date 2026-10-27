@@ -151,6 +151,12 @@ pub struct PairingState {
     pub pending: Option<PendingPairing>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_schema_version: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub schema_rollover_pending: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub resume_task: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +199,7 @@ pub enum AutomationActionStatus {
     ApprovalRequired,
     AuthenticationRequired,
     ConversationUnavailable,
+    ConversationLimit,
     RateLimited,
     Interference,
     Ambiguous,
@@ -698,6 +705,7 @@ impl AutomationTaskState {
                 | AutomationActionStatus::Interference
                 | AutomationActionStatus::AuthenticationRequired
                 | AutomationActionStatus::ConversationUnavailable
+                | AutomationActionStatus::ConversationLimit
                 | AutomationActionStatus::RateLimited
                 | AutomationActionStatus::ApprovalRequired
         ) || (self.action.status == AutomationActionStatus::Unverified
@@ -1522,12 +1530,118 @@ impl AgentAutomationStore {
         owner_generation: u64,
         now_ms: u64,
     ) -> Result<PairingIssue, String> {
+        self.issue_pairing_guarded(task, candidate_url, owner_generation, now_ms, None, None)?
+            .ok_or_else(|| "Pairing changed before it could be prepared".into())
+    }
+
+    pub(crate) fn issue_rollover_pairing(
+        &self,
+        task: &ConversationIdentity,
+        candidate_url: &str,
+        owner_generation: u64,
+        now_ms: u64,
+        expected: &AutomationActionState,
+    ) -> Result<Option<PairingIssue>, String> {
+        self.issue_pairing_guarded(
+            task,
+            candidate_url,
+            owner_generation,
+            now_ms,
+            Some(expected),
+            None,
+        )
+    }
+
+    pub(crate) fn issue_schema_rollover_pairing(
+        &self,
+        task: &ConversationIdentity,
+        candidate_url: &str,
+        owner_generation: u64,
+        now_ms: u64,
+        expected: &AutomationTaskState,
+    ) -> Result<Option<PairingIssue>, String> {
+        self.issue_pairing_guarded(
+            task,
+            candidate_url,
+            owner_generation,
+            now_ms,
+            Some(&expected.action),
+            Some(&expected.pairing),
+        )
+    }
+
+    pub(crate) fn hold_messages_for_schema_rollover(
+        &self,
+        task: &ConversationIdentity,
+        pairing: &PairingState,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.pairing != *pairing || state.pairing.verified_owner_generation.is_none() {
+                return Ok(false);
+            }
+            state.pairing.schema_rollover_pending = true;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn clear_schema_rollover_hold(
+        &self,
+        task: &ConversationIdentity,
+        pairing: &PairingState,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.pairing == *pairing {
+                state.pairing.schema_rollover_pending = false;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_creation_schema(
+        &self,
+        task: &ConversationIdentity,
+        action_id: &str,
+        generation: u64,
+        version: &str,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if !state.pairing.creating_chat
+                || state.pairing.generation != generation
+                || state.action.id.as_deref() != Some(action_id)
+            {
+                return Ok(false);
+            }
+            state.pairing.connector_schema_version = Some(version.into());
+            Ok(true)
+        })
+    }
+
+    fn issue_pairing_guarded(
+        &self,
+        task: &ConversationIdentity,
+        candidate_url: &str,
+        owner_generation: u64,
+        now_ms: u64,
+        expected: Option<&AutomationActionState>,
+        expected_pairing: Option<&PairingState>,
+    ) -> Result<Option<PairingIssue>, String> {
         let candidate_url = normalize_chatgpt_url(candidate_url)?;
         let reference = generate_reference()?;
         let digest = reference_digest(&reference);
         let task_key = task.stable_key().to_string();
         self.with_locked_task(task, |path| {
             let mut state = load_state(path)?;
+            if let Some(expected) = expected
+                && (state.action != *expected
+                    || expected_pairing.map_or(
+                        state.action.status != AutomationActionStatus::ConversationLimit,
+                        |pairing| state.pairing != *pairing,
+                    )
+                    || state.pairing.generation != expected.pairing_generation.unwrap_or(0)
+                    || state.pairing.verified_owner_generation != owner_generation.checked_sub(1))
+            {
+                return Ok(None);
+            }
             let previous_digest = state
                 .pairing
                 .pending
@@ -1542,7 +1656,7 @@ impl AgentAutomationStore {
                 .checked_add(PAIRING_REFERENCE_TTL_MS)
                 .ok_or("Agent-chat pairing expiry overflow")?;
             state.pairing = PairingState {
-                creating_chat: false,
+                creating_chat: expected.is_some(),
                 last_attempted_url: conversation_url_for_retry(&candidate_url).map(str::to_owned),
                 candidate_url: Some(candidate_url),
                 canonical_url: None,
@@ -1550,7 +1664,17 @@ impl AgentAutomationStore {
                 verified_owner_generation: None,
                 verified_at_ms: None,
                 verification_sent_at_ms: None,
-                account_fingerprint: state.selection.account_fingerprint.clone(),
+                account_fingerprint: state
+                    .selection
+                    .account_fingerprint
+                    .clone()
+                    .or(state.pairing.account_fingerprint.clone()),
+                connector_schema_version: None,
+                schema_rollover_pending: state.pairing.schema_rollover_pending
+                    && expected.is_some(),
+                resume_task: expected.is_some()
+                    && (state.pairing.resume_task
+                        || state.action.kind == Some(AutomationActionKind::TurnRenewal)),
                 pending: Some(PendingPairing {
                     generation,
                     owner_generation,
@@ -1563,8 +1687,15 @@ impl AgentAutomationStore {
                 status: AutomationActionStatus::Unverified,
                 pairing_generation: Some(generation),
                 updated_at_ms: Some(now_ms),
+                send_accepted: expected.is_some().then_some(false),
                 ..Default::default()
             };
+            if expected.is_some() {
+                state.turn_renewal = Default::default();
+                // A nudge accepted by the exhausted source cannot suppress the
+                // active goal's first wake in its replacement conversation.
+                state.goal_wake = Default::default();
+            }
             validate_state(&state)?;
             persist_state(path, &state)?;
             self.publish_pairing_index(&digest, &task_key)?;
@@ -1573,11 +1704,11 @@ impl AgentAutomationStore {
             {
                 let _ = self.remove_pairing_index(&previous_digest);
             }
-            Ok(PairingIssue {
+            Ok(Some(PairingIssue {
                 reference,
                 generation,
                 expires_at_ms,
-            })
+            }))
         })
     }
 
@@ -1708,6 +1839,28 @@ impl AgentAutomationStore {
     pub fn mark_creating_chat(&self, task: &ConversationIdentity) -> Result<(), String> {
         self.mutate(task, |state| {
             state.pairing.creating_chat = true;
+            state.action.send_accepted = Some(false);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn fail_creation_before_send(
+        &self,
+        task: &ConversationIdentity,
+        generation: u64,
+        message: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.mutate(task, |state| {
+            if state.pairing.generation == generation
+                && state.pairing.creating_chat
+                && state.action.send_accepted != Some(true)
+            {
+                state.action.status = AutomationActionStatus::Unverified;
+                state.action.send_accepted = Some(false);
+                state.action.last_error = Some(message.to_owned());
+                state.action.updated_at_ms = Some(now_ms);
+            }
             Ok(())
         })
     }
@@ -1811,6 +1964,7 @@ impl AgentAutomationStore {
             state.pairing.candidate_url = None;
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
+            state.pairing.schema_rollover_pending = false;
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
@@ -1874,6 +2028,7 @@ impl AgentAutomationStore {
             state.pairing.candidate_url = None;
             state.pairing.verified_owner_generation = Some(owner_generation);
             state.pairing.verified_at_ms = Some(now_ms);
+            state.pairing.schema_rollover_pending = false;
             state.action.status = AutomationActionStatus::Idle;
             state.action.last_error = None;
             state.action.automatic_retry_attempts = 0;
@@ -1919,6 +2074,8 @@ impl AgentAutomationStore {
             state.pairing.verified_owner_generation = None;
             state.pairing.verified_at_ms = None;
             state.action.status = AutomationActionStatus::Unverified;
+            state.pairing.connector_schema_version = None;
+            state.pairing.schema_rollover_pending = false;
             state.action.updated_at_ms = Some(now_ms);
             validate_state(&state)?;
             persist_state(path, &state)?;
@@ -1951,6 +2108,8 @@ impl AgentAutomationStore {
                 updated_at_ms: Some(now_ms),
                 ..Default::default()
             };
+            state.pairing.connector_schema_version = None;
+            state.pairing.schema_rollover_pending = false;
             validate_state(&state)?;
             persist_state(path, &state)?;
             if let Some(previous_digest) = previous_digest {
@@ -3813,6 +3972,7 @@ fn validate_action(action: &AutomationActionState) -> Result<(), String> {
             | AutomationActionStatus::ApprovalRequired
             | AutomationActionStatus::AuthenticationRequired
             | AutomationActionStatus::ConversationUnavailable
+            | AutomationActionStatus::ConversationLimit
             | AutomationActionStatus::RateLimited
             | AutomationActionStatus::Interference
             | AutomationActionStatus::Ambiguous
@@ -3873,6 +4033,13 @@ fn validate_goal_wake(wake: &GoalWakeState) -> Result<(), String> {
 }
 
 fn validate_pairing(pairing: &PairingState) -> Result<(), String> {
+    if pairing
+        .connector_schema_version
+        .as_deref()
+        .is_some_and(|version| !version.strip_prefix("schema-v1:").is_some_and(valid_digest))
+    {
+        return Err("Agent automation connector schema version is invalid".into());
+    }
     if pairing
         .account_fingerprint
         .as_deref()

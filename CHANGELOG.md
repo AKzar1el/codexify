@@ -6,6 +6,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.19] - 2026-10-27
+
+### Added
+
+- Recover rejected agent tickets with the read-only, ticketless `ticket_wait`
+  tool. Require repeated waits until an exclusive ticket renewal is available,
+  then read the latest progress reports before continuing work. Waiting does
+  not extend the active ticket's lease, consume messages, or count as work.
+- Add thinking time to weekly recap tiles and share cards. Show hours and
+  minutes below 100 hours, and whole hours from 100 hours onward.
+- Start the browser directly from the stopped-browser banner, using the same
+  button styling as Browser settings and removing the redundant instructions.
+
+### Fixed
+
+- Replace ChatGPT conversations that reach the conversation-length limit
+  instead of repeatedly submitting to the full conversation. Preserve the
+  Codexify task, workspace, queued messages, and goal across the handoff.
+- Record the connector schema on each pairing and create a fresh ChatGPT
+  conversation before sending, retrying, or renewing with an outdated schema.
+  Hold messages until the replacement has verified the current tools.
+- Retain the shared browser through re-pairing and its first normal prompt,
+  with bounded timeout and cancellation cleanup, avoiding another page load
+  and cooldown between initialization and continuing the task.
+- Supply a fresh, scoped, single-use agent ticket inline with browser prompts,
+  including initialization, retries, and turn renewals. Preserve in-flight
+  calls and transport idempotency while admitting the new agent branch.
+- Remove read-only-only turn-exit instructions from generated briefs when the
+  read-only annotation override is enabled, including live settings changes.
+- Require the matching browser companion for the updated handoff and ticket
+  protocol so updates cannot retain incompatible automation code.
+
 ## [2.3.18] - 2026-10-25
 
 ### Fixed

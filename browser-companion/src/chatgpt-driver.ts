@@ -5,7 +5,7 @@ import {ConnectorAppCache} from "./connector-cache";
 import {approveConversationCard,throwIfConversationApproval} from "./conversation-approval";
 import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
-import { throwIfSessionAttention, toolApprovalVisible } from "./browser-session";
+import { throwIfSessionAttention, throwIfConversationLimit, toolApprovalVisible } from "./browser-session";
 import {navigatePage,recordConversationAvailable} from "./navigation";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
@@ -376,7 +376,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       try {
         await throwIfSessionAttention(page);
       } catch (error) {
-        if (error instanceof BrowserCompanionError && error.code === "conversation_unavailable") {
+        if (error instanceof BrowserCompanionError && ["conversation_unavailable","conversation_limit"].includes(error.code)) {
           // The account was verified independently. Keep it signed in; the
           // shared navigation budget enforces the conversation-load cooldown.
           return {authenticated:true, accountFingerprint:account.fingerprint, status:"idle", detail:error.message};
@@ -575,7 +575,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       try { await throwIfSessionAttention(page); }
       catch(error) {
         // A page-local load failure must not prevent opening global settings.
-        if (!(error instanceof BrowserCompanionError && error.code === "conversation_unavailable")) throw error;
+        if (!(error instanceof BrowserCompanionError && ["conversation_unavailable","conversation_limit"].includes(error.code))) throw error;
       }
       // Ownership tracks our UI operation, never ChatGPT's response lifetime.
       const composers=page.locator(CHATGPT_COMPOSER_SELECTOR).filter({visible:true});
@@ -821,6 +821,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       await throwIfConversationApproval(page);
       execution.signal.throwIfAborted();
       await verifyHandoff();
+      await throwIfConversationLimit(page);
       sendActivated = true;
       if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
       step("clicking Send");
@@ -831,6 +832,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       try {
         await waitForSubmissionAcceptance(page, baseline, Date.now() + 30_000, execution.signal);
       } catch (error) {
+        if(error instanceof BrowserCompanionError&&error.code==="conversation_limit")throw error;
         throw new BrowserCompanionError(
           "ChatGPT Send may have been accepted, but semantic acceptance could not be proven",
           "ambiguous_send",
@@ -864,9 +866,20 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       step("letting submission requests settle");
       await settleSubmission();
       execution.signal.throwIfAborted();
+      await throwIfConversationLimit(page);
       execution.emit({ type:"submission_complete", canonicalUrl });
     } catch (error) {
       if (process.env.CODEXIFY_BROWSER_TRACE_SUBMISSION === "1") console.error(`[submission-step] ${execution.request.actionId} failed at ${submissionStep}; sendActivated=${sendActivated}; sendAccepted=${sendAccepted}`);
+      if(error instanceof BrowserCompanionError&&error.code==="conversation_limit") {
+        const current=await this.surface.page();
+        if(execution.request.prompt.kind!=="create_chat"&&canonicalChatGptConversationUrl(current.url())!==canonicalChatGptConversationUrl(execution.request.expectedUrl)) {
+          throw new BrowserCompanionError("ChatGPT changed conversations before its length limit could be verified","external_interference",{sendAccepted:sendActivated});
+        }
+        if((await readChatGptAccount(current)).fingerprint!==execution.request.expectedAccountFingerprint) {
+          throw new BrowserCompanionError("ChatGPT account changed before its conversation limit could be verified","authentication_required",{sendAccepted:sendActivated});
+        }
+        throw new BrowserCompanionError(error.message,"conversation_limit",{sendAccepted:sendAccepted,cause:error});
+      }
       if (!sendActivated && insertionAttempted && ownedPage) {
         // A failed readiness check must not leave our own unchanged prompt blocking retries.
         // Never clear a draft that was edited, moved, or might already have been submitted.

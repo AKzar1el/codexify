@@ -17,9 +17,9 @@ use crate::markdown_chat::AgentAutomationConfig;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const COMPANION_KIND: &str = "codexify-browser-companion";
 pub const PROTOCOL_SCHEMA_HASH: &str =
-    "53a2df01e3f607a740c232005a0fa624bf5fce59ea20ecee6566fa73845f8bf3";
+    "437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
 pub const PROTOCOL_BUILD_SUFFIX: &str =
-    "+protocol.53a2df01e3f607a740c232005a0fa624bf5fce59ea20ecee6566fa73845f8bf3";
+    "+protocol.437af1843194972ed7c3595ab493df709e03569cc86f9552930e457833073433";
 
 const MAX_DESCRIPTOR_BYTES: u64 = 8192;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
@@ -144,6 +144,12 @@ pub struct ExecuteActionRequest {
     pub auto_approve_tool_calls: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bypass_conversation_cooldown: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retain_pairing_window: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing_continuation_of: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_ticket: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -171,6 +177,7 @@ pub enum ActionPrompt {
     TurnRenewal {
         handoff_id: String,
     },
+    TaskContinuation {},
     OfflineCombined {
         batch_id: String,
         messages: Vec<CompanionUnreadMessage>,
@@ -724,6 +731,19 @@ impl BrowserCompanionClient {
             return Err("Browser companion returned the wrong action ID".into());
         }
         Ok(receipt)
+    }
+
+    pub async fn release_pairing_window(&self, action_id: &str) -> Result<(), String> {
+        validate_opaque(action_id, "browser action ID")?;
+        let _: serde_json::Value = self
+            .request_json(
+                Method::POST,
+                "/v1/actions/release-pairing",
+                Some(&serde_json::json!({"actionId":action_id})),
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn action(
@@ -1440,6 +1460,31 @@ impl BrowserCompanionClient {
 }
 
 fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String> {
+    if let Some(ticket) = &request.agent_ticket
+        && (ticket.len() != 8
+            || !ticket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    {
+        return Err("Invalid browser agent ticket".into());
+    }
+    if request.retain_pairing_window && !matches!(request.prompt, ActionPrompt::CreateChat { .. })
+        || request
+            .pairing_continuation_of
+            .as_deref()
+            .is_some_and(|parent| {
+                parent == request.action_id
+                    || matches!(
+                        request.prompt,
+                        ActionPrompt::CreateChat { .. } | ActionPrompt::PairVerify { .. }
+                    )
+            })
+    {
+        return Err("Invalid pairing window reservation".into());
+    }
+    if let Some(parent) = &request.pairing_continuation_of {
+        validate_opaque(parent, "pairing browser action ID")?;
+    }
     validate_opaque(&request.action_id, "browser action ID")?;
     validate_opaque(&request.idempotency_key, "browser action idempotency key")?;
     validate_chatgpt_url(&request.url)?;
@@ -1461,6 +1506,11 @@ fn validate_execute_request(request: &ExecuteActionRequest) -> Result<(), String
         _ => return Err("Browser model and effort must be supplied together; pairing uses the conversation settings".into()),
     }
     validate_prompt(&request.prompt)?;
+    if render_action_prompt_with_ticket(&request.prompt, request.agent_ticket.as_deref()).len()
+        > MAX_PROMPT_BYTES
+    {
+        return Err("Browser automation prompt exceeds the safety limit".into());
+    }
     let encoded = serde_json::to_vec(request)
         .map_err(|_| "Could not encode browser action request".to_string())?;
     if encoded.len() > MAX_JSON_BYTES {
@@ -1491,6 +1541,7 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
                 return Err("Turn handoff ID is invalid".into());
             }
         }
+        ActionPrompt::TaskContinuation {} => {}
         ActionPrompt::OfflineChat { batch_id, messages } => {
             validate_batch(batch_id, messages)?;
         }
@@ -1535,6 +1586,19 @@ fn validate_prompt(prompt: &ActionPrompt) -> Result<(), String> {
 
 pub(crate) fn rendered_action_prompt_bytes(prompt: &ActionPrompt) -> usize {
     render_action_prompt(prompt).len()
+}
+
+pub(crate) fn browser_ticket_prompt_overhead() -> usize {
+    render_action_prompt_with_ticket(&ActionPrompt::TaskContinuation {}, Some("AAAAAAAA")).len()
+        - render_action_prompt(&ActionPrompt::TaskContinuation {}).len()
+}
+
+fn render_action_prompt_with_ticket(prompt: &ActionPrompt, ticket: Option<&str>) -> String {
+    let mut rendered = render_action_prompt(prompt);
+    if let Some(ticket) = ticket {
+        rendered.push_str(&format!("\n\nCodexify supplied a fresh agent ticket for this prompt: `{ticket}`. Pass it as `codexify_ticket` on the first ticketed tool call in this turn, including setup or pairing verification. `continue_task` is exempt and does not consume it. After that first call, use the latest `new_codexify_ticket` returned by each response. This ticket replaces any ticket remembered from a previous turn; do not omit it or reuse an older one."));
+    }
+    rendered
 }
 
 fn validate_batch(batch_id: &str, messages: &[CompanionUnreadMessage]) -> Result<(), String> {
@@ -1624,6 +1688,7 @@ fn render_action_prompt(prompt: &ActionPrompt) -> String {
         ActionPrompt::OfflineChat { messages, .. } => unread_clause(messages),
         ActionPrompt::OfflineGoal { .. } => GOAL_CLAUSE.to_string(),
         ActionPrompt::TurnRenewal { .. } => "Continue.".to_string(),
+        ActionPrompt::TaskContinuation {} => "Continue the previous user request in this Codexify task using its existing workspace, CHAT.md and progress history. Initialization and pairing are already complete. Call get_agent_brief, read the task history and continue from the saved state; do not treat this as a new task or repeat completed work.".to_string(),
         ActionPrompt::OfflineCombined { messages, .. } => {
             format!("{}\n\n{GOAL_CLAUSE}", unread_clause(messages))
         }

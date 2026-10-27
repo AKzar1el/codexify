@@ -960,7 +960,7 @@ test('connector maintenance retains the UI lease across steps and restoration',a
  (driver as BrowserDriver).refreshConnectorSteps=async(_name,run,signal)=>{
   await run(async()=>{order.push('first-step');entered();await gate;},signal);
   await run(async()=>{order.push('second-step');},signal);
-  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false};
+  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false as const};
  };
  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,shortBudget);
  const refresh=coordinator.refreshConnector('Fixture connector');await started;
@@ -982,7 +982,7 @@ test('refresh observation and restoration exclude plan checks, navigation and su
   await run(async()=>{order.push('prepare-refresh');},signal);
   observing();await confirmation;order.push('confirmed');
   await run(async()=>{restoring();await restoration;order.push('restored');});
-  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false};
+  return {appId:'asdk_app_fixture',refreshObserved:true,permissionChanged:false,schemaVerified:false as const};
  };
  (driver as BrowserDriver).accountPlan=async()=>{order.push('plan');return {accountFingerprint:'account-1',kind:'pro',label:'Pro 20x',sourceLabel:'ChatGPT Pro 200'};};
  const capabilities=driver.capabilities.bind(driver);
@@ -1072,4 +1072,73 @@ for(const sent of [false,true])test(`cooldown deferral preserves ${sent?'accepte
  expect(snapshot?.cooldownUntilMs!==undefined).toBe(!sent);
  expect((await coordinator.health()).activeActionId).toBeNull();
  await coordinator.close();
+});
+
+for(const accepted of [false,true])test(`conversation length limit retains its terminal cause after accepted=${accepted}`,async()=>{
+ const driver=new DeferredDriver();driver.execute=async execution=>{
+  driver.runs.push(execution.request.actionId);
+  if(accepted){execution.emit({type:'model_verified',model:'gpt-6-sol',effort:'high'});execution.emit({type:'send_accepted'});}
+  throw new BrowserCompanionError('Conversation length limit','conversation_limit',{sendAccepted:accepted});
+ };
+ const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD),id='full-'+accepted;
+ await coordinator.execute(request(id));const events=await collect(coordinator,id),snapshot=await coordinator.action(id);
+ expect(events.at(-1)).toMatchObject({type:'failed',code:'conversation_limit'});
+ expect(snapshot).toMatchObject({state:'failed',sendAccepted:accepted,attention:{code:'conversation_limit'}});
+ expect(driver.runs).toEqual([id]);await coordinator.close();
+});
+
+class PairingWindowDriver extends DeferredDriver {
+  maintenanceCalls = 0;
+  async accountPlan() { this.maintenanceCalls++; return {label:"Pro",sourceLabel:"Pro",kind:"pro" as const,accountFingerprint:"account-1"}; }
+  async prepareNewChat() { this.maintenanceCalls++; return this.capabilities(); }
+  async refreshConnector() { this.maintenanceCalls++; return {appId:"app",refreshObserved:true,permissionChanged:false,schemaVerified:false as const}; }
+  override async execute(execution:DriverExecution) {
+    this.runs.push(execution.request.actionId);
+    if (execution.request.model && execution.request.effort) execution.emit({type:"model_verified",model:execution.request.model,effort:execution.request.effort});
+    execution.emit({type:"send_accepted"});
+    const canonicalUrl = execution.request.prompt.kind === "create_chat" ? "https://chatgpt.com/c/paired-window" : execution.request.expectedUrl;
+    if (execution.request.prompt.kind === "create_chat") execution.emit({type:"conversation_created",canonicalUrl});
+    execution.emit({type:"submission_complete",canonicalUrl});
+  }
+}
+
+const retainedPairing = ():ExecuteActionRequest=>({...request("pair-window"),url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",
+  model:null,effort:null,retainPairingWindow:true,prompt:{kind:"create_chat",continuationToken:"A".repeat(43),reference:Buffer.alloc(32,1).toString('base64url'),setupReference:null}});
+
+test("re-pairing retains the browser through verification and admits only its matching continuation",async()=>{
+  const driver=new PairingWindowDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  await coordinator.execute(retainedPairing());
+  for await(const _ of coordinator.events("pair-window",0)){}
+  expect((await coordinator.health()).activeActionId).toBe("pair-window");
+  await expect(coordinator.execute(request("other"))).rejects.toThrow("busy");
+  await expect(coordinator.accountPlan("epoch")).rejects.toThrow("busy");
+  await expect(coordinator.newChatCapabilities(null)).rejects.toThrow("busy");
+  await expect(coordinator.refreshConnector("Codexify")).rejects.toThrow("busy");
+  expect(driver.maintenanceCalls).toBe(0);
+  const followUp:ExecuteActionRequest={...request("normal-prompt"),url:"https://chatgpt.com/c/paired-window",expectedUrl:"https://chatgpt.com/c/paired-window",pairingContinuationOf:"pair-window"};
+  for(const change of [{url:"https://chatgpt.com/c/other"},{pairingGeneration:2},{expectedAccountFingerprint:"other-account"},{connectorName:"Other connector"},{pairingContinuationOf:"other-pair"}]) {
+    await expect(coordinator.execute({...followUp,...change})).rejects.toThrow("busy");
+  }
+  // A still-generating initialization response belongs to this reservation.
+  driver.status="busy";
+  await coordinator.execute(followUp);
+  for await(const _ of coordinator.events(followUp.actionId,0)){}
+  expect(driver.runs).toEqual(["pair-window","normal-prompt"]);
+  expect((await coordinator.health()).activeActionId).toBeNull();
+  await coordinator.close();
+});
+
+test("re-pairing reservation expires or releases without replaying Send",async()=>{
+  for(const mode of ["timeout","release","shutdown"] as const) {
+    const driver=new PairingWindowDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{operationMs:1000,cleanupMs:100,hardStopMs:100,pairingRetentionMs:30});
+    await coordinator.execute(retainedPairing());
+    for await(const _ of coordinator.events("pair-window",0)){}
+    expect(coordinator.releasePairingWindow("wrong-action")).toBeFalse();
+    if(mode==="timeout") await Bun.sleep(60);
+    else if(mode==="release") expect(coordinator.releasePairingWindow("pair-window")).toBeTrue();
+    else await coordinator.close();
+    expect((await coordinator.health()).activeActionId).toBeNull();
+    expect(driver.runs).toEqual(["pair-window"]);
+    if(mode!=="shutdown") await coordinator.close();
+  }
 });

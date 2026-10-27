@@ -90,6 +90,9 @@ fn contract_request(action_id: &str, idempotency_key: &str) -> ExecuteActionRequ
         expected_url: "https://chatgpt.com/c/contract".into(),
         auto_approve_tool_calls: false,
         bypass_conversation_cooldown: false,
+        retain_pairing_window: false,
+        pairing_continuation_of: None,
+        agent_ticket: None,
     }
 }
 
@@ -153,6 +156,9 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
         expected_url: "https://chatgpt.com/c/fixture".into(),
         auto_approve_tool_calls: false,
         bypass_conversation_cooldown: false,
+        retain_pairing_window: false,
+        pairing_continuation_of: None,
+        agent_ticket: None,
     };
     let requests = vec![
         base(
@@ -199,6 +205,40 @@ fn rust_shapes_match_every_golden_protocol_fixture() {
             handoff_id: format!("renew-{}", "a".repeat(64)),
         },
     ));
+    requests.push(base(
+        "fixture-continuation",
+        "fixture-continuation-execute",
+        ActionPrompt::TaskContinuation {},
+    ));
+    let mut retained = base(
+        "fixture-retained",
+        "fixture-retained-execute",
+        ActionPrompt::CreateChat {
+            continuation_token: "A".repeat(43),
+            reference: "A".repeat(43),
+            setup_reference: None,
+        },
+    );
+    retained.model = None;
+    retained.effort = None;
+    retained.url = "https://chatgpt.com/new".into();
+    retained.expected_url = retained.url.clone();
+    retained.retain_pairing_window = true;
+    requests.push(retained);
+    let mut follow_up = base(
+        "fixture-paired-followup",
+        "fixture-paired-followup-execute",
+        ActionPrompt::OfflineGoal { goal_revision: 3 },
+    );
+    follow_up.pairing_continuation_of = Some("fixture-retained".into());
+    requests.push(follow_up);
+    let mut ticketed = base(
+        "fixture-ticket",
+        "fixture-ticket-execute",
+        ActionPrompt::TaskContinuation {},
+    );
+    ticketed.agent_ticket = Some("FreshT_1".into());
+    requests.push(ticketed);
     assert_eq!(
         serde_json::to_value(requests).unwrap(),
         fixture["executeRequests"]

@@ -1265,7 +1265,8 @@ After changing the flag, refresh the connector's tools in ChatGPT Settings and
 start a new conversation so its cached schemas and instructions match. Disabling
 the flag uses the same commands with `false`. It does not delete ticket state.
 
-The first ticketed model-facing tool call omits `codexify_ticket` and claims the conversation's
+The first ticketed model-facing tool call uses a fresh ticket supplied inline by
+browser automation, or omits `codexify_ticket` if none was supplied, and claims the conversation's
 chain. Its result contains an eight-character `new_codexify_ticket`. Every subsequent
 ticketed call passes the latest value as `codexify_ticket`. The server reserves it before
 dispatch and replaces it at response handoff, including tool, argument-validation,
@@ -1274,7 +1275,8 @@ The ticket is returned in both structured content and
 a small text block, after output truncation. Native tools and all upstream MCP
 exposure modes are guarded centrally. App-only widget helpers and protocol-level
 discovery/resource requests (`tools/list`, `resources/list`, `resources/read`)
-do not participate. `continue_task` is also exempt: its random one-time token and
+do not participate. `ticket_wait` requires no ticket and is advertised as read-only;
+it is available only when agent tickets are enabled. `continue_task` is also exempt: its random one-time token and
 idempotent completed-claim receipt provide the exclusivity and replay handling
 needed for a handoff, without risking a lost ticket successor during ownership
 transfer. A displayed tool such as `setup` or
@@ -1284,22 +1286,23 @@ is disabled, so user interactions never consume the agent's ticket.
 
 Calls must be serial, including read-only calls, chat tools, command polling,
 and MCP search/schema tools. While a chain is active, a missing, malformed, or
-consumed ticket rejects the call before dispatch, returns no replacement, and tells that agent branch
-to stop. A rejection does not change the winning branch's ticket. Tools with
+consumed ticket rejects the call before dispatch, returns no replacement, and requires
+that agent to call `ticket_wait`. A rejection does not change the winning branch's ticket. Tools with
 input schemas that cannot safely accommodate the extra field use an
 `arguments` envelope for their original arguments; the advertised schema shows
 the applicable shape. Codexify removes its own ticket before validating or
 forwarding the original tool arguments.
 
 With `agentChat.enabled`, each rejected call writes a yellow warning between
-messages in the selected workspace's chat: **Duplicate agent detected. Its tool
-call was terminated.** This is a server notice, not an agent message. It does
+messages in the selected workspace's chat explaining that the affected agent
+was instructed to wait for ticket renewal. This is a server notice, not an agent message. It does
 not acknowledge unread user messages or increase the active agent's call
-counter. Without a selected Markdown chat, the rejection response instructs
-the blocked branch to tell the user without making another tool call. A ticket
+counter. The rejection response always directs the affected branch to `ticket_wait`,
+including before setup or workspace selection. Renewing a ticket does not authorize
+project access; setup and workspace selection still apply. A ticket
 mismatch does not prove duplication: a lost response or legitimate parallel
 call can also cause rejection. Codexify rejects that tool call and instructs
-the model branch to stop; it cannot terminate the remote model or already-running
+the model branch to wait; it cannot terminate the remote model or already-running
 commands.
 
 With stable ChatGPT conversation metadata, the current ticket is stored in one
@@ -1321,15 +1324,25 @@ has elapsed and no ticketed call is in flight, the next call may omit its ticket
 or supply an older or otherwise wrong string ticket. That call claims a new chain; competing
 calls using the old or missing ticket are rejected again. The persistent file's
 modification time records the last handoff, so this also works after restart.
-Rejected calls and widget interactions neither extend the deadline nor reset the
+Rejected calls, `ticket_wait`, and widget interactions neither extend the deadline nor reset the
 chain. A held reservation is never stolen, even after five minutes.
 
-This lets a user ask ChatGPT to continue after the conversation has gone offline,
-without obtaining a ticket from internal state. A rejected branch must not wait
-for expiry and restart itself; it may resume only when the user asks. Expiry is a
-deliberate availability trade-off: a stale fork can compete again after inactivity,
-and the server still cannot identify the original agent. Already-running commands
-are not cancelled by offline recovery.
+**Repeated ticket waits.** `ticket_wait` takes no arguments and uses
+`agentChat.maxWaitMs` (55 seconds by default). Pending or interrupted responses
+always include an instruction to call `ticket_wait` again, plus
+`required_next_action: "ticket_wait"` and `assistant_turn_may_end: false`.
+It must be repeated until a response includes `new_codexify_ticket`. After renewal,
+the agent uses that ticket to read the latest `rollout_read` reports before resuming
+work, completing setup/workspace selection first if required. Without Markdown chat,
+it recovers context using `get_agent_brief`. Descriptions and replies explicitly
+forbid treating a wait timeout or renewal as permission to end the turn. Waiting
+does not count as agent work, extend presence, deliver pending user messages, or
+trigger rollout/turn-renewal notices.
+
+Expiry remains a deliberate availability trade-off: a stale fork can compete again
+after inactivity, and the server still cannot identify the original agent.
+Already-running commands are not cancelled by offline recovery. No master/worker
+roles or multi-agent coordination are implemented by this wait protocol.
 
 This is coordination, not authentication, agent identification, or exactly-once
 execution. Whichever fork consumes a shared ticket first wins; there is no way
@@ -2441,7 +2454,7 @@ and live state take precedence.
 `agentChat.rolloutReminderInterval` defaults to **25** and accepts integers from
 1 to 10000. It is editable under **Settings → Chats & goals → Progress report
 interval** and applies without a restart. Agent work calls, including errors,
-count; app-only polling, `chat_await`, `turn_completed`, `goal_finish`, and pairing
+count; app-only polling, `chat_await`, `turn_completed`, `ticket_wait`, `goal_finish`, and pairing
 verification do not. Waiting and completion results never deliver checkpoint
 reminders; a due reminder stays pending for the next work call. When due, work
 tool results include an optional `rollout_checkpoint_required`
