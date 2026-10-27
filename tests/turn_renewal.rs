@@ -328,8 +328,10 @@ async fn fallback_proof_does_not_replace_a_newer_manual_selection_or_an_unsent_c
             )
             .await
             .unwrap();
+        f.chat.release_queued_message(now).await.unwrap();
         f.supervisor.scan_once(now).await.unwrap();
         let result = f.supervisor.run_next(now).await;
+        assert_eq!(f.executor.sent.lock().unwrap().len(), 1);
         let state = f.store.load(&f.task).unwrap();
         if manual_change {
             result.unwrap();
