@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "geo": "C:\\path\\to\\your\\mcp-geo",
+    "gsc": "C:\\path\\to\\your\\mcp-gsc"
+  },
+  "enableWrites": false
+}
