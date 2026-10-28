@@ -113,9 +113,25 @@ export function createRevenueService(config) {
         throw failure("INVALID_READ_WINDOW");
       }
       const lines = contents.toString("utf8").split(/\r?\n/);
-      const value = lines.slice(offset, offset + limit).join("\n").slice(0, 16000);
+      // Return complete lines only. A blind character slice can silently
+      // discard policy text while claiming the next line offset is safe.
+      const returned = [];
+      let bytes = 0;
+      for (let i = offset; i < Math.min(lines.length, offset + limit); i++) {
+        const line = lines[i];
+        const lineBytes = Buffer.byteLength(line, "utf8") + (returned.length ? 1 : 0);
+        if (lineBytes > 16000 && returned.length === 0) {
+          throw failure("POLICY_LINE_TOO_LARGE");
+        }
+        if (bytes + lineBytes > 16000) break;
+        returned.push(line);
+        bytes += lineBytes;
+      }
+      const nextOffset = offset + returned.length;
+      const value = returned.join("\n");
       return { project: args.project, document: doc, offset, lines: lines.length,
-        sha256: digest(contents), content: value, truncated: offset + limit < lines.length };
+        returnedLines: returned.length, nextOffset, sha256: digest(contents),
+        content: value, truncated: nextOffset < lines.length };
     },
     async get_run_ledger_status(args) {
       const project = await resolveProject(config, args?.project);

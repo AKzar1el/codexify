@@ -68,6 +68,32 @@ test("bounded preflight reads advertise evidence without claiming writer absence
   }), /UNKNOWN_PROJECT/);
 });
 
+test("long policy pages resume at complete-line boundaries without losing text", async t => {
+  const { service, shot } = await fixture(t);
+  const content = Array.from({ length: 100 },
+    (_, i) => "line" + String(i).padStart(3, "0") + " " + "x".repeat(345)).join("\n");
+  await fs.writeFile(path.join(shot, "MASTER_PLAN.md"), content);
+  let offset = 0;
+  const sections = [];
+  let pageCount = 0;
+  while (true) {
+    const page = await service.read_project_policy({
+      project: "geo", document: "master_plan", offset, limit: 180
+    });
+    assert.equal(page.offset, offset);
+    assert.ok(page.content.length <= 16000);
+    assert.ok(page.returnedLines > 0);
+    assert.equal(page.nextOffset, offset + page.returnedLines);
+    sections.push(page.content);
+    pageCount += 1;
+    offset = page.nextOffset;
+    if (!page.truncated) break;
+  }
+  assert.ok(pageCount > 1);
+  assert.equal(sections.join("\n"), content);
+  assert.equal(offset, 100);
+});
+
 test("append exactly once and make an exact-tail replay a no-op", async t => {
   const { service, args, snapshot } = await fixture(t);
   const inputs = await args();

@@ -22,6 +22,8 @@ Copy `config.example.json` to a private location, edit the **absolute, exact** p
 
 The tool names become `revenue_shot__inspect_project_writer`, `revenue_shot__read_project_policy`, and `revenue_shot__get_run_ledger_status`. Missing write permission is intentional: `append_run_record` is not advertised when disabled.
 
+`read_project_policy` accepts only fixed project IDs and a fixed document enum. Pages return whole lines and the SHA-256 of the unchanged source file. Continue using `nextOffset` until `truncated` is false; do not assume that a large 180-line request fits the 16 KB response budget. A single oversized line is rejected rather than silently dropped. This interface improves tool-risk separation; it does not authorize overriding a host denial or relaxing the project's mandatory policy and owner checks.
+
 ## Write path (migration gated)
 
 `append_run_record` is **disabled by default** and must remain disabled in production until the current Revenue Shot writers have migrated to the same lock protocol. It requires the exact current state/journal SHA-256 digests, a verified predecessor run key, and one bounded record containing an exact `RUN_KEY: ...` line. It appends rather than rewrites the journal, rejects stale preconditions, and recognizes exact-tail duplicate submissions. Its safety annotations remain conservative: this is a write, potentially irreversible, not safe to automatically retry after an ambiguous failure.
