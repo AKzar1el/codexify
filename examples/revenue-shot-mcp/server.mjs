@@ -31,6 +31,18 @@ function definitions(config) {
       "Return immutable SHA256 preconditions, bounded journal tail and textual counters. Does not prove predecessor validity or writer absence.",
       { project }, ["project"], readOnly)
   ];
+  if (config.enableKernelAttestation === true) {
+    const kernelProjects = Object.keys(config.kernelFiles ?? {})
+      .filter(id => Object.hasOwn(config.projects, id)).sort();
+    if (kernelProjects.length) {
+      list.push(tool("read_original_kernel",
+        "Read an explicitly configured, SHA256-pinned original task kernel in bounded pages. Fixed project IDs only; never takes a path. Owner authorization is required to enable this tool.",
+        { project: { type: "string", enum: kernelProjects },
+          offset: { type: "integer", minimum: 0, maximum: 1000000 },
+          limit: { type: "integer", minimum: 1, maximum: 4000 } },
+        ["project"], readOnly));
+    }
+  }
   if (config.enableWrites === true) {
     list.push(tool("append_run_record",
       "Append one bounded journal record with exact state/journal hashes and predecessor evidence. Not safe against legacy nonparticipating writers; do not automatically retry ambiguous failures.",

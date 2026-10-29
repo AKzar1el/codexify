@@ -99,6 +99,52 @@ export function createRevenueService(config) {
   if (!config || typeof config !== "object") throw failure("INVALID_CONFIGURATION");
   const writesEnabled = config.enableWrites === true;
   return {
+    // Optional fixed-file attestation, disabled unless the owner has pinned an
+    // exact kernel path and digest. Never accept a path from an MCP caller.
+    async read_original_kernel(args) {
+      if (config.enableKernelAttestation !== true) {
+        throw failure("KERNEL_ATTESTATION_DISABLED");
+      }
+      await resolveProject(config, args?.project);
+      const pinned = config.kernelFiles?.[args?.project];
+      if (!pinned || typeof pinned.path !== "string"
+          || !path.isAbsolute(pinned.path) || !validDigest(pinned.sha256)) {
+        throw failure("KERNEL_ATTESTATION_NOT_CONFIGURED");
+      }
+      const contents = await readFixedFile(pinned.path);
+      const actualSha256 = digest(contents);
+      if (actualSha256 !== pinned.sha256) {
+        throw failure("KERNEL_DIGEST_MISMATCH");
+      }
+      const offset = args.offset === undefined ? 0 : args.offset;
+      const limit = args.limit === undefined ? 2000 : args.limit;
+      if (!Number.isInteger(offset) || offset < 0 || offset > 1000000
+          || !Number.isInteger(limit) || limit < 1 || limit > 4000) {
+        throw failure("INVALID_KERNEL_READ_WINDOW");
+      }
+      // Code-point paging handles a minified one-line JSON kernel and never
+      // splits UTF-8 bytes/surrogate pairs across pages.
+      let characters;
+      try {
+        characters = Array.from(new TextDecoder("utf-8", { fatal: true }).decode(contents));
+      } catch {
+        throw failure("KERNEL_NOT_UTF8");
+      }
+      if (offset > characters.length) throw failure("KERNEL_OFFSET_OUT_OF_RANGE");
+      const page = [];
+      let pageBytes = 0;
+      for (let i = offset; i < Math.min(characters.length, offset + limit); i++) {
+        const bytes = Buffer.byteLength(characters[i], "utf8");
+        if (pageBytes + bytes > 12000) break;
+        page.push(characters[i]);
+        pageBytes += bytes;
+      }
+      const nextOffset = offset + page.length;
+      return { project: args.project, offset, nextOffset,
+        returnedCharacters: page.length, totalCharacters: characters.length,
+        sha256: actualSha256, digestVerified: true,
+        content: page.join(""), truncated: nextOffset < characters.length };
+    },
     async read_project_policy(args) {
       const project = await resolveProject(config, args?.project);
       const doc = args?.document;

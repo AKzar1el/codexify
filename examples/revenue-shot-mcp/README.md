@@ -24,6 +24,42 @@ The tool names become `revenue_shot__inspect_project_writer`, `revenue_shot__rea
 
 `read_project_policy` accepts only fixed project IDs and a fixed document enum. Pages return whole lines and the SHA-256 of the unchanged source file. Continue using `nextOffset` until `truncated` is false; do not assume that a large 180-line request fits the 16 KB response budget. A single oversized line is rejected rather than silently dropped. This interface improves tool-risk separation; it does not authorize overriding a host denial or relaxing the project's mandatory policy and owner checks.
 
+## Optional original-kernel attestation (separate owner approval)
+
+The sidecar can expose an additional **read-only** `read_original_kernel` tool,
+but it is **absent by default**. This is a fixed-file task-provenance migration
+candidate, not an authorization workaround.
+
+An owner must configure `enableKernelAttestation: true` and a per-project
+`kernelFiles` entry with an **absolute exact path** and a previously verified
+**64-character SHA-256**. Schematic example (not a working configuration):
+
+```json
+{
+  "enableKernelAttestation": false,
+  "kernelFiles": {
+    "geo": {
+      "path": "C:/approved/immutable-archive/geo-automation.json",
+      "sha256": "REPLACE_WITH_OWNER_VERIFIED_64_CHARACTER_SHA256"
+    }
+  }
+}
+```
+
+With the default false setting, no kernel tool is advertised and no archive
+is opened. After explicit enablement, callers supply only a fixed project ID
+and code-point paging offset/limit, never a path. The server verifies exact
+realpath/no symlink redirection, regular-file and size limits, and the pinned
+full-file SHA-256 before returning any bounded UTF-8 chunk. It does not write
+the journal or certify predecessor completion, external effects or ownership.
+
+**An explicit host-safety refusal to access an archive remains binding.**
+Do not enable, refresh, invoke or deploy this action until the owner/workspace
+explicitly authorizes the **new scoped action** through the supported approval
+workflow. A read-only annotation alone is not authorization. Synthetic tests
+do not touch the real migration backup. The worker must still validate the
+full original kernel identity/version/root and all independent safety gates.
+
 ## Write path (migration gated)
 
 `append_run_record` is **disabled by default** and must remain disabled in production until the current Revenue Shot writers have migrated to the same lock protocol. It requires the exact current state/journal SHA-256 digests, a verified predecessor run key, and one bounded record containing an exact `RUN_KEY: ...` line. It appends rather than rewrites the journal, rejects stale preconditions, and recognizes exact-tail duplicate submissions. Its safety annotations remain conservative: this is a write, potentially irreversible, not safe to automatically retry after an ambiguous failure.
