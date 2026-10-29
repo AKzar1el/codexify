@@ -260,7 +260,7 @@ test("owner-gated kernel attestation is digest pinned, paged and read-only", asy
   const kernelPath = path.join(temp, "original-kernel.json");
   const text = JSON.stringify({
     id: "geo-scheduled-task-20260922",
-    prompt: "A\\u2728" + "\\u{1F680}".repeat(4500)
+    prompt: "A\u2728" + "\u{1F680}".repeat(4500)
   });
   await fs.writeFile(kernelPath, text, "utf8");
   const pinned = { ...config, enableKernelAttestation: true,
