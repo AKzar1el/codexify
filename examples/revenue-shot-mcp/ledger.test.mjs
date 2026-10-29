@@ -253,3 +253,71 @@ test("stdio transport completes initialize, discovery and bounded call", async t
     child.once("error", reject);
   });
 });
+
+
+test("owner-gated kernel attestation is digest pinned, paged and read-only", async t => {
+  const { config, snapshot, temp } = await fixture(t, false);
+  const kernelPath = path.join(temp, "original-kernel.json");
+  const text = JSON.stringify({
+    id: "geo-scheduled-task-20260922",
+    prompt: "A\\u2728" + "\\u{1F680}".repeat(4500)
+  });
+  await fs.writeFile(kernelPath, text, "utf8");
+  const pinned = { ...config, enableKernelAttestation: true,
+    kernelFiles: { geo: { path: kernelPath, sha256: sha(text) } } };
+  const service = createRevenueService(pinned);
+  const before = await snapshot();
+
+  const disabled = createRevenueService({ ...pinned, enableKernelAttestation: false });
+  await assert.rejects(disabled.read_original_kernel({ project: "geo" }),
+    /KERNEL_ATTESTATION_DISABLED/);
+  const disabledHandler = makeHandler({ ...pinned, enableKernelAttestation: false });
+  const disabledList = await disabledHandler({
+    jsonrpc: "2.0", id: 1, method: "tools/list"
+  });
+  assert.ok(!disabledList.result.tools.some(tool => tool.name === "read_original_kernel"));
+
+  const handler = makeHandler(pinned);
+  const list = await handler({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+  const tool = list.result.tools.find(item => item.name === "read_original_kernel");
+  assert.equal(tool.annotations.readOnlyHint, true);
+  assert.deepEqual(tool.inputSchema.properties.project.enum, ["geo"]);
+  assert.equal(Object.hasOwn(tool.inputSchema.properties, "path"), false);
+  const chunks = [];
+  let offset = 0;
+  let sha256;
+  while (true) {
+    const page = await service.read_original_kernel({ project: "geo", offset, limit: 2800 });
+    assert.equal(page.digestVerified, true);
+    sha256 = page.sha256;
+    chunks.push(page.content);
+    assert.ok(page.nextOffset > offset);
+    offset = page.nextOffset;
+    if (!page.truncated) break;
+  }
+  assert.equal(chunks.join(""), text);
+  assert.equal(sha256, sha(text));
+  assert.deepEqual(await snapshot(), before);
+
+  await assert.rejects(service.read_original_kernel({ project: "gsc" }), /UNKNOWN_PROJECT/);
+  await assert.rejects(service.read_original_kernel({
+    project: "geo", offset: -1
+  }), /INVALID_KERNEL_READ_WINDOW/);
+  await assert.rejects(service.read_original_kernel({
+    project: "geo", offset: 0, limit: 99999
+  }), /INVALID_KERNEL_READ_WINDOW/);
+
+  await fs.appendFile(kernelPath, " ");
+  await assert.rejects(service.read_original_kernel({ project: "geo" }),
+    /KERNEL_DIGEST_MISMATCH/);
+});
+
+test("kernel attestation rejects unpinned sources without touching journals", async t => {
+  const { config, temp, snapshot } = await fixture(t, false);
+  const before = await snapshot();
+  const unpinned = createRevenueService({ ...config, enableKernelAttestation: true,
+    kernelFiles: { geo: { path: path.join(temp, "untrusted.json") } } });
+  await assert.rejects(unpinned.read_original_kernel({ project: "geo" }),
+    /KERNEL_ATTESTATION_NOT_CONFIGURED/);
+  assert.deepEqual(await snapshot(), before);
+});
