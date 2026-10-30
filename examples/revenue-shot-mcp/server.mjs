@@ -2,6 +2,7 @@
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { createRevenueService, loadRevenueConfig } from "./ledger.mjs";
+import { createCodingService } from "./coding.mjs";
 
 function tool(name, description, properties, required, annotations) {
   return { name, title: name.replaceAll("_", " "),
@@ -18,7 +19,7 @@ function definitions(config) {
     idempotentHint: false, openWorldHint: false };
   const list = [
     tool("inspect_project_writer",
-      "Inspect only this service's journal lock. Never assert that unrelated writers are absent.",
+      "Report fixed canonical project root and sidecar-only journal lock; never certify unrelated writers.",
       { project }, ["project"], readOnly),
     tool("read_project_policy",
       "Read a bounded portion of one fixed policy/state document. No arbitrary path access.",
@@ -28,8 +29,14 @@ function definitions(config) {
         limit: { type: "integer", minimum: 1, maximum: 180 } },
       ["project", "document"], readOnly),
     tool("get_run_ledger_status",
-      "Return immutable SHA256 preconditions, bounded journal tail and textual counters. Does not prove predecessor validity or writer absence.",
-      { project }, ["project"], readOnly)
+      "Return fixed-root digests and optional exact RUN_KEY record counts without journal text. Does not prove writer exclusivity or original completion.",
+      { project, run_key: { type: "string", minLength: 8, maxLength: 160,
+        pattern: "^[A-Za-z0-9_.:+-]{8,160}$" } }, ["project"], readOnly),
+    tool("read_project_journal",
+      "Read a bounded recent window of this project's canonical run journal with SHA256. Textual evidence only: no writer ownership or completion certification.",
+      { project, end_line: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 120 } },
+      ["project"], readOnly)
   ];
   if (config.enableWrites === true) {
     list.push(tool("append_run_record",
@@ -43,10 +50,77 @@ function definitions(config) {
       ["project", "run_key", "predecessor_run_key",
         "expected_journal_sha256", "expected_state_sha256", "record"], writer));
   }
+  const codingProjects = Object.keys(config.coding ?? {})
+    .filter(name => projects.includes(name)).sort();
+  if (codingProjects.length > 0) {
+    const codeProject = { type: "string", enum: codingProjects,
+      description: "Configured fixed project identifier; never a path." };
+    const file = { type: "string", minLength: 1, maxLength: 260,
+      description: "Project-relative, operator-allowlisted code file." };
+    const sha = { type: "string", pattern: "^[a-f0-9]{64}$" };
+    const ledger = { expected_journal_sha256: sha, expected_state_sha256: sha };
+    if (config.enableCodingRead === true) {
+      list.push(tool("read_project_file",
+        "Read a bounded, allowlisted source file from one fixed project. No hidden files or arbitrary paths.",
+        { project: codeProject, path: file,
+          offset: { type: "integer", minimum: 0, maximum: 1000000 },
+          limit: { type: "integer", minimum: 1, maximum: 180 } },
+        ["project", "path"], readOnly));
+      list.push(tool("inspect_project_git",
+        "Read current Git HEAD, branch and tracked status of an operator-configured project repository. Does not prove writer ownership.",
+        { project: codeProject, repository: { type: "string",
+          description: "Fixed repository alias, not a path or refspec." } },
+        ["project"], readOnly));
+      list.push(tool("inspect_project_worktrees",
+        "List existing, Git-registered worktrees of one fixed repository without modifying, creating or cleaning them. Registration does not establish live writer ownership.",
+        { project: codeProject, repository: { type: "string",
+          description: "Operator-configured repository alias." } },
+        ["project"], readOnly));
+      list.push(tool("read_project_worktree_file",
+        "Read bounded UTF-8 lines from a registered worktree under the exact project root, with source allowlist, HEAD verification and SHA256. No arbitrary worktree or file paths.",
+        { project: codeProject, repository: { type: "string",
+            description: "Operator-configured repository alias." },
+          worktree_id: { type: "string", pattern: "^[a-f0-9]{20}$" },
+          path: file,
+          offset: { type: "integer", minimum: 0, maximum: 1000000 },
+          limit: { type: "integer", minimum: 1, maximum: 180 } },
+        ["project", "worktree_id", "path"], readOnly));
+    }
+    if (config.enableProjectChecks === true) {
+      const checkProjects = codingProjects.filter(p =>
+        Object.keys(config.coding[p]?.checks ?? {}).length > 0);
+      if (checkProjects.length) {
+        list.push(tool("run_project_check",
+          "Run one operator-allowlisted, bounded project check. May change local files or contact external systems; requires exact ledger preconditions. Never assumes exclusive ownership.",
+          { project: { type: "string", enum: checkProjects },
+            check_id: { type: "string", pattern: "^[a-z][a-z0-9_-]{0,39}$" },
+            ...ledger }, ["project", "check_id",
+              "expected_journal_sha256", "expected_state_sha256"],
+          { readOnlyHint: false, destructiveHint: true,
+            idempotentHint: false, openWorldHint: true }));
+      }
+    }
+    if (config.enableCodingWrites === true) {
+      const editProjects = codingProjects.filter(p =>
+        Array.isArray(config.coding[p]?.writePrefixes)
+        && config.coding[p].writePrefixes.length > 0);
+      if (editProjects.length) {
+        list.push(tool("apply_project_edit",
+          "Replace exactly one existing source span, guarded by source and journal/state SHA256 preconditions. May overwrite code; not safe to blindly retry or use without independent owner verification.",
+          { project: { type: "string", enum: editProjects }, path: file,
+            expected_sha256: sha, ...ledger,
+            find: { type: "string", minLength: 1, maxLength: 8192 },
+            replacement: { type: "string", maxLength: 8192 } },
+          ["project", "path", "expected_sha256",
+            "expected_journal_sha256", "expected_state_sha256", "find", "replacement"],
+          writer));
+      }
+    }
+  }
   return list;
 }
 export function makeHandler(config) {
-  const service = createRevenueService(config);
+  const service = { ...createRevenueService(config), ...createCodingService(config) };
   const tools = definitions(config);
   return async function handle(request) {
     if (!request || request.jsonrpc !== "2.0" || Array.isArray(request)) {
@@ -60,7 +134,7 @@ export function makeHandler(config) {
       const preferred = request.params?.protocolVersion;
       result = { protocolVersion: ["2025-06-18", "2025-11-25", "2026-07-28"].includes(preferred)
         ? preferred : "2025-11-25", capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: "revenue-shot-scoped", version: "0.1.0" } };
+      serverInfo: { name: "revenue-shot-scoped", version: "0.4.0" } };
     } else if (method === "ping") {
       result = {};
     } else if (method === "tools/list") {
