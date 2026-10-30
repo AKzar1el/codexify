@@ -67,6 +67,28 @@ test("bounded preflight reads advertise evidence without claiming writer absence
     project: "../other"
   }), /UNKNOWN_PROJECT/);
 });
+test("journal windows page backward with stable hashes and exact content", async t => {
+  const { service, journal, snapshot } = await fixture(t, false);
+  await fs.appendFile(journal, Array.from({ length: 80 },
+    (_, i) => "record_" + String(i).padStart(3, "0")).join("\n") + "\n");
+  const before = await snapshot();
+  const newest = await service.read_project_journal({ project: "geo", limit: 9 });
+  assert.equal(newest.journalSha256, sha(before.journal));
+  assert.equal(newest.returnedLines, 9);
+  assert.equal(newest.hasEarlier, true);
+  const earlier = await service.read_project_journal({ project: "geo",
+    end_line: newest.nextEndLine, limit: 9 });
+  assert.equal(earlier.endLine, newest.startLine);
+  assert.equal(earlier.journalSha256, newest.journalSha256);
+  assert.equal(earlier.content.split("\n").length, 9);
+  assert.deepEqual(await snapshot(), before);
+  await assert.rejects(service.read_project_journal({
+    project: "geo", end_line: 999999
+  }), /INVALID_JOURNAL_WINDOW/);
+  await assert.rejects(service.read_project_journal({
+    project: "geo", limit: 121
+  }), /INVALID_JOURNAL_WINDOW/);
+});
 
 test("long policy pages resume at complete-line boundaries without losing text", async t => {
   const { service, shot } = await fixture(t);
@@ -207,7 +229,7 @@ test("MCP schema uses separate accurate risk hints and write opt-in", async t =>
   assert.equal(initialize.result.protocolVersion, "2025-11-25");
   const output = await handler({ jsonrpc: "2.0", id: 2, method: "tools/list" });
   const tools = output.result.tools;
-  assert.equal(tools.length, 4);
+  assert.equal(tools.length, 5);
   const read = tools.find(x => x.name === "read_project_policy");
   const write = tools.find(x => x.name === "append_run_record");
   assert.deepEqual(read.annotations, { readOnlyHint: true, destructiveHint: false,
@@ -219,7 +241,7 @@ test("MCP schema uses separate accurate risk hints and write opt-in", async t =>
   assert.equal(makeHandler({ ...config, enableWrites: false }) === undefined, false);
   const hidden = await makeHandler({ ...config, enableWrites: false })({
     jsonrpc: "2.0", id: 3, method: "tools/list" });
-  assert.equal(hidden.result.tools.length, 3);
+  assert.equal(hidden.result.tools.length, 4);
 });
 
 test("stdio transport completes initialize, discovery and bounded call", async t => {
@@ -242,7 +264,7 @@ test("stdio transport completes initialize, discovery and bounded call", async t
   const init = await send(1, "initialize", { protocolVersion: "2025-11-25" });
   assert.equal(init.result.serverInfo.name, "revenue-shot-scoped");
   const toolList = await send(2, "tools/list", {});
-  assert.equal(toolList.result.tools.length, 3);
+  assert.equal(toolList.result.tools.length, 4);
   const status = await send(3, "tools/call", {
     name: "get_run_ledger_status", arguments: { project: "geo" }
   });

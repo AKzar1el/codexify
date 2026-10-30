@@ -170,6 +170,38 @@ export function createRevenueService(config) {
           ? state.toString("utf8").includes(requestedKey) : null,
         note: "Record-shape evidence only. Does NOT prove owner/writer exclusivity, original completion or external effect correctness." };
     },
+    async read_project_journal(args) {
+      const project = await resolveProject(config, args?.project);
+      const journal = await readFixedFile(project.journal);
+      const lines = journal.toString("utf8").split(/\r?\n/);
+      const requestedEnd = args?.end_line === undefined ? lines.length : args.end_line;
+      const limit = args?.limit === undefined ? 60 : args.limit;
+      if (!Number.isInteger(requestedEnd) || requestedEnd < 0
+          || requestedEnd > lines.length || !Number.isInteger(limit)
+          || limit < 1 || limit > 120) {
+        throw failure("INVALID_JOURNAL_WINDOW");
+      }
+      let start = requestedEnd;
+      const selected = [];
+      let bytes = 0;
+      while (start > 0 && selected.length < limit) {
+        const value = lines[start - 1];
+        const lineBytes = Buffer.byteLength(value, "utf8") + (selected.length ? 1 : 0);
+        if (lineBytes > 16000 && selected.length === 0) {
+          throw failure("JOURNAL_LINE_TOO_LARGE");
+        }
+        if (bytes + lineBytes > 16000) break;
+        bytes += lineBytes;
+        selected.push(value);
+        start--;
+      }
+      return { project: args.project, journalSha256: digest(journal),
+        journalBytes: journal.length, totalLines: lines.length,
+        startLine: start, endLine: requestedEnd,
+        returnedLines: selected.length, nextEndLine: start,
+        hasEarlier: start > 0, content: selected.reverse().join("\n"),
+        note: "Textual evidence only; caller must verify semantic completion and writer ownership." };
+    },
     async inspect_project_writer(args) {
       const project = await resolveProject(config, args?.project);
       const lock = path.join(project.shot, ".codexify-journal-append.lock");

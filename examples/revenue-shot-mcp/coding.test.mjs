@@ -127,6 +127,40 @@ test("Git inspection returns fixed repo HEAD without arbitrary Git arguments", a
   }), /UNKNOWN_GIT_REPOSITORY/);
 });
 
+test("Git worktree inventory and source reads require registered in-root worktrees", async t => {
+  const f = await fixture(t, { read: true });
+  const git = (...args) => execFileSync("git", ["-C", f.root, ...args], {
+    encoding: "utf8" }).trim();
+  git("init", "-q");
+  git("add", "src/index.ts");
+  git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+    "commit", "-qm", "test fixture");
+  const worktree = path.join(f.shot, "worktrees", "candidate");
+  await fs.mkdir(path.dirname(worktree), { recursive: true });
+  git("worktree", "add", "-q", "-b", "candidate-branch", worktree);
+  const listing = await f.service.inspect_project_worktrees({ project: "geo" });
+  assert.equal(listing.worktrees.length, 2);
+  const entry = listing.worktrees.find(item => item.path.replaceAll("\\", "/")
+    .endsWith("/candidate"));
+  assert.ok(entry);
+  assert.equal(entry.readable, true);
+  assert.equal(entry.locked, false);
+  const result = await f.service.read_project_worktree_file({
+    project: "geo", worktree_id: entry.id, path: "src/index.ts", limit: 1
+  });
+  assert.equal(result.content, "const alpha = 1;");
+  assert.equal(result.head, entry.head);
+  await assert.rejects(f.service.read_project_worktree_file({
+    project: "geo", worktree_id: "0".repeat(20), path: "src/index.ts"
+  }), /WORKTREE_NOT_AVAILABLE/);
+  await assert.rejects(f.service.read_project_worktree_file({
+    project: "geo", worktree_id: entry.id, path: ".git/config"
+  }), /DISALLOWED_PATH_COMPONENT/);
+  await assert.rejects(f.service.read_project_worktree_file({
+    project: "geo", worktree_id: entry.id, path: "../README.md"
+  }), /DISALLOWED_PATH_COMPONENT/);
+});
+
 test("project checks require exact operator selection and ledger preconditions", async t => {
   const f = await fixture(t, { read: true, check: true });
   const conditions = await f.preconditions();
@@ -215,7 +249,7 @@ test("coding permissions default to disabled even with an operator map", async t
   }), /CODING_WRITES_DISABLED/);
   const handler = makeHandler(f.config);
   const tools = (await handler({ jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
-  assert.equal(tools.length, 3);
+  assert.equal(tools.length, 4);
 });
 
 test("MCP exposes each operator-enabled tool with accurate annotation", async t => {
@@ -224,7 +258,8 @@ test("MCP exposes each operator-enabled tool with accurate annotation", async t 
   const tools = (await handler({ jsonrpc: "2.0", id: 1, method: "tools/list" })).result.tools;
   assert.deepEqual(tools.map(item => item.name),
     ["inspect_project_writer", "read_project_policy", "get_run_ledger_status",
-      "read_project_file", "inspect_project_git", "run_project_check",
+      "read_project_journal", "read_project_file", "inspect_project_git",
+      "inspect_project_worktrees", "read_project_worktree_file", "run_project_check",
       "apply_project_edit"]);
   const byName = name => tools.find(item => item.name === name);
   assert.equal(byName("read_project_file").annotations.readOnlyHint, true);
@@ -263,7 +298,7 @@ test("stdio MCP transport advertises and executes a native read_project_file cal
     return JSON.parse(next.value);
   };
   const initialized = await send(1, "initialize", { protocolVersion: "2025-11-25" });
-  assert.equal(initialized.result.serverInfo.version, "0.3.0");
+  assert.equal(initialized.result.serverInfo.version, "0.4.0");
   const listed = await send(2, "tools/list", {});
   assert.ok(listed.result.tools.some(x => x.name === "read_project_file"));
   assert.ok(listed.result.tools.every(x => x.name !== "apply_project_edit"));

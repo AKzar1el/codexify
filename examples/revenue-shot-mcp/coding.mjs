@@ -137,6 +137,53 @@ async function gitRead(cwd, args) {
     { timeout: 8000, maxBuffer: 32 * 1024, windowsHide: true, env: sterileEnv() });
   return stdout.trimEnd();
 }
+function parsedWorktrees(output) {
+  const entries = [];
+  let entry = null;
+  for (const line of (output + "\n\n").split(/\r?\n/)) {
+    if (!line) {
+      if (entry) entries.push(entry);
+      entry = null;
+      continue;
+    }
+    if (line.startsWith("worktree ")) {
+      if (entry) deny("INVALID_GIT_WORKTREE_OUTPUT");
+      entry = { path: line.slice(9), head: null, branch: null,
+        locked: false, prunable: false };
+    } else if (!entry) {
+      deny("INVALID_GIT_WORKTREE_OUTPUT");
+    } else if (line.startsWith("HEAD ")) entry.head = line.slice(5);
+    else if (line.startsWith("branch ")) entry.branch = line.slice(7);
+    else if (line.startsWith("locked")) entry.locked = true;
+    else if (line.startsWith("prunable")) entry.prunable = true;
+    else if (line !== "detached" && line !== "bare") deny("INVALID_GIT_WORKTREE_OUTPUT");
+  }
+  if (entries.length > 80 || entries.some(e =>
+    !path.isAbsolute(e.path) || !/^[a-f0-9]{40}$/.test(e.head ?? ""))) {
+    deny("INVALID_GIT_WORKTREE_OUTPUT");
+  }
+  return entries.map(e => ({ ...e, id: hash(Buffer.from(
+    process.platform === "win32" ? path.resolve(e.path).toLowerCase() :
+      path.resolve(e.path))).slice(0, 20) }));
+}
+async function registeredWorktrees(cwd) {
+  return parsedWorktrees(await gitRead(cwd, ["worktree", "list", "--porcelain"]));
+}
+function containedIn(root, value) {
+  const relative = path.relative(root, value);
+  return relative === "" || (relative !== ".."
+    && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
+}
+async function safeWorktreeRoot(root, entry) {
+  if (!containedIn(root, entry.path) || entry.prunable) {
+    deny("WORKTREE_OUTSIDE_FIXED_ROOT_OR_PRUNABLE");
+  }
+  const stat = await fs.lstat(entry.path);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+      || !comparePath(entry.path, await fs.realpath(entry.path))) {
+    deny("WORKTREE_ROOT_REDIRECTED");
+  }
+}
 async function journalPrecondition(target, args) {
   if (!/^[a-f0-9]{64}$/.test(args?.expected_journal_sha256 ?? "")
       || !/^[a-f0-9]{64}$/.test(args?.expected_state_sha256 ?? "")) {
@@ -174,6 +221,48 @@ export function createCodingService(config) {
       return { project: args.project, repository: alias, head, branch,
         trackedChanges: status, writerStatus: "UNKNOWN",
         note: "Git status does not prove ownership or authorize a commit." };
+    },
+    async inspect_project_worktrees(args) {
+      if (config.enableCodingRead !== true) deny("CODING_READ_DISABLED");
+      const target = await policyFor(config, args?.project);
+      const { cwd, alias } = await gitDirectory(target, args?.repository);
+      const top = await gitRead(cwd, ["rev-parse", "--show-toplevel"]);
+      if (!comparePath(top, cwd)) deny("GIT_REPOSITORY_ROOT_MISMATCH");
+      const registered = await registeredWorktrees(cwd);
+      return { project: args.project, repository: alias,
+        worktrees: registered.map(item => ({
+          id: item.id, head: item.head, branch: item.branch,
+          path: item.path, locked: item.locked, prunable: item.prunable,
+          readable: containedIn(target.root, item.path) && !item.prunable
+        })),
+        note: "Git registration alone does not prove ownership, inactivity or safe cleanup." };
+    },
+    async read_project_worktree_file(args) {
+      if (config.enableCodingRead !== true) deny("CODING_READ_DISABLED");
+      const target = await policyFor(config, args?.project);
+      const { cwd, alias } = await gitDirectory(target, args?.repository);
+      const top = await gitRead(cwd, ["rev-parse", "--show-toplevel"]);
+      if (!comparePath(top, cwd)) deny("GIT_REPOSITORY_ROOT_MISMATCH");
+      if (typeof args?.worktree_id !== "string" || !/^[a-f0-9]{20}$/.test(args.worktree_id)) {
+        deny("INVALID_WORKTREE_ID");
+      }
+      const registered = await registeredWorktrees(cwd);
+      const selected = registered.find(item => item.id === args.worktree_id);
+      if (!selected || selected.locked || selected.prunable) deny("WORKTREE_NOT_AVAILABLE");
+      await safeWorktreeRoot(target.root, selected);
+      const currentHead = await gitRead(selected.path, ["rev-parse", "HEAD"]);
+      if (currentHead !== selected.head) deny("WORKTREE_CHANGED_DURING_INSPECTION");
+      const filePath = args?.path;
+      relativeName(filePath);
+      const aliasPrefix = path.relative(target.root, cwd).split(path.sep).join("/");
+      const allowPath = aliasPrefix ? aliasPrefix + "/" + filePath : filePath;
+      if (!prefixesContain(target.policy.readPrefixes, allowPath)) deny("FILE_NOT_ALLOWLISTED");
+      const pathname = await existingPath(selected.path, filePath, "file");
+      const source = await readSource(pathname);
+      return { project: args.project, repository: alias,
+        worktree_id: selected.id, head: currentHead, path: filePath,
+        sha256: hash(source), bytes: source.length, ...checkedWindow(args, source),
+        note: "Read-only from a registered in-project worktree; not proof of writer ownership." };
     },
     async run_project_check(args) {
       if (config.enableProjectChecks !== true) deny("PROJECT_CHECKS_DISABLED");

@@ -31,7 +31,12 @@ function definitions(config) {
     tool("get_run_ledger_status",
       "Return fixed-root digests and optional exact RUN_KEY record counts without journal text. Does not prove writer exclusivity or original completion.",
       { project, run_key: { type: "string", minLength: 8, maxLength: 160,
-        pattern: "^[A-Za-z0-9_.:+-]{8,160}$" } }, ["project"], readOnly)
+        pattern: "^[A-Za-z0-9_.:+-]{8,160}$" } }, ["project"], readOnly),
+    tool("read_project_journal",
+      "Read a bounded recent window of this project's canonical run journal with SHA256. Textual evidence only: no writer ownership or completion certification.",
+      { project, end_line: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 120 } },
+      ["project"], readOnly)
   ];
   if (config.enableWrites === true) {
     list.push(tool("append_run_record",
@@ -66,6 +71,20 @@ function definitions(config) {
         { project: codeProject, repository: { type: "string",
           description: "Fixed repository alias, not a path or refspec." } },
         ["project"], readOnly));
+      list.push(tool("inspect_project_worktrees",
+        "List existing, Git-registered worktrees of one fixed repository without modifying, creating or cleaning them. Registration does not establish live writer ownership.",
+        { project: codeProject, repository: { type: "string",
+          description: "Operator-configured repository alias." } },
+        ["project"], readOnly));
+      list.push(tool("read_project_worktree_file",
+        "Read bounded UTF-8 lines from a registered worktree under the exact project root, with source allowlist, HEAD verification and SHA256. No arbitrary worktree or file paths.",
+        { project: codeProject, repository: { type: "string",
+            description: "Operator-configured repository alias." },
+          worktree_id: { type: "string", pattern: "^[a-f0-9]{20}$" },
+          path: file,
+          offset: { type: "integer", minimum: 0, maximum: 1000000 },
+          limit: { type: "integer", minimum: 1, maximum: 180 } },
+        ["project", "worktree_id", "path"], readOnly));
     }
     if (config.enableProjectChecks === true) {
       const checkProjects = codingProjects.filter(p =>
@@ -115,7 +134,7 @@ export function makeHandler(config) {
       const preferred = request.params?.protocolVersion;
       result = { protocolVersion: ["2025-06-18", "2025-11-25", "2026-07-28"].includes(preferred)
         ? preferred : "2025-11-25", capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: "revenue-shot-scoped", version: "0.3.0" } };
+      serverInfo: { name: "revenue-shot-scoped", version: "0.4.0" } };
     } else if (method === "ping") {
       result = {};
     } else if (method === "tools/list") {

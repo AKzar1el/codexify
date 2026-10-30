@@ -47,12 +47,15 @@ Before a production rollout, perform isolated MCP Inspector verification (includ
 
 ## Native direct coding surface (separately opt-in)
 
-The same sidecar can now advertise four additional *individually named* MCP tools. None is a generic `n/js` dispatcher, model-selected shell command, arbitrary filesystem path or Git refspec:
+The same sidecar can now advertise seven additional *individually named* MCP tools, alongside four fixed-policy/ledger tools. None is a generic `n/js` dispatcher, model-selected shell command, arbitrary filesystem path or Git refspec:
 
 | Tool | Required config | Capability |
 | --- | --- | --- |
 | `read_project_file` | `enableCodingRead: true` | Read complete bounded lines from operator-allowlisted UTF-8 source files, with SHA-256 and pagination |
 | `inspect_project_git` | `enableCodingRead: true` | Read a configured Git repository alias, HEAD, branch and tracked status with optional Git locks disabled |
+| `inspect_project_worktrees` | `enableCodingRead: true` | List Git-registered worktrees without changing, pruning or claiming ownership |
+| `read_project_worktree_file` | `enableCodingRead: true` | Read a bounded source file in a registered in-root worktree with HEAD and symlink verification |
+| `read_project_journal` | Always available | Read bounded canonical journal lines backward with stable SHA-256 and exact page boundaries |
 | `run_project_check` | `enableProjectChecks: true` | Run one operator-fixed executable/argument tuple (no shell), bounded to 24 seconds and exact journal/state hashes |
 | `apply_project_edit` | `enableCodingWrites: true` | Replace one uniquely matching source span after exact source/journal/state digest checks, with atomic file replacement |
 
@@ -84,3 +87,11 @@ node activate-readonly.mjs rollback
 ```
 
 The activation script never restarts services or edits scheduled tasks. It fails closed on an unexpected bridge/configuration, refuses to overwrite a different staging payload, and creates a byte-for-byte private configuration backup. It does not imply OpenAI will approve every call; native, correctly annotated tools are not a permission bypass. Do not silently enable `enableProjectChecks` or `enableCodingWrites` during this read-only rollout.
+
+## v0.4 all-six native read migration
+
+Use `activate-native-v04.mjs stage` and `activate-native-v04.mjs activate` to move from the already-installed v0.3 directory to the separate `~/.codexify/revenue-shot-direct-v04/` sidecar, **without changing the single Codexify tunnel, project roots, or seven schedules**. This enables eight total *read-only* tools (the previous five plus journal and two worktree tools). It leaves all direct editing, test execution and journal-appending capabilities disabled. A byte-for-byte pre-v0.4 config backup is retained in the staged folder. Revert with `activate-native-v04.mjs rollback` if necessary, followed by a service restart at a verified idle boundary.
+
+Run the synthetic tests and `smoke-coding-readonly.mjs` against the existing six-project private map **before** activation. The smoke validates source reads, Git HEAD and registered worktree inventory for all six projects, plus one verified canonical worktree-file read. It does not inspect live journal text or retry previously host-denied project operations. A new ChatGPT tool refresh is required after a safe Codexify service restart to materialize the additional direct methods.
+
+The six scheduled Revenue Shot prompts must be migrated together using a clear routing override that supersedes *only* their old `n/js` read/Git-preflight requirement. The original product, saved-kernel, finance, host-denial, effect-deduplication, writer-ownership, Git and protected-CI controls remain binding. **This is not a full autonomous write/test migration:** a formerly denied operation must not be rerouted through the new tool names; write/test/journal tools remain disabled until participating writer ownership, project-specific tests, original authorization and correct host confirmation are independently qualified. If those prerequisites are absent, report the concrete remaining blocker rather than fabricate completion.
