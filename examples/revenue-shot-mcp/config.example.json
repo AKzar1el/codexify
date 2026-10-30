@@ -3,5 +3,16 @@
     "geo": "C:\\path\\to\\your\\mcp-geo",
     "gsc": "C:\\path\\to\\your\\mcp-gsc"
   },
-  "enableWrites": false
+  "enableWrites": false,
+  "enableCodingRead": false,
+  "enableCodingWrites": false,
+  "enableProjectChecks": false,
+  "coding": {
+    "geo": {
+      "readPrefixes": ["src/", "tests/", "README.md", "package.json"],
+      "writePrefixes": ["src/", "tests/"],
+      "gitRoots": { "root": "." },
+      "checks": {}
+    }
+  }
 }

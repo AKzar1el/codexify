@@ -42,11 +42,11 @@ async function fixedRegularFile(expected) {
   }
   return { actual, stat };
 }
-async function readFixedFile(expected) {
+export async function readFixedFile(expected) {
   const { actual } = await fixedRegularFile(expected);
   return fs.readFile(actual);
 }
-async function resolveProject(config, project) {
+export async function resolveProject(config, project) {
   if (!config || !config.projects || typeof project !== "string"
       || !Object.hasOwn(config.projects, project)
       || !/^[a-z][a-z0-9_-]{0,31}$/.test(project)) {
@@ -95,6 +95,22 @@ function markers(text) {
     actionResultMarkers: (text.match(/(?:^|\n)ACTION_RESULT_V3(?:\s|:|$)/g) || []).length
   };
 }
+function observedRuns(text, runKey) {
+  const counters = { runStarts: 0, terminals: 0, actionIntents: 0, actionResults: 0 };
+  let latestStartRunKey = null;
+  const pattern = /^(?:#{1,4}[ \t]+)?(RUN_START_V[13]|RUN_NOTE_V3|ACTION_INTENT_V3|ACTION_RESULT_V3)[ \t]*\r?\nRUN_KEY:[ \t]*(?:\r?\n)?([^\r\n]+)\r?$/gm;
+  for (const match of text.matchAll(pattern)) {
+    const [ , kind, keyValue ] = match;
+    const exact = keyValue.trim();
+    if (kind.startsWith("RUN_START_")) latestStartRunKey = exact;
+    if (exact !== runKey) continue;
+    if (kind.startsWith("RUN_START_")) counters.runStarts++;
+    else if (kind === "RUN_NOTE_V3") counters.terminals++;
+    else if (kind === "ACTION_INTENT_V3") counters.actionIntents++;
+    else if (kind === "ACTION_RESULT_V3") counters.actionResults++;
+  }
+  return { latestStartRunKey, exactRun: runKey ? counters : null };
+}
 export function createRevenueService(config) {
   if (!config || typeof config !== "object") throw failure("INVALID_CONFIGURATION");
   const writesEnabled = config.enableWrites === true;
@@ -135,14 +151,24 @@ export function createRevenueService(config) {
     },
     async get_run_ledger_status(args) {
       const project = await resolveProject(config, args?.project);
+      const requestedKey = args?.run_key;
+      if (requestedKey !== undefined && !validKey(requestedKey)) {
+        throw failure("INVALID_RUN_KEY");
+      }
       const [journal, state] = await Promise.all([
         readFixedFile(project.journal), readFixedFile(project.state)
       ]);
       const text = journal.toString("utf8");
-      return { project: args.project, journalSha256: digest(journal),
-        stateSha256: digest(state), journalBytes: journal.length, stateBytes: state.length,
-        ...markers(text), tail: text.split(/\r?\n/).slice(-8).join("\n").slice(-1800),
-        note: "Record counts are textual hints; writer identity and predecessor terminal state are NOT proven." };
+      const observed = observedRuns(text, requestedKey);
+      return { project: args.project, canonicalRoot: project.root,
+        journalSha256: digest(journal), stateSha256: digest(state),
+        journalBytes: journal.length, stateBytes: state.length,
+        ...markers(text), lastStartRunKey: observed.latestStartRunKey,
+        requestedRunKey: requestedKey ?? null,
+        exactRun: observed.exactRun,
+        stateReferencesRequestedRun: requestedKey !== undefined
+          ? state.toString("utf8").includes(requestedKey) : null,
+        note: "Record-shape evidence only. Does NOT prove owner/writer exclusivity, original completion or external effect correctness." };
     },
     async inspect_project_writer(args) {
       const project = await resolveProject(config, args?.project);
@@ -156,7 +182,8 @@ export function createRevenueService(config) {
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
       }
-      return { project: args.project, sidecarLockPresent: lockPresent, lockAgeSeconds: ageSeconds,
+      return { project: args.project, canonicalRoot: project.root, fixedRootVerified: true,
+        sidecarLockPresent: lockPresent, lockAgeSeconds: ageSeconds,
         externalWriterVerified: false, writerStatus: "UNKNOWN",
         note: "Absence of the sidecar lock does not prove that another worker is absent." };
     },
