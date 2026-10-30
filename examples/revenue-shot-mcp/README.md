@@ -88,6 +88,8 @@ node activate-readonly.mjs rollback
 
 The activation script never restarts services or edits scheduled tasks. It fails closed on an unexpected bridge/configuration, refuses to overwrite a different staging payload, and creates a byte-for-byte private configuration backup. It does not imply OpenAI will approve every call; native, correctly annotated tools are not a permission bypass. Do not silently enable `enableProjectChecks` or `enableCodingWrites` during this read-only rollout.
 
+The ledger status parser recognizes both legacy `RUN_START_V1` (used by NoFax and TrendPulse) and `RUN_START_V3`. The additive `runStartV1Markers`, `runStartV3Markers` and `escapedLiteralStartFragments` fields distinguish genuine whole-line starts from erroneous literal `\\nRUN_START_V1\\nRUN_KEY:` fragments. A malformed fragment is forensic evidence, **not** an additional genuine run or authorization to rewrite a journal. Exact RUN_KEY counts, current-state references, and independently verified effects remain decisive; global counts are not completion proof.
+
 ## v0.4 all-six native read migration
 
 Use `activate-native-v04.mjs stage` and `activate-native-v04.mjs activate` to move from the already-installed v0.3 directory to the separate `~/.codexify/revenue-shot-direct-v04/` sidecar, **without changing the single Codexify tunnel, project roots, or seven schedules**. This enables eight total *read-only* tools (the previous five plus journal and two worktree tools). It leaves all direct editing, test execution and journal-appending capabilities disabled. A byte-for-byte pre-v0.4 config backup is retained in the staged folder. Revert with `activate-native-v04.mjs rollback` if necessary, followed by a service restart at a verified idle boundary.

@@ -90,6 +90,27 @@ test("journal windows page backward with stable hashes and exact content", async
   }), /INVALID_JOURNAL_WINDOW/);
 });
 
+test("ledger counts authentic v1 and v3 starts, not escaped-literal fragments", async t => {
+  const { service, journal, snapshot } = await fixture(t, false);
+  const runKey = "nofax-20261030T201016+0100-usefulness-frontier";
+  await fs.appendFile(journal,
+    "\\nRUN_START_V1\\nRUN_KEY: " + runKey + "\\nSTATUS: STARTED\\n\n" +
+    "RUN_START_V1\nRUN_KEY: " + runKey + "\nSTATUS: STARTED\n" +
+    "### RUN_START_V3\nRUN_KEY: another-20261030-1234\nSTATUS: STARTED\n");
+  const before = await snapshot();
+  const exact = await service.get_run_ledger_status({project: "geo", run_key: runKey});
+  assert.equal(exact.runStartMarkers, 3);
+  assert.equal(exact.runStartV1Markers, 1);
+  assert.equal(exact.runStartV3Markers, 2);
+  assert.equal(exact.escapedLiteralStartFragments, 1);
+  assert.equal(exact.lastStartRunKey, "another-20261030-1234");
+  assert.deepEqual(exact.exactRun, {
+    runStarts: 1, terminals: 0, actionIntents: 0, actionResults: 0
+  });
+  assert.equal(exact.stateReferencesRequestedRun, false);
+  assert.deepEqual(await snapshot(), before);
+});
+
 test("long policy pages resume at complete-line boundaries without losing text", async t => {
   const { service, shot } = await fixture(t);
   const content = Array.from({ length: 100 },

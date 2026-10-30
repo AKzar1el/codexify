@@ -89,8 +89,13 @@ function validatedRecord(args) {
   return args.record;
 }
 function markers(text) {
+  const runStartV1Markers = (text.match(/^(?:#{1,4}[ \t]+)?RUN_START_V1(?:[ \t]|:|$)/gm) || []).length;
+  const runStartV3Markers = (text.match(/^(?:#{1,4}[ \t]+)?RUN_START_V3(?:[ \t]|:|$)/gm) || []).length;
   return {
-    runStartMarkers: (text.match(/(?:^|\n)RUN_START_V3(?:\s|:|$)/g) || []).length,
+    runStartMarkers: runStartV1Markers + runStartV3Markers,
+    runStartV1Markers,
+    runStartV3Markers,
+    escapedLiteralStartFragments: (text.match(/\\nRUN_START_V[13]\\nRUN_KEY:/g) || []).length,
     actionIntentMarkers: (text.match(/(?:^|\n)ACTION_INTENT_V3(?:\s|:|$)/g) || []).length,
     actionResultMarkers: (text.match(/(?:^|\n)ACTION_RESULT_V3(?:\s|:|$)/g) || []).length
   };
