@@ -17,7 +17,7 @@ Once the owner explicitly activates the updated MCP sidecar and enables its writ
 | TrendPulse | root | src/ | git diff --check |
 | Web Validator | root | src/ | git diff --check |
 
-The fixed branch names are revenue-shot/fleet-v1-PROJECT-REPOSITORY. Repositories and paths are configured by the operator, never supplied as arbitrary agent roots. Existing source files only; no unapproved new files. Local main is pinned by an exact SHA, and the canonical journal/state SHA are checked but not changed.
+The fixed branch names are revenue-shot/fleet-v1-PROJECT-REPOSITORY. The clean worktrees are stored in a dedicated Codexify maintenance folder outside all source checkouts, avoiding new untracked worktree folders in GSC or GodPrompt. Repositories and paths are configured by the operator, never supplied as arbitrary agent roots. Existing source files only; no unapproved new files. Local main is pinned by an exact SHA, and the canonical journal/state SHA are checked but not changed.
 
 Tools: plan_scoped_worktree (read), create_scoped_worktree (write), preflight_worktree_action (read), apply_scoped_worktree_edit (write), run_scoped_worktree_check (write). Each write tool is host-approved, source-hash guarded and uses a durable intent/result receipt. Ambiguous or interrupted operations fail closed without blind replay. Creating a worktree disables Git hooks and submodule traversal, never performs remote fetch/push or automatic cleaning.
 

@@ -48,6 +48,7 @@ export function prepare(server,config,currentHelper,fleetHelper,initHelper,fragm
  }
  policies.gsc.checkCommands={'source-diff':'git-diff-check'};
  c.scopedWorktreePolicies=policies;
+ c.fleetWorktreesRoot=path.join(home,'.codexify','maintenance','fleet-worktrees');
  let updated=one(server,
   'import { createScopedWorktreeActions } from "./scoped-worktree-actions.mjs";',
   'import { createScopedWorktreeActions } from "./fleet-scoped-worktree-actions.mjs";\n'+
@@ -69,7 +70,8 @@ export function prepare(server,config,currentHelper,fleetHelper,initHelper,fragm
     gscLauncherRetained:true,globalJournalWrites:c.enableWrites,
     globalCodingWrites:c.enableCodingWrites,
     globalProjectChecks:c.enableProjectChecks,
-    localBranchBase:'refs/heads/main',remoteActions:false}};
+    localBranchBase:'refs/heads/main',
+    worktreeStorage:'outside project repositories',remoteActions:false}};
 }
 async function create(file,bytes){
  let handle;try{handle=await fs.open(file,'wx',0o600);

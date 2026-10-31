@@ -35,6 +35,7 @@ async function fresh(project='geo',alias='root'){
  const state=sha(await fs.readFile(path.join(root,'.revenue-shot','CURRENT_STATE.md')));
  const receiptRoot=path.join(temp,'receipts');
  await fs.mkdir(receiptRoot,{recursive:true});
+ const fleetWorktreesRoot=path.join(temp,'fleet-worktrees');
  const config={
   projects:{[project]:root},
   coding:{[project]:{gitRoots:{[alias]:alias==='root'?'.':
@@ -45,7 +46,7 @@ async function fresh(project='geo',alias='root'){
     writeFiles:[],writePrefixes:['src/'],checks:['source-diff'],
     checkCommand:'git-diff-check'
   }},
-  worktreeActionRecordsRoot:receiptRoot
+  worktreeActionRecordsRoot:receiptRoot,fleetWorktreesRoot
  };
  const args={project,repository:alias,expected_main_sha:head,
    expected_journal_sha256:ledger,expected_state_sha256:state};
@@ -58,11 +59,13 @@ test('one clean disjoint worktree and durable receipts, never canonical edits',a
   const plan=await service.plan_scoped_worktree(f.args);
   assert.equal(plan.readOnly,true);
   assert.equal(await fs.stat(plan.newWorktree).then(()=>true).catch(()=>false),false);
+  const oldStatus=await cmd(f.repo,'status','--porcelain');
   const output=await service.create_scoped_worktree(f.args);
   assert.equal(output.status,'CREATED_AND_VERIFIED');
   assert.equal(output.head,f.head);
   assert.equal(await cmd(f.repo,'rev-parse','HEAD'),f.head);
   assert.equal((await fs.readFile(f.source,'utf8')),'export const answer = 1;\n');
+  assert.equal((await cmd(f.repo,'status','--porcelain')),oldStatus);
   const intent=path.join(f.receiptRoot,'geo','bootstrap-root','intent.json');
   const result=path.join(f.receiptRoot,'geo','bootstrap-root','result.json');
   assert.equal(JSON.parse(await fs.readFile(intent,'utf8')).remoteEffectsAllowed,false);

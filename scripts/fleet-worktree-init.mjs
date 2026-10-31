@@ -68,8 +68,16 @@ async function snapshot(config,args){
   if(hash(journal)!==args.expected_journal_sha256||
      hash(state)!==args.expected_state_sha256)
     deny('ACCOUNTING_PRECONDITION_CHANGED');
+  const storage=config.fleetWorktreesRoot;
+  if(typeof storage!=='string'||!path.isAbsolute(storage))
+    deny('FLEET_WORKTREE_STORAGE_NOT_CONFIGURED');
+  const relative=path.relative(ctx.repo,storage);
+  if(relative===''||
+     (relative!=='..'&&!relative.startsWith('..'+path.sep)&&
+      !path.isAbsolute(relative)))
+    deny('WORKTREE_STORAGE_INSIDE_CANONICAL_REPO');
   const suffix='fleet-v1-'+project+'-'+repository;
-  const folder=path.join(ctx.repo,'.revenue-shot','worktrees');
+  const folder=path.join(storage,project,repository);
   const target=path.join(folder,suffix);
   const branch='revenue-shot/'+suffix;
   if(await fs.stat(target).then(()=>true).catch(e=>
@@ -140,7 +148,12 @@ export function createFleetWorktreeInitializer(config){
           action:'local_git_worktree_add_only',remoteEffectsAllowed:false,
           utc:new Date().toISOString()};
         await verifiedCreate(intentFile,intent);
-        await fs.mkdir(ctx.folder,{recursive:true});
+        const storage=path.dirname(path.dirname(ctx.folder));
+        await safeDir(path.dirname(storage));
+        for(const folder of [storage,path.dirname(ctx.folder),ctx.folder]){
+          try{await fs.mkdir(folder);}catch(e){if(e.code!=='EEXIST')throw e;}
+          await safeDir(folder);
+        }
         await safeDir(ctx.folder);
         await git(ctx.repo,['worktree','add','-b',ctx.branch,ctx.target,ctx.baseline],
           {write:true});

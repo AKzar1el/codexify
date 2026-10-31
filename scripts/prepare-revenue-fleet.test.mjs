@@ -30,6 +30,7 @@ test('all six project keys enabled with project-specific aliases, source and tes
  assert.equal(c.enableCodingWrites,false);
  assert.equal(c.enableProjectChecks,false);
  assert.equal(c.enableCodingRead,true);
+ assert.equal(c.fleetWorktreesRoot,path.join(home,'.codexify','maintenance','fleet-worktrees'));
  for(const k of projects){
    const scope=c.scopedWorktreePolicies[k];
    assert.deepEqual(scope.writePrefixes,k==='godprompt'?['src/','bench/']:['src/']);

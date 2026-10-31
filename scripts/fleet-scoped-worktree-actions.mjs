@@ -89,14 +89,19 @@ async function worktree(config,args){
   const prefix=policy.branchPrefix;
   if(typeof prefix!=='string'||!prefix.startsWith('revenue-shot/')||!selected.branch.startsWith(prefix))
     stop('BRANCH_NOT_OPERATOR_ALLOWLISTED');
-  if(!within(gitRoot,selected.path)||normal(selected.path)===normal(gitRoot))
-    stop('CANONICAL_OR_OUT_OF_SCOPE_WORKTREE');
-  // Prevent using an arbitrary nested checkout. Only the explicitly dedicated
-  // worktrees directory underneath this Git root is eligible.
-  const worktrees=path.join(gitRoot,'.revenue-shot','worktrees');
-  if(!within(worktrees,selected.path)||normal(path.dirname(selected.path))!==normal(worktrees))
+  // Preserve access to previously registered internal GSC lanes, but use
+  // external maintenance storage for all NEW clean-slate fleet worktrees.
+  const legacy=path.join(gitRoot,'.revenue-shot','worktrees');
+  const externalRoot=config.fleetWorktreesRoot;
+  const external=typeof externalRoot==='string'&&path.isAbsolute(externalRoot)
+    ?path.join(externalRoot,project,repo):null;
+  const isLegacy=within(gitRoot,selected.path)&&within(legacy,selected.path)&&
+    normal(path.dirname(selected.path))===normal(legacy);
+  const isExternal=external!==null&&within(external,selected.path)&&
+    normal(path.dirname(selected.path))===normal(external);
+  if(normal(selected.path)===normal(gitRoot)||(!isLegacy&&!isExternal))
     stop('WORKTREE_NOT_IN_FIXED_LANE');
-  await safeDir(worktrees);await safeDir(selected.path);
+  await safeDir(isLegacy?legacy:external);await safeDir(selected.path);
   const head=await execGit(selected.path,['rev-parse','HEAD']);
   if(head!==selected.head||head!==args?.expected_head)
     stop('WORKTREE_HEAD_CHANGED');
