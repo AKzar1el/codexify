@@ -1,0 +1,37 @@
+  // GSC-only native worktree actions. Host approval must apply to write tools.
+  if (config.enableScopedWorktreeActions === true) {
+    const approved = ["gsc"].filter(name =>
+      Object.hasOwn(config.projects, name) &&
+      config.scopedWorktreePolicies?.[name]?.enabled === true);
+    if (approved.length > 0) {
+      const project = {type: "string", enum: approved};
+      const hash = {type: "string", pattern: "^[a-f0-9]{64}$"};
+      const base = {
+        project,
+        repository: {type: "string", enum: ["root"]},
+        worktree_id: {type: "string", pattern: "^[a-f0-9]{20}$"},
+        expected_head: {type: "string", pattern: "^[a-f0-9]{40}$"},
+        path: {type: "string", enum: ["scripts/glama-start.mjs"]},
+        expected_journal_sha256: hash,
+        expected_state_sha256: hash
+      };
+      const fields = ["project", "repository", "worktree_id", "expected_head",
+        "path", "expected_journal_sha256", "expected_state_sha256"];
+      const run = {type: "string", pattern: "^[A-Za-z0-9_.:+-]{8,160}$"};
+      list.push(tool("preflight_worktree_action",
+        "Read exact GSC isolated worktree, Git HEAD, source SHA and journal/state hashes. Does not authorize a write.",
+        base, fields, readOnly));
+      list.push(tool("apply_scoped_worktree_edit",
+        "HOST CONFIRMATION REQUIRED: One audited SHA-guarded change to an allowlisted file in a dedicated GSC worktree. No canonical checkout, Git push or release effects.",
+        {...base, run_key: run, expected_sha256: hash,
+          find: {type:"string", minLength:1, maxLength:8192},
+          replacement:{type:"string",maxLength:8192}},
+        [...fields, "run_key", "expected_sha256", "find", "replacement"],
+        {readOnlyHint:false, destructiveHint:true, idempotentHint:false, openWorldHint:false}));
+      list.push(tool("run_scoped_worktree_check",
+        "HOST CONFIRMATION REQUIRED: Run only the approved bounded GSC launcher test after an independently verified worktree edit.",
+        {...base, run_key:run, check_id:{type:"string",enum:["launcher"]}},
+        [...fields, "run_key","check_id"],
+        {readOnlyHint:false, destructiveHint:true, idempotentHint:false, openWorldHint:false}));
+    }
+  }
