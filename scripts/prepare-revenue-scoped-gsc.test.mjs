@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
-import {prepare,pathsFor} from './prepare-revenue-scoped-gsc.mjs';
+import {prepare,pathsFor,run} from './prepare-revenue-scoped-gsc.mjs';
 
 const home=process.env.USERPROFILE;
 const sha=v=>createHash('sha256').update(v).digest('hex');
@@ -36,6 +36,13 @@ test('new sidecar rejects changed baseline without writing anything',async()=>{
     /UNRECOGNIZED_PRODUCTION_BASELINE/);
   assert.throws(()=>prepare(v.server,v.config.replace('"enableWrites": false','"enableWrites": true'),
     v.helper,v.fragment,home),/UNRECOGNIZED_PRODUCTION_BASELINE/);
+});
+test('a noninteractive host cannot activate the canary or alter the live sidecar',async()=>{
+  const v=await source();
+  const before=await fs.readFile(v.files.server);
+  await assert.rejects(run(v.files,home,true),/OWNER_INTERACTIVE_APPROVAL_REQUIRED/);
+  assert.deepEqual(await fs.readFile(v.files.server),before);
+  assert.equal(await fs.stat(v.files.targetHelper).then(()=>true).catch(()=>false),false);
 });
 test('generated MCP server lists isolated write actions with truthful annotations',async()=>{
   const v=await source();
