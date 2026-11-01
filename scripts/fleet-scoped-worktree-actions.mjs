@@ -108,8 +108,13 @@ async function worktree(config,args){
     ?path.join(externalRoot,project,repo):null;
   const isLegacy=within(gitRoot,selected.path)&&within(legacy,selected.path)&&
     normal(path.dirname(selected.path))===normal(legacy);
+  const expectedLanes=['fleet-v1-','fleet-v3-'].map(prefix=>
+    prefix+project+'-'+repo);
   const isExternal=external!==null&&within(external,selected.path)&&
-    normal(path.dirname(selected.path))===normal(external);
+    normal(path.dirname(selected.path))===normal(external)&&
+    expectedLanes.some(suffix=>
+      normal(selected.path)===normal(path.join(external,suffix))&&
+      selected.branch==='revenue-shot/'+suffix);
   if(normal(selected.path)===normal(gitRoot)||(!isLegacy&&!isExternal))
     stop('WORKTREE_NOT_IN_FIXED_LANE');
   await safeDir(isLegacy?legacy:external);await safeDir(selected.path);

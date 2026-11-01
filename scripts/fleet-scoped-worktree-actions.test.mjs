@@ -80,6 +80,109 @@ test('one clean disjoint worktree and durable receipts, never canonical edits',a
     /CLEAN_SLATE_WORKTREE_ALREADY_EXISTS/);
  }finally{await fs.rm(f.temp,{recursive:true,force:true})}
 });
+test('fresh remote-main v3 lane retains canonical main and previously edited v1 lane',async()=>{
+ const f=await fresh('nofax');
+ try{
+  const init=createFleetWorktreeInitializer(f.config);
+  const old=await init.create_scoped_worktree(f.args);
+  const oldSource=path.join(old.worktree,'src','source.ts');
+  await fs.writeFile(oldSource,'export const answer = 9;\n');
+  await cmd(f.repo,'checkout','-b','fixture-new-remote-main');
+  await fs.writeFile(f.source,'export const answer = 2;\n');
+  await cmd(f.repo,'add','src/source.ts');
+  await cmd(f.repo,'-c','user.name=Fixture','-c','user.email=fixture@example.test',
+    'commit','-m','remote main advances');
+  const upstream=await cmd(f.repo,'rev-parse','HEAD');
+  await cmd(f.repo,'update-ref','refs/remotes/origin/main',upstream);
+  await cmd(f.repo,'checkout','main');
+  assert.equal(await cmd(f.repo,'rev-parse','refs/heads/main'),f.head);
+  const params={...f.args,baseline_mode:'remote-main',
+    expected_main_sha:upstream,expected_local_main_sha:f.head};
+  const plan=await init.plan_scoped_worktree(params);
+  assert.equal(plan.baselineMode,'remote-main');
+  assert.equal(plan.localBaseSha,upstream);
+  assert.equal(plan.canonicalMainSha,f.head);
+  assert.equal(plan.branch,'revenue-shot/fleet-v3-nofax-root');
+  assert.equal(await fs.stat(plan.newWorktree).then(()=>true).catch(()=>false),false);
+  const created=await init.create_scoped_worktree(params);
+  assert.equal(created.status,'CREATED_AND_VERIFIED');
+  assert.equal(created.head,upstream);
+  assert.equal(await fs.readFile(oldSource,'utf8'),'export const answer = 9;\n');
+  assert.equal((await fs.readFile(f.source,'utf8')).replace(/\r\n/g,'\n'),
+    'export const answer = 1;\n');
+  assert.equal((await fs.readFile(path.join(created.worktree,'src/source.ts'),'utf8')).replace(/\r\n/g,'\n'),
+    'export const answer = 2;\n');
+  assert.equal(await cmd(f.repo,'rev-parse','refs/heads/main'),f.head);
+  const id=sha(Buffer.from(path.resolve(created.worktree).toLowerCase())).slice(0,20);
+  const scoped=createScopedWorktreeActions(f.config);
+  const scope={project:'nofax',repository:'root',worktree_id:id,
+    expected_head:upstream,path:'src/source.ts',
+    expected_journal_sha256:f.ledger,expected_state_sha256:f.state};
+  const pre=await scoped.preflight_worktree_action(scope);
+  const edit=await scoped.apply_scoped_worktree_edit({...scope,
+    run_key:'remote-main-fixture-v3-001',expected_sha256:pre.sha256,
+    find:'answer = 2',replacement:'answer = 3'});
+  assert.equal(edit.status,'WORKTREE_EDIT_VERIFIED');
+  const diff=await scoped.run_scoped_worktree_check({...scope,
+    run_key:'remote-main-fixture-v3-001',check_id:'source-diff'});
+  const unit=await scoped.run_scoped_worktree_check({...scope,
+    run_key:'remote-main-fixture-v3-001',check_id:'project-unit'});
+  assert.equal(diff.status,'CHECK_PASSED',JSON.stringify(diff));
+  assert.equal(unit.status,'CHECK_PASSED',JSON.stringify(unit));
+  f.config.coding.nofax.readPrefixes=['src/'];
+  const readerRoot=path.join(f.temp,'reader-v3');
+  await fs.mkdir(readerRoot);
+  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify',
+    'revenue-shot-direct-v041','ledger.mjs'),path.join(readerRoot,'ledger.mjs'));
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
+    path.join(readerRoot,'coding.mjs'));
+  const {createCodingService}=await import(pathToFileURL(
+    path.join(readerRoot,'coding.mjs')).href);
+  const reader=createCodingService(f.config);
+  const entries=await reader.inspect_project_worktrees({project:'nofax',repository:'root'});
+  assert.equal(entries.worktrees.find(item=>item.id===id).readable,true);
+  const readback=await reader.read_project_worktree_file({
+    project:'nofax',repository:'root',worktree_id:id,
+    path:'src/source.ts',offset:0,limit:12
+  });
+  assert.match(readback.content,/answer = 3/);
+  assert.equal(readback.worktree_id,id);
+  assert.equal(await fs.readFile(oldSource,'utf8'),'export const answer = 9;\n');
+  assert.equal((await fs.readFile(f.source,'utf8')).replace(/\r\n/g,'\n'),
+    'export const answer = 1;\n');
+  assert.equal((await fs.stat(path.join(f.receiptRoot,'nofax',
+    'bootstrap-root-remote-v3','result.json'))).isFile(),true);
+ }finally{await fs.rm(f.temp,{recursive:true,force:true})}
+});
+test('fresh remote-main v3 refuses non-FF remote, wrong local SHA and stale remote SHA',async()=>{
+ const f=await fresh('geo');
+ try{
+  const service=createFleetWorktreeInitializer(f.config);
+  const args={...f.args,baseline_mode:'remote-main',
+    expected_local_main_sha:f.head};
+  await assert.rejects(service.plan_scoped_worktree(args),
+    /REMOTE_MAIN_REF_NOT_FETCHED|Command failed/);
+  await cmd(f.repo,'update-ref','refs/remotes/origin/main',f.head);
+  await assert.rejects(service.plan_scoped_worktree({
+    ...args,expected_main_sha:'0'.repeat(40)
+  }),/BASELINE_SHA_MISMATCH/);
+  await assert.rejects(service.plan_scoped_worktree({
+    ...args,expected_main_sha:f.head,expected_local_main_sha:'0'.repeat(40)
+  }),/CANONICAL_MAIN_PRECONDITION_CHANGED/);
+  await cmd(f.repo,'checkout','--orphan','independent-remote');
+  await cmd(f.repo,'rm','-rf','.');
+  await fs.writeFile(path.join(f.repo,'standalone.txt'),'unrelated\n');
+  await cmd(f.repo,'add','standalone.txt');
+  await cmd(f.repo,'-c','user.name=Fixture','-c','user.email=fixture@example.test',
+    'commit','-m','unrelated remote');
+  const other=await cmd(f.repo,'rev-parse','HEAD');
+  await cmd(f.repo,'update-ref','refs/remotes/origin/main',other);
+  await cmd(f.repo,'checkout','main');
+  await assert.rejects(service.plan_scoped_worktree({
+    ...args,expected_main_sha:other
+  }),/REMOTE_MAIN_NOT_FAST_FORWARD/);
+ }finally{await fs.rm(f.temp,{recursive:true,force:true})}
+});
 test('edited source in new lane passes only operator-allowlisted source-diff check',async()=>{
  const f=await fresh();
  try{

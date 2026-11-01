@@ -174,7 +174,7 @@ function containedIn(root, value) {
   return relative === "" || (relative !== ".."
     && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative));
 }
-function externalFleetLane(config, project, alias) {
+function externalFleetLanes(config, project, alias) {
   const scope = config.scopedWorktreePolicies?.[project];
   const storage = config.fleetWorktreesRoot;
   if (config.enableScopedWorktreeActions !== true || scope?.enabled !== true
@@ -183,25 +183,29 @@ function externalFleetLane(config, project, alias) {
       || typeof storage !== "string" || !path.isAbsolute(storage)
       || !/^[a-z][a-z0-9_-]*$/.test(project)
       || !/^[a-z][a-z0-9_-]*$/.test(alias)) return null;
-  return {
-    path: path.join(storage, project, alias, `fleet-v1-${project}-${alias}`),
-    branch: `refs/heads/revenue-shot/fleet-v1-${project}-${alias}`,
-    storage, project, alias
-  };
+  return ["v1","v3"].map(version => ({
+    path: path.join(storage, project, alias, `fleet-${version}-${project}-${alias}`),
+    branch: `refs/heads/revenue-shot/fleet-${version}-${project}-${alias}`,
+    storage, project, alias, version
+  }));
 }
 function approvedWorktreeLocation(config, project, alias, fixedRoot, entry) {
   if (entry.prunable || entry.locked) return null;
   if (containedIn(fixedRoot, entry.path)) return "legacy";
-  const lane = externalFleetLane(config, project, alias);
-  if (lane && comparePath(entry.path, lane.path) && entry.branch === lane.branch
-      && !containedIn(fixedRoot, lane.storage)) return "fleet";
+  const lanes = externalFleetLanes(config, project, alias) ?? [];
+  if (lanes.some(lane => comparePath(entry.path, lane.path)
+      && entry.branch === lane.branch && !containedIn(fixedRoot, lane.storage)))
+    return "fleet";
   return null;
 }
 async function safeWorktreeRoot(config, project, alias, fixedRoot, entry) {
   const kind = approvedWorktreeLocation(config, project, alias, fixedRoot, entry);
   if (!kind) deny("WORKTREE_OUTSIDE_FIXED_ROOT_OR_PRUNABLE");
   if (kind === "fleet") {
-    const lane = externalFleetLane(config, project, alias);
+    const lane = (externalFleetLanes(config, project, alias) ?? [])
+      .find(candidate => comparePath(entry.path, candidate.path)
+        && entry.branch === candidate.branch);
+    if (!lane) deny("WORKTREE_LANE_CHANGED");
     for (const dir of [lane.storage, path.dirname(path.dirname(lane.path)),
       path.dirname(lane.path)]) {
       const stat = await fs.lstat(dir);

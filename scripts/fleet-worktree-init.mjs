@@ -58,9 +58,23 @@ async function snapshot(config,args){
   await safeDir(ctx.root);await safeDir(ctx.repo);
   const top=await git(ctx.repo,['rev-parse','--show-toplevel']);
   if(norm(top)!==norm(ctx.repo))deny('REPOSITORY_TOP_LEVEL_CHANGED');
-  const baseline=await git(ctx.repo,['rev-parse','--verify','refs/heads/main']);
-  if(!/^[a-f0-9]{40}$/.test(baseline)||baseline!==args?.expected_main_sha)
-    deny('BASELINE_SHA_MISMATCH');
+  const localMain=await git(ctx.repo,['rev-parse','--verify','refs/heads/main']);
+  if(!/^[a-f0-9]{40}$/.test(localMain))deny('LOCAL_MAIN_SHA_INVALID');
+  const mode=args?.baseline_mode??'local-main';
+  if(!['local-main','remote-main'].includes(mode))deny('BASELINE_MODE_NOT_APPROVED');
+  let baseline=localMain;
+  if(mode==='remote-main'){
+    if(!/^[a-f0-9]{40}$/.test(args?.expected_local_main_sha??'')||
+       args.expected_local_main_sha!==localMain)
+      deny('CANONICAL_MAIN_PRECONDITION_CHANGED');
+    baseline=await git(ctx.repo,['rev-parse','--verify','refs/remotes/origin/main']);
+    if(!/^[a-f0-9]{40}$/.test(baseline))
+      deny('REMOTE_MAIN_REF_NOT_FETCHED');
+    try{
+      await git(ctx.repo,['merge-base','--is-ancestor',localMain,baseline]);
+    }catch{deny('REMOTE_MAIN_NOT_FAST_FORWARD');}
+  }
+  if(baseline!==args?.expected_main_sha)deny('BASELINE_SHA_MISMATCH');
   if(!SHA.test(args?.expected_journal_sha256||'')||
      !SHA.test(args?.expected_state_sha256||''))deny('INVALID_ACCOUNTING_DIGEST');
   const journal=await safeFile(path.join(ctx.root,'.revenue-shot','RUN_JOURNAL.md'));
@@ -76,7 +90,9 @@ async function snapshot(config,args){
      (relative!=='..'&&!relative.startsWith('..'+path.sep)&&
       !path.isAbsolute(relative)))
     deny('WORKTREE_STORAGE_INSIDE_CANONICAL_REPO');
-  const suffix='fleet-v1-'+project+'-'+repository;
+  // Keep the historical v1 worktree and its pending changes untouched.
+  // Remote-main mode creates one separate fixed v3 lane with pinned origin/main.
+  const suffix=(mode==='remote-main'?'fleet-v3-':'fleet-v1-')+project+'-'+repository;
   const folder=path.join(storage,project,repository);
   const target=path.join(folder,suffix);
   const branch='revenue-shot/'+suffix;
@@ -87,7 +103,7 @@ async function snapshot(config,args){
   try{await git(ctx.repo,['show-ref','--verify','--quiet','refs/heads/'+branch]);branchExists=true;}
   catch(e){if(e.code!==1)throw e;}
   if(branchExists)deny('CLEAN_SLATE_BRANCH_ALREADY_EXISTS');
-  return {project,repository,...ctx,baseline,branch,folder,target,
+  return {project,repository,...ctx,baseline,localMain,mode,branch,folder,target,
     journalSha256:hash(journal),stateSha256:hash(state)};
 }
 async function verifiedCreate(file,value){
@@ -99,11 +115,13 @@ async function verifiedCreate(file,value){
 function receiptBase(config,ctx){
   const root=config.worktreeActionRecordsRoot;
   if(typeof root!=='string'||!path.isAbsolute(root))deny('RECEIPT_ROOT_UNSET');
-  return path.join(root,ctx.project,'bootstrap-'+ctx.repository);
+  return path.join(root,ctx.project,'bootstrap-'+ctx.repository+
+    (ctx.mode==='remote-main'?'-remote-v3':''));
 }
 function fingerprint(ctx){
   return hash(Buffer.from(JSON.stringify({
     project:ctx.project,repository:ctx.repository,head:ctx.baseline,
+    localMain:ctx.localMain,mode:ctx.mode,
     branch:ctx.branch,source:ctx.target,journal:ctx.journalSha256,
     state:ctx.stateSha256
   })));
@@ -122,6 +140,7 @@ export function createFleetWorktreeInitializer(config){
       const ctx=await snapshot(config,args);
       return {project:ctx.project,repository:ctx.repository,branch:ctx.branch,
         newWorktree:ctx.target,localBaseSha:ctx.baseline,
+        baselineMode:ctx.mode,canonicalMainSha:ctx.localMain,
         journalSha256:ctx.journalSha256,stateSha256:ctx.stateSha256,
         requiresHostWriteApproval:true,readOnly:true};
     },
@@ -143,7 +162,8 @@ export function createFleetWorktreeInitializer(config){
         const fp=fingerprint(ctx);
         const intent={schema:'FLEET_SCOPED_BOOTSTRAP_V1',project:ctx.project,
           repository:ctx.repository,branch:ctx.branch,target:ctx.target,
-          baseline:ctx.baseline,journalSha256:ctx.journalSha256,
+          baseline:ctx.baseline,baselineMode:ctx.mode,canonicalMain:ctx.localMain,
+          journalSha256:ctx.journalSha256,
           stateSha256:ctx.stateSha256,fingerprint:fp,
           action:'local_git_worktree_add_only',remoteEffectsAllowed:false,
           utc:new Date().toISOString()};
