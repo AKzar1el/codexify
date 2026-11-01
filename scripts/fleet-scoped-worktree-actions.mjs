@@ -13,6 +13,17 @@ const exec=promisify(execFile);
 const KEY=/^[A-Za-z0-9_.:+-]{8,160}$/;
 const SHA=/^[a-f0-9]{64}$/;
 const sha=b=>createHash('sha256').update(b).digest('hex');
+// Fixed local unit-test commands. No agent-supplied executable, arguments,
+// environment, network destination, or working directory is accepted.
+const PROJECT_UNIT_PLANS=Object.freeze({
+  'geo/root':{runtime:'node',cwd:'.',args:['--import','tsx','--test','tests/matching.test.ts']},
+  'godprompt/primary':{runtime:'python',cwd:'bench',args:['-m','pytest','-q','-p','no:cacheprovider','tests/test_policy.py']},
+  'godprompt/companion':{runtime:'node',cwd:'.',args:['--test','tests/normalize-mcpb.test.mjs']},
+  'gsc/root':{runtime:'node',cwd:'.',args:['--test','tests/launcher.test.mjs']},
+  'nofax/root':{runtime:'node',cwd:'.',args:['--test','test/mcp-tools.test.mjs']},
+  'trendpulse/root':{runtime:'python',cwd:'.',args:['-m','pytest','-q','-p','no:cacheprovider','-m','not integration and not network and not browser','tests/test_article_url_validation.py']},
+  'webvalidator/root':{runtime:'node',cwd:'.',args:['--test','test/report.test.js']}
+});
 const normal=p=>process.platform==='win32'?path.resolve(p).toLowerCase():path.resolve(p);
 function stop(code){const e=new Error(code);e.code=code;throw e;}
 function within(parent,child){const relative=path.relative(parent,child);return relative && relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);}
@@ -124,9 +135,41 @@ async function worktree(config,args){
   const state=await safeFile(path.join(root,'.revenue-shot','CURRENT_STATE.md'),16*1024*1024);
   if(sha(journal)!==args?.expected_journal_sha256||sha(state)!==args?.expected_state_sha256)
     stop('CANONICAL_ACCOUNTING_CHANGED');
-  return {project,policy,root,gitRoot,worktree:selected.path,worktreeId:targetId,
+  return {project,repository:repo,policy,root,gitRoot,worktree:selected.path,worktreeId:targetId,
     head,file,filePath,source:bytes,sourceSha256:sha(bytes),
     journalSha256:sha(journal),stateSha256:sha(state)};
+}
+async function projectUnitCheck(ctx) {
+  const plan=PROJECT_UNIT_PLANS[ctx.project+'/'+ctx.repository];
+  if(!plan)stop('PROJECT_UNIT_SUITE_NOT_CONFIGURED');
+  const cwd=plan.cwd==='.'?ctx.worktree:path.join(ctx.worktree,plan.cwd);
+  await safeDir(cwd);
+  const executable=plan.runtime==='node'?process.execPath:'python';
+  const env={
+    PATH:process.env.PATH||'',Path:process.env.Path||process.env.PATH||'',
+    PATHEXT:process.env.PATHEXT||'',SYSTEMROOT:process.env.SYSTEMROOT||'',
+    SystemRoot:process.env.SystemRoot||process.env.SYSTEMROOT||'',
+    USERPROFILE:process.env.USERPROFILE||os.homedir(),HOME:process.env.HOME||os.homedir(),
+    TEMP:process.env.TEMP||os.tmpdir(),TMP:process.env.TMP||os.tmpdir(),
+    CI:'1',NO_COLOR:'1',PYTHONDONTWRITEBYTECODE:'1',PYTHONNOUSERSITE:'1',
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD:'1',GIT_TERMINAL_PROMPT:'0',
+    npm_config_offline:'true',npm_config_ignore_scripts:'true'
+  };
+  if(ctx.project==='trendpulse')env.PYTHONPATH=path.join(ctx.worktree,'src');
+  if(ctx.project==='godprompt'&&ctx.repository==='primary')
+    env.PYTHONPATH=cwd;
+  try {
+    const {stdout,stderr}=await exec(executable,plan.args,{
+      cwd,windowsHide:true,timeout:45000,maxBuffer:128*1024,env
+    });
+    return {passed:true,suite:ctx.project+'/'+ctx.repository,
+      commandId:'fixed-project-unit',output:(stdout+stderr).slice(-2400)};
+  }catch(e){
+    return {passed:false,suite:ctx.project+'/'+ctx.repository,
+      commandId:'fixed-project-unit',
+      error:String(e.message).slice(0,350),
+      output:String((e.stdout??'')+(e.stderr??'')).slice(-2400)};
+  }
 }
 async function rootForRecords(config){
   const root=config.worktreeActionRecordsRoot;
@@ -191,6 +234,32 @@ export function createScopedWorktreeActions(config) {
         journalSha256:ctx.journalSha256,stateSha256:ctx.stateSha256,
         projectRootUnchanged:true,readOnly:true,
         note:'Read-only evidence, not owner exclusivity or permission to edit.'};
+    },
+    async read_scoped_worktree_source(args) {
+      const ctx=await worktree(config,args);
+      if(!SHA.test(args?.expected_sha256??'')||
+         args.expected_sha256!==ctx.sourceSha256)stop('SOURCE_PRECONDITION_CHANGED');
+      const offset=args.offset??0,limit=args.limit??80;
+      if(!Number.isInteger(offset)||offset<0||offset>1000000||
+         !Number.isInteger(limit)||limit<1||limit>180)stop('INVALID_READ_WINDOW');
+      if(ctx.source.includes(0))stop('BINARY_SOURCE_NOT_ALLOWED');
+      let contents;
+      try{contents=new TextDecoder('utf-8',{fatal:true}).decode(ctx.source);}
+      catch{stop('NON_UTF8_SOURCE_NOT_ALLOWED');}
+      const lines=contents.split(/\r?\n/),selected=[];
+      let bytes=0;
+      for(let i=offset;i<Math.min(lines.length,offset+limit);i++){
+        const next=Buffer.byteLength(lines[i],'utf8')+(selected.length?1:0);
+        if(next>12000&&selected.length===0)stop('SOURCE_LINE_TOO_LARGE');
+        if(bytes+next>12000)break;
+        selected.push(lines[i]);bytes+=next;
+      }
+      return {project:ctx.project,repository:ctx.repository,
+        worktree_id:ctx.worktreeId,head:ctx.head,path:ctx.file,
+        sha256:ctx.sourceSha256,sourceBytes:ctx.source.length,
+        offset,lines:lines.length,returnedLines:selected.length,
+        nextOffset:offset+selected.length,truncated:offset+selected.length<lines.length,
+        content:selected.join('\n'),readOnly:true};
     },
     async apply_scoped_worktree_edit(args){
       if(!KEY.test(args?.run_key??''))stop('INVALID_RUN_KEY');
@@ -262,7 +331,16 @@ export function createScopedWorktreeActions(config) {
       if(done.status!=='WORKTREE_EDIT_VERIFIED'||done.project!==ctx.project||
          done.newSha256!==ctx.sourceSha256||done.run_key!==args.run_key)
         stop('MISSING_VERIFIED_EDIT_FOR_CHECK');
-      const checkFile=path.join(runDir,'check.json');
+      const checkFile=path.join(runDir,'check-'+args.check_id+'.json');
+      const legacy=path.join(runDir,'check.json');
+      // Preserve/reuse old single-check receipts without overwriting them.
+      try {
+        const old=await readJson(legacy);
+        if(old.check_id===args.check_id){
+          if(old.sourceSha256!==ctx.sourceSha256)stop('LEGACY_CHECK_RECEIPT_DRIFT');
+          return {...old,reused:true};
+        }
+      }catch(e){if(e.code!=='ENOENT')throw e;}
       try{
         const result=await readJson(checkFile);
         if(result.sourceSha256!==ctx.sourceSha256||result.check_id!==args.check_id)
@@ -296,6 +374,9 @@ export function createScopedWorktreeActions(config) {
             outcome={passed:stdout.includes('# fail 0')&&stdout.includes('# pass 5'),
               output:(stdout+stderr).slice(-2000)};
           }catch(e){outcome={passed:false,error:String(e.message).slice(0,300)};}
+        }else if(args.check_id==='project-unit'&&
+                 ctx.policy.checks.includes('project-unit')){
+          outcome=await projectUnitCheck(ctx);
         }else stop('UNSUPPORTED_CHECK');
         const after=await worktree(config,args);
         if(after.sourceSha256!==ctx.sourceSha256||after.head!==ctx.head)

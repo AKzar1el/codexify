@@ -7,6 +7,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {createFleetWorktreeInitializer} from './fleet-worktree-init.mjs';
 import {createScopedWorktreeActions} from './fleet-scoped-worktree-actions.mjs';
+import {pathToFileURL} from 'node:url';
 
 const run=promisify(execFile);
 const sha=b=>createHash('sha256').update(b).digest('hex');
@@ -20,6 +21,11 @@ async function fresh(project='geo',alias='root'){
  const repo=alias==='companion'?path.join(root,'god-prompt-mcp'):
    alias==='primary'?path.join(root,'god-prompt'):root;
  await fs.mkdir(path.join(repo,'src'),{recursive:true});
+ if(project==='nofax'){
+   await fs.mkdir(path.join(repo,'test'),{recursive:true});
+   await fs.writeFile(path.join(repo,'test','mcp-tools.test.mjs'),
+     "import test from 'node:test'; import assert from 'node:assert/strict'; test('fixed suite',()=>assert.equal(2,1+1));\n");
+ }
  await fs.mkdir(path.join(root,'.revenue-shot'),{recursive:true});
  const source=path.join(repo,'src','source.ts');
  await fs.writeFile(source,'export const answer = 1;\n','utf8');
@@ -27,7 +33,7 @@ async function fresh(project='geo',alias='root'){
  await fs.writeFile(path.join(root,'.revenue-shot','CURRENT_STATE.md'),'STATUS: old-completed\n','utf8');
  await cmd(repo,'init','-b','main');
  await cmd(repo,'-c','user.name=Fixture','-c','user.email=fixture@example.test',
-   'add','src/source.ts');
+   'add','.');
  await cmd(repo,'-c','user.name=Fixture','-c','user.email=fixture@example.test',
    'commit','-m','fixture');
  const head=await cmd(repo,'rev-parse','HEAD');
@@ -40,10 +46,10 @@ async function fresh(project='geo',alias='root'){
   projects:{[project]:root},
   coding:{[project]:{gitRoots:{[alias]:alias==='root'?'.':
     alias==='primary'?'god-prompt':'god-prompt-mcp'}}},
-  enableScopedWorktreeActions:true,
+  enableScopedWorktreeActions:true,enableCodingRead:true,
   scopedWorktreePolicies:{[project]:{
     enabled:true,allowedRepositories:[alias],branchPrefix:'revenue-shot/',
-    writeFiles:[],writePrefixes:['src/'],checks:['source-diff'],
+    writeFiles:[],writePrefixes:['src/'],checks:['source-diff','project-unit'],
     checkCommand:'git-diff-check'
   }},
   worktreeActionRecordsRoot:receiptRoot,fleetWorktreesRoot
@@ -99,6 +105,77 @@ test('edited source in new lane passes only operator-allowlisted source-diff che
     'export const answer = 2;\n');
   await assert.rejects(edit.preflight_worktree_action({...params,path:'../escape'}),
     /DISALLOWED_FILE_COMPONENT/);
+ }finally{await fs.rm(f.temp,{recursive:true,force:true})}
+});
+test('scoped readers inspect only the exact registered external lane with source SHA',async()=>{
+ const f=await fresh('gsc');
+ try{
+  f.config.coding.gsc.readPrefixes=['src/'];
+  const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
+  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const tempModule=path.join(f.temp,'module');
+  await fs.mkdir(tempModule);
+  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify','revenue-shot-direct-v041','ledger.mjs'),
+    path.join(tempModule,'ledger.mjs'));
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
+    path.join(tempModule,'coding.mjs'));
+  const {createCodingService}=await import(pathToFileURL(path.join(tempModule,'coding.mjs')).href);
+  const original=createCodingService(f.config);
+  const listing=await original.inspect_project_worktrees({project:'gsc',repository:'root'});
+  assert.equal(listing.worktrees.find(x=>x.id===id).readable,true);
+  const result=await original.read_project_worktree_file({
+    project:'gsc',repository:'root',worktree_id:id,
+    path:'src/source.ts',offset:0,limit:12
+  });
+  assert.match(result.content,/answer = 1/);
+  assert.equal(result.worktree_id,id);
+  await assert.rejects(original.read_project_worktree_file({
+    project:'gsc',repository:'root',worktree_id:id,path:'../secret'
+  }),/DISALLOWED_PATH_COMPONENT/);
+  await assert.rejects(original.read_project_worktree_file({
+    project:'gsc',repository:'root',worktree_id:id,path:'nonallowlisted/private.txt'
+  }),/FILE_NOT_ALLOWLISTED/);
+  const scoped=createScopedWorktreeActions(f.config);
+  const params={project:'gsc',repository:'root',worktree_id:id,
+    expected_head:lane.head,path:'src/source.ts',
+    expected_journal_sha256:f.ledger,expected_state_sha256:f.state};
+  const pre=await scoped.preflight_worktree_action(params);
+  const window=await scoped.read_scoped_worktree_source({
+    ...params,expected_sha256:pre.sha256,offset:0,limit:20
+  });
+  assert.match(window.content,/answer = 1/);
+  assert.equal(window.readOnly,true);
+  await assert.rejects(scoped.read_scoped_worktree_source({
+    ...params,expected_sha256:'0'.repeat(64)
+  }),/SOURCE_PRECONDITION_CHANGED/);
+ }finally{await fs.rm(f.temp,{recursive:true,force:true})}
+});
+test('project-specific NoFax unit suite and git diff both record separate immutable checks',async()=>{
+ const f=await fresh('nofax');
+ try{
+  const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
+  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const scoped=createScopedWorktreeActions(f.config);
+  const params={project:'nofax',repository:'root',worktree_id:id,
+    expected_head:lane.head,path:'src/source.ts',
+    expected_journal_sha256:f.ledger,expected_state_sha256:f.state,
+    run_key:'fleet-test-nofax-unit-002'};
+  const pre=await scoped.preflight_worktree_action(params);
+  const changed=await scoped.apply_scoped_worktree_edit({
+    ...params,expected_sha256:pre.sha256,
+    find:'answer = 1',replacement:'answer = 2'
+  });
+  assert.equal(changed.status,'WORKTREE_EDIT_VERIFIED');
+  const diff=await scoped.run_scoped_worktree_check({...params,check_id:'source-diff'});
+  assert.equal(diff.status,'CHECK_PASSED',JSON.stringify(diff));
+  const unit=await scoped.run_scoped_worktree_check({...params,check_id:'project-unit'});
+  assert.equal(unit.status,'CHECK_PASSED',JSON.stringify(unit));
+  assert.match(unit.output,/pass/i);
+  assert.equal((await scoped.run_scoped_worktree_check({...params,check_id:'project-unit'})).reused,true);
+  const receiptDir=path.join(f.receiptRoot,'nofax',id,
+    sha(Buffer.from(params.run_key)).slice(0,32));
+  assert.equal(JSON.parse(await fs.readFile(path.join(receiptDir,'check-project-unit.json'),'utf8')).status,'CHECK_PASSED');
+  assert.equal(JSON.parse(await fs.readFile(path.join(receiptDir,'check-source-diff.json'),'utf8')).status,'CHECK_PASSED');
  }finally{await fs.rm(f.temp,{recursive:true,force:true})}
 });
 test('all six scopes use fixed roots and cannot replace source or historical state',async()=>{
