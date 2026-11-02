@@ -10,8 +10,9 @@ Fixed output root for owner-approved activation:
 C:\Users\Tomi\.codexify\revenue-shot-research
 
 Files:
-- tasks.txt: generated, human-readable review queue; proposal only
+- tasks.txt: generated, human-readable aggregate review queue; proposal only
 - tasks.json: durable canonical queue state, identity and original evidence
+- godprompt/tasks.txt, gsc/tasks.txt, geo/tasks.txt, webvalidator/tasks.txt, trendpulse/tasks.txt, nofax/tasks.txt: generated project-specific read-only views; same canonical JSON, never independent writers
 - .tasks.lock: temporary exclusive writer lock; never auto-break if stale
 
 The root must exist before enabling the tool, be configured privately, and be outside every project checkout.
