@@ -120,7 +120,7 @@ function render(state){
     ''
   ];
   for(const item of active){
-    out.push('['+(item.status==='APPROVED'?'x':' ')+'] ['+item.priority+'] ['+
+    out.push('['+(item.status==='APPROVED'?'>':' ')+'] ['+item.priority+'] ['+
       item.project.toUpperCase()+'] '+item.id+' - '+item.title);
     out.push('Status: '+item.status+' | Confidence: '+item.confidence+
       ' | First seen: '+item.created.slice(0,10));
@@ -159,6 +159,34 @@ function validate(config,input){
     validation:clean(input.validation,600,'VALIDATION'),
     evidence,priority,confidence,run_key:input.run_key
   };
+}
+// Owner review is a programmatic local capability only; it is deliberately NOT
+// exposed as an MCP tool to unattended Revenue Shot workers.
+export async function ownerReviewResearchTask(config,args){
+  const id=args?.id,status=args?.status;
+  if(typeof id!=='string'||!/^[a-f0-9]{12}$/.test(id))deny('INVALID_TASK_ID');
+  if(!new Set(['APPROVED','DEFERRED','DONE','REJECTED']).has(status))
+    deny('INVALID_REVIEW_STATUS');
+  const expected=args?.expected_state_sha256;
+  if(typeof expected!=='string'||!/^[a-f0-9]{64}$/.test(expected))
+    deny('OWNER_REVIEW_CAS_REQUIRED');
+  const root=await fixedRoot(config);
+  return withLock(root,async()=>{
+    const previous=await fileBytes(root,'tasks.json');
+    if(!previous||sha(previous)!==expected)deny('OWNER_REVIEW_STATE_CHANGED');
+    const state=await current(root);
+    const item=state.items.find(i=>i.id===id);
+    if(!item)deny('REVIEW_TASK_NOT_FOUND');
+    if(item.status===status)return {id,status,reused:true};
+    if(['DONE','REJECTED'].includes(item.status))deny('REVIEW_FINAL_STATUS_IMMUTABLE');
+    const next={version:VERSION,items:state.items.map(i=>i.id===id?
+      {...i,status,reviewed:new Date().toISOString()}:i)};
+    const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
+    const txt=Buffer.from(render(next),'utf8');
+    await atomic(root,'tasks.json',json);
+    await atomic(root,'tasks.txt',txt);
+    return {id,status,reviewed:true,stateSha256:sha(json),tasksSha256:sha(txt)};
+  });
 }
 export function createResearchInbox(config){
   return {
