@@ -75,9 +75,49 @@ test('same issue key cannot create a duplicate or rewrite existing tasks',async(
     await f.api.propose_research_task(f.task);
     const before=await fs.readFile(path.join(f.inbox,'tasks.txt'));
     const duplicate=await f.api.propose_research_task({...f.task,
-      title:'Another headline for the same underlying issue'});
+      run_key:'geo-research-20261102T1815'});
     assert.equal(duplicate.status,'DUPLICATE_NOT_MODIFIED');
     assert.deepEqual(await fs.readFile(path.join(f.inbox,'tasks.txt')),before);
+    assert.equal((await f.api.read_research_tasks()).count,1);
+  }finally{await cleanup(f);}
+});
+
+test('new evidence refines the same task and preserves each prior revision',async()=>{
+  const f=await fixture();
+  try{
+    const first=await f.api.propose_research_task(f.task);
+    const before=await fs.readFile(path.join(f.inbox,'tasks.json'));
+    const revision=await f.api.propose_research_task({...f.task,
+      run_key:'geo-research-20261102T1810',
+      problem:'Offline batch results lack tool-based grounding while live search includes citations.',
+      action:'Mark batch results as ungrounded and add an evidence provenance enum.',
+      evidence:[...f.task.evidence,'src/core/tools.ts:91 at new reviewed HEAD']});
+    assert.equal(revision.status,'TASK_REFINED');
+    assert.equal(revision.id,first.id);
+    assert.equal(revision.revision,2);
+    const state=JSON.parse(await fs.readFile(path.join(f.inbox,'tasks.json'),'utf8'));
+    assert.equal(state.items.length,1);
+    assert.equal(state.items[0].history.length,2);
+    assert.equal(state.items[0].history[0].kind,'CREATED');
+    assert.equal(state.items[0].history[1].kind,'REFINED');
+    assert.equal(state.items[0].history[1].previous.action,f.task.action);
+    assert.equal(state.items[0].created,JSON.parse(before).items[0].created);
+    const history=await fs.readFile(path.join(f.inbox,'geo','history.txt'),'utf8');
+    assert.match(history,/Previous action: Trace which batch outputs/);
+    assert.match(history,/changed: problem, action, evidence/);
+    const userFacing=await fs.readFile(path.join(f.inbox,'geo','tasks.txt'),'utf8');
+    assert.match(userFacing,/Revision: 2/);
+    assert.match(userFacing,/Mark batch results as ungrounded/);
+    const duplicate=await f.api.propose_research_task({...f.task,
+      run_key:'geo-research-20261102T1815',
+      problem:'Offline batch results lack tool-based grounding while live search includes citations.',
+      action:'Mark batch results as ungrounded and add an evidence provenance enum.',
+      evidence:[...f.task.evidence,'src/core/tools.ts:91 at new reviewed HEAD']});
+    assert.equal(duplicate.status,'DUPLICATE_NOT_MODIFIED');
+    const reused=await f.api.propose_research_task({...f.task,
+      run_key:'geo-research-20261102T1810',
+      action:'Silently rewrite the task with a recycled run key'});
+    assert.equal(reused.status,'RUN_KEY_REUSED_DIFFERENT_CONTENT');
     assert.equal((await f.api.read_research_tasks()).count,1);
   }finally{await cleanup(f);}
 });
@@ -97,20 +137,24 @@ test('interrupted view write is repaired by exact duplicate replay without a sec
   }finally{await cleanup(f);}
 });
 
-test('only two new research findings per project per UTC day, other project independent',async()=>{
+test('no daily cap: several same-day actionable findings and independent projects',async()=>{
   const f=await fixture();
   try{
-    await f.api.propose_research_task(f.task);
-    await f.api.propose_research_task({...f.task,issue_key:'anthropic-result-labeling',
-      run_key:'geo-research-20261102T1800'});
-    await assert.rejects(f.api.propose_research_task({...f.task,
-      issue_key:'third-similar-issue',
-      run_key:'geo-research-20261102T1900'}),/PROJECT_DAILY_RESEARCH_LIMIT/);
+    for(let i=0;i<8;i++){
+      const result=await f.api.propose_research_task({...f.task,
+        issue_key:'anthropic-finding-'+String(i).padStart(2,'0'),
+        run_key:'geo-research-20261102-'+i});
+      assert.equal(result.status,'QUEUED_FOR_HUMAN_REVIEW');
+    }
     const gsc=await f.api.propose_research_task({...f.task,
       project:'gsc',issue_key:'weekly-host-path-alias',
       run_key:'gsc-research-20261102T1900',evidence:['src/digest.ts:88 at GSC main']});
     assert.equal(gsc.status,'QUEUED_FOR_HUMAN_REVIEW');
-    assert.equal((await f.api.read_research_tasks()).count,3);
+    assert.equal((await f.api.read_research_tasks()).count,9);
+    const history=await fs.readFile(path.join(f.inbox,'history.txt'),'utf8');
+    assert.match(history,/anthropic-finding-07/);
+    const gscHistory=await fs.readFile(path.join(f.inbox,'gsc','history.txt'),'utf8');
+    assert.doesNotMatch(gscHistory,/anthropic-finding-07/);
   }finally{await cleanup(f);}
 });
 
@@ -175,6 +219,9 @@ test('human-only CAS review approves, completes and cannot be invoked by the sch
     const updated=await fs.readFile(path.join(f.inbox,'tasks.json'));
     const finish=await ownerReviewResearchTask(f.config,{
       id:entry.id,status:'DONE',expected_state_sha256:sha(updated)});
+    const history=await fs.readFile(path.join(f.inbox,'geo','history.txt'),'utf8');
+    assert.match(history,/OWNER_STATUS/);
+    assert.match(history,/Owner status: APPROVED -> DONE/);
     assert.equal(finish.status,'DONE');
     text=await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8');
     assert.doesNotMatch(text,/Distinguish search-backed/);
