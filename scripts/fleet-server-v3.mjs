@@ -173,7 +173,10 @@ function definitions(config) {
         .filter(p=>Object.hasOwn(config.projects,p))};
     list.push(tool("read_research_tasks",
       "Read-only snapshot of the shared fixed-root research task queue; no project files or journals modified.",
-      {project:researchProject},[],readOnly));
+      {project:researchProject,
+       issue_key:{type:"string",pattern:"^[a-z][a-z0-9-]{3,79}$"},
+       query:{type:"string",minLength:3,maxLength:100},
+       limit:{type:"integer",minimum:1,maximum:100}},[],readOnly));
     const line={type:"string",minLength:12,maxLength:700};
     list.push(tool("propose_research_task",
       "WRITE APPROVAL REQUIRED: Submit one concrete, evidence-backed proposal to a bounded shared tasks.txt queue. Never execute code, change project sources, write journals, or approve implementation.",
