@@ -134,8 +134,7 @@ test('fresh remote-main v3 lane retains canonical main and previously edited v1 
   f.config.coding.nofax.readPrefixes=['src/'];
   const readerRoot=path.join(f.temp,'reader-v3');
   await fs.mkdir(readerRoot);
-  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify',
-    'revenue-shot-direct-v041','ledger.mjs'),path.join(readerRoot,'ledger.mjs'));
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-ledger-test-fixture.mjs'),path.join(readerRoot,'ledger.mjs'));
   await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
     path.join(readerRoot,'coding.mjs'));
   const {createCodingService}=await import(pathToFileURL(
@@ -220,7 +219,7 @@ test('scoped readers inspect only the exact registered external lane with source
   const id=worktreeId(lane.worktree);
   const tempModule=path.join(f.temp,'module');
   await fs.mkdir(tempModule);
-  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify','revenue-shot-direct-v041','ledger.mjs'),
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-ledger-test-fixture.mjs'),
     path.join(tempModule,'ledger.mjs'));
   await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
     path.join(tempModule,'coding.mjs'));
