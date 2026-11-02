@@ -11,6 +11,8 @@ import {pathToFileURL} from 'node:url';
 
 const run=promisify(execFile);
 const sha=b=>createHash('sha256').update(b).digest('hex');
+const worktreeId=value=>sha(Buffer.from(process.platform==='win32'?
+  path.resolve(value).toLowerCase():path.resolve(value))).slice(0,20);
 async function cmd(cwd,...args){
  const r=await run('git',['-C',cwd,...args],{windowsHide:true,timeout:7000});
  return r.stdout.trim();
@@ -113,7 +115,7 @@ test('fresh remote-main v3 lane retains canonical main and previously edited v1 
   assert.equal((await fs.readFile(path.join(created.worktree,'src/source.ts'),'utf8')).replace(/\r\n/g,'\n'),
     'export const answer = 2;\n');
   assert.equal(await cmd(f.repo,'rev-parse','refs/heads/main'),f.head);
-  const id=sha(Buffer.from(path.resolve(created.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(created.worktree);
   const scoped=createScopedWorktreeActions(f.config);
   const scope={project:'nofax',repository:'root',worktree_id:id,
     expected_head:upstream,path:'src/source.ts',
@@ -132,8 +134,7 @@ test('fresh remote-main v3 lane retains canonical main and previously edited v1 
   f.config.coding.nofax.readPrefixes=['src/'];
   const readerRoot=path.join(f.temp,'reader-v3');
   await fs.mkdir(readerRoot);
-  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify',
-    'revenue-shot-direct-v041','ledger.mjs'),path.join(readerRoot,'ledger.mjs'));
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-ledger-test-fixture.mjs'),path.join(readerRoot,'ledger.mjs'));
   await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
     path.join(readerRoot,'coding.mjs'));
   const {createCodingService}=await import(pathToFileURL(
@@ -188,7 +189,7 @@ test('edited source in new lane passes only operator-allowlisted source-diff che
  try{
   const init=createFleetWorktreeInitializer(f.config);
   const lane=await init.create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const edit=createScopedWorktreeActions(f.config);
   const params={project:'geo',repository:'root',worktree_id:id,
     expected_head:lane.head,path:'src/source.ts',
@@ -215,10 +216,10 @@ test('scoped readers inspect only the exact registered external lane with source
  try{
   f.config.coding.gsc.readPrefixes=['src/'];
   const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const tempModule=path.join(f.temp,'module');
   await fs.mkdir(tempModule);
-  await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify','revenue-shot-direct-v041','ledger.mjs'),
+  await fs.copyFile(path.join(process.cwd(),'scripts','fleet-ledger-test-fixture.mjs'),
     path.join(tempModule,'ledger.mjs'));
   await fs.copyFile(path.join(process.cwd(),'scripts','fleet-coding-reader-v2.mjs'),
     path.join(tempModule,'coding.mjs'));
@@ -257,7 +258,7 @@ test('project-specific NoFax unit suite and git diff both record separate immuta
  const f=await fresh('nofax');
  try{
   const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const scoped=createScopedWorktreeActions(f.config);
   const params={project:'nofax',repository:'root',worktree_id:id,
     expected_head:lane.head,path:'src/source.ts',
@@ -280,6 +281,60 @@ test('project-specific NoFax unit suite and git diff both record separate immuta
   assert.equal(JSON.parse(await fs.readFile(path.join(receiptDir,'check-project-unit.json'),'utf8')).status,'CHECK_PASSED');
   assert.equal(JSON.parse(await fs.readFile(path.join(receiptDir,'check-source-diff.json'),'utf8')).status,'CHECK_PASSED');
  }finally{await fs.rm(f.temp,{recursive:true,force:true})}
+});
+test('read-only receipt inspector preserves missing, successful, failed and tampered evidence',async()=>{
+  const f=await fresh('nofax');
+  try{
+    const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
+    const id=worktreeId(lane.worktree);
+    const action=createScopedWorktreeActions(f.config);
+    const params={project:'nofax',repository:'root',worktree_id:id,
+      expected_head:lane.head,path:'src/source.ts',
+      expected_journal_sha256:f.ledger,expected_state_sha256:f.state,
+      run_key:'receipt-readonly-20261102-01'};
+    const missing=await action.inspect_scoped_worktree_receipts(params);
+    assert.equal(missing.status,'NOT_RECORDED');
+    assert.equal(missing.intentPresent,false);
+    const pathToRun=path.join(f.receiptRoot,'nofax',id,
+      sha(Buffer.from(params.run_key)).slice(0,32));
+    await assert.rejects(fs.stat(pathToRun),{code:'ENOENT'});
+    const initial=await action.preflight_worktree_action(params);
+    await action.apply_scoped_worktree_edit({...params,
+      expected_sha256:initial.sha256,find:'answer = 1',replacement:'answer = 2'});
+    const incompleteCheck=await action.inspect_scoped_worktree_receipts(params);
+    assert.equal(incompleteCheck.status,'EDIT_RECEIPT_VERIFIED');
+    assert.deepEqual(incompleteCheck.checks,{});
+    assert.equal(incompleteCheck.exclusiveWriterVerified,false);
+    const sourceDiff=await action.run_scoped_worktree_check({...params,check_id:'source-diff'});
+    const unit=await action.run_scoped_worktree_check({...params,check_id:'project-unit'});
+    assert.equal(sourceDiff.status,'CHECK_PASSED');
+    assert.equal(unit.status,'CHECK_PASSED');
+    const before=await fs.readFile(path.join(pathToRun,'check-project-unit.json'));
+    const inspected=await action.inspect_scoped_worktree_receipts(params);
+    assert.equal(inspected.status,'EDIT_RECEIPT_VERIFIED');
+    assert.equal(inspected.checks['source-diff'].status,'CHECK_PASSED');
+    assert.equal(inspected.checks['project-unit'].status,'CHECK_PASSED');
+    assert.equal(inspected.checks['project-unit'].receiptSha256,sha(before));
+    assert.equal(inspected.externalEffectsVerified,false);
+    assert.deepEqual(await fs.readFile(path.join(pathToRun,'check-project-unit.json')),before);
+    const stored=JSON.parse(before.toString('utf8'));
+    stored.status='CHECK_FAILED';
+    await fs.writeFile(path.join(pathToRun,'check-project-unit.json'),
+      JSON.stringify(stored)+'\n');
+    const failed=await action.inspect_scoped_worktree_receipts(params);
+    assert.equal(failed.checks['project-unit'].status,'CHECK_FAILED');
+    assert.equal(failed.status,'EDIT_RECEIPT_VERIFIED');
+    stored.sourceSha256='0'.repeat(64);
+    await fs.writeFile(path.join(pathToRun,'check-project-unit.json'),
+      JSON.stringify(stored)+'\n');
+    const tampered=await action.inspect_scoped_worktree_receipts(params);
+    assert.equal(tampered.status,'RECEIPT_IDENTITY_MISMATCH');
+    assert.equal(tampered.checks['project-unit'].status,'INVALID_RECEIPT_IDENTITY');
+    await assert.rejects(action.inspect_scoped_worktree_receipts({...params,
+      run_key:'../unsafe'}),/INVALID_RUN_KEY/);
+    await assert.rejects(action.inspect_scoped_worktree_receipts({...params,
+      expected_journal_sha256:'0'.repeat(64)}),/CANONICAL_ACCOUNTING_CHANGED/);
+  }finally{await fs.rm(f.temp,{recursive:true,force:true})}
 });
 test('all six scopes use fixed roots and cannot replace source or historical state',async()=>{
  for(const [project,alias] of [

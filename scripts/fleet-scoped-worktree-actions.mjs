@@ -266,6 +266,83 @@ export function createScopedWorktreeActions(config) {
         nextOffset:offset+selected.length,truncated:offset+selected.length<lines.length,
         content:selected.join('\n'),readOnly:true};
     },
+    // Inspect immutable evidence only: never create a record directory, retry a
+    // failed check, infer remote effects, or claim exclusive writer ownership.
+    async inspect_scoped_worktree_receipts(args){
+      if(!KEY.test(args?.run_key??''))stop('INVALID_RUN_KEY');
+      const ctx=await worktree(config,args);
+      const root=await rootForRecords(config);
+      const evidenceBase={
+        project:ctx.project,repository:ctx.repository,worktree_id:ctx.worktreeId,
+        head:ctx.head,path:ctx.file,run_key:args.run_key,
+        currentSourceSha256:ctx.sourceSha256,readOnly:true,
+        exclusiveWriterVerified:false,externalEffectsVerified:false
+      };
+      const runDir=path.join(root,ctx.project,ctx.worktreeId,
+        sha(Buffer.from(args.run_key)).slice(0,32));
+      for(const directory of [
+        path.join(root,ctx.project),path.join(root,ctx.project,ctx.worktreeId),runDir
+      ]){
+        try{await safeDir(directory);}
+        catch(e){
+          if(e.code==='ENOENT')return {...evidenceBase,status:'NOT_RECORDED',
+            intentPresent:false,resultPresent:false,checks:{}};
+          throw e;
+        }
+      }
+      async function receipt(name){
+        try{
+          const bytes=await safeFile(path.join(runDir,name),32*1024);
+          return {value:JSON.parse(bytes.toString('utf8')),sha256:sha(bytes)};
+        }catch(e){if(e.code==='ENOENT')return null;throw e;}
+      }
+      const intent=await receipt('intent.json');
+      const edit=await receipt('result.json');
+      let status='NOT_RECORDED';
+      if(intent&&!edit)status='INCOMPLETE_INTENT_UNKNOWN';
+      else if(!intent&&edit)status='ORPHAN_RESULT_UNKNOWN';
+      else if(intent&&edit){
+        const i=intent.value,r=edit.value;
+        status=r.status==='WORKTREE_EDIT_VERIFIED'&&
+          r.project===ctx.project&&r.worktree_id===ctx.worktreeId&&
+          r.run_key===args.run_key&&r.path===ctx.file&&
+          r.expectedHead===ctx.head&&r.newSha256===ctx.sourceSha256&&
+          i.project===ctx.project&&i.worktreeId===ctx.worktreeId&&
+          i.file===ctx.file&&i.expectedHead===ctx.head&&
+          i.nextSha256===r.newSha256&&i.sourceSha256===r.previousSha256&&
+          i.fingerprint===r.fingerprint
+          ?'EDIT_RECEIPT_VERIFIED':'RECEIPT_IDENTITY_MISMATCH';
+      }
+      const checks={};
+      for(const name of ['source-diff','project-unit','launcher']){
+        const found=await receipt('check-'+name+'.json');
+        if(!found)continue;
+        const c=found.value;
+        const bound=c.schema==='SCOPED_WORKTREE_CHECK_V1'&&
+          c.project===ctx.project&&c.worktree_id===ctx.worktreeId&&
+          c.run_key===args.run_key&&c.check_id===name&&
+          c.sourceSha256===ctx.sourceSha256&&c.head===ctx.head&&
+          ['CHECK_PASSED','CHECK_FAILED'].includes(c.status);
+        checks[name]={status:bound?c.status:'INVALID_RECEIPT_IDENTITY',
+          receiptSha256:found.sha256,sourceMatched:bound};
+        if(!bound)status='RECEIPT_IDENTITY_MISMATCH';
+      }
+      // Older controllers used check.json; report its identity independently.
+      const legacy=await receipt('check.json');
+      if(legacy){
+        const c=legacy.value;
+        const bound=c.project===ctx.project&&c.run_key===args.run_key&&
+          c.worktree_id===ctx.worktreeId&&c.sourceSha256===ctx.sourceSha256&&
+          ['CHECK_PASSED','CHECK_FAILED'].includes(c.status);
+        checks.legacy={status:bound?c.status:'INVALID_RECEIPT_IDENTITY',
+          receiptSha256:legacy.sha256,sourceMatched:bound};
+        if(!bound)status='RECEIPT_IDENTITY_MISMATCH';
+      }
+      return {...evidenceBase,status,intentPresent:!!intent,
+        resultPresent:!!edit,intentReceiptSha256:intent?.sha256??null,
+        resultReceiptSha256:edit?.sha256??null,checks,
+        note:'Receipt identity is not proof of live ownership, completed unit suite or external effects.'};
+    },
     async apply_scoped_worktree_edit(args){
       if(!KEY.test(args?.run_key??''))stop('INVALID_RUN_KEY');
       const ctx=await worktree(config,args);

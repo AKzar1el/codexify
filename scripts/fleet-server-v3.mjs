@@ -152,6 +152,10 @@ function definitions(config) {
       list.push(tool("preflight_worktree_action",
         "Read exact registered isolated worktree, Git HEAD, allowed source SHA and journal/state digests; no write authorization granted.",
         local,localRequired,readOnly));
+      list.push(tool("inspect_scoped_worktree_receipts",
+        "Read-only inspection of one exact immutable worktree edit/check receipt set. Reports missing, failed, incomplete and mismatched evidence without retry, write, or owner certification.",
+        {...local,run_key:runKey},
+        [...localRequired,"run_key"],readOnly));
       list.push(tool("apply_scoped_worktree_edit",
         "WRITE APPROVAL REQUIRED: Change exactly one allowlisted existing source file in a registered isolated worktree after SHA checks and durable intent. No canonical checkout or release effects.",
         {...local,run_key:runKey,expected_sha256:hash,

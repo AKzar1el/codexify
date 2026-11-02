@@ -1,0 +1,31 @@
+name: Revenue fleet receipt evidence
+
+on:
+  push:
+    branches:
+      - feat/revenue-fleet-receipt-evidence-20261102
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  receipt-evidence:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate controller syntax
+        run: |
+          node --check scripts/fleet-scoped-worktree-actions.mjs
+          node --check scripts/fleet-server-v3.mjs
+          node --check scripts/fleet-scoped-worktree-actions.test.mjs
+      - name: Test fixed worktree receipts (synthetic fixtures)
+        run: node --test --test-concurrency=1 scripts/fleet-scoped-worktree-actions.test.mjs
