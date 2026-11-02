@@ -27,5 +27,18 @@ jobs:
           node --check scripts/fleet-research-owner-review.mjs
           node --check scripts/fleet-server-v3.mjs
           node --check scripts/fleet-research-inbox.test.mjs
+      - name: Parse owner installer PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/install-revenue-research-inbox.ps1'),
+            [ref]$tokens,[ref]$errors) > $null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
       - name: Run local synthetic research queue tests
         run: node --test scripts/fleet-research-inbox.test.mjs
