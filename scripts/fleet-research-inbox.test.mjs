@@ -169,6 +169,17 @@ test('legacy V1 state with more than 200 OPEN tasks can still grow without a quo
     });
     await fs.writeFile(path.join(f.inbox,'tasks.json'),
       JSON.stringify({version:1,items},null,2)+'\n');
+    const exact=await f.api.read_research_tasks({
+      project:'geo',issue_key:'prior-finding-0000'});
+    assert.equal(exact.count,1);
+    assert.equal(exact.items[0].issue_key,'prior-finding-0000');
+    assert.equal(exact.items[0].action,f.task.action);
+    const searched=await f.api.read_research_tasks({
+      project:'geo',query:'prior-finding-0204',limit:3});
+    assert.equal(searched.count,1);
+    assert.equal(searched.items[0].issue_key,'prior-finding-0204');
+    await assert.rejects(f.api.read_research_tasks({limit:1000}),
+      /INVALID_SEARCH_LIMIT/);
     const out=await f.api.propose_research_task({...f.task,
       issue_key:'additional-finding-after-205',run_key:'geo-research-20261103T0001'});
     assert.equal(out.status,'QUEUED_FOR_HUMAN_REVIEW');
