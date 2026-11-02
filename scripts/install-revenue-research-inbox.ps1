@@ -14,7 +14,8 @@ $module=Join-Path $side 'fleet-research-inbox.mjs'
 $projects=Join-Path $side 'projects.json'
 $config=Join-Path $base 'codexify.config.json'
 $inbox=Join-Path $base 'revenue-shot-research'
-$commit='00007e8dc375c3fffc53fc84c80b976393a6eaf3'
+$commit='9fb0c86471f52b0cbfa27260e90e6b99be73a290'
+$previousCommit='00007e8dc375c3fffc53fc84c80b976393a6eaf3'
 $uri='https://raw.githubusercontent.com/AKzar1el/codexify/'+$commit+'/scripts/fleet-research-inbox.mjs'
 $node=(Get-Command node -ErrorAction Stop).Source
 
@@ -102,9 +103,19 @@ try{
   [System.IO.File]::WriteAllText($candidate,$text,$utf8)
   & $node --check $candidate
   if($LASTEXITCODE -ne 0){throw 'SERVER_SYNTAX_INVALID'}
-  if((Test-Path -LiteralPath $module) -and
-     ((Get-FileHash -LiteralPath $module).Hash -ne (Get-FileHash -LiteralPath $download).Hash)){
-    throw 'EXISTING_MODULE_DIFFERENT_REVIEW_REQUIRED'
+  $moduleExisted=Test-Path -LiteralPath $module -PathType Leaf
+  if($moduleExisted){
+    $installedHash=(Get-FileHash -LiteralPath $module -Algorithm SHA256).Hash
+    $newHash=(Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+    if($installedHash -ne $newHash){
+      $baseline=Join-Path $stage 'previous-research-inbox.mjs'
+      $priorUri='https://raw.githubusercontent.com/AKzar1el/codexify/'+
+        $previousCommit+'/scripts/fleet-research-inbox.mjs'
+      Invoke-WebRequest -Uri $priorUri -UseBasicParsing -OutFile $baseline
+      if($installedHash -ne (Get-FileHash -LiteralPath $baseline -Algorithm SHA256).Hash){
+        throw 'EXISTING_MODULE_NOT_KNOWN_BASELINE_REVIEW_REQUIRED'
+      }
+    }
   }
   if(!$Apply){
     Write-Output 'Preflight verified. Re-run this script with -Apply to install.'
@@ -125,7 +136,6 @@ try{
   Copy-Item -LiteralPath $server -Destination (Join-Path $backup 'server.mjs')
   Copy-Item -LiteralPath $projects -Destination (Join-Path $backup 'projects.json')
   Copy-Item -LiteralPath $config -Destination (Join-Path $backup 'codexify.config.json')
-  $moduleExisted=Test-Path -LiteralPath $module
   if($moduleExisted){Copy-Item -LiteralPath $module -Destination (Join-Path $backup 'fleet-research-inbox.mjs')}
   foreach($file in @($server,$projects,$config)){
     if((Get-FileHash -LiteralPath $file).Hash -ne $snapshot[$file]){
@@ -133,7 +143,7 @@ try{
     }
   }
   try{
-    if(!$moduleExisted){Copy-Item -LiteralPath $download -Destination $module}
+    Copy-Item -LiteralPath $download -Destination $module -Force
     [System.IO.File]::WriteAllText($server,$text,$utf8)
     [System.IO.File]::WriteAllText($projects,$newProjects+$lf,$utf8)
     [System.IO.File]::WriteAllText($config,$newConfig+$lf,$utf8)
@@ -157,7 +167,7 @@ console.log("NATIVE_RESEARCH_TOOLS_VERIFIED");
     [System.IO.File]::WriteAllText($probeFile,$probe,$utf8)
     & $node $probeFile
     if($LASTEXITCODE -ne 0){throw 'NATIVE_TOOL_PROBE_FAILED'}
-    Write-Output 'RESEARCH_INBOX_INSTALLED_AND_VERIFIED'
+    Write-Output 'RESEARCH_INBOX_V3_INSTALLED_AND_VERIFIED'
     Write-Output ('BACKUP='+$backup)
     Write-Output 'NEXT: codexify service restart'
     Write-Output 'Then refresh God v5 and start a new ChatGPT conversation.'
@@ -165,7 +175,8 @@ console.log("NATIVE_RESEARCH_TOOLS_VERIFIED");
     Copy-Item -LiteralPath (Join-Path $backup 'server.mjs') -Destination $server -Force
     Copy-Item -LiteralPath (Join-Path $backup 'projects.json') -Destination $projects -Force
     Copy-Item -LiteralPath (Join-Path $backup 'codexify.config.json') -Destination $config -Force
-    if(!$moduleExisted -and (Test-Path -LiteralPath $module)){Remove-Item -LiteralPath $module -Force}
+    if($moduleExisted){Copy-Item -LiteralPath (Join-Path $backup 'fleet-research-inbox.mjs') -Destination $module -Force}
+    elseif(Test-Path -LiteralPath $module){Remove-Item -LiteralPath $module -Force}
     Write-Error ('INSTALL_ROLLED_BACK: '+$_.Exception.Message)
     throw
   }
