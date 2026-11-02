@@ -225,6 +225,19 @@ async function syncViews(root,state){
   }
   return {changed,aggregateSha256:sha(Buffer.from(views[0][2],'utf8'))};
 }
+// Reject capacity problems BEFORE modifying authoritative state, so a full
+// history view cannot strand JSON ahead of its derived human-readable files.
+function preflightCapacity(state){
+  const data=Buffer.from(JSON.stringify(state,null,2)+'\n','utf8');
+  if(data.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
+  const views=[render(state),renderHistory(state)];
+  for(const project of PROJECTS){
+    views.push(render(state,project),renderHistory(state,project));
+  }
+  if(views.some(x=>Buffer.byteLength(x,'utf8')>MAX_FILE_BYTES))
+    deny('INBOX_CAPACITY_REACHED');
+  return data;
+}
 function validate(config,input){
   const project=input?.project;
   if(!PROJECTS.has(project)||!Object.hasOwn(config.projects??{},project))
@@ -273,7 +286,7 @@ export async function ownerReviewResearchTask(config,args){
       {...i,status,reviewed:now,
         history:[...historyOf(i),historyEvent('OWNER_STATUS',now,'owner',
           {from:i.status,to:status})]}:i)};
-    const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
+    const json=preflightCapacity(next);
     await atomic(root,'tasks.json',json);
     const views=await syncViews(root,next);
     return {id,status,reviewed:true,stateSha256:sha(json),tasksSha256:views.aggregateSha256};
@@ -323,8 +336,7 @@ export function createResearchInbox(config){
               {fields,previous:snapshot(existing)})]};
           const next={...state,items:state.items.map(item=>
             item.id===candidate.id?updated:item)};
-          const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
-          if(json.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
+          const json=preflightCapacity(next);
           await atomic(root,'tasks.json',json);
           const views=await syncViews(root,next);
           return {status:'TASK_REFINED',id:candidate.id,
@@ -336,8 +348,7 @@ export function createResearchInbox(config){
         const newTask={...candidate,status:'OPEN',created:now,updated:now,
           revision:1,history:[historyEvent('CREATED',now,candidate.run_key)]};
         const next={...state,items:[...state.items,newTask]};
-        const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
-        if(json.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
+        const json=preflightCapacity(next);
         await atomic(root,'tasks.json',json);
         const views=await syncViews(root,next);
         return {status:'QUEUED_FOR_HUMAN_REVIEW',id:candidate.id,
