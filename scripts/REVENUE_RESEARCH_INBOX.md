@@ -52,6 +52,6 @@ The existing prompts are very long (roughly 51-65 KiB). Do not blindly concatena
 
 Open tasks.txt. Each entry has a stable ID, project, priority, confidence, first seen, problem, impact, evidence, suggested implementation and tests. Ask ChatGPT to implement chosen IDs interactively with approved tools, independent code review and regression tests.
 
-tasks.txt is a derived view: do not edit its checkboxes, because regeneration may overwrite them. Human decisions and closing items require a separate owner-only review workflow; none of the scheduled workers receives approval or completion authority.
+tasks.txt is a derived view: do not edit its checkboxes, because regeneration may overwrite them. Human decisions and closing items use the separate interactive owner-only CLI (fleet-research-owner-review.mjs), which is never exposed as an MCP action. With REVENUE_SHOT_PROJECTS_FILE set to the approved private config, an owner can run: node fleet-research-owner-review.mjs TASK_ID APPROVED (or DEFERRED, DONE, REJECTED). The command requires a real terminal and an exact typed confirmation; it performs a SHA-256 CAS check and refuses to reopen final DONE/REJECTED items. None of the scheduled workers receives approval or completion authority.
 
 Operational acceptance is NOT a CI pass alone: one real unattended agent must write one real proposal locally, it must survive readback, and the next run must dedupe without repeating or implementing the task.
