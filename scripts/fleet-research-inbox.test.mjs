@@ -158,6 +158,38 @@ test('no daily cap: several same-day actionable findings and independent project
   }finally{await cleanup(f);}
 });
 
+test('legacy V1 state with more than 200 OPEN tasks can still grow without a quota',async()=>{
+  const f=await fixture();
+  try{
+    const template={...f.task,status:'OPEN',created:'2026-10-31T10:00:00.000Z'};
+    const items=Array.from({length:205},(_,i)=>{
+      const issue_key='prior-finding-'+String(i).padStart(4,'0');
+      return {...template,issue_key,id:sha('geo|'+issue_key).slice(0,12),
+        run_key:'geo-prior-run-'+String(i).padStart(4,'0')};
+    });
+    await fs.writeFile(path.join(f.inbox,'tasks.json'),
+      JSON.stringify({version:1,items},null,2)+'\n');
+    const out=await f.api.propose_research_task({...f.task,
+      issue_key:'additional-finding-after-205',run_key:'geo-research-20261103T0001'});
+    assert.equal(out.status,'QUEUED_FOR_HUMAN_REVIEW');
+    const snapshot=JSON.parse(await fs.readFile(path.join(f.inbox,'tasks.json'),'utf8'));
+    assert.equal(snapshot.items.length,206);
+    assert.equal(snapshot.items.filter(x=>x.status==='OPEN').length,206);
+    assert.match(await fs.readFile(path.join(f.inbox,'geo','history.txt'),'utf8'),
+      /prior-finding-0204/);
+    const legacy=await f.api.propose_research_task({...f.task,
+      issue_key:'prior-finding-0204',run_key:'geo-research-20261103T0100',
+      action:'Independently inspect the previous task and replace its old plan with a newer verified plan.'});
+    assert.equal(legacy.status,'TASK_REFINED');
+    const migrated=JSON.parse(await fs.readFile(path.join(f.inbox,'tasks.json'),'utf8'));
+    const historical=migrated.items.find(x=>x.issue_key==='prior-finding-0204');
+    assert.equal(historical.history[0].kind,'CREATED');
+    assert.equal(historical.history[1].kind,'REFINED');
+    assert.equal(historical.revision,2);
+    assert.equal(historical.created,'2026-10-31T10:00:00.000Z');
+  }finally{await cleanup(f);}
+});
+
 test('invalid project, unsafe IDs, non-concrete evidence and control characters are refused',async()=>{
   const f=await fixture();
   try{
