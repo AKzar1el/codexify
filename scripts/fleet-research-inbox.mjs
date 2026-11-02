@@ -177,6 +177,15 @@ export function createResearchInbox(config){
       return withLock(root,async()=>{
         const state=await current(root);
         if(state.items.some(i=>i.id===candidate.id)){
+          // Recover an interrupted state->view projection without adding a second
+          // item or silently changing its original evidence/first-seen date.
+          const expected=Buffer.from(render(state),'utf8');
+          const existing=await fileBytes(root,'tasks.txt');
+          if(!existing||!existing.equals(expected)){
+            await atomic(root,'tasks.txt',expected);
+            return {status:'DUPLICATE_VIEW_RECOVERED',id:candidate.id,
+              taskFile:'tasks.txt',tasksSha256:sha(expected),codeModified:false};
+          }
           return {status:'DUPLICATE_NOT_MODIFIED',id:candidate.id,
             taskFile:'tasks.txt',codeModified:false};
         }
