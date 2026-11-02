@@ -14,7 +14,7 @@ $module=Join-Path $side 'fleet-research-inbox.mjs'
 $projects=Join-Path $side 'projects.json'
 $config=Join-Path $base 'codexify.config.json'
 $inbox=Join-Path $base 'revenue-shot-research'
-$commit='9fb0c86471f52b0cbfa27260e90e6b99be73a290'
+$commit='5bd436ebf5604f0172e1e9700b6284c92611a965'
 $previousCommit='00007e8dc375c3fffc53fc84c80b976393a6eaf3'
 $uri='https://raw.githubusercontent.com/AKzar1el/codexify/'+$commit+'/scripts/fleet-research-inbox.mjs'
 $node=(Get-Command node -ErrorAction Stop).Source
@@ -76,6 +76,22 @@ if(!$integrated){
 }
 elseif(!$text.Contains('propose_research_task') -or !$text.Contains('...createResearchInbox(config)')){
   throw 'PARTIALLY_INSTALLED_SERVER_REQUIRES_REVIEW'
+}
+# Existing V1 sidecars already define the reader; extend it in-place for
+# exact issue-key lookup without disturbing unrelated native tools.
+$oldReadSchema='      {project:researchProject},[],readOnly));'
+$newReadSchema=@'
+      {project:researchProject,
+       issue_key:{type:"string",pattern:"^[a-z][a-z0-9-]{3,79}$"},
+       query:{type:"string",minLength:3,maxLength:100},
+       limit:{type:"integer",minimum:1,maximum:100}},[],readOnly));
+'@
+$newReadSchema=$newReadSchema.TrimEnd()
+if($text.Contains($oldReadSchema)){
+  $text=ReplaceOnce $text $oldReadSchema $newReadSchema 'research-reader-search'
+}
+elseif(!$text.Contains('limit:{type:"integer",minimum:1,maximum:100}')){
+  throw 'RESEARCH_READER_SCHEMA_NOT_RECOGNIZED'
 }
 if($usesCrLf){$text=$text.Replace($lf,$crlf)}
 $pc=Get-Content -LiteralPath $projects -Raw | ConvertFrom-Json
