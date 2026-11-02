@@ -11,6 +11,8 @@ import {pathToFileURL} from 'node:url';
 
 const run=promisify(execFile);
 const sha=b=>createHash('sha256').update(b).digest('hex');
+const worktreeId=value=>sha(Buffer.from(process.platform==='win32'?
+  path.resolve(value).toLowerCase():path.resolve(value))).slice(0,20);
 async function cmd(cwd,...args){
  const r=await run('git',['-C',cwd,...args],{windowsHide:true,timeout:7000});
  return r.stdout.trim();
@@ -113,7 +115,7 @@ test('fresh remote-main v3 lane retains canonical main and previously edited v1 
   assert.equal((await fs.readFile(path.join(created.worktree,'src/source.ts'),'utf8')).replace(/\r\n/g,'\n'),
     'export const answer = 2;\n');
   assert.equal(await cmd(f.repo,'rev-parse','refs/heads/main'),f.head);
-  const id=sha(Buffer.from(path.resolve(created.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(created.worktree);
   const scoped=createScopedWorktreeActions(f.config);
   const scope={project:'nofax',repository:'root',worktree_id:id,
     expected_head:upstream,path:'src/source.ts',
@@ -188,7 +190,7 @@ test('edited source in new lane passes only operator-allowlisted source-diff che
  try{
   const init=createFleetWorktreeInitializer(f.config);
   const lane=await init.create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const edit=createScopedWorktreeActions(f.config);
   const params={project:'geo',repository:'root',worktree_id:id,
     expected_head:lane.head,path:'src/source.ts',
@@ -215,7 +217,7 @@ test('scoped readers inspect only the exact registered external lane with source
  try{
   f.config.coding.gsc.readPrefixes=['src/'];
   const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const tempModule=path.join(f.temp,'module');
   await fs.mkdir(tempModule);
   await fs.copyFile(path.join(process.env.USERPROFILE,'.codexify','revenue-shot-direct-v041','ledger.mjs'),
@@ -257,7 +259,7 @@ test('project-specific NoFax unit suite and git diff both record separate immuta
  const f=await fresh('nofax');
  try{
   const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
-  const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+  const id=worktreeId(lane.worktree);
   const scoped=createScopedWorktreeActions(f.config);
   const params={project:'nofax',repository:'root',worktree_id:id,
     expected_head:lane.head,path:'src/source.ts',
@@ -285,7 +287,7 @@ test('read-only receipt inspector preserves missing, successful, failed and tamp
   const f=await fresh('nofax');
   try{
     const lane=await createFleetWorktreeInitializer(f.config).create_scoped_worktree(f.args);
-    const id=sha(Buffer.from(path.resolve(lane.worktree).toLowerCase())).slice(0,20);
+    const id=worktreeId(lane.worktree);
     const action=createScopedWorktreeActions(f.config);
     const params={project:'nofax',repository:'root',worktree_id:id,
       expected_head:lane.head,path:'src/source.ts',
