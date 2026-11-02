@@ -106,17 +106,18 @@ async function withLock(root,operation){
     return await operation();
   }finally{await lock.close();await fs.unlink(file);}
 }
-function render(state){
-  const active=state.items.filter(i=>i.status==='OPEN'||i.status==='APPROVED');
+function render(state,project=null){
+  const scoped=project?state.items.filter(i=>i.project===project):state.items;
+  const active=scoped.filter(i=>i.status==='OPEN'||i.status==='APPROVED');
   const order={P0:0,P1:1,P2:2,P3:3};
   active.sort((a,b)=>order[a.priority]-order[b.priority]||
     a.created.localeCompare(b.created)||a.project.localeCompare(b.project));
   const out=[
-    'REVENUE SHOT - RESEARCH TASKS (review queue)',
+    project?'REVENUE SHOT - '+project.toUpperCase()+' RESEARCH TASKS':'REVENUE SHOT - RESEARCH TASKS (review queue)',
     '===========================================',
     'PROPOSALS ONLY. No changes are implemented by adding an item here.',
     'Generated from tasks.json. Treat tasks.txt as read-only; discuss task IDs with the owner.',
-    'Open: '+active.length+' | Total retained: '+state.items.length,
+    'Open: '+active.length+' | Total retained: '+scoped.length,
     ''
   ];
   for(const item of active){
@@ -135,6 +136,31 @@ function render(state){
   }
   if(!active.length)out.push('No actionable research tasks are currently queued.','');
   return out.join('\n')+'\n';
+}
+function ctxProjectTask(project){return project+'/tasks.txt';}
+async function syncViews(root,state){
+  // tasks.json is authoritative. All text files are derived review views.
+  // A partial view write is repairable on a duplicate submission.
+  const views=[[root,'tasks.txt',render(state)]];
+  for(const project of PROJECTS){
+    const dir=path.join(root,project);
+    try{await fs.mkdir(dir);}
+    catch(e){if(e.code!=='EEXIST')throw e;}
+    const stat=await fs.lstat(dir);
+    if(!stat.isDirectory()||stat.isSymbolicLink())deny('PROJECT_VIEW_PATH_UNSAFE');
+    views.push([dir,'tasks.txt',render(state,project)]);
+  }
+  let changed=false;
+  for(const [dir,name,text] of views){
+    const bytes=Buffer.from(text,'utf8');
+    if(bytes.length>1024*1024)deny('INBOX_SIZE_LIMIT');
+    const previous=await fileBytes(dir,name);
+    if(!previous||!previous.equals(bytes)){
+      await atomic(dir,name,bytes);
+      changed=true;
+    }
+  }
+  return {changed,aggregateSha256:sha(Buffer.from(views[0][2],'utf8'))};
 }
 function validate(config,input){
   const project=input?.project;
@@ -182,10 +208,9 @@ export async function ownerReviewResearchTask(config,args){
     const next={version:VERSION,items:state.items.map(i=>i.id===id?
       {...i,status,reviewed:new Date().toISOString()}:i)};
     const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
-    const txt=Buffer.from(render(next),'utf8');
     await atomic(root,'tasks.json',json);
-    await atomic(root,'tasks.txt',txt);
-    return {id,status,reviewed:true,stateSha256:sha(json),tasksSha256:sha(txt)};
+    const views=await syncViews(root,next);
+    return {id,status,reviewed:true,stateSha256:sha(json),tasksSha256:views.aggregateSha256};
   });
 }
 export function createResearchInbox(config){
@@ -207,12 +232,11 @@ export function createResearchInbox(config){
         if(state.items.some(i=>i.id===candidate.id)){
           // Recover an interrupted state->view projection without adding a second
           // item or silently changing its original evidence/first-seen date.
-          const expected=Buffer.from(render(state),'utf8');
-          const existing=await fileBytes(root,'tasks.txt');
-          if(!existing||!existing.equals(expected)){
-            await atomic(root,'tasks.txt',expected);
+          const views=await syncViews(root,state);
+          if(views.changed){
             return {status:'DUPLICATE_VIEW_RECOVERED',id:candidate.id,
-              taskFile:'tasks.txt',tasksSha256:sha(expected),codeModified:false};
+              taskFile:'tasks.txt',projectTaskFile:ctxProjectTask(candidate.project),
+              tasksSha256:views.aggregateSha256,codeModified:false};
           }
           return {status:'DUPLICATE_NOT_MODIFIED',id:candidate.id,
             taskFile:'tasks.txt',codeModified:false};
@@ -232,9 +256,10 @@ export function createResearchInbox(config){
         if(json.length>1024*1024||readable.length>1024*1024)
           deny('INBOX_SIZE_LIMIT');
         await atomic(root,'tasks.json',json);
-        await atomic(root,'tasks.txt',readable);
+        const views=await syncViews(root,next);
         return {status:'QUEUED_FOR_HUMAN_REVIEW',id:candidate.id,
-          tasksSha256:sha(readable),taskFile:'tasks.txt',codeModified:false,
+          tasksSha256:views.aggregateSha256,taskFile:'tasks.txt',
+          projectTaskFile:ctxProjectTask(candidate.project),codeModified:false,
           journalModified:false,project:candidate.project};
       });
     }
