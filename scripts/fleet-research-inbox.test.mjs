@@ -77,6 +77,21 @@ test('same issue key cannot create a duplicate or rewrite existing tasks',async(
   }finally{await cleanup(f);}
 });
 
+test('interrupted view write is repaired by exact duplicate replay without a second task',async()=>{
+  const f=await fixture();
+  try{
+    await f.api.propose_research_task(f.task);
+    const state=await fs.readFile(path.join(f.inbox,'tasks.json'));
+    await fs.unlink(path.join(f.inbox,'tasks.txt'));
+    const r=await f.api.propose_research_task(f.task);
+    assert.equal(r.status,'DUPLICATE_VIEW_RECOVERED');
+    assert.deepEqual(await fs.readFile(path.join(f.inbox,'tasks.json')),state);
+    assert.match(await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8'),
+      /PROPOSALS ONLY/);
+    assert.equal((await f.api.read_research_tasks()).count,1);
+  }finally{await cleanup(f);}
+});
+
 test('only two new research findings per project per UTC day, other project independent',async()=>{
   const f=await fixture();
   try{
