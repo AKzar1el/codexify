@@ -296,11 +296,34 @@ export function createResearchInbox(config){
   return {
     async read_research_tasks(args={}){
       const root=await fixedRoot(config),state=await current(root);
-      const visible=state.items.filter(i=>!args.project||i.project===args.project);
+      if(args.project!==undefined&&!PROJECTS.has(args.project))
+        deny('UNKNOWN_RESEARCH_PROJECT');
+      if(args.issue_key!==undefined&&!KEY.test(args.issue_key))
+        deny('INVALID_ISSUE_KEY');
+      if(args.query!==undefined&&
+         (typeof args.query!=='string'||args.query.length<3||args.query.length>100))
+        deny('INVALID_SEARCH_QUERY');
+      const limit=args.limit??50;
+      if(!Number.isInteger(limit)||limit<1||limit>100)deny('INVALID_SEARCH_LIMIT');
+      const query=args.query?.toLowerCase();
+      const visible=state.items.filter(i=>
+        (!args.project||i.project===args.project)&&
+        (!args.issue_key||i.issue_key===args.issue_key)&&
+        (!query||[i.title,i.issue_key,i.problem,...(i.evidence??[])]
+          .some(value=>String(value).toLowerCase().includes(query))));
+      const ordered=visible.slice().sort((a,b)=>
+        (b.updated??b.created).localeCompare(a.updated??a.created)||
+        a.id.localeCompare(b.id));
       return {readOnly:true,rootConfigured:true,version:VERSION,
-        count:visible.length,open:visible.filter(i=>i.status==='OPEN').length,
-        items:visible.slice(-50).map(i=>({id:i.id,project:i.project,status:i.status,
-          priority:i.priority,title:i.title,created:i.created})),
+        total:state.items.length,count:visible.length,
+        open:visible.filter(i=>i.status==='OPEN').length,
+        items:ordered.slice(0,limit).map(i=>({
+          id:i.id,project:i.project,issue_key:i.issue_key,status:i.status,
+          priority:i.priority,confidence:i.confidence,title:i.title,
+          revision:i.revision??1,created:i.created,updated:i.updated??i.created,
+          ...(args.issue_key?{problem:i.problem,impact:i.impact,
+            action:i.action,validation:i.validation,evidence:i.evidence}: {})
+        })),
         tasksFilePresent:!!(await fileBytes(root,'tasks.txt')),
         note:'Read-only summary; no code execution or owner approval implied.'};
     },
