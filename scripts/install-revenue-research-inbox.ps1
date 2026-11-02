@@ -153,7 +153,9 @@ for(const name of ["read_research_tasks","propose_research_task","inspect_projec
 }
 console.log("NATIVE_RESEARCH_TOOLS_VERIFIED");
 '@
-    & $node --input-type=module --eval $probe
+    $probeFile=Join-Path $stage 'native-tools-probe.mjs'
+    [System.IO.File]::WriteAllText($probeFile,$probe,$utf8)
+    & $node $probeFile
     if($LASTEXITCODE -ne 0){throw 'NATIVE_TOOL_PROBE_FAILED'}
     Write-Output 'RESEARCH_INBOX_INSTALLED_AND_VERIFIED'
     Write-Output ('BACKUP='+$backup)
