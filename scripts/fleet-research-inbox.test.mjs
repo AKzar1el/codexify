@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {createHash} from 'node:crypto';
-import {createResearchInbox} from './fleet-research-inbox.mjs';
+import {createResearchInbox,ownerReviewResearchTask} from './fleet-research-inbox.mjs';
 
 const sha=s=>createHash('sha256').update(s).digest('hex');
 async function fixture(){
@@ -146,6 +146,38 @@ test('source checkout directory cannot be used as research queue root',async()=>
     await fs.mkdir(unsafe);
     const api=createResearchInbox({...f.config,researchInboxRoot:unsafe});
     await assert.rejects(api.propose_research_task(f.task),/INBOX_INSIDE_SOURCE_CHECKOUT/);
+  }finally{await cleanup(f);}
+});
+
+test('human-only CAS review approves, completes and cannot be invoked by the scheduled MCP service',async()=>{
+  const f=await fixture();
+  try{
+    assert.deepEqual(Object.keys(f.api).sort(),
+      ['propose_research_task','read_research_tasks']);
+    const entry=await f.api.propose_research_task(f.task);
+    const source=await fs.readFile(path.join(f.inbox,'tasks.json'));
+    const review=await ownerReviewResearchTask(f.config,{
+      id:entry.id,status:'APPROVED',expected_state_sha256:sha(source)});
+    assert.equal(review.status,'APPROVED');
+    let text=await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8');
+    assert.match(text,/Status: APPROVED/);
+    assert.match(text,/\[>\] \[P1\]/);
+    await assert.rejects(ownerReviewResearchTask(f.config,{
+      id:entry.id,status:'DONE',expected_state_sha256:sha(source)}),
+      /OWNER_REVIEW_STATE_CHANGED/);
+    const updated=await fs.readFile(path.join(f.inbox,'tasks.json'));
+    const finish=await ownerReviewResearchTask(f.config,{
+      id:entry.id,status:'DONE',expected_state_sha256:sha(updated)});
+    assert.equal(finish.status,'DONE');
+    text=await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8');
+    assert.doesNotMatch(text,/Distinguish search-backed/);
+    const duplicate=await f.api.propose_research_task(f.task);
+    assert.equal(duplicate.status,'DUPLICATE_NOT_MODIFIED');
+    await assert.rejects(ownerReviewResearchTask(f.config,{
+      id:entry.id,status:'APPROVED',
+      expected_state_sha256:finish.stateSha256}),/REVIEW_FINAL_STATUS_IMMUTABLE/);
+    assert.equal(await fs.readFile(path.join(f.src,'sentinel.txt'),'utf8'),
+      'CANONICAL SOURCE UNMODIFIED\n');
   }finally{await cleanup(f);}
 });
 
