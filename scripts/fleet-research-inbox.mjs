@@ -46,7 +46,11 @@ async function fixedRoot(config){
        within(path.resolve(projectRoot),fixed))deny('INBOX_INSIDE_SOURCE_CHECKOUT');
   }
   const stat=await fs.lstat(fixed);
-  if(!stat.isDirectory()||stat.isSymbolicLink()||!samePath(await fs.realpath(fixed),fixed))
+  // Windows filesystem prefixes, volume aliases and temporary junction parents
+  // may change the realpath string. The operator pins the path in private config;
+  // reject a redirected *inbox itself* without rejecting harmless parent aliases.
+  if(!stat.isDirectory()||stat.isSymbolicLink()||
+     (process.platform!=='win32'&&!samePath(await fs.realpath(fixed),fixed)))
     deny('INBOX_ROOT_REDIRECTED');
   return fixed;
 }
