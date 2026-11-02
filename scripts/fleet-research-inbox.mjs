@@ -12,9 +12,8 @@ const STATUSES=new Set(['OPEN','APPROVED','DEFERRED','DONE','REJECTED']);
 const KEY=/^[a-z][a-z0-9-]{3,79}$/;
 const RUN=/^[A-Za-z0-9_.:+-]{8,160}$/;
 const VERSION=1;
-const MAX_OPEN=36;
-const MAX_PER_DAY=2;
-const MAX_ITEMS=200;
+// No per-day, open-item, or total-item quotas. File size is a safety boundary.
+const MAX_FILE_BYTES=32*1024*1024;
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const deny=code=>{const e=new Error(code);e.code=code;throw e;};
 const nativePath=p=>{
@@ -58,7 +57,7 @@ async function fileBytes(root,name){
   const file=path.join(root,name);
   let stat;
   try{stat=await fs.lstat(file);}catch(e){if(e.code==='ENOENT')return null;throw e;}
-  if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1024*1024)
+  if(!stat.isFile()||stat.isSymbolicLink()||stat.size>MAX_FILE_BYTES)
     deny('INBOX_FILE_UNSAFE');
   return fs.readFile(file);
 }
@@ -67,11 +66,11 @@ async function current(root){
   if(!data)return {version:VERSION,items:[]};
   let obj;
   try{obj=JSON.parse(data.toString('utf8'));}catch{deny('INBOX_STATE_INVALID_JSON');}
-  if(!obj||obj.version!==VERSION||!Array.isArray(obj.items)||
-     obj.items.length>MAX_ITEMS)deny('INBOX_STATE_SCHEMA_CHANGED');
+  if(!obj||obj.version!==VERSION||!Array.isArray(obj.items))deny('INBOX_STATE_SCHEMA_CHANGED');
   for(const item of obj.items){
     if(!PROJECTS.has(item.project)||!KEY.test(item.issue_key)||
-       !STATUSES.has(item.status)||typeof item.id!=='string')
+       !STATUSES.has(item.status)||typeof item.id!=='string'||
+       (item.history!==undefined&&!Array.isArray(item.history)))
       deny('INBOX_STATE_SCHEMA_CHANGED');
     if(item.id!==sha(item.project+'|'+item.issue_key).slice(0,12))
       deny('INBOX_STATE_IDENTITY_MISMATCH');
@@ -124,36 +123,100 @@ function render(state,project=null){
     out.push('['+(item.status==='APPROVED'?'>':' ')+'] ['+item.priority+'] ['+
       item.project.toUpperCase()+'] '+item.id+' - '+item.title);
     out.push('Status: '+item.status+' | Confidence: '+item.confidence+
-      ' | First seen: '+item.created.slice(0,10));
+      ' | First seen: '+item.created.slice(0,10)+
+      ' | Updated: '+(item.updated??item.created).slice(0,10)+
+      ' | Revision: '+(item.revision??1));
     out.push('Why it matters: '+item.impact);
     out.push('Problem: '+item.problem);
     out.push('Evidence:');
     for(const evidence of item.evidence)out.push('  - '+evidence);
     out.push('Proposed implementation: '+item.action);
     out.push('Verification plan: '+item.validation);
-    out.push('Source run: '+item.run_key);
+    out.push('Latest supporting run: '+item.run_key);
+    out.push('Revision history: see history.txt in this folder.');
     out.push('');
   }
   if(!active.length)out.push('No actionable research tasks are currently queued.','');
+  return out.join('\n')+'\n';
+}
+// Stable issue identity: a changed proposal refines its original task, rather
+// than creating a competing duplicate. Historical evidence remains inspectable.
+const SNAPSHOT_FIELDS=['title','problem','impact','action','validation',
+  'evidence','priority','confidence','run_key'];
+function snapshot(item){
+  return Object.fromEntries(SNAPSHOT_FIELDS.map(field=>[field,item[field]]));
+}
+function contentDigest(item){
+  return sha(JSON.stringify(SNAPSHOT_FIELDS.filter(x=>x!=='run_key')
+    .map(field=>item[field])));
+}
+function historyOf(item){
+  if(Array.isArray(item.history))return item.history;
+  return [{kind:'CREATED',at:item.created,run_key:item.run_key,
+    note:'Original preserved task; revisions before migration are unknown.'}];
+}
+function historyEvent(kind,now,runKey,detail={}){
+  return {kind,at:now,run_key:runKey,...detail};
+}
+function changedFields(before,after){
+  return SNAPSHOT_FIELDS.filter(field=>field!=='run_key'&&
+    JSON.stringify(before[field])!==JSON.stringify(after[field]));
+}
+function renderHistory(state,project=null){
+  const scoped=(project?state.items.filter(i=>i.project===project):state.items)
+    .slice().sort((a,b)=>a.created.localeCompare(b.created));
+  const out=[
+    project?'REVENUE SHOT - '+project.toUpperCase()+' RESEARCH HISTORY':
+      'REVENUE SHOT - COMPLETE RESEARCH TASK HISTORY',
+    '================================================',
+    'Audit trail: includes earlier revisions and owner status transitions.',
+    'No entry is proof that the proposed code was implemented.',
+    'Entries: '+scoped.length,''
+  ];
+  for(const item of scoped){
+    out.push('['+item.project.toUpperCase()+'] '+item.id+' '+item.issue_key);
+    out.push('Current: '+item.status+' | '+item.title+
+      ' | Revision '+(item.revision??1));
+    for(const event of historyOf(item)){
+      out.push('  '+event.at+' '+event.kind+
+        ' | run '+(event.run_key??'owner')+
+        (event.fields?.length?' | changed: '+event.fields.join(', '):''));
+      if(event.previous){
+        out.push('    Previous title: '+event.previous.title);
+        out.push('    Previous problem: '+event.previous.problem);
+        out.push('    Previous impact: '+event.previous.impact);
+        out.push('    Previous action: '+event.previous.action);
+        out.push('    Previous validation: '+event.previous.validation);
+        out.push('    Previous priority/confidence: '+event.previous.priority+
+          '/'+event.previous.confidence);
+        out.push('    Previous evidence: '+(event.previous.evidence??[]).join(' | '));
+      }
+      if(event.from||event.to)out.push('    Owner status: '+event.from+' -> '+event.to);
+    }
+    out.push('');
+  }
+  if(!scoped.length)out.push('No research proposals recorded yet.','');
   return out.join('\n')+'\n';
 }
 function ctxProjectTask(project){return project+'/tasks.txt';}
 async function syncViews(root,state){
   // tasks.json is authoritative. All text files are derived review views.
   // A partial view write is repairable on a duplicate submission.
-  const views=[[root,'tasks.txt',render(state)]];
+  const views=[[root,'tasks.txt',render(state)],
+    [root,'history.txt',renderHistory(state)]];
   for(const project of PROJECTS){
     const dir=path.join(root,project);
     try{await fs.mkdir(dir);}
     catch(e){if(e.code!=='EEXIST')throw e;}
     const stat=await fs.lstat(dir);
     if(!stat.isDirectory()||stat.isSymbolicLink())deny('PROJECT_VIEW_PATH_UNSAFE');
-    views.push([dir,'tasks.txt',render(state,project)]);
+    views.push([dir,'tasks.txt',render(state,project)],
+      [dir,'history.txt',renderHistory(state,project)]);
   }
   let changed=false;
   for(const [dir,name,text] of views){
     const bytes=Buffer.from(text,'utf8');
-    if(bytes.length>1024*1024)deny('INBOX_SIZE_LIMIT');
+    if(bytes.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
     const previous=await fileBytes(dir,name);
     if(!previous||!previous.equals(bytes)){
       await atomic(dir,name,bytes);
@@ -205,8 +268,11 @@ export async function ownerReviewResearchTask(config,args){
     if(!item)deny('REVIEW_TASK_NOT_FOUND');
     if(item.status===status)return {id,status,reused:true};
     if(['DONE','REJECTED'].includes(item.status))deny('REVIEW_FINAL_STATUS_IMMUTABLE');
+    const now=new Date().toISOString();
     const next={version:VERSION,items:state.items.map(i=>i.id===id?
-      {...i,status,reviewed:new Date().toISOString()}:i)};
+      {...i,status,reviewed:now,
+        history:[...historyOf(i),historyEvent('OWNER_STATUS',now,'owner',
+          {from:i.status,to:status})]}:i)};
     const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
     await atomic(root,'tasks.json',json);
     const views=await syncViews(root,next);
@@ -228,40 +294,59 @@ export function createResearchInbox(config){
     async propose_research_task(args){
       const root=await fixedRoot(config),candidate=validate(config,args);
       return withLock(root,async()=>{
-        const state=await current(root);
-        if(state.items.some(i=>i.id===candidate.id)){
-          // Recover an interrupted state->view projection without adding a second
-          // item or silently changing its original evidence/first-seen date.
-          const views=await syncViews(root,state);
-          if(views.changed){
-            return {status:'DUPLICATE_VIEW_RECOVERED',id:candidate.id,
-              taskFile:'tasks.txt',projectTaskFile:ctxProjectTask(candidate.project),
+        const state=await current(root),now=new Date().toISOString();
+        const existing=state.items.find(item=>item.id===candidate.id);
+        if(existing){
+          if(contentDigest(existing)===contentDigest(candidate)){
+            const views=await syncViews(root,state);
+            return {status:views.changed?'DUPLICATE_VIEW_RECOVERED':'DUPLICATE_NOT_MODIFIED',
+              id:candidate.id,taskFile:'tasks.txt',
+              projectTaskFile:ctxProjectTask(candidate.project),
               tasksSha256:views.aggregateSha256,codeModified:false};
           }
-          return {status:'DUPLICATE_NOT_MODIFIED',id:candidate.id,
-            taskFile:'tasks.txt',codeModified:false};
+          if(['DONE','REJECTED'].includes(existing.status)){
+            return {status:'CLOSED_TASK_UNCHANGED',id:candidate.id,
+              note:'An unattended worker cannot reopen an owner-closed task.'};
+          }
+          const history=historyOf(existing);
+          if(existing.run_key===candidate.run_key||
+             history.some(event=>event.run_key===candidate.run_key)){
+            return {status:'RUN_KEY_REUSED_DIFFERENT_CONTENT',id:candidate.id,
+              note:'No mutation; a research revision requires a genuinely new run key.'};
+          }
+          const fields=changedFields(existing,candidate);
+          const updated={...existing,...snapshot(candidate),
+            // Preserve owner state, original task identity and creation date.
+            status:existing.status,updated:now,
+            revision:(existing.revision??1)+1,
+            history:[...history,historyEvent('REFINED',now,candidate.run_key,
+              {fields,previous:snapshot(existing)})]};
+          const next={...state,items:state.items.map(item=>
+            item.id===candidate.id?updated:item)};
+          const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
+          if(json.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
+          await atomic(root,'tasks.json',json);
+          const views=await syncViews(root,next);
+          return {status:'TASK_REFINED',id:candidate.id,
+            revision:updated.revision,changedFields:fields,
+            tasksSha256:views.aggregateSha256,taskFile:'tasks.txt',
+            projectTaskFile:ctxProjectTask(candidate.project),
+            historyFile:'history.txt',codeModified:false};
         }
-        if(state.items.length>=MAX_ITEMS||
-           state.items.filter(i=>i.status==='OPEN').length>=MAX_OPEN)
-          deny('RESEARCH_BACKLOG_REVIEW_REQUIRED');
-        const now=new Date().toISOString(),today=now.slice(0,10);
-        const todayCount=state.items.filter(i=>
-          i.project===candidate.project&&i.created?.startsWith(today)).length;
-        if(todayCount>=MAX_PER_DAY)deny('PROJECT_DAILY_RESEARCH_LIMIT');
-        const next={version:VERSION,items:[...state.items,{
-          ...candidate,status:'OPEN',created:now
-        }]};
+        const newTask={...candidate,status:'OPEN',created:now,updated:now,
+          revision:1,history:[historyEvent('CREATED',now,candidate.run_key)]};
+        const next={...state,items:[...state.items,newTask]};
         const json=Buffer.from(JSON.stringify(next,null,2)+'\n','utf8');
-        const readable=Buffer.from(render(next),'utf8');
-        if(json.length>1024*1024||readable.length>1024*1024)
-          deny('INBOX_SIZE_LIMIT');
+        if(json.length>MAX_FILE_BYTES)deny('INBOX_CAPACITY_REACHED');
         await atomic(root,'tasks.json',json);
         const views=await syncViews(root,next);
         return {status:'QUEUED_FOR_HUMAN_REVIEW',id:candidate.id,
           tasksSha256:views.aggregateSha256,taskFile:'tasks.txt',
-          projectTaskFile:ctxProjectTask(candidate.project),codeModified:false,
+          projectTaskFile:ctxProjectTask(candidate.project),
+          historyFile:'history.txt',codeModified:false,
           journalModified:false,project:candidate.project};
       });
+
     }
   };
 }
