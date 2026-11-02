@@ -17,9 +17,13 @@ const MAX_PER_DAY=2;
 const MAX_ITEMS=200;
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const deny=code=>{const e=new Error(code);e.code=code;throw e;};
-const samePath=(a,b)=>process.platform==='win32'
-  ?path.resolve(a).toLowerCase()===path.resolve(b).toLowerCase()
-  :path.resolve(a)===path.resolve(b);
+const nativePath=p=>{
+  const unprefixed=process.platform==='win32'&&p.startsWith('\\\\?\\')
+    ?p.slice(4):p;
+  const canonical=path.resolve(unprefixed);
+  return process.platform==='win32'?canonical.toLowerCase():canonical;
+};
+const samePath=(a,b)=>nativePath(a)===nativePath(b);
 const within=(parent,child)=>{
   const rel=path.relative(parent,child);
   return !rel||(!rel.startsWith('..'+path.sep)&&rel!=='..'&&!path.isAbsolute(rel));
