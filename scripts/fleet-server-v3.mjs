@@ -5,6 +5,7 @@ import { createRevenueService, loadRevenueConfig } from "./ledger.mjs";
 import { createCodingService } from "./coding.mjs";
 import { createScopedWorktreeActions } from "./fleet-scoped-worktree-actions.mjs";
 import { createFleetWorktreeInitializer } from "./fleet-worktree-init.mjs";
+import { createResearchInbox } from "./fleet-research-inbox.mjs";
 
 function tool(name, description, properties, required, annotations) {
   return { name, title: name.replaceAll("_", " "),
@@ -166,11 +167,36 @@ function definitions(config) {
         {readOnlyHint:false,destructiveHint:true,idempotentHint:false,openWorldHint:false}));
     }
   }
+  if(config.enableResearchInbox===true){
+    const researchProject={type:"string",
+      enum:["geo","godprompt","gsc","nofax","trendpulse","webvalidator"]
+        .filter(p=>Object.hasOwn(config.projects,p))};
+    list.push(tool("read_research_tasks",
+      "Read-only snapshot of the shared fixed-root research task queue; no project files or journals modified.",
+      {project:researchProject},[],readOnly));
+    const line={type:"string",minLength:12,maxLength:700};
+    list.push(tool("propose_research_task",
+      "WRITE APPROVAL REQUIRED: Submit one concrete, evidence-backed proposal to a bounded shared tasks.txt queue. Never execute code, change project sources, write journals, or approve implementation.",
+      {project:researchProject,
+       issue_key:{type:"string",pattern:"^[a-z][a-z0-9-]{3,79}$"},
+       run_key:{type:"string",pattern:"^[A-Za-z0-9_.:+-]{8,160}$"},
+       priority:{type:"string",enum:["P0","P1","P2","P3"]},
+       confidence:{type:"string",enum:["HIGH","MEDIUM"]},
+       title:{...line,maxLength:120},
+       problem:line,impact:{...line,maxLength:400},
+       action:line,validation:{...line,maxLength:600},
+       evidence:{type:"array",items:{type:"string",minLength:12,maxLength:500},
+         minItems:1,maxItems:4}},
+      ["project","issue_key","run_key","priority","confidence",
+       "title","problem","impact","action","validation","evidence"],
+      {readOnlyHint:false,destructiveHint:false,idempotentHint:true,openWorldHint:false}));
+  }
   return list;
 }
 export function makeHandler(config) {
   const service = { ...createRevenueService(config), ...createCodingService(config),
-    ...createScopedWorktreeActions(config), ...createFleetWorktreeInitializer(config) };
+    ...createScopedWorktreeActions(config), ...createFleetWorktreeInitializer(config),
+    ...createResearchInbox(config) };
   const tools = definitions(config);
   return async function handle(request) {
     if (!request || request.jsonrpc !== "2.0" || Array.isArray(request)) {
