@@ -58,6 +58,11 @@ test('one evidence-backed proposal generates readable local tasks.txt and stable
     assert.match(text,/src\/core\/anthropic\.ts:87/);
     assert.match(text,/Verification plan:/);
     assert.equal(sha(text),r.tasksSha256);
+    assert.equal(r.projectTaskFile,'geo/tasks.txt');
+    const scoped=await fs.readFile(path.join(f.inbox,'geo','tasks.txt'),'utf8');
+    const other=await fs.readFile(path.join(f.inbox,'gsc','tasks.txt'),'utf8');
+    assert.match(scoped,/Distinguish search-backed/);
+    assert.doesNotMatch(other,/Distinguish search-backed/);
     assert.equal(await fs.readFile(path.join(f.src,'sentinel.txt'),'utf8'),
       'CANONICAL SOURCE UNMODIFIED\n');
     assert.equal((await fs.readdir(f.inbox)).filter(x=>x.includes('.lock')).length,0);
@@ -82,12 +87,12 @@ test('interrupted view write is repaired by exact duplicate replay without a sec
   try{
     await f.api.propose_research_task(f.task);
     const state=await fs.readFile(path.join(f.inbox,'tasks.json'));
-    await fs.unlink(path.join(f.inbox,'tasks.txt'));
+    await fs.unlink(path.join(f.inbox,'geo','tasks.txt'));
     const r=await f.api.propose_research_task(f.task);
     assert.equal(r.status,'DUPLICATE_VIEW_RECOVERED');
     assert.deepEqual(await fs.readFile(path.join(f.inbox,'tasks.json')),state);
-    assert.match(await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8'),
-      /PROPOSALS ONLY/);
+    assert.match(await fs.readFile(path.join(f.inbox,'geo','tasks.txt'),'utf8'),
+      /Distinguish search-backed/);
     assert.equal((await f.api.read_research_tasks()).count,1);
   }finally{await cleanup(f);}
 });
@@ -161,6 +166,8 @@ test('human-only CAS review approves, completes and cannot be invoked by the sch
     assert.equal(review.status,'APPROVED');
     let text=await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8');
     assert.match(text,/Status: APPROVED/);
+    assert.match(await fs.readFile(path.join(f.inbox,'geo','tasks.txt'),'utf8'),
+      /Status: APPROVED/);
     assert.match(text,/\[>\] \[P1\]/);
     await assert.rejects(ownerReviewResearchTask(f.config,{
       id:entry.id,status:'DONE',expected_state_sha256:sha(source)}),
@@ -171,6 +178,8 @@ test('human-only CAS review approves, completes and cannot be invoked by the sch
     assert.equal(finish.status,'DONE');
     text=await fs.readFile(path.join(f.inbox,'tasks.txt'),'utf8');
     assert.doesNotMatch(text,/Distinguish search-backed/);
+    assert.doesNotMatch(await fs.readFile(path.join(f.inbox,'geo','tasks.txt'),'utf8'),
+      /Distinguish search-backed/);
     const duplicate=await f.api.propose_research_task(f.task);
     assert.equal(duplicate.status,'DUPLICATE_NOT_MODIFIED');
     await assert.rejects(ownerReviewResearchTask(f.config,{
