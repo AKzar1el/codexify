@@ -1,0 +1,44 @@
+name: Revenue Shot research inbox
+on:
+  push:
+    branches:
+      - feat/revenue-research-inbox-20261102
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  research-inbox:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax-check new native tools
+        run: |
+          node --check scripts/fleet-research-inbox.mjs
+          node --check scripts/fleet-research-owner-review.mjs
+          node --check scripts/fleet-server-v3.mjs
+          node --check scripts/fleet-research-inbox.test.mjs
+      - name: Parse owner installer PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/install-revenue-research-inbox.ps1'),
+            [ref]$tokens,[ref]$errors) > $null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+      - name: Run local synthetic research queue tests
+        run: node --test scripts/fleet-research-inbox.test.mjs
