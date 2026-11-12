@@ -39,6 +39,10 @@ export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_o
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
+// A cold ChatGPT tab can hydrate its model picker, inspect multiple families,
+// and restore the prior selection more slowly than ordinary single-turn work.
+// The server bounds both catalogue endpoints to 180 seconds.
+const BROWSER_CAPABILITY_TIMEOUT_MS = 150_000;
 const BROWSER_PREFLIGHT_TIMEOUT_MS = 60_000;
 const BROWSER_READINESS_WAIT_MS = 45_000;
 // Refresh confirmation can take 60 seconds after its bounded UI steps. Keep
@@ -293,7 +297,7 @@ export class SingleWindowCoordinator {
       }
       const catalog = await this.driver.capabilities(operationSignal);
       return { ...catalog, protocolVersion:PROTOCOL_VERSION, build:this.build };
-    }, signal);
+    }, signal, false, BROWSER_CAPABILITY_TIMEOUT_MS);
   }
 
   async newChatCapabilities(projectUrl:string | null, signal?: AbortSignal): Promise<CapabilityCatalog> {
@@ -302,7 +306,7 @@ export class SingleWindowCoordinator {
       if (!this.driver.prepareNewChat) throw new Error("New chat preparation is unavailable");
       const catalog = await this.driver.prepareNewChat(projectUrl, operationSignal);
       return {...catalog, protocolVersion:PROTOCOL_VERSION, build:this.build};
-    }, signal);
+    }, signal, false, BROWSER_CAPABILITY_TIMEOUT_MS);
   }
 
   async accountPlan(epoch:string, signal?: AbortSignal, passive=false) {

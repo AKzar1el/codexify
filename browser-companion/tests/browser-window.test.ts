@@ -330,6 +330,31 @@ test("concurrent execute preflights cannot acquire the single window twice", asy
   }
 });
 
+test("catalogue discovery can outlast an ordinary operation deadline without false timeout",async()=>{
+  class SlowCatalogDriver extends DeferredDriver {
+    prepared=0;
+    override async capabilities():Promise<CapabilityCatalog> {
+      await Bun.sleep(90);
+      return super.capabilities();
+    }
+    async prepareNewChat():Promise<CapabilityCatalog> {
+      this.prepared++;
+      await Bun.sleep(90);
+      return super.capabilities();
+    }
+  }
+  const driver=new SlowCatalogDriver();
+  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
+    operationMs:40,cleanupMs:15,hardStopMs:15,
+  });
+  const prepared=await coordinator.newChatCapabilities(null);
+  const refreshed=await coordinator.capabilities();
+  expect(prepared.models[0]?.id).toBe("gpt-6-sol");
+  expect(refreshed.models[0]?.id).toBe("gpt-6-sol");
+  expect(driver.prepared).toBe(1);
+  await coordinator.close();
+});
+
 test("pre-Send readiness waits for a slow ChatGPT session without sending twice",async()=>{
   class HydratingDriver extends DeferredDriver {
     checks=0;

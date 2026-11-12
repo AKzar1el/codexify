@@ -38,8 +38,10 @@ export async function withChatGptModelOptions<T>(
         // while it is still mounted, rather than losing the submenu reference.
         let submenuId=await trigger.getAttribute("aria-controls");
         const simple=await view.count()===1&&await view.getAttribute("data-model-picker-view")==="simple";
-        if(simple||state!=="true") {await trigger.click({timeout:5_000,signal:options.signal});expanded=true;}
-        const deadline=Date.now()+5_000;
+        if(simple||state!=="true") {await trigger.click({timeout:10_000,signal:options.signal});expanded=true;}
+        // Portal-based model rows often mount after a transition; retain
+        // strict semantic checks but allow a slow browser to finish mounting.
+        const deadline=Date.now()+12_000;
         do {
           options.signal?.throwIfAborted();
           // Some submenu triggers publish aria-controls only once opened. Read

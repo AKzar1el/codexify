@@ -42,8 +42,12 @@ const fixture = `<!doctype html><style>#prompt-textarea{min-height:24px}[data-mo
     event.preventDefault();const model=definitions[family], step=event.key==='ArrowRight'?1:-1;
   let next=model.value+step;
   while(next>=model.min&&next<model.min+model.labels.length&&model.locked.includes(next-model.min)) next+=step;
-  if(next>=model.min&&next<model.min+model.labels.length) model.value=next;
+  if(document.body.dataset.slowEffort==='true') {
+    setTimeout(()=>{if(next>=model.min&&next<model.min+model.labels.length) model.value=next;render();},800);
+  } else {
+    if(next>=model.min&&next<model.min+model.labels.length) model.value=next;
     render();
+  }
   };
   range.onpointerdown=event=>{
     if (document.body.dataset.pointerOnly!=='true') return;
@@ -130,3 +134,23 @@ for (const mode of ["sliderOnly", "pointerOnly"] as const) {
     60_000,
   );
 }
+
+test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME !== "1")(
+  "Chrome waits for delayed real slider ARIA updates instead of replaying movement",
+  async () => {
+    const profilePath = await mkdtemp(join(tmpdir(), "native-slow-effort-"));
+    const executablePath = process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME_PATH
+      ?? await privateChromeExecutable(join(import.meta.dirname, "../.browsers", `${process.platform}-${process.arch}`));
+    const context = await chromium.launchPersistentContext(profilePath,{channel:"chrome",executablePath,headless:true,viewport:null});
+    try {
+      await context.route("https://chatgpt.com/**",route=>route.fulfill({contentType:"text/html",body:fixture}));
+      const page = context.pages()[0] ?? await context.newPage();
+      await page.goto("https://chatgpt.com/");
+      await page.evaluate(()=>{document.body.dataset.slowEffort="true";});
+      const result=await detectChatGptAccountCapabilities(page);
+      expect(result.models.some(model=>model.family==="6")).toBe(true);
+      expect(await page.locator('[role="slider"]').getAttribute("aria-valuenow")).toBe("2");
+      expect(await page.evaluate(()=>Number(document.body.dataset.sliderKeys||0))).toBeGreaterThan(0);
+    } finally {await context.close(); await rm(profilePath,{recursive:true,force:true});}
+  },60_000,
+);

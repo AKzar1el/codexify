@@ -343,7 +343,10 @@ export async function moveChatGptEffortSlider(
     const direction = Math.sign(target - state.value);
     const before = state.value;
     const moved = async (): Promise<boolean> => {
-      const deadline = Date.now() + 300;
+      // ChatGPT may animate the thumb immediately but commit its ARIA state
+      // only after slow React hydration. Do not misread that delay as a
+      // rejected keypress and send a second pointer/keyboard action too soon.
+      const deadline = Date.now() + 1_800;
       do {
         state = await readChatGptEffortSnapshot(menu.sliderContainer);
         if (state.min !== min || state.max !== max || !state.available[target - min]) {
