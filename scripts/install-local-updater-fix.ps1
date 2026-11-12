@@ -131,9 +131,12 @@ try {
     Report 'stopping' 'Stopping only the existing Codexify service for the local updater repair'
     & $target browser stop-for-restart
     CheckExit 'Prepare browser for service restart'
+    # Set this before running disable: Task Scheduler can stop the service
+    # successfully but the command may still fail to return a receipt.
+    # The catch handler must then attempt service recovery.
+    $serviceStopped = $true
     & $target service disable
     CheckExit 'Stop scheduled service'
-    $serviceStopped = $true
     WaitForOldListener
     $still = @(Get-CimInstance Win32_Process | Where-Object {
         $_.ExecutablePath -and
@@ -166,6 +169,10 @@ try {
     }
     if ($serviceStopped) {
         try { & $target service enable; & $target service wait-ready --port $port --timeout-ms 120000 } catch {}
+    } else {
+        # The prior service is still running, but stop-for-restart might have
+        # stopped the browser before the failure was detected.
+        try { & $target browser start | Out-Null } catch {}
     }
     throw "Local updater repair installation failed: $reason. Backup: $backup"
 } finally {
