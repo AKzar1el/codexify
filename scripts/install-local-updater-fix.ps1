@@ -41,12 +41,45 @@ function Owners() {
     return @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
         Where-Object { $_.LocalPort -eq $port })
 }
+function VerifiedCodexifyListeners() {
+    $result = @()
+    foreach ($listener in @(Owners)) {
+        $ownerId = [int]$listener.OwningProcess
+        if ($ownerId -le 0) { throw 'A listener has no verifiable owning process' }
+        $process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $ownerId) -ErrorAction Stop
+        if (-not $process -or -not $process.ExecutablePath) {
+            throw "Port $port has an unknown process owner; refusing to terminate it"
+        }
+        $samePath = [string]::Equals(
+            [IO.Path]::GetFullPath([string]$process.ExecutablePath),
+            [IO.Path]::GetFullPath($target),
+            [StringComparison]::OrdinalIgnoreCase
+        )
+        if (-not $samePath -or [string]$process.CommandLine -notmatch '(?i)(--config|service\s+run)') {
+            throw "Port $port owner $ownerId is not the verified Codexify service; refusing to terminate it"
+        }
+        $result += $ownerId
+    }
+    return $result
+}
 function WaitForOldListener() {
-    for ($i=0; $i -lt 30; $i++) {
+    for ($i=0; $i -lt 15; $i++) {
         if (@(Owners).Count -eq 0) { return }
         Start-Sleep -Seconds 1
     }
-    throw 'The old service still owns port 3000; refusing to overwrite an active executable'
+    # The scheduled service is disabled by this point. It may have left behind
+    # its child process, as seen on 11 November. Stop only the exact executable
+    # and service command line that still own this particular local port.
+    foreach ($ownerId in @(VerifiedCodexifyListeners)) {
+        if (@(VerifiedCodexifyListeners) -notcontains $ownerId) { continue }
+        Stop-Process -Id $ownerId -Force -ErrorAction Stop
+        Report 'orphan_released' "Verified stopped-service orphan PID $ownerId was holding port $port"
+    }
+    for ($i=0; $i -lt 15; $i++) {
+        if (@(Owners).Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw "Port $port remains occupied after verified old-service release; refusing to replace the executable"
 }
 function WaitForReady() {
     & $target service wait-ready --port $port --timeout-ms 120000
