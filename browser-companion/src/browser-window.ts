@@ -39,6 +39,8 @@ export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_o
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
+const BROWSER_PREFLIGHT_TIMEOUT_MS = 60_000;
+const BROWSER_READINESS_WAIT_MS = 45_000;
 // Refresh confirmation can take 60 seconds after its bounded UI steps. Keep
 // ownership through observation and restoration, below the client's 150s limit.
 const CONNECTOR_REFRESH_TIMEOUT_MS = 120_000;
@@ -73,7 +75,7 @@ export interface BrowserDriver {
   }>;
   capabilities(signal?: AbortSignal): Promise<CapabilityCatalog>;
   prepareNewChat?(projectUrl:string | null, signal?: AbortSignal): Promise<CapabilityCatalog>;
-  accountPlan?(epoch:string, signal?: AbortSignal): Promise<import("./account-settings").AccountPlan>;
+  accountPlan?(epoch:string, signal?: AbortSignal, passive?:boolean): Promise<import("./account-settings").AccountPlan>;
   navigationAvailability?(url:string):Promise<number|null>;
   turnHandoffComplete?(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean>;
   refreshConnector?(name:string, signal?: AbortSignal): Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;
@@ -233,7 +235,7 @@ export class SingleWindowCoordinator {
   private pairingWindow: {actionId:string;url:string;generation:number;account:string;connector:string;timer:ReturnType<typeof setTimeout>} | null = null;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string,
-    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number;accountPlanMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS, accountPlanMs:45_000 }) {
+    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number;accountPlanMs?:number;preflightMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS, accountPlanMs:45_000, preflightMs:BROWSER_PREFLIGHT_TIMEOUT_MS }) {
     validateProtocolBuild(build);
     if (Object.values(timeouts).some(value => !Number.isFinite(value) || value <= 0)) throw new Error("Browser operation deadlines must be positive");
   }
@@ -303,11 +305,11 @@ export class SingleWindowCoordinator {
     }, signal);
   }
 
-  async accountPlan(epoch:string, signal?: AbortSignal) {
+  async accountPlan(epoch:string, signal?: AbortSignal, passive=false) {
     return this.withWindowOperation(async operationSignal=>{
       if(this.activeActionId)throw new Error("Browser companion is busy with an active action");
       if(!this.driver.accountPlan)throw new Error("Account plan inspection is unavailable");
-      return this.driver.accountPlan(epoch, operationSignal);
+      return this.driver.accountPlan(epoch, operationSignal, passive);
     }, signal,false,this.timeouts.accountPlanMs??this.timeouts.operationMs);
   }
 
@@ -432,7 +434,22 @@ export class SingleWindowCoordinator {
       await this.withWindowOperation(async operationSignal => {
         this.pendingActionId = null;
         this.activeActionId = request.actionId;
+        // A slow machine can expose the ChatGPT window before its account
+        // session and editor finish hydrating. This is strictly pre-Send:
+        // never repeat an action once any Send may have been accepted.
+        const readinessDeadline = Date.now() + Math.min(
+          BROWSER_READINESS_WAIT_MS,
+          this.timeouts.preflightMs ?? this.timeouts.operationMs,
+        );
         let health = await this.driver.health();
+        const stillHydrating = () => health.status === "unavailable"
+          && /(?:loading|hydrating|initializing|timed out|session.*(?:pending|unavailable)|failed to fetch)/i.test(health.detail??"");
+        while(stillHydrating() && Date.now() < readinessDeadline) {
+          operationSignal.throwIfAborted();
+          await new Promise(resolve => setTimeout(resolve, 600));
+          operationSignal.throwIfAborted();
+          health = await this.driver.health();
+        }
         if (health.status === "unavailable") throw new BrowserCompanionError(health.detail || "Browser companion Chrome window is unavailable");
         const recoverAuthentication = !health.authenticated && health.status === "authentication_required"
           && request.prompt.kind !== "create_chat";
@@ -450,7 +467,7 @@ export class SingleWindowCoordinator {
           throw new BrowserCompanionError(health.detail || `Browser companion window is not idle (${health.status})`);
         }
         record.recoverAuthentication = recoverAuthentication;
-      }, record.abort.signal);
+      }, record.abort.signal, false, this.timeouts.preflightMs ?? this.timeouts.operationMs);
       await this.run(record);
     } catch (error) {
       if (!record.terminal) this.emitFailure(record, asCompanionError(error));

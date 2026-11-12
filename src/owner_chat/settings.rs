@@ -39,6 +39,16 @@ impl GlobalRuntime {
             }
         }
     }
+    fn record_passive_plan(&mut self, result: Result<Value, String>, now_ms: u64) {
+        self.record_plan(result, now_ms);
+        if self.plan.is_some() {
+            // "Pro" is an accurate basic plan from the verified session, but
+            // the detailed billing multiplier remains unknown. Do not keep
+            // retrying a background check that would navigate to settings.
+            self.plan_attempted = true;
+            self.plan_retry_at_ms = 0;
+        }
+    }
     fn observe_account(&mut self, account: Option<String>) {
         // A transient browser-health failure does not identify an account change.
         // Retain the startup cache until a different account is actually verified.
@@ -142,9 +152,11 @@ pub(super) fn start(state: OwnerState) {
                     && health.active_action_id.is_none()
                 {
                     drop(global);
-                    let plan = client.account_plan(&epoch, &CancellationToken::new()).await;
+                    let plan = client
+                        .passive_account_plan(&epoch, &CancellationToken::new())
+                        .await;
                     global = state.global.lock().await;
-                    global.record_plan(plan, crate::markdown_chat::now_ms());
+                    global.record_passive_plan(plan, crate::markdown_chat::now_ms());
                 }
                 drop(global);
                 if health.authenticated && health.active_action_id.is_none() {
@@ -850,6 +862,21 @@ mod tests {
         assert_eq!(runtime.plan.as_ref().unwrap()["label"], "Pro 20x");
         assert!(runtime.plan_attempted);
         assert_eq!(runtime.plan_retry_at_ms, 0);
+    }
+    #[test]
+    fn passive_startup_plan_does_not_repeat_billing_navigation() {
+        let mut runtime = GlobalRuntime::default();
+        runtime.observe_account(Some("account-one".into()));
+        runtime.record_passive_plan(Ok(json!({"label":"Pro","kind":"pro"})), 1000);
+        assert!(runtime.plan_attempted);
+        assert_eq!(runtime.plan_retry_at_ms, 0);
+        assert_eq!(runtime.plan.as_ref().unwrap()["label"], "Pro");
+        runtime.observe_account(Some("account-one".into()));
+        assert!(runtime.plan_attempted);
+        // A newly verified account may request a fresh passive-only lookup.
+        runtime.observe_account(Some("account-two".into()));
+        assert!(!runtime.plan_attempted);
+        assert!(runtime.plan.is_none());
     }
     #[test]
     fn cached_plan_survives_transient_health_failures_and_resets_for_a_verified_new_account() {

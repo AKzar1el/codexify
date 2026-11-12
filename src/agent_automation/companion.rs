@@ -550,6 +550,29 @@ impl BrowserCompanionClient {
         self.decode_json_response(response, cancellation).await
     }
 
+    /// Read only the verified session's basic plan tier. This is used during
+    /// unattended startup; it must not navigate the shared ChatGPT browser to
+    /// account settings while another agent is preparing a conversation.
+    pub async fn passive_account_plan(
+        &self,
+        epoch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, String> {
+        let response = self
+            .send_json_with_timeout(
+                Method::POST,
+                "/v1/account/plan",
+                Some(&serde_json::json!({"epoch":epoch,"passive":true})),
+                cancellation,
+                Some(Duration::from_secs(15)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.response_status_error(response, cancellation).await);
+        }
+        self.decode_json_response(response, cancellation).await
+    }
+
     pub async fn navigation_available_at(
         &self,
         url: &str,

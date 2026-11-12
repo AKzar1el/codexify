@@ -495,10 +495,18 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     return catalog;
   }
 
-  async accountPlan(epoch:string, signal?:AbortSignal):Promise<AccountPlan> {
+  async accountPlan(epoch:string, signal?:AbortSignal, passive=false):Promise<AccountPlan> {
     signal?.throwIfAborted();
     const main=await this.surface.page(),account=await readChatGptAccount(main);
     if(this.planCache?.epoch===epoch&&this.planCache.plan.accountFingerprint===account.fingerprint&&Date.now()<this.planCache.expiresAt)return this.planCache.plan;
+    if(passive) {
+      // The owner dashboard checks its plan automatically on each service
+      // startup. Never send that background check through account menus or
+      // billing settings: those navigations steal the live agent's shared tab.
+      // The session endpoint supports a basic tier but cannot prove Pro
+      // multipliers. Return "Pro" instead of inventing "Pro 20x".
+      return {...classifyPlan(account.planType),accountFingerprint:account.fingerprint};
+    }
     let verifiedPlan:AccountPlan|undefined;
     const cache=(plan:AccountPlan,retryAt=0)=>{
       if(!plan.label.trim())throw new BrowserCompanionError("ChatGPT did not expose its subscription plan", "selector_drift");

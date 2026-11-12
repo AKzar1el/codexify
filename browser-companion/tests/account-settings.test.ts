@@ -72,6 +72,14 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("plan chec
   const newPage=spyOn(context,'newPage').mockImplementation(async()=>{throw Error('Maintenance must never create a tab');});
   let addedPages=0;context.on('page',()=>addedPages++);
   try {
+    // Background startup plan inspection must never steal the shared tab.
+    // A session can prove "Pro" but not the exact billing multiplier.
+    const passiveBefore=billingReads, passiveVisits=visits.length;
+    const passive=await driver.accountPlan('startup-passive',undefined,true);
+    expect(passive).toMatchObject({label:'Pro',kind:'pro'});
+    expect(page.url()).toBe(original);
+    expect(billingReads).toBe(passiveBefore);
+    expect(visits).toHaveLength(passiveVisits);
     const before=billingReads;
     await driver.accountPlan('startup-one');expect(page.url()).toBe(original);
     await driver.accountPlan('startup-one');expect(billingReads-before).toBe(1);

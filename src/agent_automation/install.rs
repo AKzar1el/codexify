@@ -35,7 +35,10 @@ const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 768 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const START_TIMEOUT: Duration = Duration::from_secs(30);
+// Cold Windows browser startups can spend time launching Chrome and hydrating
+// ChatGPT. A responsive process alone is not yet a verified account session.
+const START_TIMEOUT: Duration = Duration::from_secs(90);
+const STATUS_HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_RELEASE_ROOT: &str = "https://github.com/devnoname120/codexify/releases/download";
@@ -357,18 +360,9 @@ impl BrowserCompanionManager {
             ) {
                 return Ok(status);
             }
-            if status.state == BrowserLifecycleState::Unavailable
-                && let Ok(client) = BrowserCompanionClient::from_descriptor_path_with_timeout(
-                    &self.layout.descriptor_path,
-                    Duration::from_secs(2),
-                )
-                && client
-                    .liveness(&tokio_util::sync::CancellationToken::new())
-                    .await
-                    == Ok(Some(true))
-            {
-                return Ok(status);
-            }
+            // A responsive renderer may still be loading its account/session.
+            // Keep waiting for a validated readiness/attention state instead
+            // of returning "unavailable" during this hydration interval.
             if status.state == BrowserLifecycleState::Incompatible
                 && self.layout.descriptor_path.exists()
             {
@@ -390,7 +384,7 @@ impl BrowserCompanionManager {
     pub async fn stop(&self) -> Result<BrowserCompanionStatus, String> {
         let client = match BrowserCompanionClient::from_descriptor_path_with_timeout(
             &self.layout.descriptor_path,
-            Duration::from_secs(2),
+            STATUS_HEALTH_TIMEOUT,
         ) {
             Ok(client) => client,
             Err(message) if descriptor_means_stopped(&message) => {
@@ -514,7 +508,7 @@ impl BrowserCompanionManager {
 
         let client = match BrowserCompanionClient::from_descriptor_path_with_timeout(
             &self.layout.descriptor_path,
-            Duration::from_secs(2),
+            STATUS_HEALTH_TIMEOUT,
         ) {
             Ok(client) => client,
             Err(message) if descriptor_means_stopped(&message) => {
@@ -568,6 +562,25 @@ impl BrowserCompanionManager {
                 );
             }
             Err(message) => {
+                // During slow ChatGPT hydration the local companion is
+                // responsive even when account/session verification times out.
+                // Liveness never proves authentication or a model selection.
+                if message.contains("timed out")
+                    && client
+                        .liveness(&tokio_util::sync::CancellationToken::new())
+                        .await
+                        == Ok(Some(true))
+                {
+                    return self.status_value(
+                        BrowserLifecycleState::Busy,
+                        true,
+                        true,
+                        false,
+                        Some(runtime.manifest.build),
+                        Some(runtime.entrypoint),
+                        Some("Browser is responsive; waiting for ChatGPT account/session verification".into()),
+                    );
+                }
                 return self.status_value(
                     BrowserLifecycleState::Unavailable,
                     true,

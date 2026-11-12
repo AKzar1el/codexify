@@ -330,6 +330,49 @@ test("concurrent execute preflights cannot acquire the single window twice", asy
   }
 });
 
+test("pre-Send readiness waits for a slow ChatGPT session without sending twice",async()=>{
+  class HydratingDriver extends DeferredDriver {
+    checks=0;
+    override async health() {
+      this.checks++;
+      if(this.checks<=3)return {
+        authenticated:false,accountFingerprint:null,
+        status:"unavailable" as const,detail:"ChatGPT is loading",
+      };
+      return super.health();
+    }
+  }
+  const driver=new HydratingDriver();
+  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
+    operationMs:5_000,preflightMs:5_000,cleanupMs:100,hardStopMs:100,
+  });
+  await coordinator.execute(request("slow-hydration"));
+  const events=collect(coordinator,"slow-hydration");
+  await Bun.sleep(100);
+  expect(driver.runs).toEqual([]);
+  while(!driver.releases.has("slow-hydration"))await Bun.sleep(20);
+  expect(driver.checks).toBeGreaterThanOrEqual(4);
+  expect(driver.runs).toEqual(["slow-hydration"]);
+  driver.releases.get("slow-hydration")?.();
+  expect((await events).at(-1)?.type).toBe("generation_complete");
+});
+
+test("wrong account and authentication failures do not enter readiness retry",async()=>{
+  class WrongAccountDriver extends DeferredDriver {
+    checks=0;
+    override async health() {
+      this.checks++;
+      return {...await super.health(),accountFingerprint:"someone-else"};
+    }
+  }
+  const driver=new WrongAccountDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
+  await coordinator.execute(request("wrong-account-fast"));
+  const events=await collect(coordinator,"wrong-account-fast");
+  expect(events.at(-1)).toMatchObject({type:"failed",message:expect.stringContaining("account changed")});
+  expect(driver.checks).toBe(1);
+  expect(driver.runs).toEqual([]);
+});
+
 test("execute is idempotent but an action ID cannot be rebound to another request", async () => {
   const driver = new DeferredDriver();
   const coordinator = new SingleWindowCoordinator(driver, TEST_BUILD);

@@ -186,8 +186,8 @@ async function route(
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/account/plan") {
-    const body=z.strictObject({epoch:z.string().min(1).max(128)}).parse(await readJson(request));
-    try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal));}
+    const body=z.strictObject({epoch:z.string().min(1).max(128),passive:z.boolean().optional()}).parse(await readJson(request));
+    try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal,body.passive??false));}
     catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
   }
   if(request.method==="POST"&&url.pathname==="/v1/navigation/availability") {
