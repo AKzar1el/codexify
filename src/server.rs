@@ -9,7 +9,7 @@
 //! UI resources remain presentation-only.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +73,32 @@ const HTTP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CACHE_TTL_MS: u64 = 0;
 const WORKSPACE_CHANGE_FIELD: &str = "workspace_changed";
 const WORKSPACE_CHANGE_DESCRIPTION: &str = "User-selected workspace transition. Stop using old paths and call get_agent_brief before further project work. Omitted when no transition is pending.";
+
+// A new-chat handoff can pin a normal Windows path (C:\\...) while
+// project bindings return its canonical \\\\?\\C:\\... representation.
+// Compare the actual resolved directories, not their textual spellings.
+// Never accept a different directory or a missing/unresolvable workspace.
+fn verify_continuation_workspace(current: &Path, saved: &Path) -> Result<(), String> {
+    let current = std::fs::canonicalize(current).map_err(|error| {
+        format!(
+            "Could not verify the continued workspace {}: {error}",
+            current.display()
+        )
+    })?;
+    let saved = std::fs::canonicalize(saved).map_err(|error| {
+        format!(
+            "Could not verify the saved continuation workspace {}: {error}",
+            saved.display()
+        )
+    })?;
+    if current != saved {
+        return Err(
+            "The continued task's workspace changed after the prompt was copied. Prepare a new handoff from the current conversation."
+                .into(),
+        );
+    }
+    Ok(())
+}
 
 fn should_emit_ordinary_tool_completion(
     tool_log_call: Option<&crate::tool_logging::ToolLogCall>,
@@ -1274,7 +1300,7 @@ impl ServerHandler for CodexHandler {
                             self.continuations.claim_with_generation(physical, &token, |source_task, saved, owner| {
                             if let Some(target) = selected_target.as_ref() {
                                 let next_owner = owner.checked_add(1).ok_or("Conversation owner generation overflow")?;
-                                let permitted = target.canonicalize().ok().as_deref() == Some(saved)
+                                let permitted = verify_continuation_workspace(target, saved).is_ok()
                                     && self.effective_task_config(Some(source_task), saved.to_path_buf())
                                         .and_then(|config|crate::agent_automation::AgentAutomationStore::for_config(&config))
                                         .and_then(|store|store.pending_pairing_handoff(source_task, next_owner, crate::markdown_chat::now_ms()))?;
@@ -1290,19 +1316,7 @@ impl ServerHandler for CodexHandler {
                                             .to_string()
                                     })?
                             };
-                            let current = std::fs::canonicalize(&current).map_err(|error| {
-                                format!(
-                                    "Could not verify the continued workspace {}: {error}",
-                                    current.display()
-                                )
-                            })?;
-                            if current != saved {
-                                return Err(
-                                    "The continued task's workspace changed after the prompt was copied. Prepare a new handoff from the current conversation."
-                                        .into(),
-                                );
-                            }
-                            Ok(())
+                            verify_continuation_workspace(&current, saved)
                         })
                         })();
                         match continued {
@@ -2848,6 +2862,28 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn continuation_workspace_allows_canonical_alias_but_rejects_real_change() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("apify-web-validator");
+        let other = root.path().join("unrelated-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&other).unwrap();
+
+        // The handoff may have stored a trailing separator and a non-extended
+        // path. On Windows canonicalize() gives the \\\\?\\ form instead.
+        let raw = std::path::PathBuf::from(format!(
+            "{}{}",
+            workspace.display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        assert!(super::verify_continuation_workspace(&canonical, &raw).is_ok());
+        assert!(super::verify_continuation_workspace(&raw, &canonical).is_ok());
+        assert!(super::verify_continuation_workspace(&other, &raw).is_err());
+        assert!(super::verify_continuation_workspace(&root.path().join("missing"), &raw).is_err());
+    }
+
     #[test]
     fn automation_schema_tracks_catalog_and_hints_but_not_labels_or_order() {
         let mut config = crate::config::default_config(std::path::PathBuf::from("/tmp/schema"));

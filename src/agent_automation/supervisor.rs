@@ -3723,6 +3723,19 @@ fn validate_terminal_snapshot(
         }
         return Ok(());
     }
+    // A post-Send model-restore failure can leave selected=None even though
+    // ChatGPT already accepted the new-chat initialization. Surface the
+    // companion's concrete terminal error instead of replacing it with the
+    // generic missing-selection receipt. Never treat it as a successful pair.
+    if snapshot.state == CompanionActionState::Ambiguous
+        && let Some(message) = snapshot
+            .attention
+            .as_ref()
+            .and_then(|attention| attention.message.as_deref())
+            .filter(|message| !message.trim().is_empty())
+    {
+        return Err(execution_error(message.to_owned(), true));
+    }
     if matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
         && snapshot.canonical_url.is_none()
     {
@@ -3830,7 +3843,22 @@ mod model_fallback_snapshot_tests {
             "Browser operation timed out after 30 seconds without progress"
         );
         assert!(failure.send_accepted);
+        // With the new chat URL already saved, preserve the exact post-Send
+        // restoration failure rather than saying that selection was unproven.
+        snapshot.canonical_url = Some("https://chatgpt.com/c/fallback".into());
+        snapshot.attention = Some(super::super::CompanionAttention {
+            code: "ambiguous_send".into(),
+            message: Some("Browser driver completed new-chat pairing before restoring its requested model and effort".into()),
+        });
+        let failure = validate_terminal_snapshot(&execution, &snapshot).unwrap_err();
+        assert_eq!(
+            failure.message,
+            "Browser driver completed new-chat pairing before restoring its requested model and effort"
+        );
+        assert!(failure.send_accepted);
         snapshot.state = CompanionActionState::Idle;
+        snapshot.canonical_url = None;
+        snapshot.attention = None;
         let failure = validate_terminal_snapshot(&execution, &snapshot).unwrap_err();
         assert_eq!(
             failure.message,

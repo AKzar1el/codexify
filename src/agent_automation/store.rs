@@ -2105,6 +2105,12 @@ impl AgentAutomationStore {
         validate_reference(reference)?;
         let supplied_digest = reference_digest(reference);
         let index = self.read_pairing_index(&supplied_digest)?;
+        // An unbound new conversation can receive this reference before
+        // continue_task succeeds. Reject it *before* consuming either the
+        // durable reference index or the intended task's pending state.
+        if actual_task.stable_key() != index.task_key {
+            return Err(invalid_pairing_reference());
+        }
         let intended_root = PathBuf::from(&index.task_root);
         let intended =
             Self::new_with_pairing_index(intended_root, self.pairing_index_root.clone())?;
@@ -4474,6 +4480,33 @@ fn bounded_private(value: &str) -> bool {
 #[cfg(test)]
 mod schema_rollover_tests {
     use super::*;
+
+    #[test]
+    fn unbound_verification_cannot_consume_the_intended_pairing_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("state")).unwrap();
+        let intended = ConversationIdentity::from_openai_session("intended-apify-task").unwrap();
+        let unbound = ConversationIdentity::from_openai_session("unbound-new-chat").unwrap();
+        let url = "https://chatgpt.com/c/apify-new-chat";
+        let issue = store.issue_pairing(&intended, url, 1, 100).unwrap();
+        store
+            .record_pairing_canonical_url(&intended, issue.generation, url, 101)
+            .unwrap();
+
+        assert!(
+            store
+                .verify_pairing_reference(&unbound, 1, &issue.reference, 102)
+                .is_err()
+        );
+        assert!(store.load(&intended).unwrap().pairing.pending.is_some());
+        // After the correct continue_task handoff, the same reference must
+        // still be verifiable by the rightful task owner.
+        let verified = store
+            .verify_pairing_reference(&intended, 1, &issue.reference, 103)
+            .unwrap();
+        assert_eq!(verified.verified_owner_generation, Some(1));
+        assert!(verified.pending.is_none());
+    }
 
     fn verified_idle_pairing() -> (
         tempfile::TempDir,
