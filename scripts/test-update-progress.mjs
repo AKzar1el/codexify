@@ -5,6 +5,12 @@ import {mkdirSync} from 'node:fs';
 import {setTimeout as delay} from 'node:timers/promises';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
 const {chromium,webkit}=createRequire(import.meta.url)('playwright');
+// Local Windows patch verification can use the existing installed Chrome
+// without downloading Playwright's large browser bundles. CI still exercises
+// both engines with its normal managed Playwright installations.
+const nativeChrome=process.env.CODEXIFY_UI_TEST_CHROME;
+const openBrowser=(name,engine)=>engine.launch(name==='Chromium'&&nativeChrome?{executablePath:nativeChrome}:{});
+const browserCases=process.env.CODEXIFY_UI_TEST_CHROME_ONLY==='1'?[['Chromium',chromium]]:[['Chromium',chromium],['WebKit',webkit]];
 const META='io.github.devnoname120/codexify/markdown-chat';
 const origin='http://127.0.0.1:43266',id='d'.repeat(64);
 
@@ -59,9 +65,36 @@ const assertDraft=async f=>{
  assert.equal(f.sends.length,0);
 };
 
-for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
+for(const [name,engine] of browserCases) {
+ test(`${name}: recovered same-version update failure is history, not a persistent retry banner`,{timeout:20000},async()=>{
+  const browser=await openBrowser(name,engine);
+  try{
+   const f=await fixture(browser),{page,value}=f;
+   value.latest={updateAvailable:false,version:'2.3.29'};
+   value.version='2.3.29';
+   value.readiness={ready:true,loading:false,phase:'ready'};
+   value.update={state:'failed',updateId:'old-november-11',targetVersion:'2.3.29',failureCode:'service_restart_failed',failureDetail:'The Codexify service did not restart and become healthy.'};
+   for(let attempt=0;attempt<8;attempt++){
+    await page.clock.fastForward(2000);await delay(30);
+    if(await page.locator('#global-update').evaluate(button=>button.hidden))break;
+   }
+   assert.equal(await page.locator('#global-update').evaluate(button=>button.hidden),true,'recovered current-version failure should not offer another update');
+   assert.equal(await page.locator('#global-progress').isVisible(),false);
+   assert.equal(await page.locator('#global-update').isVisible(),false);
+   assert.equal(f.sends.length,0);
+   // A genuine unresolved failure targeting a newer version must remain
+   // visible and retryable, rather than being classified as historical.
+   value.latest={updateAvailable:true,version:'2.4.0'};
+   value.update.targetVersion='2.4.0';
+   await tick(page,'Update failed');
+   assert.equal(await page.locator('#global-update').evaluate(button=>button.hidden),false);
+   assert.equal(await page.locator('#global-progress-action').textContent(),'Retry update');
+   assert.deepEqual(f.errors,[]);
+  } finally {await browser.close();}
+ });
+
  test(`${name}: sidebar update shows immediate progress and keeps drafts until browser and connector startup finish`,{timeout:30000},async()=>{
-  const browser=await engine.launch();
+  const browser=await openBrowser(name,engine);
   try {
    const f=await fixture(browser),{page,value}=f;
    // On mobile the sidebar is hidden while reading a chat. Open it to update.
@@ -105,7 +138,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
  });
 
  test(`${name}: a rolled-back update stays visible and permits retry without losing a draft`,{timeout:20000},async()=>{
-  const browser=await engine.launch();
+  const browser=await openBrowser(name,engine);
   try {
    const f=await fixture(browser),{page,value}=f;
    await page.locator('#chat-host').getByRole('button',{name:'Back to chats',exact:true}).click();
@@ -127,7 +160,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
  });
 
  test(`${name}: restart-required status explains the action and an old healthy process cannot finish a restart`,{timeout:25000},async()=>{
-  const browser=await engine.launch();
+  const browser=await openBrowser(name,engine);
   try {
    const f=await fixture(browser),{page,value}=f;
    value.connectorRefresh={phase:'waiting_for_restart',originPid:100,requiresRestart:true,refreshId:'schema-test'};
@@ -148,7 +181,7 @@ for(const [name,engine] of [['Chromium',chromium],['WebKit',webkit]]) {
  });
 
  test(`${name}: browser recovery keeps native chat usable while service startup holds messages`,{timeout:20000},async()=>{
-  const browser=await engine.launch();
+  const browser=await openBrowser(name,engine);
   try {
    const f=await fixture(browser,{online:true}),{page,value}=f;
    value.readiness={ready:false,loading:true,browserOnly:true,phase:'starting_browser',detail:'Starting the browser companion…'};

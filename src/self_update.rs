@@ -41,7 +41,10 @@ const LATEST_VERSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const LATEST_VERSION_ERROR_CACHE_TTL: Duration = Duration::from_secs(30);
 const BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const UPDATE_DELAY_SECONDS: u64 = 10;
-const SERVICE_READY_TIMEOUT_MS: u64 = 60_000;
+// Windows scheduled tasks may be slow to recreate the supervised service after
+// an executable replacement, especially when Chrome and other workers are
+// active. The service wait-ready command independently caps this at 5 minutes.
+const SERVICE_READY_TIMEOUT_MS: u64 = 120_000;
 const UPDATE_LOCK_FILE: &str = "update.lock";
 const UPDATE_STATUS_DIR: &str = "status";
 
@@ -1739,6 +1742,62 @@ fn sh_quote(value: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
+fn windows_service_port_guard_script() -> &'static str {
+    r#"
+# Stop-ScheduledTask can terminate the PowerShell launcher while leaving an
+# older Codexify child owning the service port. The 2026-11 Windows upgrade
+# needed manual orphan reconciliation. Never replace an executable while that
+# old listener is still alive, and never terminate an unrelated port owner.
+function Get-VerifiedCodexifyPortOwners {
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+        throw 'Cannot verify the Codexify port owner: Get-NetTCPConnection is unavailable.'
+    }
+    # Filtering all listeners avoids treating "no matching socket" as a CIM
+    # error and does not suppress real socket-query failures. If enumeration
+    # itself fails, abort the update rather than assuming the port is free.
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -eq $ServicePort })
+    $expected = [IO.Path]::GetFullPath($Target)
+    $result = @()
+    foreach ($ownerId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        if (-not $ownerId) { continue }
+        $process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$ownerId) -ErrorAction Stop
+        if (-not $process) { continue }
+        $actual = [string]$process.ExecutablePath
+        if (-not $actual -or
+            -not [string]::Equals([IO.Path]::GetFullPath($actual), $expected, [StringComparison]::OrdinalIgnoreCase) -or
+            -not ($process.CommandLine -match '(?i)(--config|service\s+run)')) {
+            throw "Port $ServicePort is owned by an unverified process $ownerId. Refusing to terminate it."
+        }
+        $result += [int]$ownerId
+    }
+    return $result
+}
+function Wait-VerifiedServicePortRelease {
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        $owners = @(Get-VerifiedCodexifyPortOwners)
+        if ($owners.Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    # Task Scheduler has already stopped and disabled the owned task. Only
+    # now may an orphaned process be terminated, and only if both its binary
+    # and Codexify service command line have been verified on the live port.
+    $owners = @(Get-VerifiedCodexifyPortOwners)
+    foreach ($ownerId in $owners) {
+        if (@(Get-VerifiedCodexifyPortOwners) -notcontains $ownerId) { continue }
+        Stop-Process -Id $ownerId -Force -ErrorAction Stop
+        Write-UpdateLog "stopped verified orphaned Codexify listener on port $ServicePort (PID $ownerId)"
+    }
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        $owners = @(Get-VerifiedCodexifyPortOwners)
+        if ($owners.Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw "Codexify port $ServicePort was not released after the scheduled task stopped."
+}
+"#
+}
+
+#[cfg(any(windows, test))]
 fn windows_worker_script(
     workspace: &UpdateWorkspace,
     target: &Path,
@@ -1765,6 +1824,7 @@ fn windows_worker_script(
         "$false"
     };
     let service_port = service_restart.port;
+    let service_port_guard = windows_service_port_guard_script();
 
     Ok(format!(
         r#"Set-StrictMode -Version Latest
@@ -1791,6 +1851,7 @@ $ExitCode = 0
 $FailedReplacement = "$Target.failed.$PID"
 $FailureCode = 'worker_failed'
 $FailureDetail = 'The detached updater stopped unexpectedly.'
+{service_port_guard}
 
 function Write-UpdateLog([string]$Message) {{
     try {{
@@ -1842,6 +1903,10 @@ try {{
         if ($LASTEXITCODE -ne 0) {{ throw 'failed to stop the Codexify service' }}
         try {{ & $Target browser stop-for-restart *>> $Log }} catch {{ Write-UpdateLog 'optional browser companion could not be stopped before update' }}
         Write-UpdateLog 'stopped the Codexify service'
+        $FailureCode = 'service_stop_failed'
+        $FailureDetail = 'The prior Codexify service did not release its port safely.'
+        Wait-VerifiedServicePortRelease
+        Write-UpdateLog 'verified that the old service listener released its port'
     }}
 
     $FailureCode = 'backup_failed'
@@ -1901,10 +1966,13 @@ try {{
                 if ($LASTEXITCODE -ne 0) {{ throw 'service enable returned a failure status' }}
                 & $ServiceExecutable service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs *>> $Log
                 if ($LASTEXITCODE -ne 0) {{ throw 'service readiness probe returned a failure status' }}
+                $owners = @(Get-VerifiedCodexifyPortOwners)
+                if ($owners.Count -ne 1) {{ throw 'The healthy service port is not owned by one verified Codexify service process' }}
                 Write-UpdateLog 'restarted the Codexify service and verified readiness'
             }} catch {{
                 $FailureCode = 'service_restart_failed'
                 $FailureDetail = 'The Codexify service did not restart and become healthy.'
+                Write-UpdateLog "service restart failed: $($_.Exception.Message)"
                 Write-UpdateLog 'failed to restart or verify the Codexify service; run `codexify service enable` manually'
                 $ExitCode = 1
             }}
@@ -2788,7 +2856,7 @@ mod tests {
         assert!(!script.contains("\"$TARGET\" browser stop >>"));
         assert!(script.contains("service enable"));
         assert!(script.contains("SERVICE_PORT=43123"));
-        assert!(script.contains("SERVICE_READY_TIMEOUT_MS=60000"));
+        assert!(script.contains("SERVICE_READY_TIMEOUT_MS=120000"));
         assert!(script.contains(
             "service wait-ready --port \"$SERVICE_PORT\" --timeout-ms \"$SERVICE_READY_TIMEOUT_MS\""
         ));
@@ -2826,15 +2894,34 @@ mod tests {
         assert!(script.contains("$ServicePort = 43123"));
         assert!(script.contains("& $Target browser stop-for-restart"));
         assert!(!script.contains("& $Target browser stop *>>"));
-        assert!(script.contains("$ServiceReadyTimeoutMs = 60000"));
+        assert!(script.contains("$ServiceReadyTimeoutMs = 120000"));
         assert!(script.contains(
             "service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs"
         ));
+        assert!(script.contains("Wait-VerifiedServicePortRelease"));
+        assert!(script.contains("Stop-Process -Id $ownerId -Force -ErrorAction Stop"));
+        assert!(script.contains("Port $ServicePort is owned by an unverified process"));
+        assert!(script.contains(
+            "The healthy service port is not owned by one verified Codexify service process"
+        ));
+        assert!(!script.contains("Get-Process | Stop-Process"));
         assert!(script.contains("Write-UpdateStatus 'installing'"));
         assert!(script.contains("Write-UpdateStatus 'validating'"));
         assert!(script.contains("Write-UpdateStatus 'restarting'"));
         assert!(script.contains("Write-UpdateStatus 'succeeded'"));
         assert!(script.contains("Write-UpdateStatus 'rolled_back'"));
+    }
+
+    #[test]
+    fn windows_updater_checks_exact_listener_owner_before_orphan_reconciliation() {
+        let guard = windows_service_port_guard_script();
+        assert!(guard.contains("Get-NetTCPConnection -State Listen -ErrorAction Stop"));
+        assert!(guard.contains("Where-Object { $_.LocalPort -eq $ServicePort }"));
+        assert!(guard.contains("Get-CimInstance Win32_Process -Filter"));
+        assert!(guard.contains("[IO.Path]::GetFullPath($Target)"));
+        assert!(guard.contains("StringComparison]::OrdinalIgnoreCase"));
+        assert!(guard.contains("Stop-Process -Id $ownerId -Force -ErrorAction Stop"));
+        assert!(guard.contains("scheduled task stopped"));
     }
 
     #[test]

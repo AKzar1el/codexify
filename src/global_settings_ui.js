@@ -200,6 +200,15 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   let notice=null,noticeTimer=null,maintenanceKind=null,statusReading=false,lastStatusAt=0,connectionLost=false,dismissedUpdate=null;
   const updatePending=value=>['preparing','scheduled','installing','validating','restarting'].includes(value?.state);
   const updateFailure=value=>['failed','rolled_back'].includes(value?.state);
+  // Preserve failed update receipts in the API, but do not keep displaying
+  // "Retry update" when the installed version has subsequently been recovered,
+  // verified healthy and is now the latest published release. A user who needs
+  // to inspect the historical failure can still find its status record.
+  const recoveredUpdateFailure=(update,global)=>updateFailure(update)
+    &&global?.latest?.updateAvailable===false
+    &&global?.latest?.version===global?.version
+    &&update.targetVersion===global.version
+    &&global?.readiness?.ready===true;
   const updateMessage=value=>({
     preparing:['Downloading and verifying update…','The update is being prepared. You can keep writing a draft.'],
     scheduled:['Update verified','Waiting for the updater to install the new version…'],
@@ -212,6 +221,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   }
   function renderRuntime() {
     const update=global?.update,readiness=global?.readiness,refresh=global?.connectorRefresh;
+    const actionableFailure=updateFailure(update)&&!recoveredUpdateFailure(update,global);
     const recoveringUpdate=Boolean(update?.state==='succeeded'&&update.targetVersion===global?.version&&['waiting_for_restart','starting_browser','queued','running'].includes(refresh?.phase)&&readiness?.loading);
     const updating=maintenanceKind==='update'||updatePending(update)||recoveringUpdate,busy=maintenance||updatePending(update)||recoveringUpdate;
     const message=updateMessage(update);
@@ -221,7 +231,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     else if(message)view={title:message[0],detail:message[1],loading:true};
     else if(readiness?.loading)view={title:readiness.detail||'Loading Codexify…',detail:readiness.phase==='starting_browser'?'The server is back. Messages that need the browser will be available when it is ready.':'',loading:true};
     else if(['queued','starting_browser','running'].includes(refresh?.phase))view={title:refresh.phase==='starting_browser'?'Starting the browser companion…':refresh.phase==='running'?'Refreshing ChatGPT connector tools…':'Connector refresh queued…',detail:'Waiting for the browser to finish refreshing the connector tools.',loading:true};
-    else if(!maintenance&&updateFailure(update)&&dismissedUpdate!==(update.updateId||update.failureDetail))view={title:update.state==='rolled_back'?'Update rolled back':'Update failed',detail:update.failureDetail||'The update could not complete. Try again or check the service logs.',error:true,dismiss:true,action:'update',label:'Retry update'};
+    else if(!maintenance&&actionableFailure&&dismissedUpdate!==(update.updateId||update.failureDetail))view={title:update.state==='rolled_back'?'Update rolled back':'Update failed',detail:update.failureDetail||'The update could not complete. Try again or check the service logs.',error:true,dismiss:true,action:'update',label:'Retry update'};
     else if(!maintenance&&readiness&&['browser_stopped','sign_in_required','manual_refresh_required'].includes(readiness.phase))view={title:readiness.detail,action:'browser',label:'Browser settings'};
     else if(!maintenance&&refreshNeedsRestart(refresh))view={title:'Restart required to refresh tools',detail:'Your settings are saved. Restart Codexify to apply them; the connector will refresh automatically.',action:'restart',label:'Restart Codexify'};
     else if(!maintenance&&refresh?.phase==='failed')view={title:'Connector refresh failed',detail:refresh.result?.error||'Open settings to retry the connector refresh.',action:'settings',label:'Open settings',error:true};
@@ -230,7 +240,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     progress.hidden=!view;document.body.classList.toggle('system-progress-visible',Boolean(view));
     if(view){byId('global-progress-title').textContent=view.title;byId('global-progress-detail').textContent=view.detail||'';progress.dataset.error=String(Boolean(view.error));progress.querySelector('.global-progress-spinner').hidden=!view.loading;byId('global-progress-close').hidden=!view.dismiss;const action=byId('global-progress-action');action.hidden=!view.action;action.textContent=view.label||'';action.dataset.action=view.action||'';action.disabled=maintenance;}
     const start=byId('global-progress-start');start.hidden=readiness?.phase!=='browser_stopped'||view?.action!=='browser';start.disabled=maintenance||Boolean(browserOperation);start.textContent=browserOperation==='start'?'Starting…':'Start browser';
-    const button=byId('global-update');button.hidden=!global?.latest?.updateAvailable&&!updating&&!updateFailure(update);button.disabled=maintenance||updatePending(update);button.setAttribute('aria-busy',String(updating));button.textContent=updating?'Updating…':updateFailure(update)?'Retry update':'Update';button.title=view&&updating?`${view.title} ${view.detail||''}`:'Update Codexify';
+    const button=byId('global-update');button.hidden=!global?.latest?.updateAvailable&&!updating&&!actionableFailure;button.disabled=maintenance||updatePending(update);button.setAttribute('aria-busy',String(updating));button.textContent=updating?'Updating…':actionableFailure?'Retry update':'Update';button.title=view&&updating?`${view.title} ${view.detail||''}`:'Update Codexify';
     byId('settings-update').disabled=button.disabled;byId('global-footer').dataset.maintenance=String(busy);
     document.documentElement.style.setProperty('--system-progress-height',`${progress.hidden?0:progress.getBoundingClientRect().height}px`);
   }
