@@ -39,6 +39,9 @@ export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_o
 
 export const MAX_RETAINED_ACTIONS = 8;
 export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
+// Initial chat creation may load a new ChatGPT tab and configure its model
+// before Send. Ordinary turns retain their shorter inactivity deadline.
+const BROWSER_CREATE_CHAT_TIMEOUT_MS = 120_000;
 // A cold ChatGPT tab can hydrate its model picker, inspect multiple families,
 // and restore the prior selection more slowly than ordinary single-turn work.
 // The server bounds both catalogue endpoints to 180 seconds.
@@ -239,7 +242,7 @@ export class SingleWindowCoordinator {
   private pairingWindow: {actionId:string;url:string;generation:number;account:string;connector:string;timer:ReturnType<typeof setTimeout>} | null = null;
 
   constructor(private readonly driver: BrowserDriver, readonly build: string,
-    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number;accountPlanMs?:number;preflightMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS, accountPlanMs:45_000, preflightMs:BROWSER_PREFLIGHT_TIMEOUT_MS }) {
+    private readonly timeouts: {operationMs:number;cleanupMs:number;hardStopMs:number;pairingRetentionMs?:number;accountPlanMs?:number;preflightMs?:number;creationMs?:number} = { operationMs:BROWSER_OPERATION_TIMEOUT_MS, cleanupMs:BROWSER_CLEANUP_GRACE_MS, hardStopMs:BROWSER_HARD_STOP_MS, accountPlanMs:45_000, preflightMs:BROWSER_PREFLIGHT_TIMEOUT_MS, creationMs:BROWSER_CREATE_CHAT_TIMEOUT_MS }) {
     validateProtocolBuild(build);
     if (Object.values(timeouts).some(value => !Number.isFinite(value) || value <= 0)) throw new Error("Browser operation deadlines must be positive");
   }
@@ -707,7 +710,10 @@ export class SingleWindowCoordinator {
             }
           },
         });
-      },record.abort.signal,()=>this.driver.submissionMayHaveBeenAccepted?.(record.request.actionId)??false);
+      },record.abort.signal,()=>this.driver.submissionMayHaveBeenAccepted?.(record.request.actionId)??false,
+      record.request.prompt.kind==="create_chat"
+        ? this.timeouts.creationMs??BROWSER_CREATE_CHAT_TIMEOUT_MS
+        : this.timeouts.operationMs);
       if (!record.terminal) {
         this.emit(record, {
           type:"failed",

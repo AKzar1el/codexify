@@ -183,31 +183,23 @@ fn creation_identity(
     .ok_or_else(|| internal_error("Invalid new chat identity"))
 }
 
-fn located_chat(chat: &crate::markdown_chat::ChatFile) -> LocatedChat {
-    let path = chat.path().to_owned();
-    let owner = path
-        .parent()
-        .unwrap()
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    LocatedChat {
-        id: format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes())),
-        state_root: path
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned(),
-        owner,
-        path,
-        work_dir: None,
-        workspace: String::new(),
-        is_scratch: false,
-    }
+fn located_chat(
+    state: &OwnerState,
+    chat: &crate::markdown_chat::ChatFile,
+) -> Result<LocatedChat, (StatusCode, String)> {
+    // The owner chat listing hashes the spelling of the path returned by
+    // read_dir. On Windows that can contain ".codexify/projects" while a
+    // newly constructed ChatFile uses ".codexify\projects". Hashing each
+    // spelling separately returns an ID that immediately 404s. Reuse the
+    // listing's exact ID for the same physical CHAT.md instead.
+    let actual = std::fs::canonicalize(chat.path()).map_err(internal_error)?;
+    locate(&state.config, &state.project_bindings)
+        .into_iter()
+        .find(|listed| {
+            std::fs::canonicalize(&listed.path)
+                .is_ok_and(|path| path == actual)
+        })
+        .ok_or_else(|| internal_error("The created chat is not yet visible in the conversation list; do not create another chat"))
 }
 
 fn selected_root(selection: WorkspaceSelection) -> PathBuf {
@@ -428,7 +420,9 @@ pub(super) async fn create_chat(
         )
         .await?;
     }
-    Ok(Json(json!({"id":located_chat(&chat).id,"queued":true})))
+    Ok(Json(
+        json!({"id":located_chat(&state, &chat)?.id,"queued":true}),
+    ))
 }
 
 async fn queue_creation(

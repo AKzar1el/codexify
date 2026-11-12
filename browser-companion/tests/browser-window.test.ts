@@ -1173,6 +1173,26 @@ class PairingWindowDriver extends DeferredDriver {
 const retainedPairing = ():ExecuteActionRequest=>({...request("pair-window"),url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",
   model:null,effort:null,retainPairingWindow:true,prompt:{kind:"create_chat",continuationToken:"A".repeat(43),reference:Buffer.alloc(32,1).toString('base64url'),setupReference:null}});
 
+test("fresh-chat creation has a separate slow-browser deadline but retains single-Send semantics",async()=>{
+  class SlowInitialCreation extends PairingWindowDriver {
+    override async execute(execution:DriverExecution) {
+      if(execution.request.prompt.kind==="create_chat")await Bun.sleep(115);
+      return super.execute(execution);
+    }
+  }
+  const driver=new SlowInitialCreation();
+  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
+    operationMs:40,creationMs:300,cleanupMs:20,hardStopMs:20,
+  });
+  const create={...retainedPairing(),retainPairingWindow:false};
+  await coordinator.execute(create);
+  const events=await collect(coordinator,create.actionId);
+  expect(events.filter(event=>event.type==="send_accepted")).toHaveLength(1);
+  expect(events.at(-1)?.type).toBe("submission_complete");
+  expect(driver.runs).toEqual(["pair-window"]);
+  await coordinator.close();
+});
+
 test("re-pairing retains the browser through verification and admits only its matching continuation",async()=>{
   const driver=new PairingWindowDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
   await coordinator.execute(retainedPairing());
