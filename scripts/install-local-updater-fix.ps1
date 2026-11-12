@@ -110,7 +110,7 @@ if ($PreflightOnly) {
     return
 }
 if (-not [IO.Path]::GetFullPath($backup).StartsWith(
-    [IO.Path]::GetFullPath((Join-Path $root 'backups')) + '\',
+    [IO.Path]::GetFullPath((Join-Path $root 'backups')) + [IO.Path]::DirectorySeparatorChar,
     [StringComparison]::OrdinalIgnoreCase)) {
     throw 'BackupDirectory must be a unique directory below the Codexify backups root'
 }

@@ -1761,7 +1761,9 @@ function Get-VerifiedCodexifyPortOwners {
     foreach ($ownerId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
         if (-not $ownerId) { continue }
         $process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$ownerId) -ErrorAction Stop
-        if (-not $process) { continue }
+        if (-not $process) {
+            throw "Port $ServicePort has an unknown process owner $ownerId. Refusing to continue."
+        }
         $actual = [string]$process.ExecutablePath
         if (-not $actual -or
             -not [string]::Equals([IO.Path]::GetFullPath($actual), $expected, [StringComparison]::OrdinalIgnoreCase) -or
