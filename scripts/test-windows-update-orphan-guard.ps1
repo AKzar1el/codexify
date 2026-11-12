@@ -17,6 +17,7 @@ $Target = 'C:\Tools\Codexify\codexify.exe'
 $script:listenerPresent = $true
 $script:ownerPath = 'C:\Tools\Codexify\codexify.exe'
 $script:ownerCommand = '"C:\Tools\Codexify\codexify.exe" --config C:\Tools\Codexify\codexify.config.json'
+$script:missingOwner = $false
 $script:stopped = @()
 $script:logged = @()
 
@@ -32,6 +33,7 @@ function Get-CimInstance {
     if ($Class -ne 'Win32_Process' -or $Filter -ne 'ProcessId = 44044') {
         throw 'Unexpected process lookup'
     }
+    if ($script:missingOwner) { return }
     [pscustomobject]@{ExecutablePath = $script:ownerPath; CommandLine = $script:ownerCommand}
 }
 function Stop-Process {
@@ -59,6 +61,19 @@ try {
     if ($_.Exception.Message -notmatch 'unverified process') { throw }
 }
 if ($script:stopped.Count -ne 0) { throw 'An unrelated process was stopped' }
+
+# A port listener that vanishes during process lookup must fail closed, not
+# be mistaken for a cleanly released port.
+$script:ownerPath = $Target
+$script:missingOwner = $true
+try {
+    Wait-VerifiedServicePortRelease
+    throw 'Unexpected acceptance of listener whose owner cannot be inspected'
+} catch {
+    if ($_.Exception.Message -notmatch 'unknown process owner') { throw }
+}
+$script:missingOwner = $false
+if ($script:stopped.Count -ne 0) { throw 'An unknown listener owner was stopped' }
 
 # Even the expected executable must have a matching service command line.
 $script:ownerPath = $Target
