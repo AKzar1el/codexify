@@ -5,6 +5,8 @@
 [CmdletBinding()]
 param(
     [switch]$PreflightOnly,
+    [switch]$VerifyMaintenanceOnly,
+    [switch]$AllowActiveWorkers,
     [string]$BackupDirectory
 )
 Set-StrictMode -Version Latest
@@ -124,7 +126,10 @@ function AssertFleetQuiet() {
     })
     if ($active.Count -gt 0) {
         $names = (@($active | Select-Object -ExpandProperty workspace -Unique) -join ', ')
-        throw "Other Codexify workers were active in the last three minutes: $names"
+        if (-not $AllowActiveWorkers) {
+            throw "Other Codexify workers were active in the last three minutes: $names"
+        }
+        Write-Warning "Owner-authorized maintenance will interrupt recent workers: $names. Their in-flight tool calls can fail."
     }
 }
 
@@ -149,6 +154,15 @@ if ($hash -eq $installedHash) {
 }
 if ($PreflightOnly) {
     Write-Output "PREFLIGHT_OK built=$hash installed=$installedHash"
+    return
+}
+if ($VerifyMaintenanceOnly) {
+    $browser = ((& $target browser status --json 2>&1) -join [Environment]::NewLine) | ConvertFrom-Json
+    if ($browser.state -ne 'ready' -or $browser.activeActionId) {
+        throw "Browser is not idle: $($browser.state)"
+    }
+    AssertFleetQuiet
+    Write-Output "MAINTENANCE_CHECK_OK browser=$($browser.state) authenticated=$($browser.authenticated) local_build=$hash"
     return
 }
 if (-not [IO.Path]::GetFullPath($backup).StartsWith(
