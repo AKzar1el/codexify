@@ -147,7 +147,41 @@ function WaitForVerifiedServiceProcessesExit() {
 }
 function WaitForReady() {
     & $target service wait-ready --port $port --timeout-ms 120000
-    CheckExit 'Service readiness'
+    if ($LASTEXITCODE -eq 0) { return }
+    # Native wait-ready can time out while Task Scheduler is still bringing the
+    # replacement up. Do not immediately attempt a destructive rollback: first
+    # independently verify the installed binary, supervised task, actual port
+    # owner and HTTP health. If all are healthy, the update is successful.
+    Write-Warning 'Codexify wait-ready timed out; performing independent bounded service verification before considering rollback.'
+    for ($attempt=0; $attempt -lt 20; $attempt++) {
+        if (Test-InstalledServiceHealthy) {
+            Write-Output 'SERVICE_READY_VERIFIED_AFTER_TIMEOUT'
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw 'Service readiness failed and independent native-service verification did not recover'
+}
+function Test-InstalledServiceHealthy() {
+    try {
+        $task = Get-ScheduledTask -TaskName 'Codexify' -ErrorAction Stop
+        if ($task.State -ne 'Running' -or -not $task.Settings.Enabled) { return $false }
+        $listeners = @(Owners)
+        if ($listeners.Count -ne 1) { return $false }
+        $ownerId = [int]$listeners[0].OwningProcess
+        if ($ownerId -le 0) { return $false }
+        $process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $ownerId) -ErrorAction Stop
+        $config = Join-Path $root 'codexify.config.json'
+        if (-not $process -or -not $process.ExecutablePath -or
+            -not [string]::Equals([string]$process.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -or
+            ([string]$process.CommandLine).IndexOf($config, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            return $false
+        }
+        $health = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $port + "/health") -TimeoutSec 5 -ErrorAction Stop
+        return $health.status -eq 'ok'
+    } catch {
+        return $false
+    }
 }
 function EnsureBrowserReady() {
     # The native service does not guarantee that its separate Electron browser

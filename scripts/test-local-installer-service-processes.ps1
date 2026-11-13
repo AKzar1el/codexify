@@ -106,3 +106,49 @@ $script:reusedPid = $false
 $script:processes = @()
 WaitForVerifiedServiceProcessesExit
 Write-Output 'LOCAL_UPDATER_MOCKED_ORPHAN_TESTS_PASS'
+
+# Test the independent health check that prevents an unnecessary rollback
+# when the native wait-ready deadline expires but startup completes later.
+$healthDefinition = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-InstalledServiceHealthy'
+}, $true))
+if ($healthDefinition.Count -ne 1) { throw 'Expected one native-service health helper' }
+Invoke-Expression $healthDefinition[0].Extent.Text
+$port = 3000
+$script:taskState = 'Running'
+$script:healthOk = $true
+$script:portOk = $true
+function Get-ScheduledTask {
+    [CmdletBinding()]
+    param([string]$TaskName)
+    if ($TaskName -ne 'Codexify') { throw 'Unexpected task probe' }
+    [pscustomobject]@{State=$script:taskState;Settings=[pscustomobject]@{Enabled=$true}}
+}
+function Owners {
+    if ($script:portOk) { [pscustomobject]@{OwningProcess=6952} }
+}
+function Invoke-RestMethod {
+    [CmdletBinding()]
+    param([string]$Uri,[int]$TimeoutSec)
+    if ($Uri -ne 'http://127.0.0.1:3000/health' -or $TimeoutSec -ne 5) {
+        throw 'Unexpected health probe'
+    }
+    if (-not $script:healthOk) { throw 'Simulated health outage' }
+    [pscustomobject]@{status='ok'}
+}
+$script:processes = @($child)
+if (-not (Test-InstalledServiceHealthy)) { throw 'Verified recovered service was not accepted' }
+$script:taskState = 'Ready'
+if (Test-InstalledServiceHealthy) { throw 'Stopped task was incorrectly accepted' }
+$script:taskState = 'Running'
+$script:healthOk = $false
+if (Test-InstalledServiceHealthy) { throw 'Unhealthy endpoint was incorrectly accepted' }
+$script:healthOk = $true
+$script:portOk = $false
+if (Test-InstalledServiceHealthy) { throw 'Missing listener was incorrectly accepted' }
+$script:portOk = $true
+$script:processes = @($other)
+if (Test-InstalledServiceHealthy) { throw 'Non-service process was incorrectly accepted' }
+Write-Output 'LOCAL_UPDATER_MOCKED_LATE_READINESS_TESTS_PASS'
