@@ -17,7 +17,10 @@ export function validateNewChatProjectUrl(value: string | null): string | null {
 
 export async function openNewChat(surface: SingleBrowserSurface, projectUrl: string | null, signal?: AbortSignal): Promise<Page> {
   const destination = validateNewChatProjectUrl(projectUrl) || "https://chatgpt.com/";
-  let page=await surface.page();
+  // A fresh goal gets its own draft tab; preparation and first Send reuse it.
+  // Never navigate another goal's existing ChatGPT conversation to the home
+  // page just to create a new chat.
+  let page=await (surface.newChatPage?.()??surface.page());
   const current=new URL(page.url()),target=new URL(destination);
   const projectKey=(url:URL)=>url.pathname.split('/')[2]?.replace(/^(g-p-[0-9a-f]{32}).*$/,'$1');
   const localDraft=/\/c\/local-chatgpt(?::|%3A)/i.test(current.pathname);

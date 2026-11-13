@@ -29,6 +29,12 @@ import {
 
 export interface SingleBrowserSurface {
   page(): Promise<Page>;
+  // Real Chrome keeps one persistent tab per paired conversation. Test
+  // surfaces may omit these selectors and retain legacy single-page behavior.
+  selectConversation?(url:string,signal?:AbortSignal):Promise<Page>;
+  newChatPage?():Promise<Page>;
+  utilityPage?():Promise<Page>;
+  selectUtilityPage?():Promise<Page>;
   navigate(url: string, signal?: AbortSignal): Promise<Page>;
   reveal(): Promise<void>;
   beginAction(): Promise<void>;
@@ -348,7 +354,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     let timeout:ReturnType<typeof setTimeout>|undefined;
     try {
       return await Promise.race([
-        this.surface.page().then(page=>page.evaluate(()=>true)),
+        (this.surface.utilityPage?.()??this.surface.page()).then(page=>page.evaluate(()=>true)),
         new Promise<false>(resolve=>{timeout=setTimeout(()=>resolve(false),1500);}),
       ]);
     }catch{return false;}
@@ -356,9 +362,9 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   }
 
   async approvePendingConversation(request:ConversationApprovalRequest,signal:AbortSignal):Promise<boolean> {
-    const page = await this.surface.page();
     await this.surface.beginAction();
     try {
+      const page=await (this.surface.selectConversation?.(request.url,signal)??this.surface.page());
       return await approveConversationCard(page,request,this.connectorApps.get(request.expectedAccountFingerprint,request.connectorName),signal);
     } finally { await this.surface.endAction(); }
   }
@@ -370,7 +376,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     detail:string | null;
   }> {
     try {
-      const page = await this.surface.page();
+      const page=await (this.surface.utilityPage?.()??this.surface.page());
       if (this.maintenance?.page === page) {
         return {authenticated:true,accountFingerprint:this.maintenance.account.fingerprint,
           status:"busy",detail:"The shared ChatGPT tab is performing account maintenance"};
@@ -463,6 +469,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   }> {
     this.planCache=undefined;
     this.healthAccount.invalidate();
+    await this.surface.selectUtilityPage?.();
     await this.surface.navigate("https://chatgpt.com/",signal);
     await this.surface.reveal();
     return this.health();
@@ -501,7 +508,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
 
   async accountPlan(epoch:string, signal?:AbortSignal, passive=false):Promise<AccountPlan> {
     signal?.throwIfAborted();
-    const main=await this.surface.page(),account=await readChatGptAccount(main);
+    const main=await (this.surface.selectUtilityPage?.()??this.surface.page()),account=await readChatGptAccount(main);
     if(this.planCache?.epoch===epoch&&this.planCache.plan.accountFingerprint===account.fingerprint&&Date.now()<this.planCache.expiresAt)return this.planCache.plan;
     if(passive) {
       // The owner dashboard checks its plan automatically on each service
@@ -532,7 +539,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   }
 
   async navigationAvailability(url:string):Promise<number|null> {
-    return conversationLoadAvailableAt(await this.surface.page(),url);
+    return conversationLoadAvailableAt(await (this.surface.utilityPage?.()??this.surface.page()),url);
   }
 
   async refreshConnector(name:string, signal?:AbortSignal) {
@@ -541,6 +548,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
 
   async refreshConnectorSteps(name:string,run:BrowserStepRunner,signal?:AbortSignal) {
     if(this.pendingRefresh)throw new BrowserCompanionError("Browser companion is busy with a connector refresh");
+    await this.surface.selectUtilityPage?.();
     let expectedAccount:string|undefined;
     const step = <T>(label:string,operation:(page:Page,account:ChatGptAccount,signal:AbortSignal)=>Promise<T>,maintenance=true)=>run(async operationSignal=>{
       operationSignal.throwIfAborted();
@@ -667,7 +675,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     signal.throwIfAborted();
     await this.surface.beginAction();
     try {
-      const page=await this.surface.page();
+      const page=await (this.surface.selectConversation?.(request.expectedUrl,signal)??this.surface.page());
       // Preserve a pending approval rather than discard its in-memory card.
       await throwIfConversationApproval(page);
       await navigatePage(page,request.url,{signal,reload:page.url()===request.url});
@@ -677,7 +685,8 @@ export class ChatGptBrowserDriver implements BrowserDriver {
   async replacePairingDraft(request: ExecuteActionRequest, signal?:AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
     if (request.prompt.kind !== "pair_verify") return false;
-    const page = await this.surface.page();
+    const page=await (this.surface.selectConversation?.(request.expectedUrl,signal)
+      ??this.surface.page());
     if (canonicalChatGptConversationUrl(page.url()) !== canonicalChatGptConversationUrl(request.expectedUrl)
       || await generationRunning(page) || await toolApprovalVisible(page)) return false;
     const account = await readChatGptAccount(page);
@@ -693,7 +702,7 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     await this.surface.beginAction();
     try {
       const target=canonicalChatGptConversationUrl(url),key=`${account}\u001f${target}\u001f${handoffId}`;
-      let page=await this.surface.page(),same=false;
+      let page=await (this.surface.selectConversation?.(url,signal)??this.surface.page()),same=false;
       try {same=canonicalChatGptConversationUrl(page.url())===target;}catch{}
       if(!same){
         if((await readChatGptAccount(page)).fingerprint!==account)return false;
@@ -739,7 +748,10 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     try {
       const creating = execution.request.prompt.kind === "create_chat";
       if (!creating) {
-        const current = await this.surface.page();
+        // Never read or stop a different goal's previous response. Select this
+        // action's exact paired conversation tab before any preflight/approval.
+        const current=await (this.surface.selectConversation?.(execution.request.expectedUrl,execution.signal)
+          ??this.surface.page());
         let sameConversation = false;
         try { sameConversation = canonicalChatGptConversationUrl(current.url()) === canonicalChatGptConversationUrl(execution.request.expectedUrl); } catch {}
         // Reloading can discard an in-memory approval card. Preserve it for the
