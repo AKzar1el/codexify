@@ -36,6 +36,21 @@ function Report([string]$state, [string]$detail) {
 function CheckExit([string]$description) {
     if ($LASTEXITCODE -ne 0) { throw "$description failed (exit code $LASTEXITCODE)" }
 }
+function AssertTaskAdministration() {
+    # The Codexify scheduled task is owned by BUILTIN\Administrators. A
+    # non-elevated user can query (and sometimes stop) the task but cannot
+    # disable or re-enable it. Fail before stopping the browser or copying
+    # anything instead of leaving the service partially stopped.
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Administrator PowerShell is required to control the Codexify scheduled task. Open PowerShell using Run as administrator and rerun the installer; nothing was stopped.'
+    }
+    $task = Get-ScheduledTask -TaskName 'Codexify' -ErrorAction Stop
+    if ($task.TaskPath -ne '\') {
+        throw 'The expected Codexify scheduled task was not found at the root task path'
+    }
+}
 function Owners() {
     if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
         throw 'Cannot verify the service listener without Get-NetTCPConnection'
@@ -82,6 +97,53 @@ function WaitForOldListener() {
         Start-Sleep -Seconds 1
     }
     throw "Port $port remains occupied after verified old-service release; refusing to replace the executable"
+}
+function WaitForVerifiedServiceProcessesExit() {
+    # Task Scheduler can stop the PowerShell supervisor without terminating
+    # BOTH native Codexify service processes: "service run --config" and its
+    # "--config" child. Release only those exact owned processes, after
+    # disabling the scheduled task. Other Codexify CLI invocations are never
+    # terminated just because they use the same binary.
+    $config = Join-Path $root 'codexify.config.json'
+    for ($attempt=0; $attempt -lt 10; $attempt++) {
+        $live = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $_.ExecutablePath -and
+            [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($live.Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    $verified = @()
+    foreach ($process in $live) {
+        $command = [string]$process.CommandLine
+        $looksLikeService = ($command.IndexOf($config, [StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+            ($command -match '(?i)\bservice\s+run\s+--config\b' -or
+             $command -match '(?i)\bcodexify\.exe"?\s+--config\b')
+        if (-not $looksLikeService) {
+            throw "Installed Codexify process PID $($process.ProcessId) is not a verified service process. Refusing to terminate it."
+        }
+        $verified += $process
+    }
+    foreach ($process in $verified) {
+        $command = [string]$process.CommandLine
+        $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$process.ProcessId) -ErrorAction Stop
+        if (-not $current) { continue }
+        if (-not [string]::Equals([string]$current.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -or
+            [string]$current.CommandLine -ne $command) {
+            throw "Service process PID $($process.ProcessId) changed during inspection. Refusing to terminate it."
+        }
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        Report 'old_service_released' "Stopped verified orphaned Codexify service process PID $($process.ProcessId)"
+    }
+    for ($attempt=0; $attempt -lt 12; $attempt++) {
+        $still = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $_.ExecutablePath -and
+            [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($still.Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    throw 'The previously installed Codexify executable is still in use after service shutdown'
 }
 function WaitForReady() {
     & $target service wait-ready --port $port --timeout-ms 120000
@@ -156,6 +218,9 @@ if ($PreflightOnly) {
     Write-Output "PREFLIGHT_OK built=$hash installed=$installedHash"
     return
 }
+if (-not $VerifyMaintenanceOnly) {
+    AssertTaskAdministration
+}
 if ($VerifyMaintenanceOnly) {
     $browser = ((& $target browser status --json 2>&1) -join [Environment]::NewLine) | ConvertFrom-Json
     if ($browser.state -ne 'ready' -or $browser.activeActionId) {
@@ -195,6 +260,7 @@ try {
     & $target service disable
     CheckExit 'Stop scheduled service'
     WaitForOldListener
+    WaitForVerifiedServiceProcessesExit
     $still = @(Get-CimInstance Win32_Process | Where-Object {
         $_.ExecutablePath -and
         [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)
@@ -217,6 +283,7 @@ try {
         try {
             & $target service disable
             WaitForOldListener
+            WaitForVerifiedServiceProcessesExit
             $restore = Join-Path $backup 'restore-staged.exe'
             Copy-Item -LiteralPath $previous -Destination $restore -ErrorAction Stop
             [IO.File]::Replace($restore, $target, $failed, $true)
