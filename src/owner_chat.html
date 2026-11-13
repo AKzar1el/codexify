@@ -105,7 +105,8 @@ input,select,textarea { font:inherit; }
 #new-chat-dialog::backdrop { background:#0006; }
 #new-chat-dialog h2 { margin:0; font-size:18px; }
 #new-chat-dialog label { display:block; margin:12px 0 5px; }
-#new-chat-dialog input:not([type=checkbox]),#new-chat-dialog select { width:100%; padding:8px 10px; background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; }
+#new-chat-dialog input:not([type=checkbox]),#new-chat-dialog select,#new-chat-dialog textarea { width:100%; padding:8px 10px; background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; }
+#new-chat-dialog textarea { box-sizing:border-box; resize:vertical; font:inherit; line-height:1.4; }
 #new-chat-dialog button { padding:7px 10px; border:1px solid var(--line); border-radius:8px; color:var(--ink); background:var(--bg); }
 #new-chat-dialog .new-chat-row { display:flex; gap:8px; align-items:center; margin:7px 0; }
 #new-chat-dialog .new-chat-row>* { min-width:0; }
@@ -165,6 +166,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   <p id="new-chat-loading" class="muted" role="status">Preparing a new ChatGPT chat…</p>
   <label for="new-chat-model">ChatGPT model</label><select id="new-chat-model" disabled></select>
   <label for="new-chat-effort">Reasoning effort</label><select id="new-chat-effort" disabled></select>
+  <label for="new-chat-goal">Goal for this chat (optional)</label>
+  <textarea id="new-chat-goal" maxlength="10240" rows="4" placeholder="Describe the work for this independent chat. The goal will run after pairing is verified."></textarea>
+  <p class="muted">Each new chat keeps its own goal and history, even when several chats use the same project.</p>
   <div class="new-chat-row"><button type="button" id="new-chat-login">Sign in to ChatGPT</button><button type="button" id="new-chat-refresh">Refresh models</button></div>
   <h3>Workspace</h3><div id="new-chat-workspace-picker"><div class="new-chat-row"><button type="button" id="new-chat-scratch">Chat without a project</button><button type="button" id="new-chat-new-project" aria-expanded="false" aria-controls="new-chat-project-creation">New project</button></div>
   <div id="new-chat-project-creation" hidden><label for="new-chat-project-name">New project name</label><div class="new-chat-row"><input id="new-chat-project-name" type="text" maxlength="255" autocomplete="off" placeholder="my-project"><button type="button" id="new-chat-create-project">Create project</button></div><p id="new-chat-project-root" class="muted"></p></div>
@@ -716,7 +720,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       byId("goal-metrics").textContent = goal ? `${goalDuration(elapsed)} (${turns} turn${turns === 1 ? "" : "s"})` : "";
     }
     function renderGoalBar(goal, {needsAttention=false,failure="",loading=false}={}) {
-      byId("goal-icon").dataset.state = goal?.status === "blocked" || goal?.status === "error" ? "blocked" : goal?.status === "active" ? "running" : "paused";
+      byId("goal-icon").dataset.state = goal?.status === "blocked" || goal?.status === "error" ? "blocked" : needsAttention ? "paused" : goal?.status === "active" ? "running" : "paused";
       byId("goal-bar").hidden = !goal;
       byId("goal-caption").textContent = needsAttention ? "Goal needs attention" : goal?.status === "active" ? "Pursuing goal" : goal?.status === "configured" ? "Goal paused" : `Goal ${goal?.status || ""}`;
       byId("goal-caption").title = needsAttention ? failure : "";
@@ -821,10 +825,14 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const goal = state.goal;
       byId("automation-add-goal").hidden = !verified || Boolean(goal);
       const actionFailed = !waitingForBrowser && !pairingWaiting && (pairingTimedOut || ["failed", "ambiguous", "stalled", "approval_required", "authentication_required", "conversation_unavailable", "conversation_limit", "rate_limited", "interference"].includes(state.action?.status));
-      const actionNeedsAttention = !automaticRetry && actionFailed;
+      const cancelledAcceptedGoal = goal?.status === "active" && state.action?.kind === "offline_goal"
+        && state.action?.status === "cancelled" && state.action?.sendAccepted === true
+        && state.action?.automaticRetryPaused === true;
+      const actionNeedsAttention = !automaticRetry && (actionFailed || cancelledAcceptedGoal);
       const goalNeedsAttention = goal?.status === "active" && actionNeedsAttention;
       const cooldown = conversationCooldown(state.action, Date.now() + clockOffset);
-      const failure = cooldown ? (automaticRetry && state.action.automaticRetryAtMs > cooldown.until ? cooldown.summary : cooldown.message) : state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
+      const failure = cancelledAcceptedGoal ? "This goal's last ChatGPT Send was accepted, but the browser action was cancelled. Autonomous continuation is paused to avoid replaying uncertain work."
+        : cooldown ? (automaticRetry && state.action.automaticRetryAtMs > cooldown.until ? cooldown.summary : cooldown.message) : state.action?.lastError || state.live?.status || (pairingTimedOut ? "Pairing verification has not arrived yet." : "The browser action did not finish.");
       renderGoalBar(goal, {needsAttention:goalNeedsAttention,failure});
       const retryMode = state.action && "retryMode" in state.action ? state.action.retryMode : state.action?.status === "failed" && state.action.kind !== "pair_verify" ? "retry" : null;
       const inlineRetry = byId("automation-retry-inline");
@@ -1547,6 +1555,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   }
   function newReady() {
     const choice = newWorkspaceChoice();
+    newNode("submit").textContent = newNode("goal").value.trim() ? "Create chat & run goal" : "Create chat";
     newNode("submit").disabled = newBusy || newPreparing || !newCatalog || !choice || !newNode("model").value || !newNode("effort").value;
     newNode("close").disabled = newBusy; newNode("refresh").disabled = newBusy || newPreparing; newNode("login").disabled = newBusy || newPreparing || Boolean(newCatalog);
     newNode("worktree").disabled = newBusy || Boolean(choice && (!choice.path));
@@ -1635,7 +1644,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     catch (error) { showError(error.message); return; }
     newChoice=null;newCatalog=null;newBusy=false;newWorktreeEdited=false;newRequest=requestId("create-chat");const epoch=++newEpoch;
     stopNewProgress();
-    for(const name of ["url","search","project-name"])newNode(name).value="";
+    for(const name of ["url","search","project-name","goal"])newNode(name).value="";
     newNode("project-creation").hidden=true;newNode("new-project").setAttribute("aria-expanded","false");newNode("project-root").textContent="";
     for(const name of ["model","effort"]) {newNode(name).replaceChildren();newNode(name).disabled=true;}
     newNode("selection").hidden=newNode("worktrees").hidden=true;newError("");newDialog.showModal();newReady();void newProjects();void prepareNewModels(epoch);
@@ -1643,7 +1652,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
   newNode("close").addEventListener("click",()=>{++newEpoch;++newSearchEpoch;newDialog.close();});
   newDialog.addEventListener("cancel",event=>{if(newBusy)event.preventDefault();else {++newEpoch;++newSearchEpoch;}});
   newNode("worktree").addEventListener("change",()=>{newWorktreeEdited=true;newReady();});
-  newNode("model").addEventListener("change",newEfforts);newNode("effort").addEventListener("change",newReady);
+  newNode("model").addEventListener("change",newEfforts);newNode("effort").addEventListener("change",newReady);newNode("goal").addEventListener("input",newReady);
   newNode("login").addEventListener("click",async()=>{try{await api("/api/new-chat/login",{method:"POST",body:"{}"});newNode("loading").textContent="Sign in in Chrome, then refresh models.";}catch(error){newError(error.message);}});
   newNode("refresh").addEventListener("click",()=>{newError("");void prepareNewModels(newEpoch);});
   newNode("scratch").addEventListener("click",()=>chooseNew({withoutProject:true},"Chat without a project"));
@@ -1673,6 +1682,7 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
     startNewProgress("Preparing workspace…");
     try {
       const body={requestId:newRequest,...choice,model:newNode("model").value,effort:newNode("effort").value,catalogRevision:newCatalog.catalogRevision};
+      if(newNode("goal").value.trim())body.goalMarkdown=newNode("goal").value.trim();
       if(choice.path && (!choice.worktreePath || newNode("worktree").checked))body.createWorktree=newNode("worktree").checked;
       const result=await readNewChat(await api("/api/chats",{method:"POST",headers:{Accept:"application/x-ndjson"},body:JSON.stringify(body)}));
       newDialog.close();search.value="";++listRequest;pendingList=null;await refresh();select(result.id);

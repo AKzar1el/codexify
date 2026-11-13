@@ -158,6 +158,10 @@ pub(super) struct CreateBody {
     model: String,
     effort: String,
     catalog_revision: String,
+    // Preserve the exact legacy request digest for chats created before
+    // the optional initial-goal field existed. Old retries must still match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    goal_markdown: Option<String>,
 }
 
 fn creation_identity(
@@ -293,6 +297,15 @@ pub(super) async fn create_chat(
             "Enable browser automation to create a new chat",
         ));
     }
+    // Reject invalid goals before preparing a new worktree or creating a chat.
+    if let Some(goal) = body.goal_markdown.as_deref() {
+        if goal.trim().is_empty() || goal.len() > crate::agent_automation::MAX_GOAL_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "The initial goal must contain text and fit within 10 KiB".into(),
+            ));
+        }
+    }
     let task = creation_identity(&state.config, &body.request_id)?;
     crate::project_progress::phase("Waiting for other workspace preparation");
     let _guard = state.creation_lock.lock().await;
@@ -324,12 +337,12 @@ pub(super) async fn create_chat(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&body).map_err(internal_error)?)
     );
-    if let Some(previous_root) = bindings
+    let previous_root = bindings
         .selected_project_root(&state.config, &task)
-        .map_err(internal_error)?
-    {
+        .map_err(internal_error)?;
+    if let Some(previous_root) = &previous_root {
         let mut previous_config = state.config.as_ref().clone();
-        previous_config.work_dir = previous_root;
+        previous_config.work_dir = previous_root.clone();
         AgentAutomationStore::for_config(&previous_config)
             .map_err(internal_error)?
             .record_creation_request(&task, &digest)
@@ -337,7 +350,17 @@ pub(super) async fn create_chat(
     }
     let config = selection_config(&state.config, body.create_worktree);
     crate::project_progress::phase("Preparing workspace");
-    let root = if let Some(worktree) = &body.worktree_path {
+    let root = if let Some(previous_root) = previous_root {
+        // The request digest was already checked above. A retried Create chat
+        // must reuse its existing workspace instead of allocating another
+        // worktree and silently creating a second chat/goal for the same ID.
+        if !previous_root.is_dir() {
+            return Err(internal_error(
+                "The workspace for this existing chat is missing; inspect the saved binding",
+            ));
+        }
+        previous_root
+    } else if let Some(worktree) = &body.worktree_path {
         if body.without_project.is_some() || body.resume_path.is_some() {
             return Err(internal_error(
                 "Worktree reuse cannot be combined with another workspace choice",
@@ -391,6 +414,11 @@ pub(super) async fn create_chat(
             }
         }
     };
+    // The first selection can return an ordinary Windows path while the
+    // persisted binding returns its canonical \\?\ form. Memory state roots
+    // are keyed by work_dir spelling, so normalize both paths before creating
+    // the chat or a retry can silently produce a second local chat identity.
+    let root = std::fs::canonicalize(&root).map_err(internal_error)?;
     let mut effective = state.config.as_ref().clone();
     crate::project_progress::phase("Creating local chat");
     effective.work_dir = root.clone();
@@ -409,6 +437,27 @@ pub(super) async fn create_chat(
         .map_err(internal_error)?;
     let previous = store.load(&task).map_err(internal_error)?;
     if previous.action.id.is_none() {
+        if let Some(markdown) = body.goal_markdown.as_deref() {
+            // The request ID and digest are idempotent. Persist the initial
+            // goal on this conversation before queuing its first pairing; an
+            // interrupted creation can resume without changing another chat.
+            let goal = match previous.goal {
+                Some(goal) if goal.markdown == markdown => goal,
+                Some(_) => {
+                    return Err(internal_error(
+                        "The existing chat has a different initial goal",
+                    ));
+                }
+                None => store
+                    .set_goal(&task, markdown, crate::markdown_chat::now_ms())
+                    .map_err(internal_error)?,
+            };
+            if goal.status == crate::agent_automation::GoalStatus::Configured {
+                store
+                    .run_goal(&task, goal.revision, crate::markdown_chat::now_ms())
+                    .map_err(internal_error)?;
+            }
+        }
         crate::project_progress::phase("Queuing the new ChatGPT conversation");
         queue_creation(
             &state,
@@ -547,7 +596,7 @@ mod tests {
     use crate::agent_automation::{
         ActionPrompt, AutomationExecution, AutomationExecutionError, AutomationExecutor,
         CapabilityCatalog, CompanionActionSnapshot, CompanionActionState, CompanionEvent,
-        CompanionSelection,
+        CompanionSelection, GoalStatus,
     };
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -823,7 +872,92 @@ mod tests {
             model: "discovered-model".into(),
             effort: "adaptive-choice".into(),
             catalog_revision: "creation-catalog".into(),
+            goal_markdown: None,
         }
+    }
+
+    #[tokio::test]
+    async fn distinct_new_goal_chats_in_one_project_keep_isolated_goals_and_pairings() {
+        let (_temp, state, _executor, server) = fixture().await;
+        assert!(
+            serde_json::to_value(body("legacy-goal-free-request", false))
+                .unwrap()
+                .get("goalMarkdown")
+                .is_none(),
+            "adding optional goals must not change the digest of an old Create chat retry"
+        );
+        let _ = prepare_chat(State(state.clone()), Json(Default::default()))
+            .await
+            .unwrap();
+        let first_goal = "Audit the validator API and document safe improvements";
+        let second_goal = "Investigate independent customer onboarding failures";
+        let mut first_body = body("independent-goal-first", false);
+        first_body.goal_markdown = Some(first_goal.into());
+        let mut second_body = body("independent-goal-second", false);
+        second_body.goal_markdown = Some(second_goal.into());
+        let first = create_chat(State(state.clone()), Json(first_body))
+            .await
+            .unwrap()
+            .0;
+        let second = create_chat(State(state.clone()), Json(second_body))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 2);
+
+        let first_ctx = automation_context(
+            &state,
+            &selected(&state, first["id"].as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second_ctx = automation_context(
+            &state,
+            &selected(&state, second["id"].as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first_ctx.task.stable_key(), second_ctx.task.stable_key());
+        let expected_root = std::fs::canonicalize(state.config.work_dir.join("repo")).unwrap();
+        for (ctx, expected_goal) in [(&first_ctx, first_goal), (&second_ctx, second_goal)] {
+            assert_eq!(
+                state
+                    .project_bindings
+                    .selected_project_root(&state.config, &ctx.task)
+                    .unwrap()
+                    .unwrap(),
+                expected_root
+            );
+            let saved = ctx.store.load(&ctx.task).unwrap();
+            assert_eq!(saved.goal.as_ref().unwrap().markdown, expected_goal);
+            assert_eq!(saved.goal.as_ref().unwrap().status, GoalStatus::Active);
+            assert_eq!(saved.goal.as_ref().unwrap().revision, 1);
+            assert!(saved.pairing.creating_chat);
+            assert!(saved.pairing.pending.is_some());
+        }
+
+        // Retrying the same creation request must not create a third conversation
+        // or overwrite the goal in the other chat.
+        let mut repeated = body("independent-goal-first", false);
+        repeated.goal_markdown = Some(first_goal.into());
+        let replay = create_chat(State(state.clone()), Json(repeated))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(state.automation.as_ref().unwrap().queued_count().await, 2);
+        assert_eq!(
+            second_ctx
+                .store
+                .load(&second_ctx.task)
+                .unwrap()
+                .goal
+                .unwrap()
+                .markdown,
+            second_goal
+        );
+        server.abort();
     }
 
     async fn schema_source() -> (

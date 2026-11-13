@@ -1251,6 +1251,13 @@ test(`${engineName}: standalone automation controls drive only authenticated own
     assert((await panel.locator("#automation-error").textContent()).includes("check whether the message was sent"));
     automation.action = { status:"idle", lastError:null, retryMode:null };
     await panel.locator("#goal-retry").waitFor({state:"hidden"});
+    automation.action = {id:"cancelled-accepted-goal",kind:"offline_goal",status:"cancelled",goalRevision:2,sendAccepted:true,automaticRetryPaused:true,retryMode:null};
+    await panel.getByText("Goal needs attention", {exact:true}).waitFor();
+    assert.equal(await panel.locator("#goal-icon .goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none","a cancelled accepted goal must not look like it is actively running");
+    assert((await panel.locator("#automation-error").textContent()).includes("Autonomous continuation is paused"));
+    assert.equal(await panel.locator("#automation-retry-inline").isVisible(),false,"do not offer an unsafe replay of an accepted send");
+    automation.action = {status:"idle",lastError:null,retryMode:null};
+    await panel.getByText("Pursuing goal", {exact:true}).waitFor();
     await panel.getByRole("button", { name:"Pause goal" }).click();
     await panel.getByRole("button", {name:"Run goal",exact:true}).waitFor();
     assert.equal(await panel.locator("#goal-icon .goal-outer-ring").evaluate(node=>getComputedStyle(node).animationName),"none");
@@ -1519,7 +1526,25 @@ for (const [engineName, engine] of [["Chromium",chromium],["WebKit",webkit]]) {
       assert.equal(submitted[10].path,'/workspace/My new project');assert.equal(submitted[10].createWorktree,false);
       await open();assert.equal(await projectName.isHidden(),true);assert.equal(await projectName.inputValue(),'');
       await dialog.getByRole('button',{name:'Close new chat',exact:true}).click();
-      assert.equal(preparations,12,'every New chat must freshly discover its destination-specific models');
+      // Two different goals in the same repository must produce two different
+      // new chat requests without carrying forward the previous goal draft.
+      await open();await dialog.getByRole('button',{name:'Existing repo',exact:true}).click();
+      const initialGoal=dialog.getByLabel('Goal for this chat (optional)');
+      assert.equal(await initialGoal.inputValue(),'');
+      await initialGoal.fill('Audit validator reliability');
+      await dialog.getByRole('button',{name:'Create chat & run goal',exact:true}).click();
+      await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[11].path,'repo');
+      assert.equal(submitted[11].goalMarkdown,'Audit validator reliability');
+      await open();await dialog.getByRole('button',{name:'Existing repo',exact:true}).click();
+      assert.equal(await initialGoal.inputValue(),'','a second goal cannot inherit the prior chat goal');
+      await initialGoal.fill('Improve onboarding documentation');
+      await dialog.getByRole('button',{name:'Create chat & run goal',exact:true}).click();
+      await dialog.waitFor({state:'hidden'});
+      assert.equal(submitted[12].path,'repo');
+      assert.equal(submitted[12].goalMarkdown,'Improve onboarding documentation');
+      assert.notEqual(submitted[11].requestId,submitted[12].requestId);
+      assert.equal(preparations,14,'every New chat must freshly discover its destination-specific models');
       assert.deepEqual(errors,[]);
     }finally{await browser.close();}
   });
