@@ -85,6 +85,22 @@ function WaitForReady() {
     & $target service wait-ready --port $port --timeout-ms 120000
     CheckExit 'Service readiness'
 }
+function EnsureBrowserReady() {
+    # The native service does not guarantee that its separate Electron browser
+    # companion has finished account/session initialization. Do not mistake a
+    # transient startup timeout for an installation failure.
+    & $target browser start
+    for ($attempt=0; $attempt -lt 30; $attempt++) {
+        try {
+            $result = ((& $target browser status --json 2>&1) -join [Environment]::NewLine) | ConvertFrom-Json
+            if ($result.state -eq 'ready' -and $result.authenticated -and -not $result.activeActionId) {
+                return
+            }
+        } catch {}
+        Start-Sleep -Seconds 3
+    }
+    throw 'Browser companion did not become authenticated and ready after service restart'
+}
 
 foreach ($path in @($target,$built)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing $path" }
@@ -151,7 +167,8 @@ try {
     & $target service enable
     CheckExit 'Enable scheduled service'
     WaitForReady
-    Report 'service_healthy' 'Patched Codexify service is running; original executable retained'
+    EnsureBrowserReady
+    Report 'service_healthy' 'Patched Codexify service and browser are running; original executable retained'
 } catch {
     $reason = $_.Exception.Message
     Report 'failed' $reason
@@ -168,7 +185,7 @@ try {
         }
     }
     if ($serviceStopped) {
-        try { & $target service enable; & $target service wait-ready --port $port --timeout-ms 120000 } catch {}
+        try { & $target service enable; & $target service wait-ready --port $port --timeout-ms 120000; EnsureBrowserReady } catch {}
     } else {
         # The prior service is still running, but stop-for-restart might have
         # stopped the browser before the failure was detected.
