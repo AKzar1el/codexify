@@ -241,7 +241,7 @@ export async function identifyConnectorApp(page:Page,connectorName:string,expect
   return appId;
 }
 
-async function connectorPage(page:Page,appId:string,account:string,permissions:boolean,signal?:AbortSignal) {
+async function connectorPage(page:Page,appId:string,account:string,permissions:boolean,signal?:AbortSignal,name?:string) {
   signal?.throwIfAborted();
   const url=`https://chatgpt.com/settings/plugins-settings/plugin_${appId}${permissions?'/permissions':''}`;
   const assertPage=async()=>{
@@ -250,6 +250,16 @@ async function connectorPage(page:Page,appId:string,account:string,permissions:b
     if((await readChatGptAccount(page)).fingerprint!==account)throw selectorDrift("ChatGPT account changed during connector maintenance");
   };
   await navigatePage(page,url,{timeout:30_000,signal});
+  // The settings shell is visible before the app card and account state
+  // hydrate. Verify the real app/permissions UI before checking account
+  // identity so a slow load cannot masquerade as a changed browser session.
+  if(permissions) {
+    await page.locator('[role="radio"],input[type="radio"]').filter({visible:true}).first()
+      .waitFor({state:"visible",timeout:30_000,signal});
+  } else if(name) {
+    await page.getByText(name,{exact:true}).and(page.locator(':visible')).first()
+      .waitFor({state:"visible",timeout:30_000,signal});
+  }
   await assertPage();
   return assertPage;
 }
@@ -262,10 +272,10 @@ export async function setConnectorAllowAll(page:Page,appId:string,account:string
 export type ConnectorRefreshObservation={url:string;wait:(signal?:AbortSignal)=>Promise<boolean>;dispose:()=>Promise<void>};
 export async function beginConnectorToolRefresh(page:Page,appId:string,name:string,account:string,signal?:AbortSignal):Promise<ConnectorRefreshObservation> {
   traceRefresh("prepare refresh control");
-  const assertPage=await connectorPage(page,appId,account,false,signal);
+  const assertPage=await connectorPage(page,appId,account,false,signal,name);
   // Settings can also contain a hidden app-name copy. Select visible text before
   // taking the first match, rather than waiting on that hidden copy.
-  await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:5_000,signal});
+  await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:20_000,signal});
   await markRefreshButton(page);
   const button=page.locator('button[data-refresh-tools-target="true"]');
   await assertPage();
@@ -368,9 +378,9 @@ export type PermissionWitness={summary?:string;remember:(summary:string)=>void};
 export async function inspectConnectorSettings(page:Page,appId:string,name:string,account:string,signal?:AbortSignal) {
   if(!/^asdk_app_[A-Za-z0-9_]{1,128}$/.test(appId))throw selectorDrift("Invalid connector App ID");
   traceRefresh("open settings");
-  await connectorPage(page,appId,account,false,signal);
+  await connectorPage(page,appId,account,false,signal,name);
   traceRefresh("settings opened");
-  await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:5_000,signal});
+  await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:20_000,signal});
   traceRefresh("connector name visible");
   await markRefreshButton(page);
   return connectorPermissionSummary(page);
@@ -381,11 +391,11 @@ export async function prepareConnectorRefresh(page:Page,name:string,expectedAcco
   const appId=knownAppId??await identifyConnectorApp(page,name,account,signal);
   const before=await inspectConnectorSettings(page,appId,name,account,signal);
   let permissionChanged=false;
-  if(!before?.allowAll&&(!witness?.summary||before?.summary!==witness.summary)) {
+  if(before!==null&&!before.allowAll&&(!witness?.summary||before.summary!==witness.summary)) {
     traceRefresh("permission needs selection");
     permissionChanged=await setConnectorAllowAll(page,appId,account,signal);
-    await connectorPage(page,appId,account,false,signal);
-    await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:5_000,signal});
+    await connectorPage(page,appId,account,false,signal,name);
+    await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:20_000,signal});
     await markRefreshButton(page);
   }
   const verified=await connectorPermissionSummary(page);

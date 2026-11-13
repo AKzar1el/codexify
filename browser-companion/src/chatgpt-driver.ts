@@ -582,13 +582,17 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     try {
       const before=await phase("Inspect connector settings",(page,account,operationSignal)=>inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal));
       const knownSummary=this.connectorApps.getAllowAllSummary(expectedAccount!,name);
-      const needsVerification=!before?.allowAll&&(!knownSummary||before?.summary!==knownSummary);
+      // Recent ChatGPT app settings no longer expose the legacy permissions
+      // selector on every account. Unknown is not permission to mutate:
+      // refresh tools without changing grants, and require a stable snapshot
+      // whenever actual permission controls are observable.
+      const needsVerification=before!==null&&!before.allowAll&&(!knownSummary||before.summary!==knownSummary);
       let permissionChanged=false;
       if(needsVerification)permissionChanged=await phase("Verify connector permission",(page,account,operationSignal)=>setConnectorAllowAll(page,appId,account.fingerprint,operationSignal));
       observation=await phase("Start connector refresh",async(page,account,operationSignal)=>{
         if(needsVerification)await verifyConnectorAllowAll(page,appId,account.fingerprint,operationSignal);
         const current=await inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal);
-        if(!needsVerification&&!current?.allowAll&&(!knownSummary||current?.summary!==knownSummary))throw new BrowserCompanionError("Connector permission changed before refresh","external_interference");
+        if(!needsVerification&&(Boolean(before)!==Boolean(current)||(current!==null&&!current.allowAll&&(!knownSummary||current.summary!==knownSummary))))throw new BrowserCompanionError("Connector permission changed before refresh","external_interference");
         if(current?.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
         return beginConnectorToolRefresh(page,appId,name,account.fingerprint,operationSignal);
       });
