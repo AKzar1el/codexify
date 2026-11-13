@@ -1796,6 +1796,41 @@ function Wait-VerifiedServicePortRelease {
     }
     throw "Codexify port $ServicePort was not released after the scheduled task stopped."
 }
+function Test-IndependentServiceReady {
+    try {
+        $task = Get-ScheduledTask -TaskName 'Codexify' -ErrorAction Stop
+        if ($task.State -ne 'Running' -or -not $task.Settings.Enabled) { return $false }
+        $owners = @(Get-VerifiedCodexifyPortOwners)
+        if ($owners.Count -ne 1) {
+            throw 'The healthy service port is not owned by one verified Codexify service process'
+        }
+        $health = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $ServicePort + "/health") -TimeoutSec 5 -ErrorAction Stop
+        return $health.status -eq 'ok'
+    } catch {
+        return $false
+    }
+}
+function Wait-VerifiedServiceReady {
+    $nativeReady = $false
+    try {
+        & $ServiceExecutable service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs *>> $Log
+        $nativeReady = $LASTEXITCODE -eq 0
+    } catch {
+        Write-UpdateLog "native readiness probe raised an error: $($_.Exception.Message)"
+    }
+    if ($nativeReady -and (Test-IndependentServiceReady)) { return }
+    # A timeout can race with Task Scheduler launching the replacement. Never
+    # report a failed restart while the verified Codexify service is healthy.
+    Write-UpdateLog 'native readiness probe did not verify the service; performing independent verification'
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (Test-IndependentServiceReady) {
+            Write-UpdateLog 'SERVICE_READY_VERIFIED_AFTER_TIMEOUT'
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw 'service readiness probe and independent verification both failed'
+}
 "#
 }
 
@@ -1966,10 +2001,7 @@ try {{
             try {{
                 & $ServiceExecutable service enable *>> $Log
                 if ($LASTEXITCODE -ne 0) {{ throw 'service enable returned a failure status' }}
-                & $ServiceExecutable service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs *>> $Log
-                if ($LASTEXITCODE -ne 0) {{ throw 'service readiness probe returned a failure status' }}
-                $owners = @(Get-VerifiedCodexifyPortOwners)
-                if ($owners.Count -ne 1) {{ throw 'The healthy service port is not owned by one verified Codexify service process' }}
+                Wait-VerifiedServiceReady
                 Write-UpdateLog 'restarted the Codexify service and verified readiness'
             }} catch {{
                 $FailureCode = 'service_restart_failed'
@@ -2900,6 +2932,11 @@ mod tests {
         assert!(script.contains(
             "service wait-ready --port $ServicePort --timeout-ms $ServiceReadyTimeoutMs"
         ));
+        assert!(script.contains("function Test-IndependentServiceReady"));
+        assert!(script.contains("Get-ScheduledTask -TaskName 'Codexify'"));
+        assert!(script.contains("Invoke-RestMethod -Uri (\"http://127.0.0.1:\""));
+        assert!(script.contains("SERVICE_READY_VERIFIED_AFTER_TIMEOUT"));
+        assert!(script.contains("Wait-VerifiedServiceReady"));
         assert!(script.contains("Wait-VerifiedServicePortRelease"));
         assert!(script.contains("Stop-Process -Id $ownerId -Force -ErrorAction Stop"));
         assert!(script.contains("Port $ServicePort is owned by an unverified process"));

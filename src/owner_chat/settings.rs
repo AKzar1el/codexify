@@ -243,19 +243,37 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
     let global = state.global.lock().await;
     let update_intent = crate::global_settings::read_refresh_intent();
     let update = update_progress(global.update.as_ref(), update_intent.as_ref());
-    let refresh = schema
+    // A failed schema barrier must not hide the result of the owner's more
+    // recent manual retry; surface that retry while keeping the durable gate.
+    let manual = global.manual_refresh.clone();
+    let refresh = manual
         .as_ref()
         .filter(|value| {
             matches!(
                 value["phase"].as_str(),
-                Some("queued" | "running" | "starting_browser" | "waiting_for_restart" | "failed")
+                Some("queued" | "running" | "failed")
             )
         })
         .cloned()
         .or_else(|| {
-            global
-                .manual_refresh
-                .clone()
+            schema
+                .as_ref()
+                .filter(|value| {
+                    matches!(
+                        value["phase"].as_str(),
+                        Some(
+                            "queued"
+                                | "running"
+                                | "starting_browser"
+                                | "waiting_for_restart"
+                                | "failed"
+                        )
+                    )
+                })
+                .cloned()
+        })
+        .or_else(|| {
+            manual
                 .or_else(|| global.refresh.clone())
                 .or_else(crate::global_settings::read_refresh_intent)
         })

@@ -1187,6 +1187,31 @@ impl BrowserCompanionClient {
         if response.status() != StatusCode::CONFLICT {
             return fallback;
         }
+        // Non-stage failures (for example, opening the connector settings
+        // page) are returned as bounded plain text. Preserve the specific
+        // cause rather than reporting every HTTP 409 as "state changed".
+        if response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|content| {
+                content
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("text/plain"))
+            })
+        {
+            return match read_bounded_response(response, cancellation, 4096).await {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(message)
+                        if !message.trim().is_empty()
+                            && validate_visible(&message, 4096, "browser error").is_ok() =>
+                    {
+                        format!("{fallback}: {}", message.trim())
+                    }
+                    _ => fallback,
+                },
+                Err(_) => fallback,
+            };
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields, rename_all = "camelCase")]
         struct Failure {

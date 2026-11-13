@@ -546,6 +546,12 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       return maintenance?this.withMaintenancePage(page,account,main=>operation(main,account,operationSignal),operationSignal):operation(page,account,operationSignal);
     },signal).catch(error=>{
       const failure=asCompanionError(error);
+      // A generic Playwright or navigation exception otherwise becomes only
+      // "Browser companion operation failed". Log the step and exception type,
+      // never raw page text, URLs, or account details, for local diagnostics.
+      const exceptionType=error instanceof Error&&/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name)
+        ?error.name:typeof error;
+      console.error(`[connector-refresh] ${JSON.stringify({step:label,code:failure.code,exceptionType})}`);
       throw new BrowserCompanionError(`${label}: ${failure.message}`,failure.code,{cause:error});
     });
     const appId=await step("Identify connector",async(page,account,signal)=>{

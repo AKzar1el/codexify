@@ -4,7 +4,10 @@ import {createRequire} from 'node:module';
 import {mkdirSync} from 'node:fs';
 import {setTimeout as delay} from 'node:timers/promises';
 import {ownerHtml,routeOwner} from './owner-chat-source.mjs';
-const {chromium,webkit}=createRequire(import.meta.url)('playwright');
+const localRequire=createRequire(import.meta.url);
+const {chromium,webkit}=process.env.CODEXIFY_UI_TEST_PATCHRIGHT==='1'
+ ? localRequire('../browser-companion/node_modules/patchright')
+ : localRequire('playwright');
 // Local Windows patch verification can use the existing installed Chrome
 // without downloading Playwright's large browser bundles. CI still exercises
 // both engines with its normal managed Playwright installations.
@@ -82,6 +85,14 @@ for(const [name,engine] of browserCases) {
    assert.equal(await page.locator('#global-progress').isVisible(),false);
    assert.equal(await page.locator('#global-update').isVisible(),false);
    assert.equal(f.sends.length,0);
+   // A companion/connector failure must report its own problem without
+   // resurrecting an older, already-recovered update failure.
+   value.readiness={ready:false,loading:false,phase:'connector_failed',detail:'Connector refresh needs attention.'};
+   value.connectorRefresh={phase:'failed',result:{error:'Browser companion rejected the operation because its state changed'}};
+   await tick(page,'Connector refresh failed');
+   assert.equal(await page.locator('#global-update').evaluate(button=>button.hidden),true);
+   assert.equal(await page.locator('#global-progress-action').textContent(),'Open settings');
+   assert.doesNotMatch(await page.locator('#global-progress-detail').textContent(),/did not restart/);
    // A genuine unresolved failure targeting a newer version must remain
    // visible and retryable, rather than being classified as historical.
    value.latest={updateAvailable:true,version:'2.4.0'};

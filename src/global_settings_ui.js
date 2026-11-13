@@ -201,14 +201,14 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
   const updatePending=value=>['preparing','scheduled','installing','validating','restarting'].includes(value?.state);
   const updateFailure=value=>['failed','rolled_back'].includes(value?.state);
   // Preserve failed update receipts in the API, but do not keep displaying
-  // "Retry update" when the installed version has subsequently been recovered,
-  // verified healthy and is now the latest published release. A user who needs
-  // to inspect the historical failure can still find its status record.
+  // "Retry update" once the running service reports that its installed version
+  // matches both the failed target and the latest release. Connector/browser
+  // readiness is independent: a failed tool refresh must not revive an old
+  // updater failure or obscure its own actionable error.
   const recoveredUpdateFailure=(update,global)=>updateFailure(update)
     &&global?.latest?.updateAvailable===false
     &&global?.latest?.version===global?.version
-    &&update.targetVersion===global.version
-    &&global?.readiness?.ready===true;
+    &&update.targetVersion===global.version;
   const updateMessage=value=>({
     preparing:['Downloading and verifying update…','The update is being prepared. You can keep writing a draft.'],
     scheduled:['Update verified','Waiting for the updater to install the new version…'],

@@ -215,7 +215,28 @@ pub(crate) fn start(config: Arc<AppConfig>, automation: Option<Arc<AgentAutomati
                     intent["dueAtMs"] = json!(crate::markdown_chat::now_ms() + 5000);
                     set_phase(&config, &mut intent, "queued", None).await;
                 }
+                Err(error)
+                    if error
+                        == "Browser companion rejected the operation because its state changed" =>
+                {
+                    // Connector settings navigation can race with a shared
+                    // browser context change. Retry only a few times: a
+                    // persistent selector failure must remain actionable.
+                    let retries = intent["transientRetries"].as_u64().unwrap_or(0);
+                    if retries < 3 {
+                        intent["transientRetries"] = json!(retries + 1);
+                        intent["dueAtMs"] =
+                            json!(crate::markdown_chat::now_ms() + 5000 * (retries + 1));
+                        tracing::warn!(attempt = retries + 1, %error, "retrying transient connector refresh");
+                        set_phase(&config, &mut intent, "queued", None).await;
+                    } else {
+                        tracing::warn!(%error, "connector refresh exhausted transient retries");
+                        set_phase(&config, &mut intent, "failed", Some(json!({"error":error})))
+                            .await;
+                    }
+                }
                 Err(error) => {
+                    tracing::warn!(%error, "connector schema refresh failed");
                     set_phase(&config, &mut intent, "failed", Some(json!({"error":error}))).await
                 }
             }
