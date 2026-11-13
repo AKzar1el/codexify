@@ -101,6 +101,32 @@ function EnsureBrowserReady() {
     }
     throw 'Browser companion did not become authenticated and ready after service restart'
 }
+function AssertFleetQuiet() {
+    # This one-shot updater must not terminate the shared MCP service while
+    # another Codexify conversation is actively executing tools. Read only
+    # owner-chat activity; fail closed if the owner API is not reachable.
+    $ownerFile = Join-Path $root 'owner-chat.json'
+    if (-not (Test-Path -LiteralPath $ownerFile)) {
+        throw 'Cannot confirm that the shared worker fleet is idle'
+    }
+    $owner = Get-Content -LiteralPath $ownerFile -Raw | ConvertFrom-Json
+    if (-not $owner.token -or -not $owner.port) {
+        throw 'Cannot verify owner-chat session for the idle check'
+    }
+    $url = 'http://127.0.0.1:' + $owner.port + '/api/chats'
+    $auth = @{Authorization = 'Bearer ' + $owner.token}
+    $all = Invoke-RestMethod -Uri $url -Headers $auth -TimeoutSec 12
+    $cutoff = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 180000
+    $active = @($all.chats | Where-Object {
+        $_.workspace -ne 'codexify-reliability-lab' -and
+        $_.lastAgentCallAtMs -and
+        [double]$_.lastAgentCallAtMs -gt $cutoff
+    })
+    if ($active.Count -gt 0) {
+        $names = (@($active | Select-Object -ExpandProperty workspace -Unique) -join ', ')
+        throw "Other Codexify workers were active in the last three minutes: $names"
+    }
+}
 
 foreach ($path in @($target,$built)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing $path" }
@@ -144,6 +170,7 @@ try {
     if ($browser.state -ne 'ready' -or $browser.activeActionId) {
         throw "Browser is not idle: $($browser.state)"
     }
+    AssertFleetQuiet
     Report 'stopping' 'Stopping only the existing Codexify service for the local updater repair'
     & $target browser stop-for-restart
     CheckExit 'Prepare browser for service restart'
