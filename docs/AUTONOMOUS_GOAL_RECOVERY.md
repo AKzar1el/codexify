@@ -23,3 +23,10 @@ The 4-page pool from PR #22 was inspected but deliberately NOT installed. This b
 ## Verification and release
 
 Check Rust formatting, Rust test targets, TypeScript, Stop-control unit tests, native Chrome Stop test, and full browser safety tests. Install only with a guarded quiet-fleet update, a known-good rollback, and a verification of real safe retry. This staging branch has not deployed any behavior by itself.
+## Windows native test runner
+
+Use Bun 1.4.0 (as specified in upstream CI) for the Patchright/Chrome native fixture tests. An isolated Windows probe showed that Bun 1.3.2 could launch Chrome but did not complete the Patchright connection; Node.js and Bun 1.4.0 completed the same launch quickly. The older runner therefore produces false test-startup failures. Do not weaken production browser timeouts to compensate.
+
+The multi-scenario Windows fixtures allow additional aggregate test time while preserving original Linux CI budgets and Codexify's actual per-action deadlines. Verify the End-turn wait, localized Stop approval, non-modal popover exclusion, and rejection of unrelated approval dialogs as independent safety cases.
+
+The Windows Codexify scheduled service requires elevated task-administration privileges for a guarded binary replacement. This branch is not installed merely by pushing commits; retain the original binary, companion and config as rollback inputs.

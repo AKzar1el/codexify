@@ -6,6 +6,9 @@ use super::{AgentAutomationStore, GoalStatus};
 use crate::project_bindings::ConversationIdentity;
 use serde::{Deserialize, Serialize};
 
+#[path = "goal_blocking_policy.rs"]
+mod policy;
+
 const BLOCKER_AUDIT_RECORD: &str = "goal-blocker-audit.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,10 +77,12 @@ impl AgentAutomationStore {
             });
             let audit = if same {
                 let mut previous = previous.expect("a matching audit exists");
-                if previous.last_turn != goal.turn_count {
-                    previous.last_turn = goal.turn_count;
-                    previous.attempts = previous.attempts.saturating_add(1);
-                }
+                previous.attempts = policy::next_attempts(
+                    previous.attempts,
+                    previous.last_turn,
+                    goal.turn_count,
+                );
+                previous.last_turn = goal.turn_count;
                 previous
             } else {
                 BlockerAudit {
@@ -90,7 +95,7 @@ impl AgentAutomationStore {
                 }
             };
             super::store::persist_private_record(&path, &audit)?;
-            Ok((audit.attempts < 3 || now.saturating_sub(audit.first_at_ms) < 60_000)
+            Ok((!policy::sufficient(audit.attempts, audit.first_at_ms, now))
                 .then(|| format!(
                     "Goal remains active. Blocker audit {}/3: {}. Investigate alternate free-only work, record evidence in rollout_update, and revisit the exact blocker in a later goal turn. Repeated goal_finish calls within one turn do not count. Three distinct turns spanning at least 60 seconds are required to block this autonomous goal. This does not authorize payments, contracts, private data access, or restricted operations.",
                     audit.attempts.min(3), audit.reason
