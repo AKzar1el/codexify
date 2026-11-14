@@ -65,8 +65,8 @@ class FakeContext extends EventEmitter {
   }
   async newCDPSession() {
     return {
-      send:async (method: string) => {
-        if (method === "Browser.setWindowBounds") this.windowState = "normal";
+      send:async (method: string, params?: {bounds?: {windowState?: string}}) => {
+        if (method === "Browser.setWindowBounds") this.windowState = params?.bounds?.windowState ?? "normal";
         return { windowId:1, bounds:{ windowState:this.windowState } };
       },
       detach:async () => {},
@@ -123,10 +123,12 @@ test("startup creates a background page and only an explicit reveal restores foc
   const { surface, fake } = await createSurface([]);
   expect(fake.createdTargets).toEqual([{ url:"about:blank", newWindow:true, background:true }]);
   expect(fake.tabs[0]!.revealed).toBeFalse();
+  if(process.platform==="win32")expect(fake.windowState).toBe("minimized");
   await surface.beginAction();
   await surface.endAction();
   expect(fake.tabs[0]!.revealed).toBeFalse();
-  expect(fake.windowState).toBe("normal");
+  // Background goal actions do not restore the owner's Chrome window.
+  if(process.platform==="win32")expect(fake.windowState).toBe("minimized");
   fake.windowState = "minimized";
   await surface.reveal();
   expect(fake.windowState).toBe("normal");
