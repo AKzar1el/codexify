@@ -139,6 +139,8 @@ pub struct AgentAutomationConfig {
     pub max_queued_actions: usize,
     pub auto_approve_tool_calls: bool,
     pub automatic_retries: bool,
+    // Opt-in: require persistent evidence before marking an autonomous goal blocked.
+    pub persistent_goal_blockers: bool,
     pub new_conversation_on_load_rate_limit: bool,
     pub retry_timings: RetryTimings,
     pub chatgpt_project_url: Option<String>,
@@ -156,6 +158,7 @@ impl Default for AgentAutomationConfig {
             max_queued_actions: DEFAULT_AUTOMATION_MAX_QUEUED_ACTIONS,
             auto_approve_tool_calls: true,
             automatic_retries: true,
+            persistent_goal_blockers: false,
             new_conversation_on_load_rate_limit: false,
             retry_timings: RetryTimings::default(),
             chatgpt_project_url: None,
@@ -688,6 +691,17 @@ pub(crate) async fn history_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persistent_goal_blockers_defaults_off_and_is_opt_in() {
+        let defaults = AgentAutomationConfig::default();
+        assert!(!defaults.persistent_goal_blockers);
+        let config: AgentAutomationConfig =
+            serde_json::from_value(serde_json::json!({"persistentGoalBlockers": true})).unwrap();
+        assert!(config.persistent_goal_blockers);
+        assert_eq!(config.retry_timings, defaults.retry_timings);
+        config.validate().unwrap();
+    }
+
     #[test]
     fn retry_timings_default_and_partial_configuration() {
         let defaults = AgentAutomationConfig::default();

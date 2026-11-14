@@ -86,6 +86,14 @@ export function conversationLoadAvailableAt(page:Page,url:string):number|null {
   return at>Date.now()?at:null;
 }
 
+// Preflight before creating a new Chrome tab. navigatePage still enforces
+// the actual reservation while holding its serialized navigation budget.
+export function assertConversationLoadSlot(page:Page,url:string):void {
+  if(cooldownBypass.getStore())return;
+  const availableAt=conversationLoadAvailableAt(page,url);
+  if(availableAt!==null)throw new ConversationCooldownError(Math.min(availableAt,Number.MAX_SAFE_INTEGER));
+}
+
 export function recordConversationUnavailable(page:Page):void {
   const budget=navigationBudget(page.context());
   // Repeated health checks of the same failure must not postpone recovery.

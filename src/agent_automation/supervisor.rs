@@ -1760,14 +1760,22 @@ impl AgentAutomationSupervisor {
                 renewal_enabled,
                 now_ms,
             );
+            let terminal_goal = state.goal.as_ref().is_some_and(|goal| {
+                matches!(
+                    goal.status,
+                    super::GoalStatus::Blocked | super::GoalStatus::Completed
+                )
+            });
             let renewal_invalid = activity.agent_stop_requested
+                || terminal_goal
                 || !renewal_enabled
                 || state.turn_renewal.send.as_ref().is_some_and(|send| {
                     send.owner_generation != task.owner_generation
                         || send.pairing_generation != state.pairing.generation
                 });
             if renewal_invalid
-                && (state.turn_renewal.handoff.is_some()
+                && (terminal_goal && !state.turn_renewal.is_empty()
+                    || state.turn_renewal.handoff.is_some()
                     || activity.agent_stop_requested && state.turn_renewal.send.is_some())
             {
                 task.store.clear_turn_renewal(&task.task)?;

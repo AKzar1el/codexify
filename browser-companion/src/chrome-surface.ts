@@ -7,7 +7,7 @@ import type { SingleBrowserSurface } from "./chatgpt-driver";
 import { BrowserCompanionError } from "./errors";
 import { backgroundChromeArgs } from "./background-chrome";
 import {prepareRequestBlockList,requestBlockListArgs,verifyRequestBlockList} from "./request-block-list";
-import {isChatGptPage,navigatePage,observeConversationLoadResponses} from "./navigation";
+import {assertConversationLoadSlot,isChatGptPage,navigatePage,observeConversationLoadResponses} from "./navigation";
 import {installChatModeCompatibility} from "./chat-mode";
 import {canonicalChatGptConversationUrl,validateChatGptConversationUrl} from "./protocol";
 
@@ -100,6 +100,10 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
       const surface=new ChromeSingleWindowSurface(context,control);
       if(!isChatGptPage(control.url()))await surface.navigate(CHATGPT_HOME);
       else await control.evaluate(installChatModeCompatibility,undefined,undefined,false);
+      // The managed Windows browser is a background automation surface. Keep
+      // newly launched Chrome windows out of the user's foreground desktop.
+      // An explicit owner reveal() restores the window for interactive use.
+      await surface.minimizeManagedWindow();
       return surface;
     } catch (error) {
       await context.close().catch(() => {});
@@ -141,7 +145,10 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
       &&ChromeSingleWindowSurface.conversationKey(page.url())===key);
     if(matches.length>1)throw new BrowserCompanionError("Multiple tabs show the same ChatGPT conversation; select a unique target","external_interference");
     if(matches.length===1){this.selectedPage=matches[0]!;return this.page();}
-    const previous=this.selectedPage;
+    const previous=await this.page();
+    // A cooldown rejection must never flash a blank tab before closing it.
+    // Bypass remains available only for explicitly authorized manual Retry.
+    assertConversationLoadSlot(previous,url);
     const page=await this.newTab();
     this.selectedPage=page;
     try {
@@ -170,6 +177,24 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
     await page.waitForLoadState("domcontentloaded", { timeout:30_000,signal }).catch(error => { if(signal?.aborted)throw error; });
     return page;
+  }
+
+  private async minimizeManagedWindow():Promise<void> {
+    if(process.platform!=="win32")return;
+    let session:Awaited<ReturnType<BrowserContext["newCDPSession"]>>|undefined;
+    try {
+      session=await this.context.newCDPSession(this.controlPage);
+      const window=await session.send("Browser.getWindowForTarget");
+      if(window.bounds.windowState!=="minimized")
+        await session.send("Browser.setWindowBounds",{
+          windowId:window.windowId,bounds:{windowState:"minimized"},
+        });
+    } catch {
+      // A desktop/window-manager that does not support minimizing must not
+      // break authenticated automation or silently close user goal tabs.
+    } finally {
+      await session?.detach().catch(()=>{});
+    }
   }
 
   async reveal(): Promise<void> {

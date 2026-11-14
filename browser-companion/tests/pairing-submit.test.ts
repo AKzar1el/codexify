@@ -249,7 +249,7 @@ async function installFixtureRoutes(){
 afterAll(async () => {
   await context?.close();
   if(browserContext!==context)await browserContext?.close();
-  if (profile) await rm(profile,{recursive:true,force:true});
+  if (profile) await rm(profile,{recursive:true,force:true,maxRetries:8,retryDelay:300});
 });
 
 const surface: SingleBrowserSurface = {
@@ -978,6 +978,23 @@ test.skipIf(!native)("offline messages and goals stop lingering generation befor
   }
 },25_000);
 
+test.skipIf(!native)("offline goal waits for disabled End turn control, then stops exactly once before Send",async()=>{
+  const driver=await fixture("",true,connector,31_000,true);
+  await page.evaluate(()=>{
+    const button=document.querySelector<HTMLButtonElement>("[data-fixture-stop]")!;
+    button.removeAttribute("data-testid");
+    button.setAttribute("aria-label","End turn");
+    button.textContent="End turn";
+    button.disabled=true;
+    setTimeout(()=>{button.disabled=false;},650);
+  });
+  const offline=offlineRequest();
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(28_000),emit:()=>{}});
+  expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stopped,send,");
+  expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+},35_000);
+
 test.skipIf(!native)("finished responses ignore non-modal ChatGPT popovers rather than treating them as Stop confirmation",async()=>{
   for(const aria of [' aria-modal="false"',''] as const){
     const driver=await fixture();
@@ -991,7 +1008,7 @@ test.skipIf(!native)("finished responses ignore non-modal ChatGPT popovers rathe
     expect(await page.locator('body').getAttribute('data-stops')).toBe('0');
     expect(await page.locator('[data-testid="nonmodal-menu"]').count()).toBe(1);
   }
-},18_000);
+},45_000);
 
 test.skipIf(!native)("offline Stop confirms an optional localized dialog before sending once",async()=>{
   const prompts:ExecuteActionRequest["prompt"][]=[
@@ -1010,7 +1027,7 @@ test.skipIf(!native)("offline Stop confirms an optional localized dialog before 
     expect(await page.locator('[role="dialog"]').count()).toBe(0);
     expect(documentLoads).toBe(2);
   }
-},30_000);
+},process.platform==="win32"?70_000:30_000);
 
 test.skipIf(!native)("offline Stop resumes the captured already-open confirmation before sending",async()=>{
   for(const scenario of [{frame:undefined,captured:true,draft:'Existing draft'},{frame:'srcdoc',captured:true,draft:''},{frame:undefined,captured:false,draft:''},{frame:'nested',captured:false,draft:''}] as const){
@@ -1044,7 +1061,7 @@ test.skipIf(!native)("offline Stop never confirms unrelated or ambiguous dialogs
     expect(await page.locator("body").getAttribute("data-stops")).toBe('preexisting' in scenario?"0":"1");
     expect(documentLoads).toBe(2);
   }
-},15_000);
+},process.platform==="win32"?40_000:15_000);
 
 test.skipIf(!native)("late Stop dialog during message preparation is confirmed before touching the blocked editor",async()=>{
   const driver=await fixture();

@@ -1,4 +1,5 @@
 mod companion;
+mod goal_blocking;
 mod install;
 mod model_fallback;
 mod process;

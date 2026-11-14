@@ -65,8 +65,8 @@ class FakeContext extends EventEmitter {
   }
   async newCDPSession() {
     return {
-      send:async (method: string) => {
-        if (method === "Browser.setWindowBounds") this.windowState = "normal";
+      send:async (method: string, params?: {bounds?: {windowState?: string}}) => {
+        if (method === "Browser.setWindowBounds") this.windowState = params?.bounds?.windowState ?? "normal";
         return { windowId:1, bounds:{ windowState:this.windowState } };
       },
       detach:async () => {},
@@ -123,10 +123,12 @@ test("startup creates a background page and only an explicit reveal restores foc
   const { surface, fake } = await createSurface([]);
   expect(fake.createdTargets).toEqual([{ url:"about:blank", newWindow:true, background:true }]);
   expect(fake.tabs[0]!.revealed).toBeFalse();
+  if(process.platform==="win32")expect(fake.windowState).toBe("minimized");
   await surface.beginAction();
   await surface.endAction();
   expect(fake.tabs[0]!.revealed).toBeFalse();
-  expect(fake.windowState).toBe("normal");
+  // Background goal actions do not restore the owner's Chrome window.
+  if(process.platform==="win32")expect(fake.windowState).toBe("minimized");
   fake.windowState = "minimized";
   await surface.reveal();
   expect(fake.windowState).toBe("normal");
@@ -180,6 +182,24 @@ test("each conversation has a persistent tab and visiting another does not navig
   expect(await surface.selectUtilityPage()).toBe(utility);
   expect(await surface.page()).toBe(utility);
   expect((b as unknown as FakePage).closed).toBeFalse();
+});
+
+test("automatic cooldown preflight does not create and close flickering blank goal tabs",async()=>{
+  const {surface,fake}=await createSurface();
+  const first=await surface.selectConversation('https://chatgpt.com/c/first');
+  expect(first.url()).toBe('https://chatgpt.com/c/first');
+  const count=fake.createdTargets.length;
+  await expect(surface.selectConversation('https://chatgpt.com/c/second'))
+    .rejects.toMatchObject({code:"conversation_cooldown"});
+  expect(fake.createdTargets).toHaveLength(count);
+  expect(await surface.page()).toBe(first);
+  expect(fake.tabs.filter(page=>!page.closed)).toHaveLength(2);
+  // Explicit manual Retry can bypass the local cooldown, with standard
+  // navigation and account checks still enforced by the driver.
+  const next=await withConversationCooldownBypass(true,
+    ()=>surface.selectConversation('https://chatgpt.com/c/second'));
+  expect(next.url()).toBe('https://chatgpt.com/c/second');
+  expect(fake.createdTargets).toHaveLength(count+1);
 });
 
 test("new-chat preparation reuses only its own draft tab, never another goal",async()=>{
