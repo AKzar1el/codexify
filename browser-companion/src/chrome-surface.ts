@@ -7,7 +7,7 @@ import type { SingleBrowserSurface } from "./chatgpt-driver";
 import { BrowserCompanionError } from "./errors";
 import { backgroundChromeArgs } from "./background-chrome";
 import {prepareRequestBlockList,requestBlockListArgs,verifyRequestBlockList} from "./request-block-list";
-import {isChatGptPage,navigatePage,observeConversationLoadResponses} from "./navigation";
+import {assertConversationLoadSlot,isChatGptPage,navigatePage,observeConversationLoadResponses} from "./navigation";
 import {installChatModeCompatibility} from "./chat-mode";
 import {canonicalChatGptConversationUrl,validateChatGptConversationUrl} from "./protocol";
 
@@ -141,7 +141,10 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
       &&ChromeSingleWindowSurface.conversationKey(page.url())===key);
     if(matches.length>1)throw new BrowserCompanionError("Multiple tabs show the same ChatGPT conversation; select a unique target","external_interference");
     if(matches.length===1){this.selectedPage=matches[0]!;return this.page();}
-    const previous=this.selectedPage;
+    const previous=await this.page();
+    // A cooldown rejection must never flash a blank tab before closing it.
+    // Bypass remains available only for explicitly authorized manual Retry.
+    assertConversationLoadSlot(previous,url);
     const page=await this.newTab();
     this.selectedPage=page;
     try {

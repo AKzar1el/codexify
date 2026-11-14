@@ -16,6 +16,13 @@ Do not add the new setting to a live older Codexify configuration: older builds 
 
 The browser companion recognizes a stable Stop selector, a localized Stop button, and the explicit English End-turn control. A bounded native click waits for temporary disabled state. Existing real modal checks, account verification, message ownership and Send safeguards remain mandatory.
 
+## Terminal renewal and cooldown tab churn
+
+When a goal transitions to blocked or completed, its pending automatic turn-renewal state is cleared; the supervisor also retires stale handoffs for terminal goals. This prevents unnecessary continuation messages in ended revenue goals while preserving renewal for unrelated hourly worker chats.
+
+Selecting a previously unopened goal conversation now checks the shared ChatGPT navigation cooldown before creating a background tab. A cooldown rejection no longer causes a blank tab to appear and immediately close. The actual navigation reservation remains enforced in navigatePage; a manually authorized cooldown bypass retains its existing behavior.
+
+The managed ChatGPT Chrome for Testing window was temporarily minimized during investigation to stop visible focus interruptions, without closing the user's normal Chrome.
 ## Parallel browser lanes
 
 The 4-page pool from PR #22 was inspected but deliberately NOT installed. This branch retains one browser action lane until measured tests establish safe isolation, HTTP 429 backoff, memory use and retries on the 16 GB Windows host.

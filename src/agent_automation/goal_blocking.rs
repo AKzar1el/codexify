@@ -193,6 +193,47 @@ mod tests {
     }
 
     #[test]
+    fn finishing_a_goal_retires_stale_automatic_turn_renewal_without_losing_goal_status() {
+        let (_root, store, task) = fixture_store(false);
+        store
+            .mutate(&task, |state| {
+                state.turn_renewal.send = Some(super::super::turn_renewal::TurnSend {
+                    action_id: "renewal-send".into(),
+                    at_ms: 5,
+                    model: Some("gpt-6-sol".into()),
+                    effort: Some("xhigh".into()),
+                    pairing_generation: 1,
+                    owner_generation: 1,
+                });
+                state.turn_renewal.handoff = Some(super::super::turn_renewal::TurnHandoff {
+                    id: "old-renewal".into(),
+                    requested_at_ms: 6,
+                    report_complete: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert!(!store.load(&task).unwrap().turn_renewal.is_empty());
+        let finished = store
+            .finish_goal(
+                &task,
+                1,
+                super::super::GoalFinish::Blocked {
+                    reason: "Payment acceptance requires explicit owner approval".into(),
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(finished.status, super::super::GoalStatus::Blocked);
+        let saved = store.load(&task).unwrap();
+        assert!(saved.turn_renewal.is_empty());
+        assert_eq!(
+            saved.goal.unwrap().status,
+            super::super::GoalStatus::Blocked
+        );
+    }
+
+    #[test]
     fn sidecar_does_not_change_original_goal_state_schema_or_default_policy() {
         let (_root, store, task) = fixture_store(true);
         assert!(

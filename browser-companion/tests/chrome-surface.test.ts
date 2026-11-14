@@ -182,6 +182,24 @@ test("each conversation has a persistent tab and visiting another does not navig
   expect((b as unknown as FakePage).closed).toBeFalse();
 });
 
+test("automatic cooldown preflight does not create and close flickering blank goal tabs",async()=>{
+  const {surface,fake}=await createSurface();
+  const first=await surface.selectConversation('https://chatgpt.com/c/first');
+  expect(first.url()).toBe('https://chatgpt.com/c/first');
+  const count=fake.createdTargets.length;
+  await expect(surface.selectConversation('https://chatgpt.com/c/second'))
+    .rejects.toMatchObject({code:"conversation_cooldown"});
+  expect(fake.createdTargets).toHaveLength(count);
+  expect(await surface.page()).toBe(first);
+  expect(fake.tabs.filter(page=>!page.closed)).toHaveLength(2);
+  // Explicit manual Retry can bypass the local cooldown, with standard
+  // navigation and account checks still enforced by the driver.
+  const next=await withConversationCooldownBypass(true,
+    ()=>surface.selectConversation('https://chatgpt.com/c/second'));
+  expect(next.url()).toBe('https://chatgpt.com/c/second');
+  expect(fake.createdTargets).toHaveLength(count+1);
+});
+
 test("new-chat preparation reuses only its own draft tab, never another goal",async()=>{
   const {surface,fake}=await createSurface();
   const goal=await openGoal(surface,'https://chatgpt.com/c/revenue');

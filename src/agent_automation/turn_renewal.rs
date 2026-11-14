@@ -315,6 +315,12 @@ impl AgentAutomationStore {
             return Ok(None);
         }
         self.mutate(task, |state| {
+            // The renewal timer is turn-oriented, not goal-oriented. Prevent
+            // stale sends from renewing completed/blocked goal conversations.
+            if state.goal.as_ref().is_some_and(|goal| goal.status != super::GoalStatus::Active) {
+                state.turn_renewal = Default::default();
+                return Ok(None);
+            }
             let Some(send) = &state.turn_renewal.send else {return Ok(None)};
             let Some(minutes) = config.minutes(send.model.as_deref(), send.effort.as_deref()) else {return Ok(None)};
             if send.pairing_generation != state.pairing.generation

@@ -1545,6 +1545,9 @@ impl AgentAutomationStore {
                 goal.clone()
             };
             state.goal_wake = GoalWakeState::default();
+            // Completing or blocking a goal must retire its unsent automatic
+            // renewal. Do not continue a terminal commercial goal's chat.
+            state.turn_renewal = Default::default();
             if state.action.goal_revision == Some(expected_revision) {
                 state.action.status = AutomationActionStatus::Idle;
                 state.action.automatic_retry_in_progress = false;
