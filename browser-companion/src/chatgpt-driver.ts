@@ -7,6 +7,7 @@ import {openNewChat, createdChatUrl, assertNewChatDraft} from "./new-chat";
 import { HealthAccountCache, readChatGptAccount, type ChatGptAccount } from "./account";
 import { throwIfSessionAttention, throwIfConversationLimit, toolApprovalVisible } from "./browser-session";
 import {navigatePage,recordConversationAvailable,conversationLoadAvailableAt} from "./navigation";
+import {stopControls} from "./stop-controls";
 import type { BrowserDriver, DriverExecution, BrowserStepRunner, StopProgressStep } from "./browser-window";
 import { activeComposer, composerText, insertExactPrompt, isPairingVerificationDraft, uniqueSendButton } from "./composer";
 import { clearComposerState, connectorIsSelected, ConnectorMenuUnavailableError, SELECTED_CONNECTOR_SELECTOR, selectConnector, type SelectedConnector } from "./connector-selection";
@@ -56,7 +57,7 @@ export function responseCompletionReady(input: {
 }
 
 async function generationRunning(page: Page): Promise<boolean> {
-  return page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true }).count()
+  return stopControls(page).count()
     .then(count => count > 0)
     .catch(() => false);
 }
@@ -156,7 +157,7 @@ async function stopLingeringResponse(
     }
   };
   let confirmationSubmitted = false;
-  const waitForStopped = async (stop:Locator) => {
+  const waitForStopped = async () => {
     let settleDeadline = Math.min(deadline,(lastStopRequestedAt||Date.now())+settleMs);
     while (!boundedSignal.aborted) {
       const dialogs = await visibleStopDialogs(page);
@@ -200,7 +201,7 @@ async function stopLingeringResponse(
       }
       // Confirmation can remove its entire iframe. Re-scan on the next poll
       // instead of waiting on a detached locator and retrying Stop prematurely.
-      if (!count && !await stop.isVisible()) return;
+      if (!count && !await stopControls(page).count()) return;
       if (Date.now() >= settleDeadline) throw new Error("ChatGPT Stop has not completed");
       await new Promise(resolve => setTimeout(resolve,50));
     }
@@ -210,19 +211,21 @@ async function stopLingeringResponse(
   for (let attempt = 0; attempt < 3 && !boundedSignal.aborted; attempt++) {
     await assertTarget();
     if (boundedSignal.aborted) break;
-    const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible:true });
+    const stop = stopControls(page);
     const count = await stop.count();
     const dialogCount = (await visibleStopDialogs(page)).length;
     if (count === 0 && dialogCount === 0) {emit({type:"stop_progress",step:"complete"});return;}
-    if (count !== 1 && dialogCount === 0) {
+    if (count > 1 && dialogCount === 0) {
       throw new BrowserCompanionError("ChatGPT does not have one visible Stop control", "selector_drift");
     }
     try {
-      if (dialogCount === 0 && await stop.isEnabled()) {
-        await stop.click({ timeout:timeout(750), signal:boundedSignal });
+      if (dialogCount === 0 && count === 1) {
+        // React may temporarily render the Stop/End-turn control disabled.
+        // A bounded native click waits for it rather than spinning until timeout.
+        await stop.click({ timeout:timeout(8_000), signal:boundedSignal });
         await requested((["initial","retry","recovery"] as const)[attempt]!);
       }
-      await waitForStopped(stop);
+      await waitForStopped();
       emit({type:"stop_progress",step:"complete"});
       return;
     } catch (error) {

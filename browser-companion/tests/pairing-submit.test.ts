@@ -978,6 +978,23 @@ test.skipIf(!native)("offline messages and goals stop lingering generation befor
   }
 },25_000);
 
+test.skipIf(!native)("offline goal waits for disabled End turn control, then stops exactly once before Send",async()=>{
+  const driver=await fixture("",true,connector,31_000,true);
+  await page.evaluate(()=>{
+    const button=document.querySelector<HTMLButtonElement>("[data-fixture-stop]")!;
+    button.removeAttribute("data-testid");
+    button.setAttribute("aria-label","End turn");
+    button.textContent="End turn";
+    button.disabled=true;
+    setTimeout(()=>{button.disabled=false;},650);
+  });
+  const offline=offlineRequest();
+  await executeFixture(driver,{request:offline,renderedPrompt:renderActionPrompt(offline.prompt),signal:AbortSignal.timeout(16_000),emit:()=>{}});
+  expect(await page.locator("body").getAttribute("data-order")).toBe("stop,stopped,send,");
+  expect(await page.locator("body").getAttribute("data-stops")).toBe("1");
+  expect(await page.locator("body").getAttribute("data-sends")).toBe("1");
+},20_000);
+
 test.skipIf(!native)("finished responses ignore non-modal ChatGPT popovers rather than treating them as Stop confirmation",async()=>{
   for(const aria of [' aria-modal="false"',''] as const){
     const driver=await fixture();
