@@ -420,7 +420,7 @@ impl AutomationTaskState {
             return false;
         };
         let action = &self.action;
-        if goal.status != GoalStatus::Active
+        !(goal.status != GoalStatus::Active
             || action.goal_revision != Some(goal.revision)
             || action.id.is_none()
             || action.status == AutomationActionStatus::Idle
@@ -437,11 +437,7 @@ impl AutomationTaskState {
                 || action.kind == Some(AutomationActionKind::OfflineCombined)
                     && action.status != AutomationActionStatus::Cancelled
                     && action.send_accepted == Some(true)
-                    && action.messages_fenced)
-        {
-            return false;
-        }
-        true
+                    && action.messages_fenced))
     }
 
     pub(crate) fn goal_retry_at_ms(&self) -> Option<u64> {
@@ -851,6 +847,7 @@ pub struct AgentAutomationStore {
     pub(super) renewal_config: super::turn_renewal::TurnRenewalConfig,
     pub(super) settings_path: Option<PathBuf>,
     automatic_retries: bool,
+    pub(super) persistent_goal_blockers: bool,
     retry_timings: RetryTimings,
     pub(super) usage_options: crate::usage_analytics::Options,
 }
@@ -912,6 +909,7 @@ impl AgentAutomationStore {
             renewal_config: Default::default(),
             settings_path: None,
             automatic_retries: true,
+            persistent_goal_blockers: false,
             retry_timings: RetryTimings::default(),
             usage_options: Default::default(),
         })
@@ -923,6 +921,7 @@ impl AgentAutomationStore {
         self.renewal_config = config.markdown_chat.turn_renewal.clone();
         self.settings_path = config.loaded_config_path.clone();
         self.automatic_retries = config.markdown_chat.automation.automatic_retries;
+        self.persistent_goal_blockers = config.markdown_chat.automation.persistent_goal_blockers;
         self.retry_timings = config.markdown_chat.automation.retry_timings.clone();
         self.usage_options = crate::usage_analytics::Options::from_config(config);
         self.notification_workspace = config
@@ -1408,7 +1407,7 @@ impl AgentAutomationStore {
                         completed_tool_call_count: None,
                     };
                     state.goal = Some(goal.clone());
-                    state.goal_wake = GoalWakeState::default();
+                            state.goal_wake = GoalWakeState::default();
                     if state.action.goal_revision.is_some() {
                         state.action = AutomationActionState::default();
                     }
@@ -3763,7 +3762,7 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn read_private_record(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(super) fn read_private_record(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3971,7 +3970,7 @@ fn persist_state(path: &Path, state: &AutomationTaskState) -> Result<(), String>
     persist_private_record(path, state)
 }
 
-fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), String> {
+pub(super) fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or("Agent automation state has no parent directory")?;
