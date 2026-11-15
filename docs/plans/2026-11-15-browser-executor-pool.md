@@ -1,6 +1,6 @@
 # Codexify browser executor pool — staged engineering plan
 
-Status: **design only — do not enable additional browser executors until the single-companion health gate is proven**.
+Status: **two-browser offline isolation canary passed; production still uses one executor.** Do not enable additional ChatGPT browser executors until the single-companion health and deployment gates are proven.
 Date: 2026-11-15. Existing production path: Rust `AgentAutomationSupervisor` global `VecDeque<AutomationExecution>` and `run_lock`; one private-profile Chrome/Electron companion.
 
 ## User objective
@@ -50,5 +50,13 @@ Goal events / hourly wake-ups
 - Security: profile/descriptor isolation, no token exposure, private file ACLs, no cross-account pairing or untrusted ChatGPT instructions.
 - Windows: atomic state publication under simulated short sharing lock; permanent AccessDenied remains an explicit error.
 - E2E: real two-lane canary with owner-visible evidence, unchanged ten hourly task schedules, and quantified throughput gains; no claims from synthetic tests alone.
+
+## Verified offline two-browser canary (2026-11-15)
+
+- Command: `node --test tests/two-lane-browser-canary.node.cjs` from `browser-companion/`.
+- Result: **1/1 PASS**. Two separate headless Chromium processes used independent disposable profiles, navigated concurrently to a loopback-only fixture (barrier requires both browsers), and proved isolated cookies/local storage. A simulated global Send budget never exceeded one concurrent slot.
+- The test made **zero ChatGPT requests** and did not open or modify the production browser home, descriptor, cookies, or session. The test closed its owned browser contexts and removed only its own temporary profile directories.
+- This **does not** validate two authenticated Codexify companions, production dispatch/affinity, accepted-send replay fencing across executors, or a two-lane throughput gain. Current Rust `run_lock` still enforces one browser action at a time. Do not misreport a browser-isolation smoke as a live two-agent rollout.
+- Resource preflight on this 16 GB Windows host found about 20 Chrome processes consuming roughly 3.4 GB. Measure free RAM and p95 queue/Send time before adding another persistent companion; five separate Chrome profiles may not fit comfortably.
 
 **Not authorized here:** purchasing credits, creating multiple ChatGPT accounts, credential/session extraction, circumventing rate limits, changing recurring schedules, replaying ambiguous messages, or restarting productive agents merely to increase the queue count.
