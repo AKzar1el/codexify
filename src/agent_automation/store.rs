@@ -3994,6 +3994,36 @@ fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), St
         .write_all(&bytes)
         .and_then(|_| temporary.as_file().sync_all())
         .map_err(|error| format!("Could not write agent automation state: {error}"))?;
+    #[cfg(windows)]
+    {
+        // Windows file scanners and readers may briefly hold a destination
+        // without FILE_SHARE_DELETE. PersistError gives back the original
+        // synced temporary file, allowing a bounded atomic retry rather than
+        // dropping a completed state update.
+        let mut attempts = 0;
+        loop {
+            match temporary.persist(path) {
+                Ok(_) => break,
+                Err(error) => {
+                    if attempts >= 8
+                        || !matches!(
+                            error.error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                        )
+                    {
+                        return Err(format!(
+                            "Could not publish agent automation state: {}",
+                            error.error
+                        ));
+                    }
+                    temporary = error.file;
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
     temporary
         .persist(path)
         .map_err(|error| format!("Could not publish agent automation state: {}", error.error))?;
@@ -4595,5 +4625,56 @@ mod schema_rollover_tests {
             );
             assert_eq!(std::fs::read(path).unwrap(), before, "{changed}");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_state_publication_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn transient_sharing_violation_does_not_lose_automation_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+
+        // Another Windows process can briefly open the old destination without
+        // FILE_SHARE_DELETE (e.g. antivirus or a file indexer). The new atomic
+        // replacement must preserve its temporary file until that handle exits.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let target = path.clone();
+        let publisher = std::thread::spawn(move || {
+            persist_private_record(&target, &serde_json::json!({"version":2}))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        drop(held);
+        publisher.join().unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 2);
+    }
+
+    #[test]
+    fn persistent_sharing_violation_fails_without_overwriting_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = persist_private_record(&path, &serde_json::json!({"version":2}))
+            .expect_err("permanent destination lock must remain a hard error");
+        assert!(error.contains("Could not publish agent automation state"));
+        drop(held);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
     }
 }
