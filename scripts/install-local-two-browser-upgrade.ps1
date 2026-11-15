@@ -8,6 +8,8 @@ param(
     [switch]$PreflightOnly,
     [switch]$VerifyMaintenanceOnly,
     [switch]$SelfTest,
+    [switch]$WaitForFleetQuiet,
+    [ValidateRange(1,120)][int]$WaitTimeoutMinutes = 60,
     [string]$CanaryTaskKey = '',
     [string]$BackupDirectory
 )
@@ -364,6 +366,34 @@ function AssertFleetQuiet() {
         throw "Other Codexify workers were active in the last three minutes: $names"
     }
 }
+function WaitForQuietFleet([int]$maximumMinutes) {
+    # Only wait for a verified busy fleet. Any owner-API/identity failure is
+    # still fatal; waiting must never turn an unknown state into permission.
+    $deadline = [DateTimeOffset]::UtcNow.AddMinutes($maximumMinutes)
+    $nextReport = [DateTimeOffset]::MinValue
+    while ($true) {
+        try {
+            AssertFleetQuiet
+            Write-Output 'FLEET_QUIET_CONFIRMED'
+            return
+        } catch {
+            $reason = $_.Exception.Message
+            if ($reason -notlike 'Other Codexify workers were active in the last three minutes:*') {
+                throw
+            }
+            $now = [DateTimeOffset]::UtcNow
+            if ($now -ge $deadline) {
+                throw "FleetQuiet did not become true within $maximumMinutes minute(s); no installation started"
+            }
+            if ($now -ge $nextReport) {
+                Write-Output "WAITING_FOR_FLEET_QUIET $reason"
+                $nextReport = $now.AddMinutes(1)
+            }
+            $remainingSeconds = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)
+            Start-Sleep -Seconds ([Math]::Min(15, [Math]::Max(1, $remainingSeconds)))
+        }
+    }
+}
 function BrowserProof([string]$descriptorPath) {
     $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json
     $uri = [Uri]$descriptor.endpoint
@@ -476,6 +506,9 @@ function TestTransactionWithoutService {
         Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+if ($WaitForFleetQuiet -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest)) {
+    throw 'WaitForFleetQuiet is only valid with Apply, outside PreflightOnly, VerifyMaintenanceOnly and SelfTest'
+}
 if ($SelfTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
         throw 'SelfTest cannot be combined with deployment or preflight switches'
@@ -513,6 +546,16 @@ if ($VerifyMaintenanceOnly) {
     return
 }
 AssertTaskAdministration
+if ($WaitForFleetQuiet -and -not $probe.Flags.FleetQuiet) {
+    $otherBlockers = @($probe.InstallationBlockedBy | Where-Object { $_ -ne 'FleetQuiet' })
+    if ($otherBlockers.Count -gt 0) {
+        throw ('Cannot wait for FleetQuiet while other installation gates are closed: ' + ($otherBlockers -join ', '))
+    }
+    WaitForQuietFleet $WaitTimeoutMinutes
+    # The installer rechecks *every* preflight gate after the wait, and again
+    # immediately before service shutdown; a quiet result is not a lease.
+    $probe = Preflight
+}
 AssertReadyForInstall $probe
 AssertCanaryBelongsToPairedGoal $CanaryTaskKey
 if ($CanaryTaskKey -and $CanaryTaskKey -notmatch '^[a-f0-9]{64}$') {

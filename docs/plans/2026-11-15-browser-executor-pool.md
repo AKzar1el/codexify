@@ -189,3 +189,28 @@ Goal events / hourly wake-ups
   paired, noncritical `-CanaryTaskKey`, installation enables the new binary
   and shared gate but leaves the second execution lane disabled. Do not
   auto-select a revenue goal or infer success from enabled schedules.
+
+## FleetQuiet wait option following owner's guarded install attempt
+
+- The owner ran `-Apply` from Administrator PowerShell and received
+  `Installation gate is closed: FleetQuiet` before any production swap. A
+  read-only live owner-API check found recent activity in `mcp-geo` and
+  `ml-research`. The quiet gate is working, but staggered hourly tasks can
+  make finding a safe maintenance window inconvenient.
+- The installer now accepts `-Apply -WaitForFleetQuiet -WaitTimeoutMinutes 60`
+  (timeout bounded to 1-120 minutes). This opt-in foreground loop waits only
+  while the *existing* owner-API gate reports active workers, checks every
+  15 seconds, and surfaces the blocking workspace names. It does not create
+  or reserve a quiet window, pause schedules, stop service processes, or
+  relax the required three-minute inactivity rule. An unavailable owner API
+  or any other preflight failure aborts rather than proceeding.
+- After observed quiet, the installer runs the entire read-only preflight
+  again, then the existing canary/backup/staging checks, and another fleet
+  and browser-idle verification immediately before shutdown. An unrelated
+  worker starting meanwhile closes the gate again. On wait timeout, the
+  installer aborts without staging anything. Run only from an independent
+  elevated console, not this connector (which is owned by the service).
+- The isolated `scripts/test-two-browser-fleet-quiet-wait.ps1` exercises
+  busy-to-idle success, API/owner verification refusal, deadline expiry,
+  and initially idle behavior without contacting live worker state. Use
+  it alongside the installer's existing `-SelfTest` fixture.
