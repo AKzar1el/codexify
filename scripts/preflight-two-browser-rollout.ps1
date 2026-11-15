@@ -1,0 +1,146 @@
+# Read-only two-browser deployment gate. Never restarts services or sends ChatGPT messages.
+[CmdletBinding()]
+param(
+  [string]$CanaryTaskKey = '',
+  [string]$CandidateBinary = '',
+  [string]$CandidateCompanion = '',
+  [int]$QuietMinutes = 3
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+$homeDir = Join-Path $env:USERPROFILE '.codexify'
+if (-not $CandidateBinary) { $CandidateBinary = Join-Path $repo 'target\debug\codexify.exe' }
+if (-not $CandidateCompanion) {
+  $CandidateCompanion = Join-Path $repo 'browser-companion\release\win-unpacked'
+}
+$primaryDescriptor = Join-Path $homeDir 'browser\descriptor.json'
+$secondDescriptor = Join-Path $homeDir 'browser-lane2-canary\descriptor.json'
+$sharedGate = Join-Path $homeDir 'browser-pool\send.lock'
+
+function Get-CompanionState([string]$descriptor) {
+  if (-not (Test-Path -LiteralPath $descriptor -PathType Leaf)) { return $null }
+  $d = Get-Content -LiteralPath $descriptor -Raw | ConvertFrom-Json
+  if (-not $d.pid -or -not $d.endpoint -or -not $d.token) { return $null }
+  $u = [Uri]$d.endpoint
+  if ($u.Scheme -ne 'http' -or $u.Host -ne '127.0.0.1') { return $null }
+  if (-not (Get-Process -Id $d.pid -ErrorAction SilentlyContinue)) { return $null }
+  $auth = @{ Authorization = 'Bearer ' + $d.token }
+  $health = Invoke-RestMethod -Uri ($d.endpoint + '/v1/health') -Headers $auth -TimeoutSec 12
+  $gate = $null
+  try { $gate = Invoke-RestMethod -Uri ($d.endpoint + '/v1/send-gate/status') -Headers $auth -TimeoutSec 10 } catch {}
+  return [pscustomobject]@{
+    Pid = [int]$d.pid
+    Build = [string]$d.build
+    Auth = [bool]$health.authenticated
+    Idle = ($health.status -eq 'idle' -and -not $health.activeActionId)
+    Account = [string]$health.accountFingerprint
+    Gate = $gate
+  }
+}
+
+function Check-FleetQuiet([int]$minutes) {
+  $ownerFile = Join-Path $homeDir 'owner-chat.json'
+  if (-not (Test-Path -LiteralPath $ownerFile -PathType Leaf)) { return $false }
+  $owner = Get-Content -LiteralPath $ownerFile -Raw | ConvertFrom-Json
+  $uri = 'http://127.0.0.1:' + [int]$owner.port + '/api/chats'
+  $list = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = 'Bearer ' + $owner.token } -TimeoutSec 15
+  $cutoff = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - ($minutes * 60000)
+  $active = @($list.chats | Where-Object {
+    $_.workspace -ne 'codexify-reliability-lab' -and $_.lastAgentCallAtMs -and
+    [double]$_.lastAgentCallAtMs -gt $cutoff
+  })
+  return ($active.Count -eq 0)
+}
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+$installed = Join-Path $homeDir 'bin\codexify.exe'
+$configFile = Join-Path $homeDir 'codexify.config.json'
+if (-not $CanaryTaskKey -and (Test-Path -LiteralPath $configFile -PathType Leaf)) {
+  $config = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+  if ($config.PSObject.Properties['agentChat'] -and
+      $config.agentChat.PSObject.Properties['automation'] -and
+      $config.agentChat.automation.PSObject.Properties['canaryTaskKey'] -and
+      $config.agentChat.automation.canaryTaskKey) {
+    $CanaryTaskKey = [string]$config.agentChat.automation.canaryTaskKey
+  }
+}
+$exeCandidate = Test-Path -LiteralPath $CandidateBinary -PathType Leaf
+$packagedExecutable = Join-Path $CandidateCompanion 'codexify-browser-companion.exe'
+$packagedChrome = Join-Path $CandidateCompanion 'resources\chrome\chrome-executable.json'
+$packageReady = (Test-Path -LiteralPath $packagedExecutable -PathType Leaf) -and
+                (Test-Path -LiteralPath $packagedChrome -PathType Leaf)
+$rustSources = @(Get-ChildItem -LiteralPath (Join-Path $repo 'src') -Recurse -File -Filter '*.rs')
+$rustSources += Get-Item -LiteralPath (Join-Path $repo 'Cargo.toml')
+$mostRecentRust = ($rustSources | Measure-Object -Property LastWriteTime -Maximum).Maximum
+$nativeFresh = $exeCandidate -and (Get-Item -LiteralPath $CandidateBinary).LastWriteTime -ge $mostRecentRust
+$companionBundle = Join-Path $CandidateCompanion 'resources\app.asar'
+$browserSources = @(Get-ChildItem -LiteralPath (Join-Path $repo 'browser-companion\src') -Recurse -File -Filter '*.ts')
+$newestBrowserSource = ($browserSources | Measure-Object -Property LastWriteTime -Maximum).Maximum
+$companionFresh = $packageReady -and (Test-Path -LiteralPath $companionBundle -PathType Leaf) -and
+  (Get-Item -LiteralPath $companionBundle).LastWriteTime -ge $newestBrowserSource
+$canaryKeyValid = ($CanaryTaskKey -match '^[a-f0-9]{64}$')
+
+$primary = Get-CompanionState $primaryDescriptor
+$lane2 = Get-CompanionState $secondDescriptor
+
+$sameAccount = [bool]($primary -and $lane2 -and $primary.Auth -and $lane2.Auth -and
+  $primary.Account -and $primary.Account -eq $lane2.Account)
+$separateProcesses = [bool]($primary -and $lane2 -and $primary.Pid -ne $lane2.Pid)
+$primaryGate = [bool]($primary -and $primary.Gate -and $primary.Gate.enabled)
+$lane2Gate = [bool]($lane2 -and $lane2.Gate -and $lane2.Gate.enabled)
+$sameGate = [bool]($primaryGate -and $lane2Gate -and
+  $primary.Gate.pathFingerprint -eq $lane2.Gate.pathFingerprint)
+$quiet = $false
+try { $quiet = Check-FleetQuiet $QuietMinutes } catch {}
+$task = Get-ScheduledTask -TaskName 'Codexify' -ErrorAction SilentlyContinue
+
+$flags = [ordered]@{
+  CandidateNative = [bool]$exeCandidate
+  CandidateNativeFresh = [bool]$nativeFresh
+  CandidateCompanion = [bool]$packageReady
+  CandidateCompanionFresh = [bool]$companionFresh
+  AdministrativelyElevated = [bool]$isAdmin
+  ScheduledServiceRunning = [bool]($task -and $task.State -eq 'Running')
+  CanaryTaskKeyValid = [bool]$canaryKeyValid
+  PrimaryAuthenticatedIdle = [bool]($primary -and $primary.Auth -and $primary.Idle)
+  SecondaryAuthenticatedIdle = [bool]($lane2 -and $lane2.Auth -and $lane2.Idle)
+  DistinctBrowserProcesses = $separateProcesses
+  SameVerifiedAccount = $sameAccount
+  BothCompanionsGateEnabledAndMatching = $sameGate
+  FleetQuiet = $quiet
+  SharedGateNotHeld = -not (Test-Path -LiteralPath $sharedGate)
+}
+# Installing the candidate necessarily precedes enabling the primary gate.
+# Requiring both companions' new gate before upgrading the old primary would
+# make this preflight impossible to satisfy. Keep the two gates separate.
+$installChecks = @(
+  'CandidateNative', 'CandidateNativeFresh',
+  'CandidateCompanion', 'CandidateCompanionFresh', 'AdministrativelyElevated',
+  'ScheduledServiceRunning', 'PrimaryAuthenticatedIdle', 'FleetQuiet',
+  'SharedGateNotHeld'
+)
+$activationChecks = @(
+  'CanaryTaskKeyValid', 'SecondaryAuthenticatedIdle',
+  'DistinctBrowserProcesses', 'SameVerifiedAccount',
+  'BothCompanionsGateEnabledAndMatching'
+)
+$maintenanceReady = -not (@($installChecks | Where-Object { -not $flags[$_] }).Count -gt 0)
+$activationReady = $maintenanceReady -and
+  -not (@($activationChecks | Where-Object { -not $flags[$_] }).Count -gt 0)
+$result = [ordered]@{
+  ReadOnly = $true
+  ReadyForGuardedMaintenance = $maintenanceReady
+  ReadyToActivateTwoLanes = $activationReady
+  InstallationBlockedBy = @($installChecks | Where-Object { -not $flags[$_] })
+  ActivationBlockedBy = @($activationChecks | Where-Object { -not $flags[$_] })
+  Flags = $flags
+  NativeCandidateSHA256 = if ($exeCandidate) { (Get-FileHash -LiteralPath $CandidateBinary -Algorithm SHA256).Hash } else { $null }
+  InstalledBinarySHA256 = if (Test-Path -LiteralPath $installed) { (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash } else { $null }
+}
+$result | ConvertTo-Json -Depth 5
+if (-not $activationReady) { exit 2 }

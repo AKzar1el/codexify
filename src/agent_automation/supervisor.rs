@@ -101,6 +101,7 @@ pub trait AutomationExecutor: Send + Sync {
     async fn approve_pending_conversation_for_task(
         &self,
         _task_key: &str,
+        _eligible_offline: bool,
         url: &str,
         account: &str,
         connector_name: &str,
@@ -140,6 +141,7 @@ pub trait AutomationExecutor: Send + Sync {
     async fn retained_action_for_task(
         &self,
         _task_key: &str,
+        _eligible_offline: bool,
         action_id: &str,
         account_fingerprint: &str,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
@@ -206,10 +208,14 @@ impl BrowserAutomationExecutor {
             .map(|(_, config)| config)
             .unwrap_or(&self.config)
     }
-    fn config_for_task_key(&self, task_key: &str) -> &AgentAutomationConfig {
+    fn config_for_task_key(
+        &self,
+        task_key: &str,
+        eligible_offline: bool,
+    ) -> &AgentAutomationConfig {
         self.secondary
             .as_ref()
-            .filter(|(key, _)| key == task_key)
+            .filter(|(key, _)| eligible_offline && key == task_key)
             .map(|(_, config)| config)
             .unwrap_or(&self.config)
     }
@@ -310,12 +316,13 @@ impl AutomationExecutor for BrowserAutomationExecutor {
     async fn approve_pending_conversation_for_task(
         &self,
         task_key: &str,
+        eligible_offline: bool,
         url: &str,
         account: &str,
         connector_name: &str,
     ) -> Result<bool, String> {
         self.approve_from_config(
-            self.config_for_task_key(task_key),
+            self.config_for_task_key(task_key, eligible_offline),
             url,
             account,
             connector_name,
@@ -399,11 +406,12 @@ impl AutomationExecutor for BrowserAutomationExecutor {
     async fn retained_action_for_task(
         &self,
         task_key: &str,
+        eligible_offline: bool,
         action_id: &str,
         account_fingerprint: &str,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
         Self::retained_from_config(
-            self.config_for_task_key(task_key),
+            self.config_for_task_key(task_key, eligible_offline),
             action_id,
             account_fingerprint,
         )
@@ -1967,6 +1975,14 @@ impl AgentAutomationSupervisor {
                     .executor
                     .approve_pending_conversation_for_task(
                         task.task.stable_key(),
+                        matches!(
+                            state.action.kind,
+                            Some(
+                                AutomationActionKind::OfflineChat
+                                    | AutomationActionKind::OfflineGoal
+                                    | AutomationActionKind::OfflineCombined
+                            )
+                        ),
                         url,
                         account,
                         &connector,
@@ -2241,6 +2257,7 @@ impl AgentAutomationSupervisor {
                     Duration::from_secs(10),
                     self.executor.retained_action_for_task(
                         task.task.stable_key(),
+                        true,
                         action_id,
                         account,
                     ),
@@ -3632,6 +3649,12 @@ impl AgentAutomationSupervisor {
                     .executor
                     .approve_pending_conversation_for_task(
                         task.task.stable_key(),
+                        matches!(
+                            execution_kind(&execution),
+                            AutomationActionKind::OfflineChat
+                                | AutomationActionKind::OfflineGoal
+                                | AutomationActionKind::OfflineCombined
+                        ),
                         &execution.request.expected_url,
                         &execution.account_fingerprint,
                         &connector,

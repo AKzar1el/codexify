@@ -2032,14 +2032,24 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
             Err(error) => tracing::warn!("managed-worktree cleanup skipped: {error}"),
         }
     }
+    // Persisted agentChat.automation settings are the production source of
+    // truth. Optional environment overrides remain useful for isolated
+    // canaries, but the primary launcher must receive the same Send gate path.
+    if let Ok(gate) = std::env::var("CODEXIFY_BROWSER_SEND_GATE_PATH") {
+        config.markdown_chat.automation.provider_send_gate_path = Some(gate);
+    }
     let config = Arc::new(config);
     let _browser_recovery =
         crate::agent_automation::watch_browser_companion(&config.markdown_chat.automation);
     let agent_automation = if config.markdown_chat.automation.enabled {
         let base = config.markdown_chat.automation.clone();
-        let canary = std::env::var("CODEXIFY_BROWSER_CANARY_TASK_KEY").ok();
-        let descriptor = std::env::var("CODEXIFY_BROWSER_LANE2_DESCRIPTOR").ok();
-        let gate = std::env::var("CODEXIFY_BROWSER_SEND_GATE_PATH").ok();
+        let canary = std::env::var("CODEXIFY_BROWSER_CANARY_TASK_KEY")
+            .ok()
+            .or_else(|| base.canary_task_key.clone());
+        let descriptor = std::env::var("CODEXIFY_BROWSER_LANE2_DESCRIPTOR")
+            .ok()
+            .or_else(|| base.lane2_descriptor_path.clone());
+        let gate = base.provider_send_gate_path.clone();
         if let Some(task_key) = canary {
             let lane2 = descriptor.ok_or_else(|| {
                 anyhow::anyhow!(

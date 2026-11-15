@@ -145,6 +145,12 @@ pub struct AgentAutomationConfig {
     #[serde(deserialize_with = "deserialize_request_block_list")]
     pub request_block_list: Vec<String>,
     pub request_blocking_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canary_task_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane2_descriptor_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_send_gate_path: Option<String>,
 }
 
 impl Default for AgentAutomationConfig {
@@ -167,6 +173,9 @@ impl Default for AgentAutomationConfig {
                 r"^https?://(www\.)?chatgpt\.com/backend-api/.*/sidebar".into(),
             ],
             request_blocking_enabled: false,
+            canary_task_key: None,
+            lane2_descriptor_path: None,
+            provider_send_gate_path: None,
         }
     }
 }
@@ -182,6 +191,38 @@ impl AgentAutomationConfig {
 
     fn validate(&self) -> Result<(), String> {
         self.retry_timings.validate()?;
+        if let Some(key) = &self.canary_task_key {
+            if key.len() != 64
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
+                return Err("agentChat.automation.canaryTaskKey must be one exact lowercase 64-character task key".into());
+            }
+        }
+        if self.lane2_descriptor_path.is_some() && self.canary_task_key.is_none() {
+            return Err("agentChat.automation.lane2DescriptorPath requires canaryTaskKey".into());
+        }
+        if self.canary_task_key.is_some()
+            && (self.lane2_descriptor_path.is_none() || self.provider_send_gate_path.is_none())
+        {
+            return Err("agentChat.automation.canaryTaskKey requires lane2DescriptorPath and providerSendGatePath".into());
+        }
+        for (name, path) in [
+            ("lane2DescriptorPath", &self.lane2_descriptor_path),
+            ("providerSendGatePath", &self.provider_send_gate_path),
+        ] {
+            if let Some(path) = path {
+                if path.len() > 4096
+                    || !std::path::Path::new(path).is_absolute()
+                    || path.contains('\0')
+                {
+                    return Err(format!(
+                        "agentChat.automation.{name} must be a nonempty absolute path"
+                    ));
+                }
+            }
+        }
         if self.request_block_list.len() > 128 {
             return Err(
                 "agentChat.automation.requestBlockList accepts at most 128 patterns".into(),
@@ -864,6 +905,37 @@ mod tests {
             };
             assert_eq!(config.validate().is_ok(), valid);
         }
+    }
+
+    #[test]
+    fn two_lane_settings_are_persistable_and_require_complete_safe_identity() {
+        let default = serde_json::to_value(AgentAutomationConfig::default()).unwrap();
+        for key in [
+            "canaryTaskKey",
+            "lane2DescriptorPath",
+            "providerSendGatePath",
+        ] {
+            assert!(default.get(key).is_none(), "default must not enable {key}");
+        }
+        let root = std::env::temp_dir();
+        let mut config = AgentAutomationConfig::default();
+        config.canary_task_key = Some("a".repeat(64));
+        assert!(config.validate().is_err());
+        config.lane2_descriptor_path =
+            Some(root.join("canary-descriptor.json").display().to_string());
+        assert!(config.validate().is_err());
+        config.provider_send_gate_path =
+            Some(root.join("provider-send.lock").display().to_string());
+        assert!(config.validate().is_ok());
+        let recovered: AgentAutomationConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(recovered.canary_task_key, config.canary_task_key);
+        assert_eq!(
+            recovered.provider_send_gate_path,
+            config.provider_send_gate_path
+        );
+        config.canary_task_key = Some("NOT_A_VALID_KEY".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]
