@@ -1,77 +1,125 @@
-# Isolated tests of the installer's wait loop. Never contacts the owner API or changes services.
+# Isolated tests for a fail-closed maintenance window. Never contacts the owner API or changes services.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
 $scriptPath = Join-Path $PSScriptRoot 'install-local-two-browser-upgrade.ps1'
-$tokens = $null
-$parseErrors = $null
-$ast = [Management.Automation.Language.Parser]::ParseFile(
-    $scriptPath, [ref]$tokens, [ref]$parseErrors
-)
-if ($parseErrors.Count -gt 0) { throw 'Installer PowerShell syntax is invalid' }
-$waitFunction = $ast.FindAll({
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { throw 'Installer PowerShell syntax is invalid' }
+$fn = $ast.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -eq 'WaitForQuietFleet'
 }, $true) | Select-Object -First 1
-if (-not $waitFunction) { throw 'The bounded FleetQuiet wait function is missing' }
-Invoke-Expression $waitFunction.Extent.Text
+if (-not $fn) { throw 'The bounded wait function is missing' }
+Invoke-Expression $fn.Extent.Text
 
+$script:statuses = @()
 $script:attempts = 0
 $script:sleeps = 0
-$script:mode = 'busy_then_idle'
-function AssertFleetQuiet {
-    $script:attempts++
-    if ($script:mode -eq 'unknown') { throw 'Cannot verify owner-chat session for the idle check' }
-    if ($script:mode -eq 'busy_forever' -or
-        ($script:mode -eq 'busy_then_idle' -and $script:attempts -lt 3)) {
-        throw 'Other Codexify workers were active in the last three minutes: mcp-geo'
+$script:unknown = $false
+function Probe([string[]]$blocked, [bool]$authenticatedBusy) {
+    return [pscustomobject]@{
+        ReadyForGuardedMaintenance=($blocked.Count -eq 0)
+        InstallationBlockedBy=@($blocked)
+        Flags=[pscustomobject]@{
+            PrimaryAuthenticatedBusy=$authenticatedBusy
+            FleetStatusVerified=$true
+        }
     }
 }
+function Preflight {
+    $script:attempts++
+    if ($script:unknown) { throw 'Cannot verify owner-chat session for the idle check' }
+    $idx = [Math]::Min($script:attempts - 1, $script:statuses.Count - 1)
+    return $script:statuses[$idx]
+}
 function Start-Sleep {
-    param([int]$Seconds)
+    [CmdletBinding()] param([int]$Seconds)
     if ($Seconds -lt 1 -or $Seconds -gt 15) { throw "Unsafe wait interval $Seconds" }
     $script:sleeps++
 }
-
-WaitForQuietFleet 1 | Out-Null
-if ($script:attempts -ne 3 -or $script:sleeps -ne 2) {
-    throw 'Quiet wait did not retry busy workers exactly twice'
+function SetScenario($sequence) {
+    $script:statuses = @($sequence)
+    $script:attempts = 0
+    $script:sleeps = 0
+    $script:unknown = $false
 }
-Write-Output 'PASS busy workers clear without bypassing the guard'
 
-$script:mode = 'unknown'
-$script:attempts = 0
-$script:sleeps = 0
+SetScenario @(
+    (Probe @('FleetQuiet') $false),
+    (Probe @('FleetQuiet','PrimaryAuthenticatedIdle') $true),
+    (Probe @('PrimaryAuthenticatedIdle') $true),
+    (Probe @() $false)
+)
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 4 -or $script:sleeps -ne 3) {
+    throw 'Did not wait for both quiet fleet and authenticated idle primary'
+}
+Write-Output 'PASS fleet and authenticated browser become idle independently'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle') $true),(Probe @() $false))
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $script:sleeps -ne 1) {
+    throw 'Transient primary activity did not wait correctly'
+}
+Write-Output 'PASS transient primary busy state is safely waited out'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle') $false))
 $refused = $false
 try { WaitForQuietFleet 1 | Out-Null } catch {
-    if ($_.Exception.Message -match 'Cannot verify owner-chat session') { $refused = $true }
-    else { throw }
+    if ($_.Exception.Message -match 'PrimaryAuthenticatedIdle') { $refused = $true } else { throw }
 }
 if (-not $refused -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
-    throw 'Unknown fleet status did not fail closed immediately'
+    throw 'An unauthenticated, missing or unknown primary was treated as waitable'
 }
-Write-Output 'PASS unverified fleet state fails closed'
+Write-Output 'PASS unverified primary state fails closed'
 
-$script:mode = 'busy_forever'
-$script:attempts = 0
-$script:sleeps = 0
+SetScenario @((Probe @('FleetQuiet','CandidateBrowserRuntimeCompatible') $false))
+$refused = $false
+try { WaitForQuietFleet 1 | Out-Null } catch {
+    if ($_.Exception.Message -match 'CandidateBrowserRuntimeCompatible') { $refused = $true } else { throw }
+}
+if (-not $refused -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
+    throw 'A non-waitable prerequisite was ignored'
+}
+Write-Output 'PASS non-transient installation gate fails closed'
+
+SetScenario @((Probe @('FleetQuiet') $false))
+$script:statuses[0].Flags.FleetStatusVerified = $false
+$refused = $false
+try { WaitForQuietFleet 1 | Out-Null } catch {
+    if ($_.Exception.Message -match 'cannot be verified') { $refused = $true } else { throw }
+}
+if (-not $refused -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
+    throw 'Unverifiable fleet status was treated as legitimately busy'
+}
+Write-Output 'PASS unavailable fleet status fails closed, rather than waiting'
+
+SetScenario @((Probe @('FleetQuiet') $false))
+$script:unknown = $true
+$refused = $false
+try { WaitForQuietFleet 1 | Out-Null } catch {
+    if ($_.Exception.Message -match 'Cannot verify owner-chat session') { $refused = $true } else { throw }
+}
+if (-not $refused -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
+    throw 'Unknown owner state did not fail closed immediately'
+}
+Write-Output 'PASS unknown owner-API state fails closed'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle') $true))
 $timedOut = $false
 try { WaitForQuietFleet 0 | Out-Null } catch {
-    if ($_.Exception.Message -match 'no installation started') { $timedOut = $true }
-    else { throw }
+    if ($_.Exception.Message -match 'no installation started') { $timedOut = $true } else { throw }
 }
 if (-not $timedOut -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
-    throw 'Timed-out maintenance wait did not fail without starting installation'
+    throw 'Quiet-window deadline was not enforced'
 }
-Write-Output 'PASS exhausted quiet-window deadline aborts safely'
+Write-Output 'PASS bounded maintenance-window deadline refuses safely'
 
-$script:mode = 'idle'
-$script:attempts = 0
-$script:sleeps = 0
-WaitForQuietFleet 1 | Out-Null
-if ($script:attempts -ne 1 -or $script:sleeps -ne 0) {
-    throw 'Idle fleet unnecessarily waited'
+SetScenario @((Probe @() $false))
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
+    throw 'Ready fleet and browser unnecessarily waited'
 }
-Write-Output 'PASS already-quiet fleet returns immediately'
-Write-Output 'FLEET_QUIET_WAIT_TESTS_PASS'
+Write-Output 'PASS already-ready maintenance window returns immediately'
+Write-Output 'FLEET_AND_PRIMARY_IDLE_WAIT_TESTS_PASS'

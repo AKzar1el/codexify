@@ -250,3 +250,42 @@ Goal events / hourly wake-ups
   PowerShell syntax checks. The fix has **not** been deployed to the running
   Codexify service; the owner must run the guard-equipped installer again
   from independent Administrator PowerShell when a quiet window reappears.
+
+## PrimaryAuthenticatedIdle retry and disabled-lane verification
+
+- An independent Administrator `-Apply -WaitForFleetQuiet -WaitTimeoutMinutes 60`
+  attempt next returned `Cannot wait for FleetQuiet while other installation
+  gates are closed: PrimaryAuthenticatedIdle`. This was a preflight refusal:
+  no files were staged or service stopped. Subsequent read-only primary health
+  showed `status=idle`, `authenticated=true`, no active action, demonstrating
+  transient activity rather than an expired login. The previously configured
+  second companion did not respond to its own localhost health endpoint.
+- The opt-in bounded maintenance wait now polls *all* read-only preflight
+  gates until the fleet is quiet for three minutes **and** the primary is
+  both authenticated and idle. Only a verifiably authenticated busy primary
+  (`status=busy` or a nonempty activeActionId) is treated as waitable; unknown,
+  unavailable, unauthenticated, or inconsistent browser state still aborts
+  immediately. Missing owner-API evidence is explicitly distinguished from
+  workers being busy and fails closed. Any other installation gate error also
+  aborts without installing. A full preflight runs again before shutdown.
+- With **no canary enabled**, an offline lane-2 companion is noncritical to
+  the native+primary Send-gate upgrade. The preflight treats its absence as a
+  disabled activation capability rather than a maintenance failure; after
+  restart the installer verifies the primary account and Send gate instead
+  of unconditionally requiring two live browsers. The second execution lane
+  stays disabled. With an actual canary key, two distinct authenticated
+  browser processes and matching Send gate fingerprints are still mandatory.
+- The modified `scripts/test-two-browser-fleet-quiet-wait.ps1` covers
+  asynchronous fleet/primary readiness, primary busy, unknown primary and
+  owner API, unrelated gates, bounded timeout and immediately idle behavior.
+  New `scripts/test-two-browser-optional-secondary.ps1` covers optional
+  offline companion, strict canary gate, healthy primary Send gate and
+  enabled dual-lane verification. These tests and the original PID/rollback
+  cases pass without modifying running service or worker schedules.
+- The wrapper also clears the read-only helper's expected exit code `2`
+  after parsing its diagnostic JSON; `-PreflightOnly` itself now exits `0`
+  when it successfully reports missing **activation** prerequisites. Live
+  read-only verification confirmed `NativeCandidateFresh=true`,
+  `BrowserCandidateFresh=true`, installed original binary intact and
+  `/health` returning `ok`. The deployed browser runtime has NOT yet been
+  replaced and the secondary execution lane remains disabled.

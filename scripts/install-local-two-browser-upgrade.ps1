@@ -57,9 +57,14 @@ function Preflight() {
     $arguments = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$preflightScript)
     if ($CanaryTaskKey) { $arguments += @('-CanaryTaskKey',$CanaryTaskKey) }
     $raw = & $powershellExe @arguments 2>&1
-    if ($LASTEXITCODE -notin @(0,2)) {
+    $preflightExit = $LASTEXITCODE
+    if ($preflightExit -notin @(0,2)) {
         throw 'Read-only two-browser preflight did not produce a supported result'
     }
+    # Exit 2 from the read-only helper means lane activation prerequisites
+    # are missing, not that maintenance diagnostics failed. Do not propagate
+    # this expected helper status into the installer's PreflightOnly exit code.
+    $global:LASTEXITCODE = 0
     return (($raw -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop)
 }
 function AssertReadyForInstall($probe) {
@@ -382,31 +387,38 @@ function AssertFleetQuiet() {
     }
 }
 function WaitForQuietFleet([int]$maximumMinutes) {
-    # Only wait for a verified busy fleet. Any owner-API/identity failure is
-    # still fatal; waiting must never turn an unknown state into permission.
+    # Wait for BOTH the fleet and an authenticated but actively working primary
+    # browser. Neither condition can be relaxed. Missing/unauthenticated or
+    # unknown browser health, owner-API failures and unrelated gates fail closed.
     $deadline = [DateTimeOffset]::UtcNow.AddMinutes($maximumMinutes)
     $nextReport = [DateTimeOffset]::MinValue
     while ($true) {
-        try {
-            AssertFleetQuiet
-            Write-Output 'FLEET_QUIET_CONFIRMED'
-            return
-        } catch {
-            $reason = $_.Exception.Message
-            if ($reason -notlike 'Other Codexify workers were active in the last three minutes:*') {
-                throw
-            }
-            $now = [DateTimeOffset]::UtcNow
-            if ($now -ge $deadline) {
-                throw "FleetQuiet did not become true within $maximumMinutes minute(s); no installation started"
-            }
-            if ($now -ge $nextReport) {
-                Write-Output "WAITING_FOR_FLEET_QUIET $reason"
-                $nextReport = $now.AddMinutes(1)
-            }
-            $remainingSeconds = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)
-            Start-Sleep -Seconds ([Math]::Min(15, [Math]::Max(1, $remainingSeconds)))
+        $fresh = Preflight
+        $blocked = @($fresh.InstallationBlockedBy)
+        $unexpected = @($blocked | Where-Object { $_ -notin @('FleetQuiet','PrimaryAuthenticatedIdle') })
+        if ($unexpected.Count -gt 0) {
+            throw ('Cannot wait while unrelated installation gates are closed: ' + ($unexpected -join ', '))
         }
+        if ('FleetQuiet' -in $blocked -and -not $fresh.Flags.FleetStatusVerified) {
+            throw 'FleetQuiet cannot be verified from the owner-chat API; refusing to wait on unknown fleet status'
+        }
+        if ('PrimaryAuthenticatedIdle' -in $blocked -and -not $fresh.Flags.PrimaryAuthenticatedBusy) {
+            throw 'PrimaryAuthenticatedIdle is closed, but the primary is not verifiably authenticated and busy; refusing to wait on unknown browser state'
+        }
+        if ($fresh.ReadyForGuardedMaintenance) {
+            Write-Host 'FLEET_AND_PRIMARY_IDLE_CONFIRMED'
+            return $fresh
+        }
+        $now = [DateTimeOffset]::UtcNow
+        if ($now -ge $deadline) {
+            throw "Maintenance window did not become ready within $maximumMinutes minute(s); no installation started"
+        }
+        if ($now -ge $nextReport) {
+            Write-Host ('WAITING_FOR_MAINTENANCE_WINDOW ' + ($blocked -join ', '))
+            $nextReport = $now.AddMinutes(1)
+        }
+        $remainingSeconds = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)
+        Start-Sleep -Seconds ([Math]::Min(15, [Math]::Max(1, $remainingSeconds)))
     }
 }
 function BrowserProof([string]$descriptorPath) {
@@ -439,6 +451,22 @@ function AssertTwoBrowsersGuarded() {
         $primary.account -ne $secondary.account -or $primary.gate -ne $secondary.gate) {
         throw 'Independent browser accounts or Send gate fingerprints do not match'
     }
+}
+function AssertEnabledBrowserGates([string]$canaryKey) {
+    if ($canaryKey) {
+        # A live canary must share the exact Send gate across both authenticated
+        # independent browser processes before it is allowed to execute.
+        AssertTwoBrowsersGuarded
+        return
+    }
+    # With no canary enabled the second browser does not execute goals. The
+    # primary still MUST be authenticated and protected by the new Send gate,
+    # but an offline/stale optional secondary must not cause a false rollback.
+    $primary = BrowserProof (Join-Path $root 'browser\descriptor.json')
+    if (-not $primary.account) {
+        throw 'Primary account fingerprint is missing after browser upgrade'
+    }
+    Write-Host 'PRIMARY_SEND_GATE_VERIFIED_SECOND_LANE_DISABLED'
 }
 function TestTransactionWithoutService {
     $fixture = Join-Path ([IO.Path]::GetTempPath()) ('codexify-two-browser-test-'+[Guid]::NewGuid().ToString('N'))
@@ -561,15 +589,10 @@ if ($VerifyMaintenanceOnly) {
     return
 }
 AssertTaskAdministration
-if ($WaitForFleetQuiet -and -not $probe.Flags.FleetQuiet) {
-    $otherBlockers = @($probe.InstallationBlockedBy | Where-Object { $_ -ne 'FleetQuiet' })
-    if ($otherBlockers.Count -gt 0) {
-        throw ('Cannot wait for FleetQuiet while other installation gates are closed: ' + ($otherBlockers -join ', '))
-    }
-    WaitForQuietFleet $WaitTimeoutMinutes
-    # The installer rechecks *every* preflight gate after the wait, and again
-    # immediately before service shutdown; a quiet result is not a lease.
-    $probe = Preflight
+if ($WaitForFleetQuiet) {
+    $probe = WaitForQuietFleet $WaitTimeoutMinutes
+    # The returned probe has freshly verified both the quiet fleet and the
+    # authenticated idle primary. The guard runs once more before shutdown.
 }
 AssertReadyForInstall $probe
 AssertCanaryBelongsToPairedGoal $CanaryTaskKey
@@ -639,8 +662,8 @@ try {
     CheckExit 'Enable scheduled service'
     WaitForReady
     EnsureBrowserReady
-    AssertTwoBrowsersGuarded
-    Report 'service_healthy' ('Native service and two signed-in browsers verified with matching Send gates; canary_enabled='+[bool]$CanaryTaskKey)
+    AssertEnabledBrowserGates $CanaryTaskKey
+    Report 'service_healthy' ('Native service and required browser Send gates verified; canary_enabled='+[bool]$CanaryTaskKey)
 } catch {
     $reason = $_.Exception.Message
     Report 'failed' $reason

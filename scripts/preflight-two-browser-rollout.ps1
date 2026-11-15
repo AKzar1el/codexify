@@ -35,8 +35,19 @@ function Get-CompanionState([string]$descriptor) {
     Build = [string]$d.build
     Auth = [bool]$health.authenticated
     Idle = ($health.status -eq 'idle' -and -not $health.activeActionId)
+    Busy = ($health.status -eq 'busy' -or [bool]$health.activeActionId)
     Account = [string]$health.accountFingerprint
     Gate = $gate
+  }
+}
+
+function Get-SecondaryStateForInstall([string]$descriptor,[bool]$required) {
+  # The second companion is not on the execution path when no canary is
+  # configured. A stale/offline lane-2 descriptor must not prevent the
+  # primary-only guarded upgrade, but enabling lane 2 still requires proof.
+  try { return Get-CompanionState $descriptor } catch {
+    if ($required) { throw }
+    return $null
   }
 }
 
@@ -118,7 +129,7 @@ if ($runtimeCompatible) {
 $canaryKeyValid = ($CanaryTaskKey -match '^[a-f0-9]{64}$')
 
 $primary = Get-CompanionState $primaryDescriptor
-$lane2 = Get-CompanionState $secondDescriptor
+$lane2 = Get-SecondaryStateForInstall $secondDescriptor ([bool]$CanaryTaskKey)
 
 $sameAccount = [bool]($primary -and $lane2 -and $primary.Auth -and $lane2.Auth -and
   $primary.Account -and $primary.Account -eq $lane2.Account)
@@ -128,7 +139,14 @@ $lane2Gate = [bool]($lane2 -and $lane2.Gate -and $lane2.Gate.enabled)
 $sameGate = [bool]($primaryGate -and $lane2Gate -and
   $primary.Gate.pathFingerprint -eq $lane2.Gate.pathFingerprint)
 $quiet = $false
-try { $quiet = Check-FleetQuiet $QuietMinutes } catch {}
+$fleetVerified = $false
+try {
+  if (-not (Test-Path -LiteralPath (Join-Path $homeDir 'owner-chat.json') -PathType Leaf)) {
+    throw 'Owner-chat status file is missing'
+  }
+  $quiet = Check-FleetQuiet $QuietMinutes
+  $fleetVerified = $true
+} catch {}
 $task = Get-ScheduledTask -TaskName 'Codexify' -ErrorAction SilentlyContinue
 
 $flags = [ordered]@{
@@ -141,11 +159,13 @@ $flags = [ordered]@{
   ScheduledServiceRunning = [bool]($task -and $task.State -eq 'Running')
   CanaryTaskKeyValid = [bool]$canaryKeyValid
   PrimaryAuthenticatedIdle = [bool]($primary -and $primary.Auth -and $primary.Idle)
+  PrimaryAuthenticatedBusy = [bool]($primary -and $primary.Auth -and $primary.Busy -and -not $primary.Idle)
   SecondaryAuthenticatedIdle = [bool]($lane2 -and $lane2.Auth -and $lane2.Idle)
   DistinctBrowserProcesses = $separateProcesses
   SameVerifiedAccount = $sameAccount
   BothCompanionsGateEnabledAndMatching = $sameGate
   FleetQuiet = $quiet
+  FleetStatusVerified = $fleetVerified
   SharedGateNotHeld = -not (Test-Path -LiteralPath $sharedGate)
 }
 # Installing the candidate necessarily precedes enabling the primary gate.
