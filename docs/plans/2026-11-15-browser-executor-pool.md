@@ -162,3 +162,30 @@ Goal events / hourly wake-ups
   repair. Ten hourly scheduled automations remain enabled. Waiting for a
   separately elevated quiet maintenance window is an actual hard gate, not
   an invitation to bypass Windows permissions.
+
+## Late November 15 live recheck and post-restart safety fix
+
+- Read-only preflight found the local candidate and companion fresh and
+  runtime-compatible, both browser processes distinct, idle, authenticated,
+  and on the same verified account. The running Windows service remained on
+  the older native executable. `AdministrativelyElevated=false` and
+  `FleetQuiet=false` prevented guarded maintenance. A canary key was not
+  configured and the old primary did not yet expose the shared Send gate.
+- The owner-chat activity API still reported other workers performing tools
+  during the three-minute quiet window. All ten Revenue Shot hourly tasks
+  remained enabled. No release, service stop, queued-send replay, or task
+  schedule change was attempted.
+- Fresh tests passed: five lane-affinity unit cases, four turn-renewal cases,
+  two cross-process Send-gate tests, and the guarded install/rollback self-test.
+  The installed binary still differed from the candidate; `/health` was `ok`.
+- Post-restart authentication verification no longer requires the browser to
+  have zero active actions. New work can start after the service is brought
+  back; an authenticated, ready browser doing productive work must not cause
+  an unnecessary rollback. The **pre-install** idle and fleet-quiet guards
+  are unchanged. The self-test was run red/green against this regression,
+  and separately rejects unauthenticated or unavailable browser status.
+- Next genuine activation requires an independent Administrator PowerShell
+  after an actual three-minute quiet window. Without a specific, already
+  paired, noncritical `-CanaryTaskKey`, installation enables the new binary
+  and shared gate but leaves the second execution lane disabled. Do not
+  auto-select a revenue goal or infer success from enabled schedules.

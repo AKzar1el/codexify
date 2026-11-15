@@ -312,6 +312,12 @@ function Test-InstalledServiceHealthy() {
         return $false
     }
 }
+function PostRestartBrowserReady($browserStatus) {
+    # New work may begin between service restart and verification. Do not
+    # roll back merely because an authenticated browser accepted an action.
+    return ($null -ne $browserStatus -and $browserStatus.state -eq 'ready' -and
+        [bool]$browserStatus.authenticated)
+}
 function EnsureBrowserReady() {
     # The native service does not guarantee that its separate Electron browser
     # companion has finished account/session initialization. Do not mistake a
@@ -320,7 +326,7 @@ function EnsureBrowserReady() {
     for ($attempt=0; $attempt -lt 30; $attempt++) {
         try {
             $result = ((& $target browser status --json 2>&1) -join [Environment]::NewLine) | ConvertFrom-Json
-            if ($result.state -eq 'ready' -and $result.authenticated -and -not $result.activeActionId) {
+            if (PostRestartBrowserReady $result) {
                 return
             }
         } catch {}
@@ -452,6 +458,19 @@ function TestTransactionWithoutService {
         $rejected = $false
         try { AssertCanaryBelongsToPairedGoal $testKey } catch { $rejected = $true }
         if (-not $rejected) { throw 'Ambiguous accepted action was allowed as a canary' }
+        $productive = [pscustomobject]@{state='ready';authenticated=$true;activeActionId='accepted-action'}
+        if (-not (PostRestartBrowserReady $productive)) {
+            throw 'Post-restart verification rejected an authenticated browser doing productive work'
+        }
+        foreach ($unready in @(
+            [pscustomobject]@{state='ready';authenticated=$false;activeActionId=$null},
+            [pscustomobject]@{state='unavailable';authenticated=$true;activeActionId=$null}
+        )) {
+            if (PostRestartBrowserReady $unready) {
+                throw 'Post-restart verification accepted an unauthenticated or unavailable browser'
+            }
+        }
+        Write-Output 'TEST_POST_RESTART_PRODUCTIVE_BROWSER=PASS'
         Write-Output 'TEST_ATOMIC_NATIVE_BROWSER_CONFIG_AND_ROLLBACK=PASS'
     } finally {
         Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
