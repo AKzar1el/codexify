@@ -29,6 +29,7 @@ function Probe([string[]]$blocked, [bool]$authenticatedBusy) {
         InstallationBlockedBy=@($blocked)
         PrimaryBrowserStatus='idle'
         Flags=[pscustomobject]@{
+            PrimaryAccountVerified=$authenticatedBusy
             PrimaryAuthenticatedBusy=$authenticatedBusy
             PrimaryAuthenticatedUnavailable=$false
             PrimaryAuthenticationRequired=$false
@@ -89,6 +90,23 @@ if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $scrip
     throw 'Brief unreachable-primary health probe should recover without action or service restart'
 }
 Write-Output 'PASS transient primary health endpoint interruption may recover'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle','FleetQuiet') $false),(Probe @() $false))
+$script:statuses[0].PrimaryBrowserStatus = 'busy'
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $script:sleeps -ne 1) {
+    throw 'Unverified busy browser did not wait for a fresh authenticated idle result'
+}
+Write-Output 'PASS busy with unknown authentication cannot install but can recover'
+
+$now = [DateTimeOffset]::UtcNow
+AssertTransientPrimaryGrace ($now.AddSeconds(-179)) $now 180
+$refused = $false
+try { AssertTransientPrimaryGrace ($now.AddSeconds(-181)) $now 180 } catch {
+    if ($_.Exception.Message -match 'unverifiable for 180 seconds') { $refused = $true } else { throw }
+}
+if (-not $refused) { throw 'Unknown primary state was allowed beyond the bound' }
+Write-Output 'PASS transient busy without authentication has a strict timeout'
 
 $now = [DateTimeOffset]::UtcNow
 AssertTransientPrimaryGrace ($now.AddSeconds(-179)) $now 180

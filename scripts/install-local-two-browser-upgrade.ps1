@@ -419,10 +419,11 @@ function WaitForQuietFleet([int]$maximumMinutes) {
                 # Account identity was verified. Wait without a separate
                 # transient limit; the overall maintenance deadline remains.
                 $unknownPrimarySince = $null
-            } elseif ($fresh.PrimaryBrowserStatus -in @('unavailable','probe_unavailable','companion_missing')) {
-                # Browser process/HTTP status may be temporarily inaccessible
-                # during a companion handoff. Bound the gap to three minutes;
-                # no action or browser restart is ever attempted from here.
+            } elseif ($fresh.PrimaryBrowserStatus -in @('busy','unavailable','probe_unavailable','companion_missing')) {
+                # BrowserWindow.health may publish 'busy' while the underlying
+                # driver cannot verify the ChatGPT account during navigation.
+                # This is NOT proof of authentication or safe idleness: just
+                # allow a short passive recovery, as for a rotated endpoint.
                 $now = [DateTimeOffset]::UtcNow
                 if ($null -eq $unknownPrimarySince) { $unknownPrimarySince = $now }
                 AssertTransientPrimaryGrace $unknownPrimarySince $now $unknownPrimaryLimitSeconds
@@ -441,7 +442,7 @@ function WaitForQuietFleet([int]$maximumMinutes) {
             throw "Maintenance window did not become ready within $maximumMinutes minute(s); no installation started"
         }
         if ($now -ge $nextReport) {
-            Write-Host ('WAITING_FOR_MAINTENANCE_WINDOW ' + ($blocked -join ', ') + ' primary=' + [string]$fresh.PrimaryBrowserStatus)
+            Write-Host ('WAITING_FOR_MAINTENANCE_WINDOW ' + ($blocked -join ', ') + ' primary=' + [string]$fresh.PrimaryBrowserStatus + ' account_verified=' + [bool]$fresh.Flags.PrimaryAccountVerified)
             $nextReport = $now.AddMinutes(1)
         }
         $remainingSeconds = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)

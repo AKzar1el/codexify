@@ -170,6 +170,7 @@ $flags = [ordered]@{
   ScheduledServiceRunning = [bool]($task -and $task.State -eq 'Running')
   CanaryTaskKeyValid = [bool]$canaryKeyValid
   PrimaryAuthenticatedIdle = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Idle)
+  PrimaryAccountVerified = [bool]($primary -and $primary.Auth -and $primary.Account)
   PrimaryAuthenticatedBusy = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Busy -and -not $primary.Idle)
   PrimaryAuthenticatedUnavailable = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Status -eq 'unavailable')
   PrimaryAuthenticationRequired = [bool]($primary -and $primary.Status -eq 'authentication_required')

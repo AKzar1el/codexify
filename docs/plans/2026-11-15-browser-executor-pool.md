@@ -327,3 +327,38 @@ Goal events / hourly wake-ups
   explicit sign-in requirement, and previous fleet/security/timeout cases.
   Optional secondary-browser, stale-PID and atomic rollback fixture tests
   still passed. No production task or worker was modified by this source fix.
+
+## `busy` with an unverified account, and fleet starvation
+
+- Another independent Administrator install attempt waited through over 30
+  successive maintenance-window reports, predominantly `FleetQuiet`, with
+  occasional `primary=busy` and one `primary=probe_unavailable`. It ultimately
+  aborted before any service change on `PrimaryAuthenticatedIdle is closed with
+  an unexpected or unauthenticated browser state: busy`.
+- Source confirms `BrowserWindow.health()` emits `status=busy` whenever a
+  browser operation is active, even if `ChatGptDriver.health()` cannot verify
+  account identity during navigation. The combination `status=busy` and
+  `authenticated=false` is therefore plausible and NOT proof of sign-out.
+  Conversely, it is NOT safe to install on this state, since the Send may
+  still be active. This is a wait-only classification error.
+- The installer now allows `busy` with unverified authentication to recover
+  passively, under the same hard 180-second consecutive-unknown grace as a
+  temporarily unreachable primary. Once authenticated busy/unavailable is
+  verified, the grace resets. An explicit `authentication_required` remains a
+  hard refusal, and the actual replacement path still mandates fresh proof
+  of `PrimaryAuthenticatedIdle`, `FleetQuiet`, and an unheld shared Send lock.
+  The maintenance progress output includes a non-secret `account_verified`
+  boolean to distinguish busy actions from temporary authentication uncertainty.
+- The wait regression was run against the old predicate (RED) and the new
+  predicate (GREEN), including an unverified busy browser transitioning to
+  authenticated idle and the strict 180-second grace helper. The existing
+  optional secondary, PID identity, and rollback fixtures still passed.
+- A live read-only inventory found **ten enabled hourly Revenue Shot tasks**
+  staggered at minute :00, :05, :10, :15, :20, :25, :30, :35, :45 and :50,
+  plus other active project chats. When these jobs run tens of minutes, they
+  overlap and can starve the three-minute global quiet condition. Changing
+  browser retry classifications alone does not create a maintenance window.
+  A reliable production rollout needs an explicitly owner-approved, reversible
+  pause of new automated wakes, letting already-active work finish before
+  the guarded installer runs, followed by verified restoration of all paused
+  schedules. Do not silently disable tasks or bypass the fleet-quiet gate.
