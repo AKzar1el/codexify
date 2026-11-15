@@ -2035,15 +2035,63 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let _browser_recovery =
         crate::agent_automation::watch_browser_companion(&config.markdown_chat.automation);
-    let agent_automation = config.markdown_chat.automation.enabled.then(|| {
-        let executor = Arc::new(crate::agent_automation::BrowserAutomationExecutor::new(
-            config.markdown_chat.automation.clone(),
-        ));
-        crate::agent_automation::AgentAutomationSupervisor::new(
-            config.markdown_chat.automation.clone(),
-            executor,
-        )
-    });
+    let agent_automation = if config.markdown_chat.automation.enabled {
+        let base = config.markdown_chat.automation.clone();
+        let canary = std::env::var("CODEXIFY_BROWSER_CANARY_TASK_KEY").ok();
+        let descriptor = std::env::var("CODEXIFY_BROWSER_LANE2_DESCRIPTOR").ok();
+        let gate = std::env::var("CODEXIFY_BROWSER_SEND_GATE_PATH").ok();
+        if let Some(task_key) = canary {
+            let lane2 = descriptor.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "The second browser canary requires CODEXIFY_BROWSER_LANE2_DESCRIPTOR"
+                )
+            })?;
+            let path = std::path::Path::new(&lane2);
+            if !path.is_absolute() || !path.is_file() || path.is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "Second browser descriptor must be an existing regular absolute file"
+                ));
+            }
+            if gate
+                .as_deref()
+                .is_none_or(|p| !std::path::Path::new(p).is_absolute())
+            {
+                return Err(anyhow::anyhow!(
+                    "Two browser lanes require one absolute shared provider Send gate path"
+                ));
+            }
+            let mut secondary = base.clone();
+            secondary.descriptor_path = lane2;
+            let executor = Arc::new(
+                crate::agent_automation::BrowserAutomationExecutor::with_canary(
+                    base.clone(),
+                    task_key.clone(),
+                    secondary,
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            Some(
+                crate::agent_automation::AgentAutomationSupervisor::new_with_canary_lane(
+                    base, executor, task_key,
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            if descriptor.is_some() {
+                return Err(anyhow::anyhow!(
+                    "CODEXIFY_BROWSER_LANE2_DESCRIPTOR cannot be configured without an explicit canary task"
+                ));
+            }
+            let executor = Arc::new(crate::agent_automation::BrowserAutomationExecutor::new(
+                base.clone(),
+            ));
+            Some(crate::agent_automation::AgentAutomationSupervisor::new(
+                base, executor,
+            ))
+        }
+    } else {
+        None
+    };
     // Connect to any configured upstream MCP servers and merge their tools in.
     // The returned services must stay alive for the whole server lifetime, so
     // they are held in `_bridge_services` until `axum::serve` returns.

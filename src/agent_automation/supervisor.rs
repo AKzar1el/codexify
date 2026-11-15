@@ -139,18 +139,50 @@ pub trait AutomationExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct BrowserAutomationExecutor {
     config: AgentAutomationConfig,
+    // A canary is explicit and sticky to one task key. Never hash or rotate
+    // production jobs into a second, potentially unsigned-in browser.
+    secondary: Option<(String, AgentAutomationConfig)>,
 }
 
 impl BrowserAutomationExecutor {
     pub fn new(config: AgentAutomationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            secondary: None,
+        }
     }
 
-    async fn ready_client(
+    pub fn with_canary(
+        config: AgentAutomationConfig,
+        task_key: String,
+        secondary_config: AgentAutomationConfig,
+    ) -> Result<Self, String> {
+        if task_key.is_empty()
+            || task_key.len() > 256
+            || config.descriptor_path == secondary_config.descriptor_path
+        {
+            return Err("Second lane must have an exact task key and a distinct descriptor".into());
+        }
+        Ok(Self {
+            config,
+            secondary: Some((task_key, secondary_config)),
+        })
+    }
+
+    fn config_for(&self, task_key: &str) -> &AgentAutomationConfig {
+        self.secondary
+            .as_ref()
+            .filter(|(key, _)| key == task_key)
+            .map(|(_, config)| config)
+            .unwrap_or(&self.config)
+    }
+
+    async fn ready_client_for(
         &self,
+        config: &AgentAutomationConfig,
         cancellation: &CancellationToken,
     ) -> Result<BrowserCompanionClient, String> {
-        super::BrowserCompanionControl::new(&self.config)?
+        super::BrowserCompanionControl::new(config)?
             .ensure_running(cancellation)
             .await
     }
@@ -212,7 +244,7 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         handoff_id: &str,
     ) -> Result<bool, String> {
         let cancellation = CancellationToken::new();
-        let client = self.ready_client(&cancellation).await?;
+        let client = self.ready_client_for(&self.config, &cancellation).await?;
         client
             .turn_handoff_complete(url, account, handoff_id, &cancellation)
             .await
@@ -222,7 +254,7 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         project_url: Option<&str>,
         cancellation: CancellationToken,
     ) -> Result<super::CapabilityCatalog, String> {
-        let client = self.ready_client(&cancellation).await?;
+        let client = self.ready_client_for(&self.config, &cancellation).await?;
         client
             .new_chat_capabilities(project_url, &cancellation)
             .await
@@ -233,7 +265,8 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         message: &str,
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
         let uncertain = |error: String| execution_error(format!("{message}; {error}"), true);
-        let client = BrowserCompanionClient::from_config(&self.config).map_err(uncertain)?;
+        let client = BrowserCompanionClient::from_config(self.config_for(&execution.task_key))
+            .map_err(uncertain)?;
         let cancellation = CancellationToken::new();
         let health = client.health(&cancellation).await.map_err(uncertain)?;
         if !health.authenticated
@@ -296,10 +329,54 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         events: mpsc::UnboundedSender<CompanionEvent>,
         cancellation: CancellationToken,
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
+        if self
+            .secondary
+            .as_ref()
+            .is_some_and(|(key, _)| key == &execution.task_key)
+            && !matches!(
+                execution.request.prompt,
+                ActionPrompt::OfflineChat { .. }
+                    | ActionPrompt::OfflineGoal { .. }
+                    | ActionPrompt::OfflineCombined { .. }
+            )
+        {
+            // Only already-paired offline goals/messages may enter the canary.
+            // Creation, pairing, and turn-renewal handoffs still require their
+            // original single-browser controls rather than a guessed session.
+            return Err(execution_error(
+                "Second browser lane only supports already-paired offline work".into(),
+                false,
+            ));
+        }
         let client = self
-            .ready_client(&cancellation)
+            .ready_client_for(self.config_for(&execution.task_key), &cancellation)
             .await
             .map_err(|message| execution_error(message, false))?;
+        if self
+            .secondary
+            .as_ref()
+            .is_some_and(|(key, _)| key == &execution.task_key)
+        {
+            // A second lane may never submit while primary still runs a
+            // companion without cross-process Send admission support.
+            let primary = BrowserCompanionClient::from_config(&self.config)
+                .map_err(|message| execution_error(message, false))?;
+            let first = primary
+                .send_gate_fingerprint(&cancellation)
+                .await
+                .map_err(|message| execution_error(message, false))?;
+            let second = client
+                .send_gate_fingerprint(&cancellation)
+                .await
+                .map_err(|message| execution_error(message, false))?;
+            if first != second {
+                return Err(execution_error(
+                    "The two browser companions do not share the exact same Send admission gate"
+                        .into(),
+                    false,
+                ));
+            }
+        }
         let health = client
             .health(&cancellation)
             .await
@@ -546,6 +623,8 @@ pub struct AgentAutomationSupervisor {
     queue: Mutex<VecDeque<AutomationExecution>>,
     scan_lock: Mutex<()>,
     run_lock: Mutex<()>,
+    canary_run_lock: Mutex<()>,
+    canary_task_key: Option<String>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
     action_timeouts: ActionTimeouts,
@@ -578,15 +657,35 @@ struct ActionTimeouts {
 
 pub struct AutomationSupervisorWorker {
     task: tokio::task::JoinHandle<()>,
+    canary: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for AutomationSupervisorWorker {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(canary) = self.canary.take() {
+            canary.abort();
+        }
     }
 }
 
 impl AgentAutomationSupervisor {
+    /// Explicit one-task canary; the default remains the original single lane.
+    pub fn new_with_canary_lane(
+        config: AgentAutomationConfig,
+        executor: Arc<dyn AutomationExecutor>,
+        task_key: String,
+    ) -> Result<Arc<Self>, String> {
+        if task_key.len() < 20 || task_key.len() > 256 {
+            return Err("Canary task identity is invalid".into());
+        }
+        let mut supervisor = Self::new(config, executor);
+        Arc::get_mut(&mut supervisor)
+            .ok_or("New canary supervisor has unexpected shared ownership")?
+            .canary_task_key = Some(task_key);
+        Ok(supervisor)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_pairing_wait_timeout(
         config: AgentAutomationConfig,
@@ -625,6 +724,8 @@ impl AgentAutomationSupervisor {
             queue: Mutex::new(VecDeque::new()),
             scan_lock: Mutex::new(()),
             run_lock: Mutex::new(()),
+            canary_run_lock: Mutex::new(()),
+            canary_task_key: None,
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
             approval_next_scan_ms: AtomicU64::new(0),
@@ -888,7 +989,10 @@ impl AgentAutomationSupervisor {
                             Ok(Some(_)) => {}
                             Ok(None)
                                 if supervisor
-                                    .has_ready_action(crate::markdown_chat::now_ms())
+                                    .has_ready_action_for_lane(
+                                        crate::markdown_chat::now_ms(),
+                                        false,
+                                    )
                                     .await =>
                             {
                                 continue;
@@ -906,7 +1010,37 @@ impl AgentAutomationSupervisor {
                 }
             }
         });
-        AutomationSupervisorWorker { task }
+        let canary = self.canary_task_key.as_ref().map(|_| {
+            let supervisor = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    // The owner's primary browser Pause/Restart setting is a
+                    // fleet-wide safety hold; lane 2 must honor it as well.
+                    let paused = super::BrowserCompanionControl::new(&supervisor.config).is_ok_and(
+                        |control| {
+                            let state = control.public_status();
+                            state["manuallyStopped"] == true
+                                || state["waitingForServerRestart"] == true
+                        },
+                    );
+                    if paused {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    match supervisor
+                        .run_next_for_lane(crate::markdown_chat::now_ms(), true)
+                        .await
+                    {
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(error) => tracing::warn!(%error, "canary browser action failed"),
+                    }
+                    // A bounded poll avoids losing a wake notification to the
+                    // primary worker; only the explicit canary chat is eligible.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        });
+        AutomationSupervisorWorker { task, canary }
     }
 
     pub fn notify(&self) {
@@ -2397,9 +2531,23 @@ impl AgentAutomationSupervisor {
     }
 
     pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
-        let _run_guard = self.run_lock.lock().await;
+        self.run_next_for_lane(now_ms, false).await
+    }
+
+    async fn run_next_for_lane(
+        &self,
+        now_ms: u64,
+        secondary: bool,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        let _run_guard = if secondary {
+            self.canary_run_lock.lock().await
+        } else {
+            self.run_lock.lock().await
+        };
         let mut reservation = None;
-        let outcome = self.run_next_locked(now_ms, None, &mut reservation).await;
+        let outcome = self
+            .run_next_locked(now_ms, None, &mut reservation, secondary)
+            .await;
         if let Some(reservation) = reservation {
             if outcome.as_ref().is_ok_and(|snapshot| {
                 snapshot.as_ref().is_some_and(|snapshot| {
@@ -2408,7 +2556,9 @@ impl AgentAutomationSupervisor {
                         && snapshot.state == CompanionActionState::Idle
                         && snapshot.attention.is_none()
                 })
-            }) && let Err(error) = self.finish_pairing_without_yielding(&reservation).await
+            }) && let Err(error) = self
+                .finish_pairing_without_yielding(&reservation, secondary)
+                .await
             {
                 tracing::warn!(%error, "pairing continuation could not be dispatched");
             }
@@ -2426,6 +2576,7 @@ impl AgentAutomationSupervisor {
     async fn finish_pairing_without_yielding(
         &self,
         reservation: &PairingWindow,
+        secondary: bool,
     ) -> Result<(), String> {
         let recovery = reservation
             .task
@@ -2494,6 +2645,7 @@ impl AgentAutomationSupervisor {
                             crate::markdown_chat::now_ms(),
                             Some(reservation),
                             &mut unused,
+                            secondary,
                         )
                         .await;
                     if let Err(error) = attempted
@@ -2544,6 +2696,7 @@ impl AgentAutomationSupervisor {
         now_ms: u64,
         preferred: Option<&PairingWindow>,
         reservation: &mut Option<PairingWindow>,
+        secondary: bool,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
         let maximum_candidates = self.queue.lock().await.len();
         let mut considered = 0;
@@ -2563,7 +2716,13 @@ impl AgentAutomationSupervisor {
                     });
                     position.and_then(|position| queue.remove(position))
                 } else {
-                    queue.pop_front()
+                    let position = super::lane_affinity::first_in_lane(
+                        &queue,
+                        self.canary_task_key.as_deref(),
+                        usize::from(secondary),
+                        |queued| queued.task_key.as_str(),
+                    );
+                    position.and_then(|position| queue.remove(position))
                 }
             };
             let Some(mut execution) = next else {
@@ -3332,13 +3491,20 @@ impl AgentAutomationSupervisor {
         Ok(Some(snapshot))
     }
 
-    async fn has_ready_action(&self, now_ms: u64) -> bool {
+    async fn has_ready_action_for_lane(&self, now_ms: u64, secondary: bool) -> bool {
         if !self.schema_refresh_ready() {
             return false;
         }
         let tasks = self.tasks.read().await;
         let queue = self.queue.lock().await;
         queue.iter().any(|execution| {
+            if !super::lane_affinity::owns(
+                &execution.task_key,
+                self.canary_task_key.as_deref(),
+                usize::from(secondary),
+            ) {
+                return false;
+            }
             tasks
                 .get(&execution.task_key)
                 .and_then(|task| task.store.load(&task.task).ok())

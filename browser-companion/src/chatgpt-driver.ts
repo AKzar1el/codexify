@@ -16,6 +16,7 @@ import { assertSelectedModelAndEffort, selectAvailableModelAndEffort } from "./m
 import { selectPairingMedium, type PairingMediumSelection } from "./pairing-model";
 import { buildCapabilityCatalog, type AccountCapabilities } from "./models";
 import { canonicalChatGptConversationUrl, validateChatGptConversationUrl, type CapabilityCatalog, type ExecuteActionRequest, type ConversationApprovalRequest } from "./protocol";
+import { withSharedProviderSendGate } from "./provider-send-gate";
 import {
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
@@ -891,25 +892,36 @@ export class ChatGptBrowserDriver implements BrowserDriver {
       execution.signal.throwIfAborted();
       await verifyHandoff();
       await throwIfConversationLimit(page);
-      sendActivated = true;
-      if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
-      step("clicking Send");
-      submissionSettlesAt = Date.now() + 5_000;
-      await send.click({ timeout:10_000, signal:execution.signal });
-      submissionSettlesAt = Date.now() + 5_000;
-      step("confirming Send acceptance");
-      try {
-        await waitForSubmissionAcceptance(page, baseline, Date.now() + 30_000, execution.signal);
-      } catch (error) {
-        if(error instanceof BrowserCompanionError&&error.code==="conversation_limit")throw error;
-        throw new BrowserCompanionError(
-          "ChatGPT Send may have been accepted, but semantic acceptance could not be proven",
-          "ambiguous_send",
-          { sendAccepted:true, cause:error },
-        );
-      }
-      sendAccepted = true;
-      execution.emit({ type:"send_accepted" });
+      await withSharedProviderSendGate(execution.request.actionId, execution.signal, async () => {
+        // Admission may wait for another companion. Revalidate exact account,
+        // destination, and draft immediately before irreversible Send.
+        if ((await readChatGptAccount(page)).fingerprint !== execution.request.expectedAccountFingerprint
+          || (!creating && canonicalChatGptConversationUrl(page.url()) !== canonicalUrl)
+          || await composerText(await activeComposer(page, 30_000, execution.signal)) !== execution.renderedPrompt) {
+          throw new BrowserCompanionError("ChatGPT destination, account or draft changed while waiting for global Send admission","external_interference");
+        }
+        await throwIfConversationApproval(page);
+        execution.signal.throwIfAborted();
+        sendActivated = true;
+        if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
+        step("clicking Send");
+        submissionSettlesAt = Date.now() + 5_000;
+        await send.click({ timeout:10_000, signal:execution.signal });
+        submissionSettlesAt = Date.now() + 5_000;
+        step("confirming Send acceptance");
+        try {
+          await waitForSubmissionAcceptance(page, baseline, Date.now() + 30_000, execution.signal);
+        } catch (error) {
+          if(error instanceof BrowserCompanionError&&error.code==="conversation_limit")throw error;
+          throw new BrowserCompanionError(
+            "ChatGPT Send may have been accepted, but semantic acceptance could not be proven",
+            "ambiguous_send",
+            { sendAccepted:true, cause:error },
+          );
+        }
+        sendAccepted = true;
+        execution.emit({ type:"send_accepted" });
+      });
       if (creating) {
         const created = new URL(await createdChatUrl(page, execution.signal)); created.search = ""; created.hash = ""; canonicalUrl = created.href;
         // Persist the actual chat identity before model restoration can fail or time out.

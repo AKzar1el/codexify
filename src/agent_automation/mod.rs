@@ -1,5 +1,6 @@
 mod companion;
 mod install;
+mod lane_affinity;
 mod model_fallback;
 mod process;
 mod recovery;

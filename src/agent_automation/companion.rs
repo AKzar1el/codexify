@@ -473,6 +473,36 @@ impl BrowserCompanionClient {
         Ok(health)
     }
 
+    /// Verify both companion processes really enforce the same cross-process
+    /// Send admission gate. A legacy companion returns 404 and fails closed.
+    pub async fn send_gate_fingerprint(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<String, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct GateStatus {
+            protocol_version: u32,
+            build: String,
+            enabled: bool,
+            path_fingerprint: Option<String>,
+        }
+        let status: GateStatus = self
+            .request_json(
+                Method::GET,
+                "/v1/send-gate/status",
+                Option::<&Value>::None,
+                cancellation,
+            )
+            .await?;
+        self.validate_envelope(status.protocol_version, &status.build)?;
+        let hash = status.path_fingerprint.unwrap_or_default();
+        if !status.enabled || hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Browser companion does not advertise a valid global Send gate".into());
+        }
+        Ok(hash)
+    }
+
     pub async fn turn_handoff_complete(
         &self,
         url: &str,

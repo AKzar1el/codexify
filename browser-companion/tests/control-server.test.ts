@@ -74,6 +74,24 @@ class BlockingDriver extends ImmediateDriver {
   }
 }
 
+test("provider Send gate capability is authenticated and reports only a path fingerprint",async()=>{
+  const root=await mkdtemp(join(tmpdir(),"provider-gate-status-"));
+  const coordinator=new SingleWindowCoordinator(new ImmediateDriver(),TEST_BUILD);
+  const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+  try{
+    const endpoint=server.endpoint+"/v1/send-gate/status";
+    expect((await fetch(endpoint)).status).toBe(401);
+    const response=await fetch(endpoint,{headers:{Authorization:`Bearer ${server.token}`}});
+    expect(response.status).toBe(200);
+    const data=await response.json();
+    expect(data.protocolVersion).toBe(1);
+    expect(data.build).toBe(TEST_BUILD);
+    expect(data.enabled).toBe(Boolean(process.env.CODEXIFY_BROWSER_SEND_GATE_PATH));
+    expect(data.pathFingerprint===null||/^[a-f0-9]{64}$/.test(data.pathFingerprint)).toBe(true);
+    expect(JSON.stringify(data)).not.toContain("CODEXIFY_BROWSER");
+  }finally{await server.close();}
+});
+
 test("pairing lease renewal is authenticated and preserves the held page",async()=>{
   class PairDriver extends ImmediateDriver {
     override async execute(execution:DriverExecution){

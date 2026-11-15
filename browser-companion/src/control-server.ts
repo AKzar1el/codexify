@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   chmod,
@@ -170,6 +170,19 @@ async function route(
   response.once("close",()=>{ if(!response.writableEnded)operation.abort(); });
   if(request.method === "GET" && url.pathname === "/v1/liveness") {
     json(response,200,await coordinator.liveness());return;
+  }
+  if(request.method === "GET" && url.pathname === "/v1/send-gate/status") {
+    // The URL is authenticated by this private loopback server. Expose only
+    // the digest, never the local path or token, to verify that two separate
+    // browser companions use the same admission gate before allowing lane 2.
+    const gate=process.env.CODEXIFY_BROWSER_SEND_GATE_PATH;
+    json(response,200,{
+      protocolVersion:PROTOCOL_VERSION,
+      build:coordinator.build,
+      enabled:Boolean(gate),
+      pathFingerprint:gate?createHash("sha256").update(gate).digest("hex"):null,
+    });
+    return;
   }
   if (request.method === "GET" && url.pathname === "/v1/health") {
     json(response, 200, await coordinator.health());
