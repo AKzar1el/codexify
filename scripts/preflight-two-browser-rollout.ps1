@@ -47,9 +47,14 @@ function Check-FleetQuiet([int]$minutes) {
   $uri = 'http://127.0.0.1:' + [int]$owner.port + '/api/chats'
   $list = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = 'Bearer ' + $owner.token } -TimeoutSec 15
   $cutoff = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - ($minutes * 60000)
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $active = @($list.chats | Where-Object {
-    $_.workspace -ne 'codexify-reliability-lab' -and $_.lastAgentCallAtMs -and
-    [double]$_.lastAgentCallAtMs -gt $cutoff
+    $_.workspace -ne 'codexify-reliability-lab' -and (
+      ($_.lastAgentCallAtMs -and [double]$_.lastAgentCallAtMs -gt $cutoff) -or
+      ($_.agentPresenceUntilMs -and [double]$_.agentPresenceUntilMs -gt $now -and
+        (-not $_.agentIdleUntilMs -or [double]$_.agentIdleUntilMs -le $now) -and
+        (-not $_.agentWaitingUntilMs -or [double]$_.agentWaitingUntilMs -le $now))
+    )
   })
   return ($active.Count -eq 0)
 }
@@ -83,6 +88,33 @@ $browserSources = @(Get-ChildItem -LiteralPath (Join-Path $repo 'browser-compani
 $newestBrowserSource = ($browserSources | Measure-Object -Property LastWriteTime -Maximum).Maximum
 $companionFresh = $packageReady -and (Test-Path -LiteralPath $companionBundle -PathType Leaf) -and
   (Get-Item -LiteralPath $companionBundle).LastWriteTime -ge $newestBrowserSource
+# This installer deliberately preserves the signed-in Electron executable
+# and Chrome profile, replacing only app.asar. Refuse the swap if the new
+# package expects different Electron support files from the installed runtime.
+$installedApp = Join-Path $homeDir 'browser\runtime\2.3.29\app'
+$installedSupport = if (Test-Path -LiteralPath $installedApp -PathType Container) {
+  @(Get-ChildItem -LiteralPath $installedApp -File | Where-Object {
+    $_.Name -ne 'codexify-browser-companion.exe'
+  })
+} else { @() }
+$candidateSupport = if (Test-Path -LiteralPath $CandidateCompanion -PathType Container) {
+  @(Get-ChildItem -LiteralPath $CandidateCompanion -File | Where-Object {
+    $_.Name -ne 'codexify-browser-companion.exe'
+  })
+} else { @() }
+$runtimeCompatible = $packageReady -and $installedSupport.Count -gt 0 -and
+  $installedSupport.Count -eq $candidateSupport.Count
+if ($runtimeCompatible) {
+  foreach ($f in $installedSupport) {
+    $other = Join-Path $CandidateCompanion $f.Name
+    if (-not (Test-Path -LiteralPath $other -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $other -Algorithm SHA256).Hash) {
+      $runtimeCompatible = $false
+      break
+    }
+  }
+}
 $canaryKeyValid = ($CanaryTaskKey -match '^[a-f0-9]{64}$')
 
 $primary = Get-CompanionState $primaryDescriptor
@@ -104,6 +136,7 @@ $flags = [ordered]@{
   CandidateNativeFresh = [bool]$nativeFresh
   CandidateCompanion = [bool]$packageReady
   CandidateCompanionFresh = [bool]$companionFresh
+  CandidateBrowserRuntimeCompatible = [bool]$runtimeCompatible
   AdministrativelyElevated = [bool]$isAdmin
   ScheduledServiceRunning = [bool]($task -and $task.State -eq 'Running')
   CanaryTaskKeyValid = [bool]$canaryKeyValid
@@ -120,7 +153,8 @@ $flags = [ordered]@{
 # make this preflight impossible to satisfy. Keep the two gates separate.
 $installChecks = @(
   'CandidateNative', 'CandidateNativeFresh',
-  'CandidateCompanion', 'CandidateCompanionFresh', 'AdministrativelyElevated',
+  'CandidateCompanion', 'CandidateCompanionFresh',
+  'CandidateBrowserRuntimeCompatible', 'AdministrativelyElevated',
   'ScheduledServiceRunning', 'PrimaryAuthenticatedIdle', 'FleetQuiet',
   'SharedGateNotHeld'
 )

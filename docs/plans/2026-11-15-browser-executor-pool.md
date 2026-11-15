@@ -111,3 +111,48 @@ Goal events / hourly wake-ups
   service update. It cannot retroactively guarantee that a timed-out ChatGPT
   response was generated. Manual recovery of any particular failed
   conversation still requires inspection of its exact final handoff.
+
+## Tested independent Windows deployment transaction
+
+- Owner-approved release path: `scripts/install-local-two-browser-upgrade.ps1`. It is
+  **read-only by default**. `-PreflightOnly` shows all hard gates, and
+  `-SelfTest` exercises atomic install/restore of executable, browser bundle
+  and config against disposable files, including a rejected ambiguous canary.
+- Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-two-browser-upgrade.ps1 -SelfTest`
+  and then `... -PreflightOnly` from this repository. The self-test passes
+  without Administrator rights, without touching the real service.
+- The real command is `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-two-browser-upgrade.ps1 -Apply`,
+  launched from an **independent Administrator PowerShell** when the worker
+  fleet has been quiet for at least three minutes. The installer refuses to
+  run from a child process of the service it will replace. Do not run this
+  via the current God v5 MCP tunnel, since a service restart will terminate
+  the same connection. An `-Apply` without an explicit canary key upgrades
+  only the native binary, primary companion and shared gate; it does
+  **not** start a second execution worker by itself.
+- For a genuine two-lane canary, supply
+  `-CanaryTaskKey <exact 64-character stable key>`. The installer checks
+  that it corresponds to exactly one already paired, active, non-ambiguous
+  task, without an unverified turn-renewal handoff; no revenue goal is
+  automatically chosen or migrated. The independently signed-in second
+  Chrome profile is reused, never cloned.
+- The installer checks Administrator elevation, correct scheduled task,
+  no recent competing worker activity, fresh native and companion candidates,
+  matching Electron support files, shared gate availability, and browser
+  authentication before it stages anything. It then backs up the **exact**
+  old native executable, `app.asar`, and config with checksums, verifies
+  worker/browser idleness again, stops the old service, atomically replaces
+  those three files and restarts it. On failure it attempts a full rollback
+  and records a durable receipt under `~/.codexify/backups/two-browser-*`.
+- Verified separately: all **17** installed/candidate Electron support
+  files are byte-identical, and an isolated launch of the installed Electron
+  executable with the new candidate `app.asar` passed the packaged smoke
+  check using the exact current Codexify protocol build. No profiles,
+  cookies or account data were copied.
+- As of this implementation, the live Windows connector runs **without
+  Administrator elevation**, so an intentional `-Apply` test rejects
+  maintenance before stopping or modifying the service; installed binary
+  SHA remains unchanged. Native recovery tests 38/38 passed, and the local
+  source-derived candidate exists, but a source build is **not** a deployed
+  repair. Ten hourly scheduled automations remain enabled. Waiting for a
+  separately elevated quiet maintenance window is an actual hard gate, not
+  an invitation to bypass Windows permissions.
