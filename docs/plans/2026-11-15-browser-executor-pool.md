@@ -214,3 +214,39 @@ Goal events / hourly wake-ups
   busy-to-idle success, API/owner verification refusal, deadline expiry,
   and initially idle behavior without contacting live worker state. Use
   it alongside the installer's existing `-SelfTest` fixture.
+
+## Live guarded-upgrade failure after FleetQuiet and process-identity fix
+
+- The owner used the new `-WaitForFleetQuiet` option and obtained
+  `FLEET_QUIET_CONFIRMED`. After backing up production, the installer stopped
+  the browser companion and disabled the scheduled service. It freed a
+  verified port-3000 orphan PID 20792, then a verified service PID 7904. A
+  second snapshot PID 11188 **changed identity** between enumeration and
+  termination, so the installer correctly refused to kill it and restored
+  service operation. The failure occurred **before** any native, browser or
+  configuration file replacement. The failure backup is under
+  `.codexify/backups/two-browser-20261115-223846`.
+- Independent live checks after that attempt: Codexify Task Scheduler task
+  running, HTTP `/health` status `ok`, installed native SHA-256 still
+  `B8136AC54B4697AA4A009AE37850B4103D0055767C79DD99C5BB5F51420F50CF`,
+  candidate native SHA-256 still
+  `A65083AE1A6EFCA14522D9B3D57EE6546D720A44278332A5A5793FF292F34037`.
+  Installed native, browser `app.asar` and configuration files matched the
+  files staged in the failure backup; no deployment took place.
+- Repaired `WaitForVerifiedServiceProcessesExit`: a process that exits or
+  changes identity after snapshot is **never terminated** using a stale PID.
+  Creation timestamp now joins executable path and exact command line in
+  identity verification, so even PID reuse by another process with an
+  identical command line cannot silently pass. A skipped PID is not assumed
+  to be cleaned up: the installer still requires a fresh executable-wide
+  scan showing **zero** installed native processes before replacing files.
+  If another Codexify process actually persists, installation still aborts;
+  the mismatch does not bypass the safety gate.
+- New isolated mocked regression `scripts/test-two-browser-orphan-race.ps1`
+  initially failed on the reported race, then passed five scenarios: normal
+  orphan cleanup, unrelated PID reuse, vanished service, same-executable
+  changed command, and same-command PID reuse with a different creation time.
+  Also passed FleetQuiet tests, atomic installer/rollback self-tests and
+  PowerShell syntax checks. The fix has **not** been deployed to the running
+  Codexify service; the owner must run the guard-equipped installer again
+  from independent Administrator PowerShell when a quiet window reappears.

@@ -258,10 +258,25 @@ function WaitForVerifiedServiceProcessesExit() {
     foreach ($process in $verified) {
         $command = [string]$process.CommandLine
         $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$process.ProcessId) -ErrorAction Stop
-        if (-not $current) { continue }
-        if (-not [string]::Equals([string]$current.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]$current.CommandLine -ne $command) {
-            throw "Service process PID $($process.ProcessId) changed during inspection. Refusing to terminate it."
+        if (-not $current) {
+            # The original process exited after the first snapshot. Nothing
+            # may be killed using its now-stale numeric PID.
+            Report 'old_service_exited' "Verified service PID $($process.ProcessId) exited before termination"
+            continue
+        }
+        $sameProcess = [string]::Equals([string]$current.ExecutablePath, $target,
+            [StringComparison]::OrdinalIgnoreCase) -and
+            [string]$current.CommandLine -ceq $command -and
+            $null -ne $process.CreationDate -and
+            $null -ne $current.CreationDate -and
+            [datetime]$current.CreationDate -eq [datetime]$process.CreationDate
+        if (-not $sameProcess) {
+            # A fast-shutting-down service may lose a PID or Windows can reuse
+            # that PID for a different process while we inspect the snapshot.
+            # Never kill the new occupant. A fresh executable-wide scan below
+            # must still prove that NO old Codexify processes survive.
+            Report 'stale_service_pid_skipped' "PID $($process.ProcessId) changed identity after snapshot; no termination attempted"
+            continue
         }
         Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
         Report 'old_service_released' "Stopped verified orphaned Codexify service process PID $($process.ProcessId)"
