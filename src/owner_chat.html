@@ -785,11 +785,16 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       if (!state?.enabled) { showSettings(false); return; }
       const waitingForBrowser = Number.isSafeInteger(state.action?.cooldownUntilMs);
       const automaticRetry = !waitingForBrowser && Number.isSafeInteger(state.action?.automaticRetryAtMs);
+      // Pair verification is deliberately not auto-replayed after an access
+      // failure. Make that distinct from an ordinary goal's scheduled retry.
+      const pairingLoadBlocked = state.action?.kind === "pair_verify" && state.action?.sendAccepted === false
+        && ["conversation_unavailable", "rate_limited"].includes(state.action?.status);
       const presenceState = presence(state.presence?.lastAgentCallAtMs, Date.now() + clockOffset, state.presence?.agentWaitingUntilMs, state.presence?.agentPresenceUntilMs, state.presence?.agentIdleUntilMs);
       nodes.presence.textContent = sentenceCase(presenceState);
       nodes.queue.hidden = !Number.isSafeInteger(state.queue?.position);
       nodes.queue.textContent = nodes.queue.hidden ? "" : `· Queue ${state.queue.position} of ${state.queue.total}`;
-      nodes.action.textContent = waitingForBrowser ? "Waiting for browser" : automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
+      nodes.action.textContent = pairingLoadBlocked ? "Pairing blocked — ChatGPT conversation load"
+        : waitingForBrowser ? "Waiting for browser" : automaticRetry ? "Retrying automatically" : sentenceCase(state.action?.status || state.live?.phase || "idle");
       const companion = state.companion || {};
       const pairing = state.pairing || { status:"unpaired" };
       const verified = pairing.status === "verified";
@@ -855,7 +860,9 @@ dialog:modal{box-sizing:border-box;block-size:fit-content;margin:auto;inset-bloc
       const cooldownSeconds = waitingForBrowser ? Math.max(0,Math.ceil((state.action.cooldownUntilMs-Date.now()-clockOffset)/1000)) : 0;
       const queuePosition = Number.isSafeInteger(state.queue?.position) && state.queue.position > 0 ? ` (position in queue: ${state.queue.position})` : "";
       const waitingStatus = cooldownSeconds ? `Conversation loading available in ${cooldownSeconds}s${queuePosition}.` : `Waiting for the shared browser${queuePosition}.`;
-      nodes.liveStatus.textContent = automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
+      nodes.liveStatus.textContent = pairingLoadBlocked
+        ? `${state.action.lastError || "ChatGPT could not load this conversation."} No message was sent; pairing is not retrying automatically. Once the original conversation loads normally, choose Retry chat pairing.`
+        : automaticRetry ? retryStatus : cooldown && (!state.live?.status || state.live.status === state.action?.lastError) ? cooldown.message : state.live?.status || state.action?.lastError || "";
       nodes.liveCommentary.textContent = state.live?.commentary || "";
       nodes.liveAnswer.textContent = state.live?.answer || state.action?.lastStableAnswer || "";
       for (const node of [nodes.liveStatus,nodes.liveCommentary,nodes.liveAnswer]) node.hidden = !node.textContent;

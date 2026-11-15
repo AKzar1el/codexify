@@ -19,6 +19,7 @@ const message = "ChatGPT conversation temporarily not accessible";
 const account = fingerprintAccountIdentity("fixture-user", "fixture-account");
 const labels = [
   ["Could not load this ChatGPT conversation", "Retry"],
+  ["Tega pogovora ChatGPT ni bilo mogoče naložiti", "Poskusi znova"],
   ["Δεν ήταν δυνατή η φόρτωση αυτής της συνομιλίας ChatGPT", "Επανάληψη"],
   ["Impossibile caricare questa conversazione ChatGPT", "Riprova"],
 ] as const;
@@ -102,7 +103,7 @@ beforeEach(async()=>{
 });
 afterAll(async () => { await context?.close(); if (profile) await rm(profile, {recursive:true, force:true});setSystemTime(); });
 
-test.skipIf(!native)("conversation load failures are recognized in English, Greek and Italian on both chat URL forms", async () => {
+test.skipIf(!native)("conversation load failures are recognized in English, Slovenian, Greek and Italian on both chat URL forms", async () => {
   for (const render of [errorPage,inlineErrorPage,identifiedInlineErrorPage]) for (const [title, retry] of labels) {
     currentHtml = render(title, retry);
     for (const destination of [url, projectUrl]) {

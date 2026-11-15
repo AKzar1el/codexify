@@ -38,7 +38,10 @@ export type DriverEvent = WithoutEventEnvelope<ActionEvent> | {type:"connector_o
   | {type:"stop_progress";step:StopProgressStep};
 
 export const MAX_RETAINED_ACTIONS = 8;
-export const BROWSER_OPERATION_TIMEOUT_MS = 30_000;
+// Slow but responsive ChatGPT conversations can take longer than 30 seconds
+// to hydrate on a memory-constrained, multi-goal shared browser. The deadline
+// still applies independently to each verified stage and never infers Send.
+export const BROWSER_OPERATION_TIMEOUT_MS = 75_000;
 // Initial chat creation may load a new ChatGPT tab and configure its model
 // before Send. Ordinary turns retain their shorter inactivity deadline.
 const BROWSER_CREATE_CHAT_TIMEOUT_MS = 120_000;

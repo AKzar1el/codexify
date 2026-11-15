@@ -846,14 +846,15 @@ test("passive approval checks yield to active sends and never start another acti
 
 const shortBudget = {operationMs:45,cleanupMs:40,hardStopMs:30};
 
-test('slow navigation, connector selection and Send acceptance get the 30-second budget',async()=>{
+test('slow navigation, connector selection and Send acceptance get the 75-second budget',async()=>{
  // Scale the production budget and browser delays together to exercise a
- // 27-second stage without making the test wait in real time.
+ // 52-second stage without making the test wait in real time. This exceeds
+ // the previous 30-second timeout but remains bounded by the new deadline.
  const scale=100;
  class SlowSubmissionDriver extends DeferredDriver {
   override async execute(execution:DriverExecution) {
    this.runs.push(execution.request.actionId);
-   const slowStage=async()=>{await new Promise(resolve=>setTimeout(resolve,27_000/scale));execution.signal.throwIfAborted();};
+   const slowStage=async()=>{await new Promise(resolve=>setTimeout(resolve,52_000/scale));execution.signal.throwIfAborted();};
    execution.emit({type:'navigating'});await slowStage();
    execution.emit({type:'composer_ready'});
    execution.emit({type:'model_verified',model:execution.request.model!,effort:execution.request.effort!});await slowStage();
