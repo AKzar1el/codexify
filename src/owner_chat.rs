@@ -1186,6 +1186,14 @@ async fn browser_snapshot(state: &OwnerState) -> (Value, Option<Value>) {
             Ok(Ok(Some(true)))
         );
         companion["responsive"] = json!(responsive);
+        if responsive {
+            // A responsive companion is not evidence that the ChatGPT account
+            // is authenticated. Distinguish a slow/failed session check from a
+            // dead browser so the owner isn't prompted to sign in repeatedly.
+            companion["detail"] = json!(
+                "The browser companion is responding, but ChatGPT account/session verification is unavailable. Do not resend an accepted message; check the session again."
+            );
+        }
     }
     if let Ok(control) = crate::agent_automation::BrowserCompanionControl::new(
         &state.config.markdown_chat.automation,
