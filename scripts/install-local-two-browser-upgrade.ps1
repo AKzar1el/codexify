@@ -112,6 +112,18 @@ function StageFile([string]$source,[string]$destination) {
         throw 'File staging checksum mismatch'
     }
 }
+function AssertInstalledMatchesBackup() {
+    foreach ($pair in @(
+        @($target,$previous),
+        @($asar,$previousAsar),
+        @($configFile,$previousConfig)
+    )) {
+        if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash) {
+            throw 'A production file changed during staging; aborting without overwriting it'
+        }
+    }
+}
 function PrepareConfig([string]$destination) {
     $settings = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json -ErrorAction Stop
     if (-not $settings.PSObject.Properties['agentChat'] -or
@@ -409,6 +421,17 @@ function TestTransactionWithoutService {
         if ((Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash -ne $originalConfig) {
             throw 'Config preview unexpectedly changed the installed configuration'
         }
+        $target = Join-Path $fixture 'native.installed'
+        $previous = Join-Path $fixture 'native.backup'
+        $asar = Join-Path $fixture 'browser.installed'
+        $previousAsar = Join-Path $fixture 'browser.backup'
+        $configFile = Join-Path $fixture 'config.installed'
+        $previousConfig = Join-Path $fixture 'config.backup'
+        AssertInstalledMatchesBackup
+        [IO.File]::WriteAllText($configFile,'concurrent-change')
+        $rejected = $false
+        try { AssertInstalledMatchesBackup } catch { $rejected = $true }
+        if (-not $rejected) { throw 'Concurrent production config change was not detected' }
         # Validate a real task-key shape and reject an unresolved action using
         # a disposable project state, not any production chat or accepted Send.
         $root = Join-Path $fixture 'fake-codexify-home'
@@ -503,6 +526,7 @@ try {
         (Get-FileHash -LiteralPath $asarStage -Algorithm SHA256).Hash -ne $asarHash) {
         throw 'Candidate changed after staging'
     }
+    AssertInstalledMatchesBackup
     Report 'backed_up' 'Existing native binary, browser app.asar and configuration preserved'
     $browser = ((& $target browser status --json 2>&1) -join "`n") | ConvertFrom-Json
     if ($browser.state -ne 'ready' -or -not $browser.authenticated -or $browser.activeActionId) {
@@ -520,6 +544,7 @@ try {
     CheckExit 'Stop scheduled service'
     WaitForOldListener
     WaitForVerifiedServiceProcessesExit
+    AssertInstalledMatchesBackup
     $still = @(Get-CimInstance Win32_Process | Where-Object {
         $_.ExecutablePath -and
         [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)

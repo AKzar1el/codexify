@@ -140,9 +140,15 @@ Goal events / hourly wake-ups
   matching Electron support files, shared gate availability, and browser
   authentication before it stages anything. It then backs up the **exact**
   old native executable, `app.asar`, and config with checksums, verifies
-  worker/browser idleness again, stops the old service, atomically replaces
+  worker/browser idleness again and confirms that no production file changed
+  during staging (including **after** stopping the old service). It then atomically replaces
   those three files and restarts it. On failure it attempts a full rollback
   and records a durable receipt under `~/.codexify/backups/two-browser-*`.
+- The disposable installer self-test also verifies that a concurrent config
+  edit is rejected rather than silently overwritten, and that an ambiguous
+  canary action cannot be selected. File-transaction tests do not establish
+  that a production service restart is safe; an independent Administrator
+  session and a quiet fleet remain mandatory.
 - Verified separately: all **17** installed/candidate Electron support
   files are byte-identical, and an isolated launch of the installed Electron
   executable with the new candidate `app.asar` passed the packaged smoke
