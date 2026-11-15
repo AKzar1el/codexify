@@ -362,3 +362,35 @@ Goal events / hourly wake-ups
   pause of new automated wakes, letting already-active work finish before
   the guarded installer runs, followed by verified restoration of all paused
   schedules. Do not silently disable tasks or bypass the fleet-quiet gate.
+
+## Explicit owner-authorized forced maintenance
+
+- On 2026-11-16 the owner explicitly approved interrupting current workers
+  and requested one force command rather than waiting for all of the staggered
+  hourly schedules to become quiet. A dedicated installer switch is therefore
+  available: `-Apply -ForceMaintenance` in an **independent Administrator
+  PowerShell**, without `-WaitForFleetQuiet`.
+- Force maintenance waives **exactly** the `FleetQuiet` and
+  `PrimaryAuthenticatedIdle` installation preflight gates; it does not waive
+  elevation, candidate native/browser freshness, runtime compatibility,
+  scheduled service presence, or the `SharedGateNotHeld` gate. An already-held
+  shared Send lock remains a hard stop even in forced mode. Canary activation
+  is intentionally disallowed during the force upgrade.
+- Force mode does not probe the primary for idle before shutdown. Instead,
+  after backups, staged checksums, and another complete (force-filtered)
+  preflight, it disables the scheduled service **first**, then stops the
+  browser companion for restart, preventing the service from relaunching that
+  companion before the native/browser/config replacement. Exact service
+  process identity verification, original-file backup checks, atomic replace,
+  service health, authenticated primary Send gate and rollback remain required.
+- Current workers may lose in-flight tool or browser actions. Owner-chat
+  history, journals, pending handoffs and task schedules are not erased or
+  resubmitted by the installer; uncertain accepted Sends must be reconciled
+  before retry, not blindly replayed. The ten hourly automations remain
+  enabled for their ordinary subsequent wakes. This is an authorized service
+  interruption, **not** an automatic worker-resume or two-lane activation.
+- Offline tests in `scripts/test-two-browser-force-maintenance.ps1` verify
+  the two permitted gate exceptions, refusal of each representative hard
+  gate, normal-mode strictness, primary-idle probe handling, canary parameter
+  restrictions, and supervisor-first shutdown ordering. All existing race,
+  fleet-wait, optional secondary, and atomic rollback tests were re-run.

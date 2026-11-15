@@ -9,6 +9,7 @@ param(
     [switch]$VerifyMaintenanceOnly,
     [switch]$SelfTest,
     [switch]$WaitForFleetQuiet,
+    [switch]$ForceMaintenance,
     [ValidateRange(1,120)][int]$WaitTimeoutMinutes = 60,
     [string]$CanaryTaskKey = '',
     [string]$BackupDirectory
@@ -68,8 +69,15 @@ function Preflight() {
     return (($raw -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop)
 }
 function AssertReadyForInstall($probe) {
-    if (-not $probe.ReadyForGuardedMaintenance) {
-        throw ('Installation gate is closed: ' + ($probe.InstallationBlockedBy -join ', '))
+    $blocked = @($probe.InstallationBlockedBy)
+    if ($ForceMaintenance) {
+        # Explicit owner-approved interruption, not a general preflight bypass.
+        # Unverified installs, unrelated processes and outstanding Send locks
+        # remain forbidden; only worker and primary-idle gates are waived.
+        $blocked = @($blocked | Where-Object { $_ -notin @('FleetQuiet','PrimaryAuthenticatedIdle') })
+    }
+    if ($blocked.Count -gt 0) {
+        throw ('Installation gate is closed: ' + ($blocked -join ', '))
     }
     if ($CanaryTaskKey) {
         foreach ($name in @('CanaryTaskKeyValid','SecondaryAuthenticatedIdle','DistinctBrowserProcesses','SameVerifiedAccount')) {
@@ -77,6 +85,18 @@ function AssertReadyForInstall($probe) {
                 throw "Canary prerequisite is missing: $name"
             }
         }
+    }
+}
+function AssertBrowserIdleBeforeShutdown() {
+    if ($ForceMaintenance) {
+        # This mode is allowed to interrupt active actions; do not turn an
+        # intentional interruption into a failed idle probe. The Send-lock
+        # gate is checked independently and must still be free.
+        return
+    }
+    $browser = ((& $target browser status --json 2>&1) -join [Environment]::NewLine) | ConvertFrom-Json
+    if ($browser.state -ne 'ready' -or -not $browser.authenticated -or $browser.activeActionId) {
+        throw "Browser is not idle: $($browser.state)"
     }
 }
 function AssertCanaryBelongsToPairedGoal([string]$key) {
@@ -580,6 +600,9 @@ function TestTransactionWithoutService {
 if ($WaitForFleetQuiet -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest)) {
     throw 'WaitForFleetQuiet is only valid with Apply, outside PreflightOnly, VerifyMaintenanceOnly and SelfTest'
 }
+if ($ForceMaintenance -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet -or $CanaryTaskKey)) {
+    throw 'ForceMaintenance requires Apply alone; it cannot be combined with waiting, diagnostics, or canary activation'
+}
 if ($SelfTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
         throw 'SelfTest cannot be combined with deployment or preflight switches'
@@ -624,6 +647,9 @@ if ($WaitForFleetQuiet) {
     # authenticated idle primary. The guard runs once more before shutdown.
 }
 AssertReadyForInstall $probe
+if ($ForceMaintenance) {
+    Write-Warning 'FORCE_MAINTENANCE: owner-authorized interruption of active Codexify workers; tool calls and browser actions may be incomplete. Do not replay uncertain accepted Sends.'
+}
 AssertCanaryBelongsToPairedGoal $CanaryTaskKey
 if ($CanaryTaskKey -and $CanaryTaskKey -notmatch '^[a-f0-9]{64}$') {
     throw 'Canary key must be the exact verified lowercase stable task key'
@@ -657,20 +683,27 @@ try {
     }
     AssertInstalledMatchesBackup
     Report 'backed_up' 'Existing native binary, browser app.asar and configuration preserved'
-    $browser = ((& $target browser status --json 2>&1) -join "`n") | ConvertFrom-Json
-    if ($browser.state -ne 'ready' -or -not $browser.authenticated -or $browser.activeActionId) {
-        throw "Browser is not idle: $($browser.state)"
-    }
+    AssertBrowserIdleBeforeShutdown
     AssertReadyForInstall (Preflight)
-    Report 'stopping' 'Guarded update of native service, signed-in browser runtime and configuration'
-    & $target browser stop-for-restart
-    CheckExit 'Prepare browser for service restart'
+    Report 'stopping' ('Guarded native/browser/config update; forced_worker_interruption=' + [bool]$ForceMaintenance)
     # Set this before running disable: Task Scheduler can stop the service
     # successfully but the command may still fail to return a receipt.
     # The catch handler must then attempt service recovery.
-    $serviceStopped = $true
-    & $target service disable
-    CheckExit 'Stop scheduled service'
+    if ($ForceMaintenance) {
+        # Stop the supervisor FIRST so active workers cannot immediately
+        # relaunch the companion while the updater is trying to retire it.
+        $serviceStopped = $true
+        & $target service disable
+        CheckExit 'Stop scheduled service'
+        & $target browser stop-for-restart
+        CheckExit 'Prepare browser for service restart'
+    } else {
+        & $target browser stop-for-restart
+        CheckExit 'Prepare browser for service restart'
+        $serviceStopped = $true
+        & $target service disable
+        CheckExit 'Stop scheduled service'
+    }
     WaitForOldListener
     WaitForVerifiedServiceProcessesExit
     AssertInstalledMatchesBackup
