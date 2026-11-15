@@ -80,3 +80,34 @@ Goal events / hourly wake-ups
 - **Follow-up tests:** Five pure Rust lane-affinity checks, four native Node tests (including real two-Chromium isolation), all 12 Bun 1.4.3 control-server tests, and Rust `cargo check --offline --bin codexify --jobs 1` pass. These are **source-level gates**, not permission to claim two live production workers are running.
 
 **Not authorized here:** purchasing credits, creating multiple ChatGPT accounts, credential/session extraction, circumventing rate limits, changing recurring schedules, replaying ambiguous messages, or restarting productive agents merely to increase the queue count.
+
+## Localized response-delivery timeout and accepted renewal recovery
+
+- The existing installed browser companion already recognizes the exact Slovene ChatGPT alert
+  `Čas za dostavo sporočila se je iztekel. Poskusite znova.`, as well as English
+  delivery-timeout variants. This means the *previous assistant response* timed out:
+  it does not establish HTTP 429 or an unsent user turn. The companion never
+  clicks the app's `Poskusi znova` button or replays the accepted user message.
+- Five isolated Chromium regression tests passed in
+  `browser-companion/tests/response-delivery-timeout.node.cjs`: localization,
+  app-owned alerts, no-ARIA alerts, quoted-text rejection, and unrelated errors.
+- Read-only inspection of persisted automation states found ten active goals
+  with a recorded accepted renewal Send and a handoff whose
+  `reportComplete` flag was still false. The old supervisor's unconditional
+  `if sendAccepted { continue }` bypassed its own read-only proof scan.
+- The repaired supervisor always checks that exact handoff in ChatGPT before
+  scheduling another turn. A confirmed handoff can progress to the next
+  **distinct** continuation; an unverified handoff older than 30 minutes
+  becomes visibly `Stalled` with its action ID and accepted-send record
+  preserved. Repeated scans cannot replay the accepted message. A subsequent
+  exact handoff proof clears only this special stalled warning.
+- The proof scanner enforces an in-process, read-only inspection budget:
+  at most one new handoff-navigation attempt globally per minute, and one
+  attempt per handoff every ten minutes. The budget is not a Send retry
+  budget, and it avoids a fleet of old accepted sends constantly opening
+  ChatGPT tabs. Proof of a complete handoff remains mandatory for renewal.
+- This is a **source-only fix** until the new Codexify native executable
+  passes tests and is installed through an elevated, quiet, rollback-safe
+  service update. It cannot retroactively guarantee that a timed-out ChatGPT
+  response was generated. Manual recovery of any particular failed
+  conversation still requires inspection of its exact final handoff.

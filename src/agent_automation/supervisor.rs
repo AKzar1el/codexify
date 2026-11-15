@@ -738,6 +738,9 @@ pub struct AgentAutomationSupervisor {
     scan_lock: Mutex<()>,
     run_lock: Mutex<()>,
     canary_run_lock: Mutex<()>,
+    // Rate-limit handoff read probes independently of Send admission. A fleet
+    // of stalled handoffs must not poll ten ChatGPT tabs every 30 seconds.
+    handoff_probe_budget: Mutex<HandoffProbeBudget>,
     canary_task_key: Option<String>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
@@ -753,6 +756,34 @@ struct PairingWindow {
     action_id: String,
     generation: u64,
     owner_generation: u64,
+}
+
+#[derive(Default)]
+struct HandoffProbeBudget {
+    global_next_at_ms: u64,
+    task_next_at_ms: HashMap<String, u64>,
+}
+
+impl HandoffProbeBudget {
+    fn claim(&mut self, task_key: &str, now_ms: u64) -> bool {
+        if now_ms < self.global_next_at_ms
+            || self
+                .task_next_at_ms
+                .get(task_key)
+                .is_some_and(|next| now_ms < *next)
+        {
+            return false;
+        }
+        // At most one new navigation per minute across all handoffs, and no
+        // more than one attempt per handoff every ten minutes.
+        self.global_next_at_ms = now_ms.saturating_add(60_000);
+        self.task_next_at_ms
+            .insert(task_key.to_owned(), now_ms.saturating_add(10 * 60_000));
+        if self.task_next_at_ms.len() > 256 {
+            self.task_next_at_ms.retain(|_, next| *next > now_ms);
+        }
+        true
+    }
 }
 
 struct ConversationRolloverContext {
@@ -839,6 +870,7 @@ impl AgentAutomationSupervisor {
             scan_lock: Mutex::new(()),
             run_lock: Mutex::new(()),
             canary_run_lock: Mutex::new(()),
+            handoff_probe_budget: Mutex::new(HandoffProbeBudget::default()),
             canary_task_key: None,
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
@@ -2092,27 +2124,56 @@ impl AgentAutomationSupervisor {
                         } else {
                             continue;
                         }
-                    } else if state.action.send_accepted == Some(true) {
+                    } else if super::turn_renewal::handoff_has_accepted_continuation(
+                        &state, &handoff,
+                    ) {
+                        // A *newer* accepted continuation owns this handoff.
+                        // An accepted renewal Send alone does not prove that
+                        // ChatGPT delivered its final handoff report.
                         continue;
                     }
                 }
                 if !handoff.report_complete {
-                    if let (Some(url), Some(account)) = (
+                    let handoff_proven = if let (Some(url), Some(account)) = (
                         state.pairing.canonical_url.as_deref(),
                         state.pairing.account_fingerprint.as_deref(),
-                    ) && state.pairing.verified_owner_generation == Some(task.owner_generation)
+                    ) && state.pairing.verified_owner_generation
+                        == Some(task.owner_generation)
                         && now_ms.saturating_sub(handoff.requested_at_ms) >= 5_000
                         && let Ok(_browser_guard) = self.run_lock.try_lock()
-                        && let Ok(Ok(true)) = tokio::time::timeout(
-                            Duration::from_secs(15),
-                            self.executor
-                                .turn_handoff_complete(url, account, &handoff.id),
-                        )
-                        .await
+                        && self
+                            .handoff_probe_budget
+                            .lock()
+                            .await
+                            .claim(task.task.stable_key(), now_ms)
                     {
+                        matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(15),
+                                self.executor
+                                    .turn_handoff_complete(url, account, &handoff.id),
+                            )
+                            .await,
+                            Ok(Ok(true))
+                        )
+                    } else {
+                        false
+                    };
+                    if handoff_proven {
                         task.store.confirm_turn_handoff(&task.task, &handoff.id)?;
                         state = task.store.load(&task.task)?;
                     } else {
+                        if state.action.kind == Some(AutomationActionKind::TurnRenewal)
+                            && !activity.is_online(now_ms, task.store.offline_after_ms())
+                            && now_ms.saturating_sub(handoff.requested_at_ms) >= 30 * 60_000
+                            && let Ok(_browser_guard) = self.run_lock.try_lock()
+                            && task
+                                .store
+                                .mark_unverified_handoff_stalled(&task.task, &state, now_ms)?
+                        {
+                            state = task.store.load(&task.task)?;
+                            task.store.notify_state(&task.chat, &state).await;
+                        }
                         continue;
                     }
                 }
@@ -4264,6 +4325,19 @@ mod model_fallback_snapshot_tests {
 #[cfg(test)]
 mod retry_wake_tests {
     use super::*;
+    #[test]
+    fn handoff_read_probes_are_global_and_per_task_throttled() {
+        let mut budget = HandoffProbeBudget::default();
+        assert!(budget.claim("a", 1_000));
+        assert!(!budget.claim("a", 1_000));
+        assert!(!budget.claim("b", 60_999));
+        assert!(budget.claim("b", 61_000));
+        assert!(!budget.claim("a", 9 * 60_000));
+        assert!(budget.claim("a", 10 * 60_000 + 1_000));
+        assert!(!budget.claim("b", 10 * 60_000 + 1_000));
+        // A single stalled goal cannot starve other ready goals forever.
+        assert!(budget.claim("c", 11 * 60_000 + 1_000));
+    }
     #[test]
     fn jittered_retry_deadlines_are_not_rounded_into_one_scan() {
         let config = AgentAutomationConfig::default();

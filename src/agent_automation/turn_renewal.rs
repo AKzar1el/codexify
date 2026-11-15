@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const NOTICE_FIELD: &str = "turn_renewal_required";
+pub(super) const UNVERIFIED_HANDOFF_WARNING: &str = "ChatGPT has not confirmed the final turn-renewal handoff after 30 minutes. The previous Send was accepted; Codexify did not click Retry or resend it.";
 pub const NOTICE_DESCRIPTION: &str = "Turn renewal overrides the ordinary non-terminal chat protocol: write the requested handoff as a normal final ChatGPT answer and end this turn. Codexify will continue automatically after that answer is complete.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +123,60 @@ impl TurnRenewalState {
     }
 }
 
+/// A verified handoff from the last accepted send is new work. Only an action
+/// newer than that send can already own the corresponding continuation.
+pub(super) fn handoff_has_accepted_continuation(
+    state: &super::AutomationTaskState,
+    handoff: &TurnHandoff,
+) -> bool {
+    handoff.report_complete
+        && state.action.kind == Some(AutomationActionKind::TurnRenewal)
+        && state.action.send_accepted == Some(true)
+        && state
+            .turn_renewal
+            .send
+            .as_ref()
+            .is_none_or(|send| state.action.id.as_deref() != Some(send.action_id.as_str()))
+}
+
 impl AgentAutomationStore {
+    pub(super) fn mark_unverified_handoff_stalled(
+        &self,
+        task: &ConversationIdentity,
+        expected: &super::AutomationTaskState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.turn_renewal.handoff != expected.turn_renewal.handoff
+                || state.action.kind != Some(AutomationActionKind::TurnRenewal)
+                || state.action.send_accepted != Some(true)
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Idle
+                        | AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
+                || state.turn_renewal.handoff.as_ref().is_none_or(|handoff| {
+                    handoff.report_complete
+                        || now_ms.saturating_sub(handoff.requested_at_ms) < 30 * 60_000
+                })
+                || (state.action.status != AutomationActionStatus::Idle
+                    && state
+                        .action
+                        .updated_at_ms
+                        .is_none_or(|at| now_ms.saturating_sub(at) < 32 * 60_000))
+            {
+                return Ok(false);
+            }
+            // This is an observation failure, not an unsent user message.
+            // Preserve the accepted Send, action ID, and its original clock.
+            state.action.status = AutomationActionStatus::Stalled;
+            state.action.last_error = Some(UNVERIFIED_HANDOFF_WARNING.into());
+            Ok(true)
+        })
+    }
     pub fn turn_renewal_settings(&self) -> Result<TurnRenewalConfig, String> {
         crate::global_settings::turn_renewal_settings(
             self.settings_path.as_deref(),
@@ -399,6 +453,13 @@ impl AgentAutomationStore {
                 && h.id == id
             {
                 h.report_complete = true;
+                if state.action.kind == Some(AutomationActionKind::TurnRenewal)
+                    && state.action.status == AutomationActionStatus::Stalled
+                    && state.action.last_error.as_deref() == Some(UNVERIFIED_HANDOFF_WARNING)
+                {
+                    state.action.status = AutomationActionStatus::Idle;
+                    state.action.last_error = None;
+                }
                 return Ok(true);
             }
             Ok(false)
@@ -409,5 +470,134 @@ impl AgentAutomationStore {
             state.turn_renewal = Default::default();
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod delivery_timeout_handoff_tests {
+    use super::*;
+
+    fn accepted_pending_handoff() -> super::super::AutomationTaskState {
+        let mut state = super::super::AutomationTaskState::default();
+        state.pairing.generation = 1;
+        state.action.id = Some("accepted-renewal-1".into());
+        state.action.kind = Some(AutomationActionKind::TurnRenewal);
+        state.action.pairing_generation = Some(1);
+        state.action.status = AutomationActionStatus::Idle;
+        state.action.send_accepted = Some(true);
+        state.action.updated_at_ms = Some(1_000);
+        state.turn_renewal.send = Some(TurnSend {
+            action_id: "accepted-renewal-1".into(),
+            at_ms: 1_000,
+            model: None,
+            effort: None,
+            pairing_generation: 1,
+            owner_generation: 0,
+        });
+        state.turn_renewal.handoff = Some(TurnHandoff {
+            id: "renewal-proof-1".into(),
+            requested_at_ms: 2_000,
+            report_complete: false,
+        });
+        state
+    }
+
+    #[test]
+    fn accepted_send_does_not_skip_handoff_proof_or_duplicate_a_newer_send() {
+        let mut state = accepted_pending_handoff();
+        let pending = state.turn_renewal.handoff.clone().unwrap();
+        assert!(!handoff_has_accepted_continuation(&state, &pending));
+        state.turn_renewal.handoff.as_mut().unwrap().report_complete = true;
+        let verified = state.turn_renewal.handoff.clone().unwrap();
+        assert!(
+            !handoff_has_accepted_continuation(&state, &verified),
+            "a newly proven handoff still needs its own continuation"
+        );
+        state.action.id = Some("newer-accepted-renewal-2".into());
+        assert!(
+            handoff_has_accepted_continuation(&state, &verified),
+            "a different accepted action must not be sent again"
+        );
+    }
+
+    #[test]
+    fn unverified_handoff_becomes_visible_without_changing_accepted_send() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("chats")).unwrap();
+        let task = ConversationIdentity::from_openai_session("stale-handoff-fixture").unwrap();
+        let expected = accepted_pending_handoff();
+        store
+            .mutate(&task, |state| {
+                *state = expected.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !store
+                .mark_unverified_handoff_stalled(&task, &expected, 30 * 60_000 + 1_999)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_unverified_handoff_stalled(&task, &expected, 30 * 60_000 + 2_000)
+                .unwrap()
+        );
+        let stalled = store.load(&task).unwrap();
+        assert_eq!(stalled.action.status, AutomationActionStatus::Stalled);
+        assert_eq!(stalled.action.send_accepted, Some(true));
+        assert_eq!(stalled.action.id, expected.action.id);
+        assert_eq!(stalled.action.updated_at_ms, expected.action.updated_at_ms);
+        assert_eq!(
+            stalled.action.last_error.as_deref(),
+            Some(UNVERIFIED_HANDOFF_WARNING)
+        );
+        assert!(
+            !store
+                .mark_unverified_handoff_stalled(&task, &expected, 30 * 60_000 + 2_100)
+                .unwrap(),
+            "a repeated scan must not rewrite or replay the stalled action"
+        );
+        assert!(
+            store
+                .confirm_turn_handoff(&task, "renewal-proof-1")
+                .unwrap()
+        );
+        let recovered = store.load(&task).unwrap();
+        assert!(recovered.turn_renewal.handoff.unwrap().report_complete);
+        assert_eq!(recovered.action.status, AutomationActionStatus::Idle);
+        assert_eq!(recovered.action.send_accepted, Some(true));
+        assert!(recovered.action.last_error.is_none());
+    }
+
+    #[test]
+    fn abandoned_inflight_renewal_is_not_hidden_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentAutomationStore::new(root.path().join("chats")).unwrap();
+        let task = ConversationIdentity::from_openai_session("stale-navigating-renewal").unwrap();
+        let mut pending = accepted_pending_handoff();
+        pending.action.status = AutomationActionStatus::Navigating;
+        store
+            .mutate(&task, |state| {
+                *state = pending.clone();
+                Ok(())
+            })
+            .unwrap();
+        let too_early = 32 * 60_000 + 999;
+        assert!(
+            !store
+                .mark_unverified_handoff_stalled(&task, &pending, too_early)
+                .unwrap()
+        );
+        let observed = 32 * 60_000 + 1_000;
+        assert!(
+            store
+                .mark_unverified_handoff_stalled(&task, &pending, observed)
+                .unwrap()
+        );
+        let stale = store.load(&task).unwrap();
+        assert_eq!(stale.action.status, AutomationActionStatus::Stalled);
+        assert_eq!(stale.action.send_accepted, Some(true));
+        assert_eq!(stale.action.id, pending.action.id);
+        assert_eq!(stale.action.updated_at_ms, pending.action.updated_at_ms);
     }
 }
