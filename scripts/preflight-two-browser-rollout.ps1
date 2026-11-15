@@ -33,6 +33,7 @@ function Get-CompanionState([string]$descriptor) {
   return [pscustomobject]@{
     Pid = [int]$d.pid
     Build = [string]$d.build
+    Status = [string]$health.status
     Auth = [bool]$health.authenticated
     Idle = ($health.status -eq 'idle' -and -not $health.activeActionId)
     Busy = ($health.status -eq 'busy' -or [bool]$health.activeActionId)
@@ -128,7 +129,17 @@ if ($runtimeCompatible) {
 }
 $canaryKeyValid = ($CanaryTaskKey -match '^[a-f0-9]{64}$')
 
-$primary = Get-CompanionState $primaryDescriptor
+$primaryProbeError = $false
+try { $primary = Get-CompanionState $primaryDescriptor } catch {
+  # A companion restart may rotate its loopback endpoint/descriptor during
+  # a read-only preflight. Treat failed health as UNKNOWN, not idle/allowed;
+  # the installer can only wait for verified recovery, never install on it.
+  $primary = $null
+  $primaryProbeError = $true
+}
+$primaryBrowserStatus = if ($primary) { $primary.Status }
+  elseif ($primaryProbeError) { 'probe_unavailable' }
+  else { 'companion_missing' }
 $lane2 = Get-SecondaryStateForInstall $secondDescriptor ([bool]$CanaryTaskKey)
 
 $sameAccount = [bool]($primary -and $lane2 -and $primary.Auth -and $lane2.Auth -and
@@ -158,8 +169,10 @@ $flags = [ordered]@{
   AdministrativelyElevated = [bool]$isAdmin
   ScheduledServiceRunning = [bool]($task -and $task.State -eq 'Running')
   CanaryTaskKeyValid = [bool]$canaryKeyValid
-  PrimaryAuthenticatedIdle = [bool]($primary -and $primary.Auth -and $primary.Idle)
-  PrimaryAuthenticatedBusy = [bool]($primary -and $primary.Auth -and $primary.Busy -and -not $primary.Idle)
+  PrimaryAuthenticatedIdle = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Idle)
+  PrimaryAuthenticatedBusy = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Busy -and -not $primary.Idle)
+  PrimaryAuthenticatedUnavailable = [bool]($primary -and $primary.Auth -and $primary.Account -and $primary.Status -eq 'unavailable')
+  PrimaryAuthenticationRequired = [bool]($primary -and $primary.Status -eq 'authentication_required')
   SecondaryAuthenticatedIdle = [bool]($lane2 -and $lane2.Auth -and $lane2.Idle)
   DistinctBrowserProcesses = $separateProcesses
   SameVerifiedAccount = $sameAccount
@@ -188,6 +201,7 @@ $activationReady = $maintenanceReady -and
   -not (@($activationChecks | Where-Object { -not $flags[$_] }).Count -gt 0)
 $result = [ordered]@{
   ReadOnly = $true
+  PrimaryBrowserStatus = $primaryBrowserStatus
   ReadyForGuardedMaintenance = $maintenanceReady
   ReadyToActivateTwoLanes = $activationReady
   InstallationBlockedBy = @($installChecks | Where-Object { -not $flags[$_] })

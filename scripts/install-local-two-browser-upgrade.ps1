@@ -386,12 +386,21 @@ function AssertFleetQuiet() {
         throw "Other Codexify workers were active in the last three minutes: $names"
     }
 }
+function AssertTransientPrimaryGrace([DateTimeOffset]$firstUnknown,[DateTimeOffset]$now,[int]$limitSeconds) {
+    if (($now - $firstUnknown).TotalSeconds -ge $limitSeconds) {
+        throw "The primary browser health was unverifiable for $limitSeconds seconds; aborting before any installation"
+    }
+}
 function WaitForQuietFleet([int]$maximumMinutes) {
-    # Wait for BOTH the fleet and an authenticated but actively working primary
-    # browser. Neither condition can be relaxed. Missing/unauthenticated or
-    # unknown browser health, owner-API failures and unrelated gates fail closed.
+    # Only a fresh, fully verified authenticated idle primary + quiet fleet
+    # can start installation. A signed-in ChatGPT page can briefly report
+    # 'unavailable' (no usable composer) without being signed out. The
+    # companion can also restart while this polling script is running.
+    # Allow passive recovery, NEVER treat uncertain status as proof of idle.
     $deadline = [DateTimeOffset]::UtcNow.AddMinutes($maximumMinutes)
     $nextReport = [DateTimeOffset]::MinValue
+    $unknownPrimarySince = $null
+    $unknownPrimaryLimitSeconds = 180
     while ($true) {
         $fresh = Preflight
         $blocked = @($fresh.InstallationBlockedBy)
@@ -402,8 +411,26 @@ function WaitForQuietFleet([int]$maximumMinutes) {
         if ('FleetQuiet' -in $blocked -and -not $fresh.Flags.FleetStatusVerified) {
             throw 'FleetQuiet cannot be verified from the owner-chat API; refusing to wait on unknown fleet status'
         }
-        if ('PrimaryAuthenticatedIdle' -in $blocked -and -not $fresh.Flags.PrimaryAuthenticatedBusy) {
-            throw 'PrimaryAuthenticatedIdle is closed, but the primary is not verifiably authenticated and busy; refusing to wait on unknown browser state'
+        if ('PrimaryAuthenticatedIdle' -in $blocked) {
+            if ($fresh.Flags.PrimaryAuthenticationRequired) {
+                throw 'The primary browser explicitly requires ChatGPT authentication; sign-in is needed before maintenance'
+            }
+            if ($fresh.Flags.PrimaryAuthenticatedBusy -or $fresh.Flags.PrimaryAuthenticatedUnavailable) {
+                # Account identity was verified. Wait without a separate
+                # transient limit; the overall maintenance deadline remains.
+                $unknownPrimarySince = $null
+            } elseif ($fresh.PrimaryBrowserStatus -in @('unavailable','probe_unavailable','companion_missing')) {
+                # Browser process/HTTP status may be temporarily inaccessible
+                # during a companion handoff. Bound the gap to three minutes;
+                # no action or browser restart is ever attempted from here.
+                $now = [DateTimeOffset]::UtcNow
+                if ($null -eq $unknownPrimarySince) { $unknownPrimarySince = $now }
+                AssertTransientPrimaryGrace $unknownPrimarySince $now $unknownPrimaryLimitSeconds
+            } else {
+                throw ('PrimaryAuthenticatedIdle is closed with an unexpected or unauthenticated browser state: ' + [string]$fresh.PrimaryBrowserStatus)
+            }
+        } else {
+            $unknownPrimarySince = $null
         }
         if ($fresh.ReadyForGuardedMaintenance) {
             Write-Host 'FLEET_AND_PRIMARY_IDLE_CONFIRMED'
@@ -414,7 +441,7 @@ function WaitForQuietFleet([int]$maximumMinutes) {
             throw "Maintenance window did not become ready within $maximumMinutes minute(s); no installation started"
         }
         if ($now -ge $nextReport) {
-            Write-Host ('WAITING_FOR_MAINTENANCE_WINDOW ' + ($blocked -join ', '))
+            Write-Host ('WAITING_FOR_MAINTENANCE_WINDOW ' + ($blocked -join ', ') + ' primary=' + [string]$fresh.PrimaryBrowserStatus)
             $nextReport = $now.AddMinutes(1)
         }
         $remainingSeconds = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)
@@ -570,6 +597,7 @@ $asarHash = (Get-FileHash -LiteralPath $builtAsar -Algorithm SHA256).Hash
 if ($PreflightOnly -or (-not $Apply -and -not $VerifyMaintenanceOnly)) {
     Write-Output (ConvertTo-Json ([ordered]@{
         ReadOnly = $true
+        PrimaryBrowserStatus = $probe.PrimaryBrowserStatus
         NativeCandidateFresh = $probe.Flags.CandidateNativeFresh
         BrowserCandidateFresh = $probe.Flags.CandidateCompanionFresh
         InstallationBlockedBy = @($probe.InstallationBlockedBy)

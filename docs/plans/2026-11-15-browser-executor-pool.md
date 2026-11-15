@@ -289,3 +289,41 @@ Goal events / hourly wake-ups
   `BrowserCandidateFresh=true`, installed original binary intact and
   `/health` returning `ok`. The deployed browser runtime has NOT yet been
   replaced and the secondary execution lane remains disabled.
+
+## Recovery from transient primary-browser `unavailable` states
+
+- A later elevated `-Apply -WaitForFleetQuiet -WaitTimeoutMinutes 60` waited
+  repeatedly for fleet quietness and primary idle, then exited before any
+  service change with `PrimaryAuthenticatedIdle is closed, but the primary is
+  not verifiably authenticated and busy`. The predicate was overly narrow:
+  `ChatGptDriver.health()` can return `authenticated=true,status=unavailable`
+  while the account is verified but ChatGPT temporarily has no unique usable
+  composer or displays session-attention UI. This is not evidence that a Send
+  is safe, but it is a reasonable *passive waiting* condition. A companion
+  process can also restart/rotate its descriptor during an extended wait.
+- A read-only live audit after the failure found healthy native `/health`,
+  the original installed SHA unchanged, and four consecutive primary health
+  samples reporting `authenticated=true,status=idle,activeActionId=null`.
+  The companion process had started at 23:31:21 local during the owner's
+  extended wait; precise cause of that restart was not established.
+- Preflight now reports `PrimaryBrowserStatus` (`idle`, `busy`, `unavailable`,
+  `authentication_required`, `probe_unavailable`, or `companion_missing`)
+  without emitting credentials. It continues to require an authenticated
+  account fingerprint to positively classify idle, busy or temporarily
+  unavailable. A failed local companion health probe becomes an explicit
+  *unknown* status, never an implicit success.
+- `WaitForQuietFleet` now passively waits for a signed-in `unavailable`
+  browser to recover within the overall owner-set maintenance timeout. A
+  temporarily missing/unreachable/unauthenticated-unavailable companion is
+  given at most **180 seconds of consecutive unknown health** before an
+  explicit abort; a verified busy or unavailable companion resets that
+  grace counter. An explicit `authentication_required` state aborts promptly.
+  This relaxation applies to waiting **only**. Before replacement the original
+  authenticated-idle gate, owner-verified three-minute fleet-quiet gate, and
+  process/Send-lock checks must all pass; otherwise no production swap occurs.
+- Targeted test cases were first run against the old predicate to reproduce
+  the abort, then passed after the patch: authenticated unavailable then idle,
+  temporary unreachable health then idle, 180-second unknown-state expiry,
+  explicit sign-in requirement, and previous fleet/security/timeout cases.
+  Optional secondary-browser, stale-PID and atomic rollback fixture tests
+  still passed. No production task or worker was modified by this source fix.

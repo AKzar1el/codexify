@@ -12,6 +12,12 @@ $fn = $ast.FindAll({
 }, $true) | Select-Object -First 1
 if (-not $fn) { throw 'The bounded wait function is missing' }
 Invoke-Expression $fn.Extent.Text
+$grace = $ast.FindAll({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'AssertTransientPrimaryGrace'
+}, $true) | Select-Object -First 1
+if (-not $grace) { throw 'The bounded transient primary grace helper is missing' }
+Invoke-Expression $grace.Extent.Text
 
 $script:statuses = @()
 $script:attempts = 0
@@ -21,8 +27,11 @@ function Probe([string[]]$blocked, [bool]$authenticatedBusy) {
     return [pscustomobject]@{
         ReadyForGuardedMaintenance=($blocked.Count -eq 0)
         InstallationBlockedBy=@($blocked)
+        PrimaryBrowserStatus='idle'
         Flags=[pscustomobject]@{
             PrimaryAuthenticatedBusy=$authenticatedBusy
+            PrimaryAuthenticatedUnavailable=$false
+            PrimaryAuthenticationRequired=$false
             FleetStatusVerified=$true
         }
     }
@@ -63,6 +72,44 @@ if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $scrip
     throw 'Transient primary activity did not wait correctly'
 }
 Write-Output 'PASS transient primary busy state is safely waited out'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle','FleetQuiet') $false),(Probe @() $false))
+$script:statuses[0].PrimaryBrowserStatus = 'unavailable'
+$script:statuses[0].Flags.PrimaryAuthenticatedUnavailable = $true
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $script:sleeps -ne 1) {
+    throw 'Verified, authenticated but temporarily unavailable browser was not allowed to recover'
+}
+Write-Output 'PASS authenticated but unavailable composer may recover without skipping checks'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle') $false),(Probe @() $false))
+$script:statuses[0].PrimaryBrowserStatus = 'probe_unavailable'
+$ready = WaitForQuietFleet 1 | Select-Object -Last 1
+if (-not $ready.ReadyForGuardedMaintenance -or $script:attempts -ne 2 -or $script:sleeps -ne 1) {
+    throw 'Brief unreachable-primary health probe should recover without action or service restart'
+}
+Write-Output 'PASS transient primary health endpoint interruption may recover'
+
+$now = [DateTimeOffset]::UtcNow
+AssertTransientPrimaryGrace ($now.AddSeconds(-179)) $now 180
+$refused = $false
+try { AssertTransientPrimaryGrace ($now.AddSeconds(-181)) $now 180 } catch {
+    if ($_.Exception.Message -match 'unverifiable for 180 seconds') { $refused = $true } else { throw }
+}
+if (-not $refused) { throw 'Unknown primary status was allowed beyond its 180-second recovery window' }
+Write-Output 'PASS bounded unverified primary health grace expires fail-closed'
+
+SetScenario @((Probe @('PrimaryAuthenticatedIdle') $false))
+$script:statuses[0].PrimaryBrowserStatus = 'authentication_required'
+$script:statuses[0].Flags.PrimaryAuthenticationRequired = $true
+$refused = $false
+try { WaitForQuietFleet 1 | Out-Null } catch {
+    if ($_.Exception.Message -match '(authentication|sign.in)') { $refused = $true } else { throw }
+}
+if (-not $refused -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
+    throw 'Explicit sign-in requirement must not be mistaken for transient unavailability'
+}
+Write-Output 'PASS explicit authentication requirement fails immediately'
 
 SetScenario @((Probe @('PrimaryAuthenticatedIdle') $false))
 $refused = $false
