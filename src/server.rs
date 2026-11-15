@@ -2061,7 +2061,33 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
                 ));
             }
             let mut secondary = base.clone();
-            secondary.descriptor_path = lane2;
+            secondary.descriptor_path = lane2.clone();
+            // Lane 2 is a pre-launched, independently signed-in browser.
+            // Its descriptor's parent must be a separate physical home;
+            // the process-wide CODEXIFY_BROWSER_HOME applies only to lane 1.
+            let primary_manager =
+                crate::agent_automation::BrowserCompanionManager::from_config(&base)
+                    .map_err(anyhow::Error::msg)?;
+            let primary_root = std::fs::canonicalize(&primary_manager.layout().root)?;
+            let second_root = std::fs::canonicalize(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("Second browser descriptor has no parent"))?,
+            )?;
+            if primary_root == second_root
+                || second_root.starts_with(&primary_root)
+                || primary_root.starts_with(&second_root)
+            {
+                return Err(anyhow::anyhow!(
+                    "Two browser lanes must use distinct physical browser roots and Chrome profiles"
+                ));
+            }
+            if std::fs::canonicalize(&primary_manager.layout().descriptor_path)?
+                == std::fs::canonicalize(path)?
+            {
+                return Err(anyhow::anyhow!(
+                    "Two browser lanes cannot use the same physical companion descriptor"
+                ));
+            }
             let executor = Arc::new(
                 crate::agent_automation::BrowserAutomationExecutor::with_canary(
                     base.clone(),

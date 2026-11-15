@@ -168,6 +168,11 @@ async function route(
   const operation = new AbortController();
   request.once("aborted",()=>operation.abort());
   response.once("close",()=>{ if(!response.writableEnded)operation.abort(); });
+  // A client can disconnect after its request body was fully received.
+  // That does not emit IncomingMessage.aborted in all Node/Bun runtimes.
+  const clientClosed=()=>operation.abort();
+  request.socket.once("close",clientClosed);
+  response.once("finish",()=>request.socket.off("close",clientClosed));
   if(request.method === "GET" && url.pathname === "/v1/liveness") {
     json(response,200,await coordinator.liveness());return;
   }
@@ -270,7 +275,11 @@ async function route(
     response.setHeader("Connection", "keep-alive");
     response.flushHeaders();
     const cancellation = new AbortController();
-    request.once("close", () => cancellation.abort());
+    const disconnect = () => cancellation.abort();
+    // IncomingMessage.close means the request body was received, not that
+    // the NDJSON response subscriber disconnected.
+    response.once("close", disconnect);
+    request.socket.once("close", disconnect);
     const heartbeat = setInterval(() => { if (!response.destroyed) response.write("\n"); }, HEARTBEAT_MS);
     heartbeat.unref();
     try {
@@ -280,6 +289,8 @@ async function route(
       response.end();
     } finally {
       clearInterval(heartbeat);
+      response.off("close", disconnect);
+      request.socket.off("close", disconnect);
     }
     return;
   }

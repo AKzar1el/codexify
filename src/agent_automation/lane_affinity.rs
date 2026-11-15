@@ -1,15 +1,40 @@
 use std::collections::VecDeque;
 
 /// Stable explicit canary ownership; never migrate tasks by modulo/hash.
+#[cfg(test)]
 pub fn owns(task_key: &str, canary_key: Option<&str>, lane: usize) -> bool {
-    match (canary_key, lane) {
-        (None, 0) => true,
-        (Some(key), 0) => key != task_key,
-        (Some(key), 1) => key == task_key,
+    owns_operation(task_key, canary_key, lane, true)
+}
+
+/// Pairing, creation and turn-renewal actions always stay on the primary
+/// browser. Only ordinary offline work may enter the explicitly chosen canary.
+pub fn owns_operation(
+    task_key: &str,
+    canary_key: Option<&str>,
+    lane: usize,
+    eligible_offline: bool,
+) -> bool {
+    let second = eligible_offline && canary_key.is_some_and(|key| key == task_key);
+    match lane {
+        0 => !second,
+        1 => second,
         _ => false,
     }
 }
 
+pub fn first_operation_in_lane<T>(
+    queue: &VecDeque<T>,
+    canary_key: Option<&str>,
+    lane: usize,
+    route: impl Fn(&T) -> (&str, bool),
+) -> Option<usize> {
+    queue.iter().position(|entry| {
+        let (task_key, eligible_offline) = route(entry);
+        owns_operation(task_key, canary_key, lane, eligible_offline)
+    })
+}
+
+#[cfg(test)]
 pub fn first_in_lane<T>(
     queue: &VecDeque<T>,
     canary_key: Option<&str>,
@@ -67,5 +92,29 @@ mod tests {
             assert!(owns(key, Some("selected"), 0));
         }
         assert!(!owns("selected", Some("selected"), 2));
+    }
+
+    #[test]
+    fn selected_canary_pairing_and_turn_renewal_remain_primary() {
+        let queue = VecDeque::from([
+            ("selected", false), // Pairing on lane 1
+            ("selected", true),  // Offline work on lane 2
+            ("revenue", true),   // Revenue goal stays on lane 1
+            ("selected", false), // Turn renewal on lane 1
+        ]);
+        assert_eq!(
+            first_operation_in_lane(&queue, Some("selected"), 0, |(key, offline)| (
+                key, *offline
+            )),
+            Some(0)
+        );
+        assert_eq!(
+            first_operation_in_lane(&queue, Some("selected"), 1, |(key, offline)| (
+                key, *offline
+            )),
+            Some(1)
+        );
+        assert!(owns_operation("selected", Some("selected"), 0, false));
+        assert!(!owns_operation("selected", Some("selected"), 1, false));
     }
 }

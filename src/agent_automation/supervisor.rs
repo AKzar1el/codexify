@@ -98,6 +98,16 @@ pub trait AutomationExecutor: Send + Sync {
     ) -> Result<bool, String> {
         Ok(false)
     }
+    async fn approve_pending_conversation_for_task(
+        &self,
+        _task_key: &str,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        self.approve_pending_conversation(url, account, connector_name)
+            .await
+    }
     async fn turn_handoff_complete(
         &self,
         _url: &str,
@@ -126,6 +136,14 @@ pub trait AutomationExecutor: Send + Sync {
         _account_fingerprint: &str,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
         Ok(None)
+    }
+    async fn retained_action_for_task(
+        &self,
+        _task_key: &str,
+        action_id: &str,
+        account_fingerprint: &str,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        self.retained_action(action_id, account_fingerprint).await
     }
 
     async fn execute(
@@ -169,12 +187,79 @@ impl BrowserAutomationExecutor {
         })
     }
 
-    fn config_for(&self, task_key: &str) -> &AgentAutomationConfig {
+    fn is_canary_action(&self, execution: &AutomationExecution) -> bool {
+        self.secondary
+            .as_ref()
+            .is_some_and(|(key, _)| key == &execution.task_key)
+            && matches!(
+                &execution.request.prompt,
+                ActionPrompt::OfflineChat { .. }
+                    | ActionPrompt::OfflineGoal { .. }
+                    | ActionPrompt::OfflineCombined { .. }
+            )
+    }
+
+    fn config_for(&self, execution: &AutomationExecution) -> &AgentAutomationConfig {
+        self.secondary
+            .as_ref()
+            .filter(|_| self.is_canary_action(execution))
+            .map(|(_, config)| config)
+            .unwrap_or(&self.config)
+    }
+    fn config_for_task_key(&self, task_key: &str) -> &AgentAutomationConfig {
         self.secondary
             .as_ref()
             .filter(|(key, _)| key == task_key)
             .map(|(_, config)| config)
             .unwrap_or(&self.config)
+    }
+
+    async fn retained_from_config(
+        config: &AgentAutomationConfig,
+        action_id: &str,
+        account_fingerprint: &str,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        let client = BrowserCompanionClient::from_config(config)?;
+        let cancellation = CancellationToken::new();
+        let health = client.health(&cancellation).await?;
+        if !health.authenticated
+            || health.account_fingerprint.as_deref() != Some(account_fingerprint)
+        {
+            return Err("Browser action recovery could not verify the signed-in account".into());
+        }
+        if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() {
+            return Ok(None);
+        }
+        client.action(action_id, &cancellation).await.map(Some)
+    }
+
+    async fn approve_from_config(
+        &self,
+        config: &AgentAutomationConfig,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        if !self.config.auto_approve_tool_calls {
+            return Ok(false);
+        }
+        let lifecycle = super::BrowserCompanionControl::new(&self.config)?.public_status();
+        if lifecycle["manuallyStopped"] == true || lifecycle["waitingForServerRestart"] == true {
+            return Ok(false);
+        }
+        let client = BrowserCompanionClient::from_config(config)?;
+        let cancellation = CancellationToken::new();
+        let health = client.health(&cancellation).await?;
+        if !health.authenticated || health.account_fingerprint.as_deref() != Some(account) {
+            return Err("Browser approval cannot verify the paired account".into());
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            client.approve_pending_conversation(url, account, connector_name, &cancellation),
+        )
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| "ChatGPT approval check timed out".to_string())?
     }
 
     async fn ready_client_for(
@@ -219,23 +304,23 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         account: &str,
         connector_name: &str,
     ) -> Result<bool, String> {
-        if !self.config.auto_approve_tool_calls {
-            return Ok(false);
-        }
-        let lifecycle = super::BrowserCompanionControl::new(&self.config)?.public_status();
-        if lifecycle["manuallyStopped"] == true || lifecycle["waitingForServerRestart"] == true {
-            return Ok(false);
-        }
-        // Passive checks reuse an existing companion; they never start or reveal it.
-        let client = BrowserCompanionClient::from_config(&self.config)?;
-        let cancellation = CancellationToken::new();
-        let result = tokio::time::timeout(
-            Duration::from_secs(6),
-            client.approve_pending_conversation(url, account, connector_name, &cancellation),
+        self.approve_from_config(&self.config, url, account, connector_name)
+            .await
+    }
+    async fn approve_pending_conversation_for_task(
+        &self,
+        task_key: &str,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        self.approve_from_config(
+            self.config_for_task_key(task_key),
+            url,
+            account,
+            connector_name,
         )
-        .await;
-        cancellation.cancel();
-        result.map_err(|_| "ChatGPT approval check timed out".to_string())?
+        .await
     }
     async fn turn_handoff_complete(
         &self,
@@ -265,8 +350,8 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         message: &str,
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
         let uncertain = |error: String| execution_error(format!("{message}; {error}"), true);
-        let client = BrowserCompanionClient::from_config(self.config_for(&execution.task_key))
-            .map_err(uncertain)?;
+        let client =
+            BrowserCompanionClient::from_config(self.config_for(execution)).map_err(uncertain)?;
         let cancellation = CancellationToken::new();
         let health = client.health(&cancellation).await.map_err(uncertain)?;
         if !health.authenticated
@@ -309,18 +394,20 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         action_id: &str,
         account_fingerprint: &str,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
-        let client = BrowserCompanionClient::from_config(&self.config)?;
-        let cancellation = CancellationToken::new();
-        let health = client.health(&cancellation).await?;
-        if !health.authenticated
-            || health.account_fingerprint.as_deref() != Some(account_fingerprint)
-        {
-            return Err("Browser action recovery could not verify the signed-in account".into());
-        }
-        if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() {
-            return Ok(None);
-        }
-        client.action(action_id, &cancellation).await.map(Some)
+        Self::retained_from_config(&self.config, action_id, account_fingerprint).await
+    }
+    async fn retained_action_for_task(
+        &self,
+        task_key: &str,
+        action_id: &str,
+        account_fingerprint: &str,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        Self::retained_from_config(
+            self.config_for_task_key(task_key),
+            action_id,
+            account_fingerprint,
+        )
+        .await
     }
 
     async fn execute(
@@ -329,52 +416,71 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         events: mpsc::UnboundedSender<CompanionEvent>,
         cancellation: CancellationToken,
     ) -> Result<CompanionActionSnapshot, AutomationExecutionError> {
-        if self
-            .secondary
-            .as_ref()
-            .is_some_and(|(key, _)| key == &execution.task_key)
-            && !matches!(
-                execution.request.prompt,
-                ActionPrompt::OfflineChat { .. }
-                    | ActionPrompt::OfflineGoal { .. }
-                    | ActionPrompt::OfflineCombined { .. }
-            )
-        {
-            // Only already-paired offline goals/messages may enter the canary.
-            // Creation, pairing, and turn-renewal handoffs still require their
-            // original single-browser controls rather than a guessed session.
-            return Err(execution_error(
-                "Second browser lane only supports already-paired offline work".into(),
-                false,
-            ));
-        }
-        let client = self
-            .ready_client_for(self.config_for(&execution.task_key), &cancellation)
-            .await
-            .map_err(|message| execution_error(message, false))?;
-        if self
-            .secondary
-            .as_ref()
-            .is_some_and(|(key, _)| key == &execution.task_key)
-        {
-            // A second lane may never submit while primary still runs a
-            // companion without cross-process Send admission support.
+        let canary = self.is_canary_action(&execution);
+        let client = if canary {
+            // Lane 2 must already be running and independently signed in.
+            // Never auto-start or repair it through the process-wide browser
+            // lifecycle manager, which owns the original Chrome profile.
+            let client = BrowserCompanionClient::from_config(self.config_for(&execution))
+                .map_err(|message| execution_error(message, false))?;
+            if client
+                .liveness(&cancellation)
+                .await
+                .map_err(|message| execution_error(message, false))?
+                != Some(true)
+            {
+                return Err(execution_error(
+                    "The independent second browser companion is not alive".into(),
+                    false,
+                ));
+            }
+            client
+        } else {
+            self.ready_client_for(&self.config, &cancellation)
+                .await
+                .map_err(|message| execution_error(message, false))?
+        };
+        if self.secondary.is_some() {
+            // Every browser used by this supervisor must participate in the
+            // same cross-process Send gate. Never allow an older primary
+            // companion to send unprotected while lane 2 is enabled.
             let primary = BrowserCompanionClient::from_config(&self.config)
                 .map_err(|message| execution_error(message, false))?;
             let first = primary
                 .send_gate_fingerprint(&cancellation)
                 .await
                 .map_err(|message| execution_error(message, false))?;
-            let second = client
-                .send_gate_fingerprint(&cancellation)
-                .await
-                .map_err(|message| execution_error(message, false))?;
-            if first != second {
-                return Err(execution_error(
-                    "The two browser companions do not share the exact same Send admission gate"
-                        .into(),
-                    false,
-                ));
+            if canary {
+                if primary.pid() == client.pid() {
+                    return Err(execution_error(
+                        "Both lanes point to the same browser companion process".into(),
+                        false,
+                    ));
+                }
+                let primary_health = primary
+                    .health(&cancellation)
+                    .await
+                    .map_err(|message| execution_error(message, false))?;
+                if !primary_health.authenticated
+                    || primary_health.account_fingerprint.as_deref()
+                        != Some(execution.account_fingerprint.as_str())
+                {
+                    return Err(execution_error(
+                        "Lane 1 does not match the canary conversation's verified account".into(),
+                        false,
+                    ));
+                }
+                let second = client
+                    .send_gate_fingerprint(&cancellation)
+                    .await
+                    .map_err(|message| execution_error(message, false))?;
+                if first != second {
+                    return Err(execution_error(
+                        "The two browser companions do not share the exact same Send admission gate"
+                            .into(),
+                        false,
+                    ));
+                }
             }
         }
         let health = client
@@ -1843,10 +1949,28 @@ impl AgentAutomationSupervisor {
                     state.pairing.account_fingerprint.as_deref(),
                     task.store.connector_name(&self.config.connector_name)?,
                 )
-                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(_run_guard) = if self.canary_task_key.as_deref()
+                    == Some(task.task.stable_key())
+                    && matches!(
+                        state.action.kind,
+                        Some(
+                            AutomationActionKind::OfflineChat
+                                | AutomationActionKind::OfflineGoal
+                                | AutomationActionKind::OfflineCombined
+                        )
+                    ) {
+                    self.canary_run_lock.try_lock()
+                } else {
+                    self.run_lock.try_lock()
+                }
                 && let Ok(true) = self
                     .executor
-                    .approve_pending_conversation(url, account, &connector)
+                    .approve_pending_conversation_for_task(
+                        task.task.stable_key(),
+                        url,
+                        account,
+                        &connector,
+                    )
                     .await
             {
                 let epoch = activity
@@ -2104,13 +2228,22 @@ impl AgentAutomationSupervisor {
                         .as_deref()
                         .or(state.selection.account_fingerprint.as_deref()),
                 )
-                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(_run_guard) =
+                    if self.canary_task_key.as_deref() == Some(task.task.stable_key()) {
+                        self.canary_run_lock.try_lock()
+                    } else {
+                        self.run_lock.try_lock()
+                    }
             {
                 // The old observer may have disappeared during a service restart. Recover only
                 // an exact, completed goal-only receipt; never replay an uncertain user send.
                 if let Ok(Ok(Some(snapshot))) = tokio::time::timeout(
                     Duration::from_secs(10),
-                    self.executor.retained_action(action_id, account),
+                    self.executor.retained_action_for_task(
+                        task.task.stable_key(),
+                        action_id,
+                        account,
+                    ),
                 )
                 .await
                     && snapshot.action_id == action_id
@@ -2636,6 +2769,24 @@ impl AgentAutomationSupervisor {
                         && execution_kind(queued) != AutomationActionKind::PairVerify
                 });
                 if follow_up {
+                    let canary_follow_up = self.canary_task_key.as_deref()
+                        == Some(reservation.task.task.stable_key())
+                        && self.queue.lock().await.iter().any(|queued| {
+                            queued.task_key == reservation.task.task.stable_key()
+                                && queued.owner_generation == reservation.owner_generation
+                                && matches!(
+                                    execution_kind(queued),
+                                    AutomationActionKind::OfflineChat
+                                        | AutomationActionKind::OfflineGoal
+                                        | AutomationActionKind::OfflineCombined
+                                )
+                        });
+                    if canary_follow_up && !secondary {
+                        // Pairing stays on the primary lane, but the newly
+                        // verified conversation's offline work belongs to
+                        // lane 2. Release the reservation before yielding.
+                        break;
+                    }
                     self.executor
                         .refresh_pairing_window(&reservation.action_id)
                         .await?;
@@ -2713,14 +2864,35 @@ impl AgentAutomationSupervisor {
                             && queued.owner_generation == preferred.owner_generation
                             && queued.request.pairing_generation == preferred.generation
                             && execution_kind(queued) != AutomationActionKind::PairVerify
+                            && super::lane_affinity::owns_operation(
+                                &queued.task_key,
+                                self.canary_task_key.as_deref(),
+                                usize::from(secondary),
+                                matches!(
+                                    execution_kind(queued),
+                                    AutomationActionKind::OfflineChat
+                                        | AutomationActionKind::OfflineGoal
+                                        | AutomationActionKind::OfflineCombined
+                                ),
+                            )
                     });
                     position.and_then(|position| queue.remove(position))
                 } else {
-                    let position = super::lane_affinity::first_in_lane(
+                    let position = super::lane_affinity::first_operation_in_lane(
                         &queue,
                         self.canary_task_key.as_deref(),
                         usize::from(secondary),
-                        |queued| queued.task_key.as_str(),
+                        |queued| {
+                            (
+                                queued.task_key.as_str(),
+                                matches!(
+                                    execution_kind(queued),
+                                    AutomationActionKind::OfflineChat
+                                        | AutomationActionKind::OfflineGoal
+                                        | AutomationActionKind::OfflineCombined
+                                ),
+                            )
+                        },
                     );
                     position.and_then(|position| queue.remove(position))
                 }
@@ -3458,7 +3630,8 @@ impl AgentAutomationSupervisor {
                 && let Some(connector) = task.store.connector_name(&self.config.connector_name)?
                 && let Ok(true) = self
                     .executor
-                    .approve_pending_conversation(
+                    .approve_pending_conversation_for_task(
+                        task.task.stable_key(),
                         &execution.request.expected_url,
                         &execution.account_fingerprint,
                         &connector,
@@ -3498,10 +3671,16 @@ impl AgentAutomationSupervisor {
         let tasks = self.tasks.read().await;
         let queue = self.queue.lock().await;
         queue.iter().any(|execution| {
-            if !super::lane_affinity::owns(
+            if !super::lane_affinity::owns_operation(
                 &execution.task_key,
                 self.canary_task_key.as_deref(),
                 usize::from(secondary),
+                matches!(
+                    execution_kind(execution),
+                    AutomationActionKind::OfflineChat
+                        | AutomationActionKind::OfflineGoal
+                        | AutomationActionKind::OfflineCombined
+                ),
             ) {
                 return false;
             }
