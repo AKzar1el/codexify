@@ -637,3 +637,22 @@ It does not attempt to reconnect an action by sending the prompt again.
   maintenance operation after both browser actions are safe. Never restart
   Codexify from a child of its own MCP tunnel. Verify archival and a real
   subsequent goal turn before claiming live reconciliation is complete.
+- The existing two-browser installer now supports a **native-only** repair:
+  when the staged browser app.asar is byte-identical to the installed bundle
+  and the candidate native executable is new, the companion-freshness check
+  does not demand unrelated Chrome profile changes. It still requires the
+  exact pinned primary/canary identities, idle or safely queued actions,
+  authenticated browsers, an unheld Send gate, quiet fleet and an independent
+  elevated Windows PowerShell session. The secondary completed-goal exception
+  requires a strictly post-finish, idle, accepted-Send, unverified handoff.
+- Test the installer without changing production:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-local-two-browser-upgrade.ps1 -SelfTest`
+  and `-HandoffGuardTest` separately. Both tests passed on 2026-11-16; the
+  earlier installer fixture that assumed unconfigured pilot keys was updated
+  to reuse the current saved pilot keys **without altering the config file**.
+- An executable build and installation remain unverified. At 20:05 CET on
+  2026-11-16 free physical RAM was under 1 GiB and the primary action was
+  navigating; do not run the memory-heavy build or interrupt the native
+  connector in that state. Recheck the native hash, free RAM and both browser
+  actions just before staged installation. A new goal for secondary should be
+  assigned only after archival has actually persisted in the new binary.

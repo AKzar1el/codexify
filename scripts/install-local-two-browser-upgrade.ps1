@@ -8,6 +8,7 @@ param(
     [switch]$PreflightOnly,
     [switch]$VerifyMaintenanceOnly,
     [switch]$SelfTest,
+    [switch]$HandoffGuardTest,
     [switch]$WaitForFleetQuiet,
     [switch]$WaitForCanarySafe,
     [switch]$ForceMaintenance,
@@ -72,6 +73,12 @@ function Preflight() {
 }
 function AssertReadyForInstall($probe) {
     $blocked = @($probe.InstallationBlockedBy)
+    # A native-only repair intentionally retains the exact installed browser
+    # bundle. Requiring a *different* ASAR here would force an unrelated browser
+    # runtime replacement and unnecessarily disturb both authenticated profiles.
+    if ($hash -ne $installedHash -and $asarHash -eq $installedAsarHash) {
+        $blocked = @($blocked | Where-Object { $_ -ne 'CandidateCompanionFresh' })
+    }
     if ($ForceMaintenance) {
         # Explicit owner-approved interruption, not a general preflight bypass.
         # Unverified installs, unrelated processes and outstanding Send locks
@@ -101,6 +108,29 @@ function AssertBrowserIdleBeforeShutdown() {
         throw "Browser is not idle: $($browser.state)"
     }
 }
+function Test-CanaryReadyForUpgrade($state) {
+    if (-not $state -or -not $state.goal -or -not $state.action -or
+        -not $state.pairing -or
+        -not $state.pairing.verifiedOwnerGeneration -or
+        -not $state.pairing.canonicalUrl -or
+        -not $state.pairing.accountFingerprint) { return $false }
+    $handoff = if ($state.PSObject.Properties['turnRenewal'] -and
+        $null -ne $state.turnRenewal -and
+        $state.turnRenewal.PSObject.Properties['handoff']) {
+        $state.turnRenewal.handoff
+    } else { $null }
+    if ($state.goal.status -eq 'active') {
+        return (-not $handoff -or [bool]$handoff.reportComplete)
+    }
+    # Only a completed goal's *post-finish* renewal is repairable without
+    # proof of a final answer. The new binary archives it as unverified.
+    return ($state.goal.status -eq 'completed' -and
+        $state.goal.finishedAtMs -and $handoff -and
+        $handoff.reportComplete -eq $false -and
+        [long]$handoff.requestedAtMs -gt [long]$state.goal.finishedAtMs -and
+        $state.action.kind -eq 'offline_goal' -and
+        $state.action.status -eq 'idle' -and $state.action.sendAccepted -eq $true)
+}
 function ReadVerifiedCanaryState([string]$key) {
     if ($key -notmatch '^[a-f0-9]{64}$') {
         throw 'Canary key must be one verified 64-character stable task identity'
@@ -118,12 +148,8 @@ function ReadVerifiedCanaryState([string]$key) {
         throw 'Canary identity was not found in exactly one local project state'
     }
     $state = Get-Content -LiteralPath $matches[0] -Raw | ConvertFrom-Json
-    if (-not $state.pairing.verifiedOwnerGeneration -or
-        -not $state.pairing.canonicalUrl -or
-        -not $state.pairing.accountFingerprint -or
-        $state.goal.status -ne 'active' -or
-        ($state.turnRenewal.handoff -and -not $state.turnRenewal.handoff.reportComplete)) {
-        throw 'Canary is not a verified active goal with a reconciled renewal handoff'
+    if (-not (Test-CanaryReadyForUpgrade $state)) {
+        throw 'Canary is neither a verified active goal with a reconciled handoff nor a strictly idle completed goal with a post-finish orphan'
     }
     return $state
 }
@@ -610,7 +636,24 @@ function TestTransactionWithoutService {
         }
         Write-Output 'TEST_CONFIG_ONLY_CANARY_AND_ROLLBACK=PASS'
         $originalConfig = (Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash
-        PrepareConfig (Join-Path $fixture 'preview.json')
+        # Preview a currently activated pilot with its exact existing keys;
+        # leaving the test's arguments empty must not misidentify a real
+        # installation as a conflicting owner.
+        $previousPrimaryKey = $script:PilotPrimaryTaskKey
+        $previousCanaryKey = $script:CanaryTaskKey
+        try {
+            $existingSettings = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+            if (-not $script:PilotPrimaryTaskKey) {
+                $script:PilotPrimaryTaskKey = [string]$existingSettings.agentChat.automation.pilotPrimaryTaskKey
+            }
+            if (-not $script:CanaryTaskKey) {
+                $script:CanaryTaskKey = [string]$existingSettings.agentChat.automation.canaryTaskKey
+            }
+            PrepareConfig (Join-Path $fixture 'preview.json')
+        } finally {
+            $script:PilotPrimaryTaskKey = $previousPrimaryKey
+            $script:CanaryTaskKey = $previousCanaryKey
+        }
         if ((Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash -ne $originalConfig) {
             throw 'Config preview unexpectedly changed the installed configuration'
         }
@@ -693,11 +736,73 @@ if ($PilotPrimaryTaskKey -and ($PilotPrimaryTaskKey -notmatch '^[a-f0-9]{64}$' -
     -not $CanaryTaskKey -or $PilotPrimaryTaskKey -eq $CanaryTaskKey)) {
     throw 'PilotPrimaryTaskKey needs a distinct verified 64-character CanaryTaskKey'
 }
-if ($SelfTest) {
+if ($SelfTest -or $HandoffGuardTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
-        throw 'SelfTest cannot be combined with deployment or preflight switches'
+        throw 'Tests cannot be combined with deployment or preflight switches'
     }
-    TestTransactionWithoutService
+    if ($SelfTest) { TestTransactionWithoutService }
+    $fixture = [pscustomobject]@{
+        pairing = [pscustomobject]@{
+            verifiedOwnerGeneration = 2
+            canonicalUrl = 'https://chatgpt.com/c/test-handoff-repair'
+            accountFingerprint = 'verified-test-account'
+        }
+        goal = [pscustomobject]@{ status='completed'; finishedAtMs=[long]100 }
+        action = [pscustomobject]@{
+            kind='offline_goal'; status='idle'; sendAccepted=$true
+        }
+        turnRenewal = [pscustomobject]@{
+            handoff=[pscustomobject]@{
+                reportComplete=$false; requestedAtMs=[long]200
+            }
+        }
+    }
+    if (-not (Test-CanaryReadyForUpgrade $fixture)) {
+        throw 'An idle terminal-goal orphan must permit a native repair'
+    }
+    $fixture.turnRenewal.handoff.requestedAtMs = 99
+    if (Test-CanaryReadyForUpgrade $fixture) {
+        throw 'Pre-finish handoff bypassed the native maintenance guard'
+    }
+    $fixture.turnRenewal.handoff.requestedAtMs = 200
+    $fixture.action.status = 'sending'
+    if (Test-CanaryReadyForUpgrade $fixture) {
+        throw 'Active browser action bypassed the maintenance guard'
+    }
+    $fixture.action.status = 'idle'
+    $fixture.action.sendAccepted = $false
+    if (Test-CanaryReadyForUpgrade $fixture) {
+        throw 'Unaccepted Send bypassed the maintenance guard'
+    }
+    $fixture.action.sendAccepted = $true
+    $fixture.goal.status = 'active'
+    if (Test-CanaryReadyForUpgrade $fixture) {
+        throw 'Unverified active-goal handoff bypassed the guard'
+    }
+    $fixture.turnRenewal.handoff.reportComplete = $true
+    if (-not (Test-CanaryReadyForUpgrade $fixture)) {
+        throw 'Verified active-goal renewal must remain installable'
+    }
+    $fixture.turnRenewal = $null
+    if (-not (Test-CanaryReadyForUpgrade $fixture)) {
+        throw 'An active goal without a handoff must remain installable'
+    }
+    $script:hash = 'new-native'
+    $script:installedHash = 'old-native'
+    $script:asarHash = 'unchanged-browser'
+    $script:installedAsarHash = 'unchanged-browser'
+    $repairProbe = [pscustomobject]@{
+        InstallationBlockedBy = @('CandidateCompanionFresh')
+        Flags = [pscustomobject]@{}
+    }
+    AssertReadyForInstall $repairProbe
+    $script:hash = 'old-native'
+    $repairRejected = $false
+    try { AssertReadyForInstall $repairProbe } catch { $repairRejected = $true }
+    if (-not $repairRejected) {
+        throw 'An unchanged native binary bypassed the companion freshness guard'
+    }
+    Write-Output 'TERMINAL_GOAL_MAINTENANCE_FIXTURE_PASS'
     return
 }
 
