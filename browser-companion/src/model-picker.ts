@@ -16,6 +16,9 @@ export async function withChatGptModelOptions<T>(
     let scope=menu.menu,rows=await readModelOptionRows(scope),expanded=false;
     let original:Awaited<ReturnType<typeof readChatGptEffortSnapshot>>|undefined;
     const usable=async()=>{
+      // A duplicated portal ID must not make rows from two picker instances
+      // appear to be one valid, owned model menu.
+      if(await scope.count()!==1)return false;
       if(!rows.some(row=>row.family))return false;
       if(!options.visible)return true;
       // The collapsed power picker keeps its rows mounted with layout boxes.

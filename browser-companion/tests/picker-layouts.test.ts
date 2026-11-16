@@ -73,3 +73,12 @@ test.skipIf(!native)("a selected unsupported family cannot be inferred from the 
  expect(failure).toMatchObject({code:"model_unavailable",phase:"model_identity",sendAccepted:false});
  expect(await page.evaluate(()=>[document.body.dataset.family,document.body.dataset.effort,document.body.dataset.sends])).toEqual(["7","2","0"]);
 },15_000);
+test.skipIf(!native)("duplicate model submenu portals fail closed without selecting or sending",async()=>{
+ await fixture("portal");
+ await page.evaluate(()=>document.querySelector('#model-toggle')!.addEventListener('click',()=>{
+   const duplicate=document.createElement('div');duplicate.id='model-submenu';duplicate.setAttribute('role','menu');document.body.append(duplicate);
+ }));
+ const failure=await detectChatGptAccountCapabilities(page).catch(error=>error);
+ expect(failure).toMatchObject({code:'selector_drift',phase:'model_options',sendAccepted:false});
+ expect(await page.evaluate(()=>document.body.dataset.sends)).toBe('0');
+},20_000);
