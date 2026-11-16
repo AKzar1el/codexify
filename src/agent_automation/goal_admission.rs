@@ -9,6 +9,22 @@ pub(crate) struct GoalAdmission {
 }
 
 impl GoalAdmission {
+    /// Reject aliases before assigning any task to an executor. Descriptor
+    /// existence and authenticated process identity must be checked separately
+    /// at dispatch; distinct paths alone are never proof of a live browser.
+    pub(crate) fn require_distinct_descriptors(descriptors: &[String]) -> Result<(), String> {
+        if descriptors.is_empty()
+            || descriptors.iter().any(|path| path.trim().is_empty())
+            || descriptors.iter().enumerate().any(|(index, path)| {
+                descriptors[..index]
+                    .iter()
+                    .any(|previous| previous.eq_ignore_ascii_case(path))
+            })
+        {
+            return Err("Browser lanes require nonempty, distinct descriptor paths".into());
+        }
+        Ok(())
+    }
     pub(crate) fn new(
         assigned_task_keys: Vec<String>,
         available_browser_slots: usize,
@@ -152,5 +168,18 @@ mod tests {
             admission.runnable_lane(&key(2), &[true, true, true]),
             Some(1)
         );
+    }
+
+    #[test]
+    fn descriptor_aliases_cannot_create_fake_browser_capacity() {
+        assert!(GoalAdmission::require_distinct_descriptors(&[]).is_err());
+        assert!(GoalAdmission::require_distinct_descriptors(&[" ".into()]).is_err());
+        assert!(GoalAdmission::require_distinct_descriptors(&["A".into(), "a".into()]).is_err());
+        assert!(GoalAdmission::require_distinct_descriptors(&[
+            "browser-1".into(),
+            "browser-2".into(),
+            "browser-3".into()
+        ])
+        .is_ok());
     }
 }
