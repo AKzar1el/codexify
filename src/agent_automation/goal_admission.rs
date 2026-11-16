@@ -38,18 +38,22 @@ impl GoalAdmission {
     }
 
     pub(crate) fn require_slot(&self, task_key: &str) -> Result<(), String> {
-        if self
-            .assigned_task_keys
-            .iter()
-            .any(|assigned| assigned == task_key)
-        {
+        if self.lane_index(task_key).is_some() {
             Ok(())
         } else {
             Err(format!(
-                "All {} browser goal slots are reserved. This goal stays configured or parked; +                 preserve existing state and activate only after assigning a verified browser slot.",
+                "All {} browser goal slots are reserved. This goal stays configured or parked; preserve existing state and activate only after assigning a verified browser slot.",
                 self.assigned_task_keys.len()
             ))
         }
+    }
+
+    /// Stable zero-based lane reservation. An unavailable executor must freeze
+    /// this reservation, not silently shift a goal to a different browser.
+    pub(crate) fn lane_index(&self, task_key: &str) -> Option<usize> {
+        self.assigned_task_keys
+            .iter()
+            .position(|key| key == task_key)
     }
 
     pub(crate) fn is_assigned(&self, task_key: &str) -> bool {
@@ -99,5 +103,18 @@ mod tests {
         assert!(GoalAdmission::new(vec!["legacy".into()], 1).is_err());
         assert!(GoalAdmission::new(vec!["A".repeat(64)], 1).is_err());
         assert!(GoalAdmission::new(vec![], 0).is_ok());
+    }
+
+    #[test]
+    fn lane_reservations_are_sticky_and_never_promote_waiting_goals() {
+        let admission = GoalAdmission::new(vec![key(3), key(1), key(2)], 3).unwrap();
+        assert_eq!(admission.lane_index(&key(3)), Some(0));
+        assert_eq!(admission.lane_index(&key(1)), Some(1));
+        assert_eq!(admission.lane_index(&key(2)), Some(2));
+        assert_eq!(admission.lane_index(&key(4)), None);
+        assert!(admission.require_slot(&key(4)).is_err());
+        // A failed executor must not cause the remaining goals to be
+        // reindexed or a waiting goal to be promoted.
+        assert_eq!(admission.lane_index(&key(2)), Some(2));
     }
 }
