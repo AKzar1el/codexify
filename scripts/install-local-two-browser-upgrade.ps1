@@ -9,6 +9,7 @@ param(
     [switch]$VerifyMaintenanceOnly,
     [switch]$SelfTest,
     [switch]$WaitForFleetQuiet,
+    [switch]$WaitForCanarySafe,
     [switch]$ForceMaintenance,
     [ValidateRange(1,120)][int]$WaitTimeoutMinutes = 60,
     [string]$CanaryTaskKey = '',
@@ -99,8 +100,7 @@ function AssertBrowserIdleBeforeShutdown() {
         throw "Browser is not idle: $($browser.state)"
     }
 }
-function AssertCanaryBelongsToPairedGoal([string]$key) {
-    if (-not $key) { return }
+function ReadVerifiedCanaryState([string]$key) {
     if ($key -notmatch '^[a-f0-9]{64}$') {
         throw 'Canary key must be one verified 64-character stable task identity'
     }
@@ -124,8 +124,43 @@ function AssertCanaryBelongsToPairedGoal([string]$key) {
         ($state.turnRenewal.handoff -and -not $state.turnRenewal.handoff.reportComplete)) {
         throw 'Canary is not a verified active goal with a reconciled renewal handoff'
     }
-    if ($state.action.status -in @('ambiguous','rate_limited','interference','failed','navigating','sending','generating')) {
-        throw 'Canary has an unresolved in-flight or delivery-failure action'
+    return $state
+}
+function AssertCanaryBelongsToPairedGoal([string]$key) {
+    if (-not $key) { return }
+    $state = ReadVerifiedCanaryState $key
+    $actionStatus = [string]$state.action.status
+    if ($actionStatus -notin @('idle','queued') -or
+        ($actionStatus -eq 'queued' -and $state.action.sendAccepted -eq $true)) {
+        throw "Canary has an unresolved in-flight or delivery-failure action: $actionStatus"
+    }
+}
+function WaitForCanaryWindow([string]$key,[int]$maximumMinutes) {
+    # Only wait for actions that might finish normally. An accepted-but-ambiguous
+    # Send or failed action is NOT a maintenance window and is never retried.
+    $deadline = [DateTimeOffset]::UtcNow.AddMinutes($maximumMinutes)
+    $nextReport = [DateTimeOffset]::MinValue
+    while ($true) {
+        $state = ReadVerifiedCanaryState $key
+        $actionStatus = [string]$state.action.status
+        if ($actionStatus -in @('idle','queued')) {
+            AssertCanaryBelongsToPairedGoal $key
+            Write-Host 'CANARY_SAFE_WINDOW_CONFIRMED'
+            return
+        }
+        if ($actionStatus -notin @('navigating','sending','generating')) {
+            throw "Canary has an unresolved delivery failure or unsafe state: $actionStatus"
+        }
+        $now = [DateTimeOffset]::UtcNow
+        if ($now -ge $deadline) {
+            throw "Canary remained in flight for $maximumMinutes minute(s); no installation started"
+        }
+        if ($now -ge $nextReport) {
+            Write-Host "WAITING_FOR_CANARY_SAFE action=$actionStatus"
+            $nextReport = $now.AddSeconds(30)
+        }
+        $remaining = [int][Math]::Ceiling(($deadline - $now).TotalSeconds)
+        Start-Sleep -Seconds ([Math]::Min(10,[Math]::Max(1,$remaining)))
     }
 }
 function StageFile([string]$source,[string]$destination) {
@@ -600,6 +635,22 @@ function TestTransactionWithoutService {
         $rejected = $false
         try { AssertCanaryBelongsToPairedGoal $testKey } catch { $rejected = $true }
         if (-not $rejected) { throw 'Ambiguous accepted action was allowed as a canary' }
+        $state.action.status = 'queued'
+        $state.action.sendAccepted = $false
+        [IO.File]::WriteAllText($stateFile,($state | ConvertTo-Json -Depth 8))
+        AssertCanaryBelongsToPairedGoal $testKey
+        $state.action.sendAccepted = $true
+        [IO.File]::WriteAllText($stateFile,($state | ConvertTo-Json -Depth 8))
+        $rejected = $false
+        try { AssertCanaryBelongsToPairedGoal $testKey } catch { $rejected = $true }
+        if (-not $rejected) { throw 'Queued action with accepted Send was allowed as a canary' }
+        $state.action.status = 'stalled'
+        $state.action.sendAccepted = $false
+        [IO.File]::WriteAllText($stateFile,($state | ConvertTo-Json -Depth 8))
+        $rejected = $false
+        try { AssertCanaryBelongsToPairedGoal $testKey } catch { $rejected = $true }
+        if (-not $rejected) { throw 'Unreconciled stalled action was allowed as a canary' }
+        Write-Output 'TEST_CANARY_QUEUED_ACCEPTED_AND_STALLED_GUARDS=PASS'
         $productive = [pscustomobject]@{state='ready';authenticated=$true;activeActionId='accepted-action'}
         if (-not (PostRestartBrowserReady $productive)) {
             throw 'Post-restart verification rejected an authenticated browser doing productive work'
@@ -623,6 +674,10 @@ if ($WaitForFleetQuiet -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenan
 }
 if ($ForceMaintenance -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet)) {
     throw 'ForceMaintenance requires Apply; it cannot be combined with waiting or diagnostics'
+}
+if ($WaitForCanarySafe -and (-not $Apply -or -not $ForceMaintenance -or -not $CanaryTaskKey -or
+    $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet)) {
+    throw 'WaitForCanarySafe requires Apply, ForceMaintenance and an explicit CanaryTaskKey'
 }
 if ($SelfTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
@@ -676,7 +731,12 @@ AssertReadyForInstall $probe
 if ($ForceMaintenance) {
     Write-Warning 'FORCE_MAINTENANCE: owner-authorized interruption of active Codexify workers; tool calls and browser actions may be incomplete. Do not replay uncertain accepted Sends.'
 }
-AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+if ($WaitForCanarySafe) {
+    WaitForCanaryWindow $CanaryTaskKey $WaitTimeoutMinutes
+    AssertReadyForInstall (Preflight)
+} else {
+    AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+}
 if ($CanaryTaskKey -and $CanaryTaskKey -notmatch '^[a-f0-9]{64}$') {
     throw 'Canary key must be the exact verified lowercase stable task key'
 }
@@ -696,6 +756,7 @@ if (Test-Path -LiteralPath $backup) { throw "Refusing to overwrite backup $backu
 New-Item -ItemType Directory -Path $backup -Force | Out-Null
 $replaced = $false
 $serviceStopped = $false
+$browserStopAttempted = $false
 try {
     StageFile $target $previous
     StageFile $asar $previousAsar
@@ -710,6 +771,9 @@ try {
     AssertInstalledMatchesBackup
     Report 'backed_up' 'Existing native binary, browser app.asar and configuration preserved'
     AssertBrowserIdleBeforeShutdown
+    if ($WaitForCanarySafe) {
+        WaitForCanaryWindow $CanaryTaskKey $WaitTimeoutMinutes
+    }
     AssertReadyForInstall (Preflight)
     if ($CanaryTaskKey) {
         # Never route an existing task to a new browser after its state became
@@ -727,9 +791,11 @@ try {
         $serviceStopped = $true
         & $target service disable
         CheckExit 'Stop scheduled service'
+        $browserStopAttempted = $true
         & $target browser stop-for-restart
         CheckExit 'Prepare browser for service restart'
     } else {
+        $browserStopAttempted = $true
         & $target browser stop-for-restart
         CheckExit 'Prepare browser for service restart'
         $serviceStopped = $true
@@ -744,6 +810,11 @@ try {
         [string]::Equals($_.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase)
     })
     if ($still.Count) { throw 'Installed executable still in use; refusing to replace it' }
+    if ($CanaryTaskKey) {
+        # The native supervisor is now stopped. Refuse to migrate a canary
+        # whose state became in-flight during the shutdown race.
+        AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+    }
     $replaced = $true
     if ($activationConfigOnly) {
         [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
@@ -796,7 +867,7 @@ try {
     }
     if ($serviceStopped) {
         try { & $target service enable; & $target service wait-ready --port $port --timeout-ms 120000; EnsureBrowserReady } catch {}
-    } else {
+    } elseif ($browserStopAttempted) {
         # The prior service is still running, but stop-for-restart might have
         # stopped the browser before the failure was detected.
         try { & $target browser start | Out-Null } catch {}

@@ -408,3 +408,31 @@ Goal events / hourly wake-ups
   authentication/account/Send gate checks and fresh state revalidation,
   and supervisor-first shutdown ordering. All existing race,
   fleet-wait, optional secondary, and atomic rollback tests were re-run.
+
+## Race between selected canary activity and activation (2026-11-16)
+
+- An owner-run elevated `-Apply -ForceMaintenance -CanaryTaskKey <GSC key>`
+  safely aborted **before backup or service shutdown** with `Canary has an
+  unresolved in-flight or delivery-failure action`. The GSC goal had been
+  idle in earlier preflight, but its hourly runtime resumed work before the
+  owner started the installer. A subsequent read-only inspection observed an
+  active, verified GSC goal with `queued`/`sendAccepted=false`, no unreconciled
+  handoff and a healthy service. The refusal was a legitimate timing race,
+  not evidence that account identity or shared Send admission failed.
+- `-Apply -ForceMaintenance -WaitForCanarySafe -WaitTimeoutMinutes 20
+  -CanaryTaskKey <exact key>` now passively polls that **one** goal until it
+  has a verified `idle` or unsent `queued` action, without interacting with
+  any ChatGPT tab. Only `navigating`, `sending` and `generating` are waitable.
+  `ambiguous`, `failed`, `rate_limited`, `interference`, `stalled`, `cancelled`,
+  unknown states, unverified ownership or unfinished renewal handoffs abort
+  promptly; the wait has an absolute deadline. Neither accepted Sends nor
+  action records are cleared/replayed, and existing readiness checks remain.
+- The canary safety check repeats **after file staging**, with another full
+  preflight, and finally **after the native service has stopped**, before
+  installing the new config. A race detected that late causes restoration of
+  the original service without applying canary routing. Pre-stop failures no
+  longer issue an unnecessary `browser start` against a healthy primary.
+- `scripts/test-two-browser-canary-safe-wait.ps1` covers transient status
+  recovery, hard failure states, unreconciled ownership, unsafe queued Sends,
+  bounded timeout and source wiring of the three canary checks. No testing
+  directly changes live automation states or initiates a Send.
