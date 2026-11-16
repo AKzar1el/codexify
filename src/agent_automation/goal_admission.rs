@@ -1,5 +1,11 @@
 use std::collections::HashSet;
 
+// Windows accepts either separator and case-insensitive path aliases. This
+// lexical check is not a replacement for trusted canonical-path probing.
+fn normalized_path_label(path: &str) -> String {
+    path.trim().replace('\\', "/").to_lowercase()
+}
+
 /// A verified browser executor must have its own process and profile.
 /// Account identity is intentionally allowed to match across lanes: the
 /// authenticated user can legitimately run multiple independent browsers.
@@ -38,7 +44,7 @@ impl GoalAdmission {
                 || executor.account_identity.trim().is_empty()
                 || executor.profile_path.trim().is_empty()
                 || !processes.insert(executor.process_id)
-                || !profiles.insert(executor.profile_path.trim().to_lowercase())
+                || !profiles.insert(normalized_path_label(&executor.profile_path))
             {
                 return Err(
                     "Browser executors require distinct authenticated processes and profiles"
@@ -57,7 +63,7 @@ impl GoalAdmission {
             || descriptors.iter().enumerate().any(|(index, path)| {
                 descriptors[..index]
                     .iter()
-                    .any(|previous| previous.trim().eq_ignore_ascii_case(path.trim()))
+                    .any(|previous| normalized_path_label(previous) == normalized_path_label(path))
             })
         {
             return Err("Browser lanes require nonempty, distinct descriptor paths".into());
@@ -217,6 +223,13 @@ mod tests {
         assert!(GoalAdmission::require_distinct_descriptors(&[" A ".into(), "a".into()]).is_err());
         assert!(
             GoalAdmission::require_distinct_descriptors(&[
+                "C:\\profiles\\one\\descriptor.json".into(),
+                "c:/PROFILES/one/descriptor.json".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
                 "browser-1".into(),
                 "browser-2".into(),
                 "browser-3".into()
@@ -251,6 +264,12 @@ mod tests {
         duplicate_profile.profile_path = " C:/PROFILES/ONE ".into();
         assert!(
             GoalAdmission::require_independent_executors(&[first.clone(), duplicate_profile])
+                .is_err()
+        );
+        let mut separator_alias = second.clone();
+        separator_alias.profile_path = "C:\\profiles\\ONE".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), separator_alias])
                 .is_err()
         );
         let mut unauthenticated = second;
