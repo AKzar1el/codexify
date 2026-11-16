@@ -564,3 +564,53 @@ Goal events / hourly wake-ups
   selectors, tab churn, real-browser checks and accepted-Send/handoff safety.
   Each must preserve the other's working files and avoid competing git
   checkouts or parallel production restarts.
+
+## Independent lane-2 crash watchdog (2026-11-16)
+
+The two-browser pilot uses a separate, per-user Windows Scheduled Task,
+`Codexify-Lane2-Companion-Watchdog`, to restore a **dead** secondary companion.
+It deliberately does **not** modify native Codexify, its task schedule, any
+ChatGPT conversation/goal/Send receipt, or the user’s existing Chrome profiles.
+It does not attempt to reconnect an action by sending the prompt again.
+
+- Implementation: `scripts/watch-lane2-companion.ps1` checks once per run.
+  `scripts/install-lane2-companion-watchdog.ps1 -Apply` pins a verified copy at
+  `~/.codexify/browser-pool/watchdogs/lane2.ps1` and registers an interactive,
+  limited-privilege Windows task every minute and at sign-in. The pinned copy
+  survives branch changes and ordinary cleanup of the repository. Updating
+  source code alone does not deploy a changed watchdog; explicitly rerun its
+  installer after tests.
+- Guards: native service must be healthy/running and the two configured task
+  keys distinct; primary companion must be authenticated with a valid exact
+  executable, build and shared Send gate; no other unrecognized companion may
+  exist, no secondary profile Chrome process may be active, and the provider
+  Send gate must not be held. A PID reused by another executable is **not**
+  accepted as the missing secondary companion. A live but unhealthy exact
+  companion is **not** killed/replaced automatically.
+- Resource/crash loop admission: minimum 1.5 GiB free RAM; no more than
+  3 restart attempts in an hour and at least 90 seconds between attempts.
+  A failing or ambiguous startup is reported without another immediate retry.
+- Recovery: relaunch only the already-installed browser companion using the
+  original secondary isolated profile and shared provider Send gate; require
+  authenticated health and the exact same account/gate fingerprints as primary
+  before reporting `restored`. Do not clone profiles, re-login automatically,
+  bypass provider quotas, or add runnable goals.
+- Observability: `~/.codexify/browser-lane2-canary/watchdog-state.json`
+  contains the last result and recent restart timestamps (no credentials).
+  Inspect `Get-ScheduledTaskInfo -TaskName 'Codexify-Lane2-Companion-Watchdog'`.
+  The scheduled action is hidden and launched by Windows Task Scheduler rather
+  than as a child of the native service. `-SelfTest` checks fail-closed helper
+  behavior; omitting `-Apply` runs a read-only production preflight.
+- Production evidence: on 2026-11-16 the secondary companion and descriptor
+  had disappeared with no profile process. The new watchdog restored the
+  existing profile and authenticated shared gate without a Send. Repeated
+  Scheduled Task checks returned result `0` and `healthy` without starting a
+  duplicate browser. The task ran under the current Windows account without
+  elevation. Full crash injection/automatic-restart-through-a-second-failure
+  has **not** been tested on the live provider.
+- Explicit limit: a restored *browser process* does not prove recovery of an
+  ambiguous accepted Send or a handoff that has not completed. Those remain
+  frozen until genuine completion evidence is available; no watchdog script
+  changes their status. The new watchdog covers **lane 2 only**, not the native
+  primary executor, and must be generalized/tested before three-to-five lanes
+  exist. The one-admitted-runnable-goal-per-verified-browser rule remains.
