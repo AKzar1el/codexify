@@ -127,6 +127,35 @@ mod tests {
             Some((1, "b1"))
         );
     }
+
+    #[test]
+    fn recovery_preserves_unassigned_and_ambiguous_handoffs_in_queue() {
+        // These entries model persisted, unresolved work after a restart.
+        // Only the explicitly reserved task may resume on its exact lane.
+        let mut queue = VecDeque::from([
+            (None, "legacy-accepted-send"),
+            (None, "uncertain-handoff"),
+            (Some(0), "verified-primary"),
+            (Some(1), "verified-secondary"),
+        ]);
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 0, &[true, false], |entry| entry.0),
+            Some((Some(0), "verified-primary"))
+        );
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 1, &[true, false], |entry| entry.0),
+            None
+        );
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].1, "legacy-accepted-send");
+        assert_eq!(queue[1].1, "uncertain-handoff");
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 1, &[true, true], |entry| entry.0),
+            Some((Some(1), "verified-secondary"))
+        );
+        assert_eq!(queue[0].1, "legacy-accepted-send");
+        assert_eq!(queue[1].1, "uncertain-handoff");
+    }
     #[test]
     fn pilot_fences_old_goal_states_on_both_lanes_without_touching_their_records() {
         let queue = VecDeque::from([
