@@ -436,3 +436,52 @@ Goal events / hourly wake-ups
   recovery, hard failure states, unreconciled ownership, unsafe queued Sends,
   bounded timeout and source wiring of the three canary checks. No testing
   directly changes live automation states or initiates a Send.
+
+## Repeated blank tab creation during blocked conversation loads
+
+- Root cause: `ChromeSingleWindowSurface.selectConversation` opened a new
+  background tab before `navigatePage` checked the shared ChatGPT load
+  cooldown. A rejected navigation closed the blank tab in its catch handler.
+  The automatic handoff recovery scanner repeated this pattern, causing
+  visible tab open/close flicker and needless Chrome targets.
+- `assertConversationLoadAvailableBeforeTab` uses the existing shared budget
+  and honors explicit manual cooldown bypass. The original guard inside
+  `navigatePage` remains authoritative after the asynchronous tab creation;
+  there is no additional Send or navigation allowance. A rejected retry now
+  leaves the selected page and browser target count unchanged.
+- `browser-companion/tests/chrome-surface.test.ts` verifies suppressed blank
+  targets, unchanged selected tab, same-conversation reuse, and allowed
+  explicit manual navigation. Browser surface/navigation/renewal tests passed
+  34 cases (4 real-Chrome opt-in tests were skipped), and TypeScript checked.
+- The browser-only fix is compiled and staged into the existing candidate
+  `browser-companion/release/win-unpacked/resources/app.asar`, leaving the
+  installed production ASAR and Chrome profiles unchanged. The original
+  candidate is backed up under `browser-companion/artifacts/candidate-backups/`.
+  `browser-companion/scripts/stage-tab-churn-asar.cjs` restores the existing
+  packaged dependencies then replaces only the new compiled `dist/main.js`.
+- `scripts/apply-tab-churn-fix.ps1` provides a read-only preflight by default
+  and an opt-in independent elevated `-Apply -ForceMaintenance` operation.
+  It checks both authenticated companions and their shared Send gate, requires
+  idle secondary, stops only the verified secondary process tree, invokes the
+  previously tested rollback-capable native installer, and relaunches the
+  secondary with its existing separate profile. This does **not** activate
+  lane-2 task routing or automatically reconcile accepted handoffs.
+
+## Actual scheduling versus requested two-worker round robin
+
+- Current native code has **one shared queue**, a primary consumer, and an
+  optional **single-key canary** consumer. Only the explicitly assigned goal's
+  offline actions may run on the second companion; creation, pairing and
+  turn renewal remain primary. The deployed config has no canary key, so
+  lane 2 is idle even when its browser is authenticated.
+- A goal stays active across multiple ChatGPT turns, while each eligible
+  queued action runs on one lane at a time. The existing code does not yet
+  provide two general-purpose fair work pools or automatically rotate all
+  ten revenue goals between them. Such routing must first preserve each
+  conversation's pairing and accepted-Send ownership, and require a live
+  two-lane concurrency test before enabling broad production distribution.
+- A fresh non-revenue goal (revision 1) was created in the reliability-lab
+  conversation using `goal_set`, but genuine pairing is absent; it is not
+  eligible as a canary yet. Creating an eleventh scheduled ChatGPT automation
+  was rejected with `too_many_active_automations` (10/10 slots occupied).
+  No revenue schedule or pairing state was modified to manufacture capacity.

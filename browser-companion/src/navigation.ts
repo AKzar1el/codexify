@@ -86,6 +86,16 @@ export function conversationLoadAvailableAt(page:Page,url:string):number|null {
   return at>Date.now()?at:null;
 }
 
+/** Reject a forbidden conversation load before opening a disposable Chrome tab.
+ * navigatePage still enforces this budget after tab selection, so concurrent
+ * requests cannot bypass the shared rate limit during the async gap.
+ */
+export function assertConversationLoadAvailableBeforeTab(page:Page,url:string):void {
+  if(cooldownBypass.getStore())return;
+  const at=conversationLoadAvailableAt(page,url);
+  if(at!==null)throw new ConversationCooldownError(at);
+}
+
 export function recordConversationUnavailable(page:Page):void {
   const budget=navigationBudget(page.context());
   // Repeated health checks of the same failure must not postpone recovery.

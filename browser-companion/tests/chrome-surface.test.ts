@@ -182,6 +182,21 @@ test("each conversation has a persistent tab and visiting another does not navig
   expect((b as unknown as FakePage).closed).toBeFalse();
 });
 
+test("a cooled-down goal retry never creates and closes a flashing blank tab", async()=>{
+  const {surface,fake}=await createSurface();
+  const a=await openGoal(surface,'https://chatgpt.com/c/goal-a');
+  expect(fake.tabs).toHaveLength(2);
+  const created=fake.createdTargets.length;
+  await expect(surface.selectConversation('https://chatgpt.com/c/goal-b')).rejects.toThrow();
+  expect(fake.createdTargets).toHaveLength(created);
+  expect(fake.tabs).toHaveLength(2);
+  expect(await surface.page()).toBe(a);
+  expect(await surface.selectConversation('https://chatgpt.com/c/goal-a')).toBe(a);
+  const b=await openGoal(surface,'https://chatgpt.com/c/goal-b');
+  expect(b).not.toBe(a);
+  expect(fake.tabs).toHaveLength(3);
+});
+
 test("new-chat preparation reuses only its own draft tab, never another goal",async()=>{
   const {surface,fake}=await createSurface();
   const goal=await openGoal(surface,'https://chatgpt.com/c/revenue');
