@@ -41,6 +41,38 @@ try { AssertReadyForInstall $forced } catch {
 if (-not $rejected) { throw 'Non-forced mode ignored a closed FleetQuiet gate' }
 Write-Output 'PASS ordinary mode still rejects active workers'
 
+# A selected, already paired canary can be activated during owner-authorized
+# maintenance, but the matching cross-process Send admission gate is mandatory.
+$ForceMaintenance = $true
+$CanaryTaskKey = 'a' * 64
+$flags=[pscustomobject]@{
+    CanaryTaskKeyValid=$true
+    SecondaryAuthenticatedIdle=$true
+    DistinctBrowserProcesses=$true
+    SameVerifiedAccount=$true
+    BothCompanionsGateEnabledAndMatching=$true
+}
+$canary=[pscustomobject]@{
+    ReadyForGuardedMaintenance=$false
+    InstallationBlockedBy=@('FleetQuiet','PrimaryAuthenticatedIdle')
+    Flags=$flags
+}
+AssertReadyForInstall $canary
+Write-Output 'PASS forced maintenance allows a fully verified selected canary'
+foreach($flag in @('CanaryTaskKeyValid','SecondaryAuthenticatedIdle',
+                   'DistinctBrowserProcesses','SameVerifiedAccount',
+                   'BothCompanionsGateEnabledAndMatching')) {
+    $flags.$flag=$false
+    $rejected=$false
+    try { AssertReadyForInstall $canary } catch {
+        if ($_.Exception.Message -match [regex]::Escape($flag)) { $rejected=$true } else { throw }
+    }
+    if (-not $rejected) { throw "Forced canary bypassed safety proof: $flag" }
+    $flags.$flag=$true
+    Write-Output "PASS forced canary rejects missing $flag"
+}
+$CanaryTaskKey = ''
+
 # There is deliberately no executable at this path; force must not invoke it.
 $target = Join-Path $env:TEMP 'nonexistent-codexify-installer-test.exe'
 $ForceMaintenance = $true
@@ -57,8 +89,17 @@ $source=Get-Content -LiteralPath $path -Raw
 if ($source -notmatch '(?s)if \(\$ForceMaintenance\) \{\s*# Stop the supervisor FIRST.*?& \$target service disable.*?& \$target browser stop-for-restart') {
     throw 'Forced maintenance must disable the supervisor before retiring browser'
 }
-if ($source -notmatch '(?s)if \(\$ForceMaintenance -and .*?-or \$CanaryTaskKey\)\)') {
-    throw 'Forced mode must disallow canary activation and incompatible switches'
+if ($source -notmatch '(?s)if \(\$ForceMaintenance -and .*?-or \$WaitForFleetQuiet\)\)') {
+    throw 'Forced mode must disallow incompatible switches'
 }
-Write-Output 'PASS forced shutdown ordering and parameter restrictions remain enforced'
+if ($source -notmatch '(?s)AssertReadyForInstall \(Preflight\)\s*if \(\$CanaryTaskKey\) \{.*?AssertCanaryBelongsToPairedGoal \$CanaryTaskKey\s*AssertTwoBrowsersGuarded\s*\}\s*Report .stopping.') {
+    throw 'A selected canary must be revalidated immediately before service shutdown'
+}
+if ($source -notmatch '(?s)if \(\$activationConfigOnly\) \{\s*\[IO.File\]::Replace\(\$configStage, \$configFile, \$failedConfig, \$true\).*?\} else \{\s*\[IO.File\]::Replace\(\$stage, \$target, \$failed, \$true\)') {
+    throw 'An unchanged native/browser release must activate the canary with a config-only transaction'
+}
+if ($source -notmatch '(?s)\[IO.File\]::Replace\(\$restoreConfig, \$configFile.*?if \(-not \$activationConfigOnly\) \{.*?\[IO.File\]::Replace\(\$restoreAsar, \$asar') {
+    throw 'Config-only rollback must avoid replacing the in-use browser bundle'
+}
+Write-Output 'PASS forced shutdown, canary revalidation and parameter restrictions remain enforced'
 Write-Output 'FORCE_MAINTENANCE_GUARDS_PASS'

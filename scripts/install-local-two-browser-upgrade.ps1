@@ -80,7 +80,7 @@ function AssertReadyForInstall($probe) {
         throw ('Installation gate is closed: ' + ($blocked -join ', '))
     }
     if ($CanaryTaskKey) {
-        foreach ($name in @('CanaryTaskKeyValid','SecondaryAuthenticatedIdle','DistinctBrowserProcesses','SameVerifiedAccount')) {
+        foreach ($name in @('CanaryTaskKeyValid','SecondaryAuthenticatedIdle','DistinctBrowserProcesses','SameVerifiedAccount','BothCompanionsGateEnabledAndMatching')) {
             if (-not $probe.Flags.$name) {
                 throw "Canary prerequisite is missing: $name"
             }
@@ -543,6 +543,27 @@ function TestTransactionWithoutService {
                 throw 'Rollback checksum mismatch in test fixture'
             }
         }
+        # A live secondary holds the installed browser bundle open. Canary
+        # activation on an identical build must touch only the configuration.
+        $nativeBefore = (Get-FileHash (Join-Path $fixture 'native.installed') -Algorithm SHA256).Hash
+        $browserBefore = (Get-FileHash (Join-Path $fixture 'browser.installed') -Algorithm SHA256).Hash
+        $activeConfig = Join-Path $fixture 'config.installed'
+        $configOnlyStage = Join-Path $fixture 'canary-config.stage'
+        [IO.File]::WriteAllText($configOnlyStage,'canary-enabled')
+        [IO.File]::Replace($configOnlyStage,$activeConfig,(Join-Path $fixture 'canary-config.replaced'),$true)
+        if ([IO.File]::ReadAllText($activeConfig) -ne 'canary-enabled' -or
+            (Get-FileHash (Join-Path $fixture 'native.installed') -Algorithm SHA256).Hash -ne $nativeBefore -or
+            (Get-FileHash (Join-Path $fixture 'browser.installed') -Algorithm SHA256).Hash -ne $browserBefore) {
+            throw 'Config-only canary activation changed installed native or browser files'
+        }
+        $configOnlyRestore = Join-Path $fixture 'canary-config.restore'
+        StageFile (Join-Path $fixture 'config.backup') $configOnlyRestore
+        [IO.File]::Replace($configOnlyRestore,$activeConfig,(Join-Path $fixture 'canary-config.failed'),$true)
+        if ((Get-FileHash $activeConfig -Algorithm SHA256).Hash -ne
+            (Get-FileHash (Join-Path $fixture 'config.backup') -Algorithm SHA256).Hash) {
+            throw 'Config-only canary rollback failed its checksum check'
+        }
+        Write-Output 'TEST_CONFIG_ONLY_CANARY_AND_ROLLBACK=PASS'
         $originalConfig = (Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash
         PrepareConfig (Join-Path $fixture 'preview.json')
         if ((Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash -ne $originalConfig) {
@@ -600,8 +621,8 @@ function TestTransactionWithoutService {
 if ($WaitForFleetQuiet -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest)) {
     throw 'WaitForFleetQuiet is only valid with Apply, outside PreflightOnly, VerifyMaintenanceOnly and SelfTest'
 }
-if ($ForceMaintenance -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet -or $CanaryTaskKey)) {
-    throw 'ForceMaintenance requires Apply alone; it cannot be combined with waiting, diagnostics, or canary activation'
+if ($ForceMaintenance -and (-not $Apply -or $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet)) {
+    throw 'ForceMaintenance requires Apply; it cannot be combined with waiting or diagnostics'
 }
 if ($SelfTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
@@ -618,6 +639,11 @@ $probe = Preflight
 $hash = (Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash
 $installedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
 $asarHash = (Get-FileHash -LiteralPath $builtAsar -Algorithm SHA256).Hash
+$installedAsarHash = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash
+# Activating a canary on an already-upgraded release must not replace app.asar
+# while the independently launched second browser still has that file open.
+$activationConfigOnly = [bool]($CanaryTaskKey -and
+    $hash -eq $installedHash -and $asarHash -eq $installedAsarHash)
 if ($PreflightOnly -or (-not $Apply -and -not $VerifyMaintenanceOnly)) {
     Write-Output (ConvertTo-Json ([ordered]@{
         ReadOnly = $true
@@ -685,6 +711,12 @@ try {
     Report 'backed_up' 'Existing native binary, browser app.asar and configuration preserved'
     AssertBrowserIdleBeforeShutdown
     AssertReadyForInstall (Preflight)
+    if ($CanaryTaskKey) {
+        # Never route an existing task to a new browser after its state became
+        # ambiguous while the release files were staged.
+        AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+        AssertTwoBrowsersGuarded
+    }
     Report 'stopping' ('Guarded native/browser/config update; forced_worker_interruption=' + [bool]$ForceMaintenance)
     # Set this before running disable: Task Scheduler can stop the service
     # successfully but the command may still fail to return a receipt.
@@ -713,9 +745,14 @@ try {
     })
     if ($still.Count) { throw 'Installed executable still in use; refusing to replace it' }
     $replaced = $true
-    [IO.File]::Replace($stage, $target, $failed, $true)
-    [IO.File]::Replace($asarStage, $asar, $failedAsar, $true)
-    [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
+    if ($activationConfigOnly) {
+        [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
+        Report 'config_only' 'Activated a selected canary without replacing in-use native or browser runtime files'
+    } else {
+        [IO.File]::Replace($stage, $target, $failed, $true)
+        [IO.File]::Replace($asarStage, $asar, $failedAsar, $true)
+        [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
+    }
     if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $hash -or
         (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash -ne $asarHash) {
         throw 'Installed native or browser checksum mismatch'
@@ -736,21 +773,23 @@ try {
             WaitForOldListener
             WaitForVerifiedServiceProcessesExit
             $restoreConfig = Join-Path (Split-Path $configFile -Parent) ".codexify-restore-$runId.json"
-            $restoreAsar = Join-Path (Split-Path $asar -Parent) ".codexify-restore-$runId.asar"
-            $restoreBinary = Join-Path (Split-Path $target -Parent) ".codexify-restore-$runId.exe"
             StageFile $previousConfig $restoreConfig
-            StageFile $previousAsar $restoreAsar
-            StageFile $previous $restoreBinary
             [IO.File]::Replace($restoreConfig, $configFile, (Join-Path $backup 'failed-restore-config.json'), $true)
-            [IO.File]::Replace($restoreAsar, $asar, (Join-Path $backup 'failed-restore-app.asar'), $true)
-            [IO.File]::Replace($restoreBinary, $target, $failed, $true)
+            if (-not $activationConfigOnly) {
+                $restoreAsar = Join-Path (Split-Path $asar -Parent) ".codexify-restore-$runId.asar"
+                $restoreBinary = Join-Path (Split-Path $target -Parent) ".codexify-restore-$runId.exe"
+                StageFile $previousAsar $restoreAsar
+                StageFile $previous $restoreBinary
+                [IO.File]::Replace($restoreAsar, $asar, (Join-Path $backup 'failed-restore-app.asar'), $true)
+                [IO.File]::Replace($restoreBinary, $target, $failed, $true)
+            }
             foreach ($pair in @(@($previousConfig,$configFile),@($previousAsar,$asar),@($previous,$target))) {
                 if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne
                     (Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash) {
                     throw 'Rollback file checksum did not match its backup'
                 }
             }
-            Report 'rolled_back' 'Original native binary, browser runtime and config restored'
+            Report 'rolled_back' 'Original native binary, browser runtime and config verified or restored'
         } catch {
             Report 'rollback_blocked' $_.Exception.Message
         }

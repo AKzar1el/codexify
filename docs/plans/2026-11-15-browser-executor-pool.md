@@ -374,8 +374,21 @@ Goal events / hourly wake-ups
   `PrimaryAuthenticatedIdle` installation preflight gates; it does not waive
   elevation, candidate native/browser freshness, runtime compatibility,
   scheduled service presence, or the `SharedGateNotHeld` gate. An already-held
-  shared Send lock remains a hard stop even in forced mode. Canary activation
-  is intentionally disallowed during the force upgrade.
+  shared Send lock remains a hard stop even in forced mode. With an explicit
+  `-CanaryTaskKey` owner selection, force maintenance can now activate exactly
+  one canary, but only when the secondary is authenticated and idle, uses a
+  distinct live process on the same verified account, and advertises the
+  identical cross-process Send gate. The canary's persisted ownership, active
+  goal, reconciled handoff, and non-ambiguous action state are checked both
+  before staging and immediately before service shutdown. A missing or
+  mismatched condition aborts without weakening the force-install guard.
+- When the native candidate and browser `app.asar` already have the same
+  SHA-256 as the installed runtime, canary activation updates **only the
+  configuration**, using a staged atomic replace after the service is stopped.
+  This avoids replacing an `app.asar` still open in the independent secondary
+  companion. Its rollback restores only the saved configuration and verifies
+  that the untouched native and browser checksums still match the backups.
+  A full three-file transaction remains for genuine runtime upgrades.
 - Force mode does not probe the primary for idle before shutdown. Instead,
   after backups, staged checksums, and another complete (force-filtered)
   preflight, it disables the scheduled service **first**, then stops the
@@ -391,6 +404,7 @@ Goal events / hourly wake-ups
   interruption, **not** an automatic worker-resume or two-lane activation.
 - Offline tests in `scripts/test-two-browser-force-maintenance.ps1` verify
   the two permitted gate exceptions, refusal of each representative hard
-  gate, normal-mode strictness, primary-idle probe handling, canary parameter
-  restrictions, and supervisor-first shutdown ordering. All existing race,
+  gate, normal-mode strictness, primary-idle probe handling, selected canary
+  authentication/account/Send gate checks and fresh state revalidation,
+  and supervisor-first shutdown ordering. All existing race,
   fleet-wait, optional secondary, and atomic rollback tests were re-run.
