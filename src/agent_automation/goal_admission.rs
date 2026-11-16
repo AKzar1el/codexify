@@ -18,7 +18,7 @@ impl GoalAdmission {
             || descriptors.iter().enumerate().any(|(index, path)| {
                 descriptors[..index]
                     .iter()
-                    .any(|previous| previous.eq_ignore_ascii_case(path))
+                    .any(|previous| previous.trim().eq_ignore_ascii_case(path.trim()))
             })
         {
             return Err("Browser lanes require nonempty, distinct descriptor paths".into());
@@ -175,6 +175,7 @@ mod tests {
         assert!(GoalAdmission::require_distinct_descriptors(&[]).is_err());
         assert!(GoalAdmission::require_distinct_descriptors(&[" ".into()]).is_err());
         assert!(GoalAdmission::require_distinct_descriptors(&["A".into(), "a".into()]).is_err());
+        assert!(GoalAdmission::require_distinct_descriptors(&[" A ".into(), "a".into()]).is_err());
         assert!(GoalAdmission::require_distinct_descriptors(&[
             "browser-1".into(),
             "browser-2".into(),
