@@ -1,5 +1,18 @@
 use std::collections::HashSet;
 
+/// A verified browser executor must have its own process and profile.
+/// Account identity is intentionally allowed to match across lanes: the
+/// authenticated user can legitimately run multiple independent browsers.
+/// This is evidence supplied by a trusted runtime probe, not a self-attested
+/// descriptor from the queued task.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedBrowserExecutor {
+    pub(crate) process_id: u32,
+    pub(crate) profile_path: String,
+    pub(crate) account_identity: String,
+    pub(crate) authenticated: bool,
+}
+
 /// Admission slots are bound to browser executors, not to the number of
 /// persisted goal records. Legacy active records may be parked without losing
 /// their accepted Send or handoff evidence.
@@ -9,6 +22,32 @@ pub(crate) struct GoalAdmission {
 }
 
 impl GoalAdmission {
+    /// Reject missing authentication and shared process/profile resources.
+    /// This check must be repeated against fresh runtime probes before Send.
+    pub(crate) fn require_independent_executors(
+        executors: &[VerifiedBrowserExecutor],
+    ) -> Result<(), String> {
+        if executors.is_empty() {
+            return Err("No verified browser executors".into());
+        }
+        let mut processes = HashSet::new();
+        let mut profiles = HashSet::new();
+        for executor in executors {
+            if !executor.authenticated
+                || executor.process_id == 0
+                || executor.account_identity.trim().is_empty()
+                || executor.profile_path.trim().is_empty()
+                || !processes.insert(executor.process_id)
+                || !profiles.insert(executor.profile_path.trim().to_lowercase())
+            {
+                return Err(
+                    "Browser executors require distinct authenticated processes and profiles"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
     /// Reject aliases before assigning any task to an executor. Descriptor
     /// existence and authenticated process identity must be checked separately
     /// at dispatch; distinct paths alone are never proof of a live browser.
@@ -182,5 +221,39 @@ mod tests {
             "browser-3".into()
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn verified_executor_evidence_rejects_shared_process_and_profile() {
+        let first = VerifiedBrowserExecutor {
+            process_id: 101,
+            profile_path: "C:/profiles/one".into(),
+            account_identity: "same-user".into(),
+            authenticated: true,
+        };
+        let second = VerifiedBrowserExecutor {
+            process_id: 202,
+            profile_path: "C:/profiles/two".into(),
+            account_identity: "same-user".into(),
+            authenticated: true,
+        };
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), second.clone()]).is_ok()
+        );
+        let mut duplicate_pid = second.clone();
+        duplicate_pid.process_id = first.process_id;
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), duplicate_pid]).is_err()
+        );
+        let mut duplicate_profile = second.clone();
+        duplicate_profile.profile_path = " C:/PROFILES/ONE ".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), duplicate_profile])
+                .is_err()
+        );
+        let mut unauthenticated = second;
+        unauthenticated.authenticated = false;
+        assert!(GoalAdmission::require_independent_executors(&[first, unauthenticated]).is_err());
+        assert!(GoalAdmission::require_independent_executors(&[]).is_err());
     }
 }
