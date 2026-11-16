@@ -18,6 +18,30 @@ pub(crate) fn take_oldest_verified_lane<T>(
     queue.remove(position)
 }
 
+/// Select the next authenticated lane in round-robin order without changing
+/// sticky ownership. Empty or unavailable lanes are skipped, never borrowed.
+/// The returned cursor is the lane to probe on the following dispatch.
+pub(crate) fn next_verified_lane<T>(
+    queue: &VecDeque<T>,
+    cursor: usize,
+    authenticated_executors: &[bool],
+    mut assigned_lane: impl FnMut(&T) -> Option<usize>,
+) -> Option<(usize, usize)> {
+    let capacity = authenticated_executors.len();
+    if capacity == 0 {
+        return None;
+    }
+    for offset in 0..capacity {
+        let lane = (cursor % capacity + offset) % capacity;
+        if authenticated_executors[lane]
+            && queue.iter().any(|entry| assigned_lane(entry) == Some(lane))
+        {
+            return Some((lane, (lane + 1) % capacity));
+        }
+    }
+    None
+}
+
 /// Stable explicit canary ownership; never migrate tasks by modulo/hash.
 #[cfg(test)]
 pub fn owns(task_key: &str, canary_key: Option<&str>, lane: usize) -> bool {
@@ -101,6 +125,25 @@ pub fn first_in_lane<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn round_robin_is_bounded_and_preserves_lane_affinity() {
+        let queue = VecDeque::from([(0, "a"), (0, "b"), (2, "c"), (1, "d")]);
+        let ready = [true, false, true];
+        let first = next_verified_lane(&queue, 0, &ready, |entry| Some(entry.0));
+        assert_eq!(first, Some((0, 1)));
+        assert_eq!(
+            next_verified_lane(&queue, first.unwrap().1, &ready, |entry| Some(entry.0)),
+            Some((2, 0))
+        );
+        assert_eq!(
+            next_verified_lane(&queue, 0, &[false, false, false], |entry| Some(entry.0)),
+            None
+        );
+        assert_eq!(
+            next_verified_lane(&queue, 0, &[], |entry| Some(entry.0)),
+            None
+        );
+    }
     #[test]
     fn multi_lane_fifo_skips_unverified_executor_without_migrating_work() {
         let mut queue = VecDeque::from([(2, "c1"), (1, "b1"), (0, "a1"), (2, "c2"), (1, "b2")]);
