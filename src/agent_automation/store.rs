@@ -930,6 +930,11 @@ impl AgentAutomationStore {
         self.automatic_retries = config.markdown_chat.automation.automatic_retries;
         self.retry_timings = config.markdown_chat.automation.retry_timings.clone();
         self.usage_options = crate::usage_analytics::Options::from_config(config);
+        if config.markdown_chat.automation.pilot_primary_task_key.is_none()
+            && config.markdown_chat.automation.canary_task_key.is_some()
+        {
+            return Err("Two-browser goal admission requires the primary task key".into());
+        }
         if let Some(primary) = &config.markdown_chat.automation.pilot_primary_task_key {
             let secondary = config
                 .markdown_chat

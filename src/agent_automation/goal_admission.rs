@@ -215,12 +215,14 @@ mod tests {
         assert!(GoalAdmission::require_distinct_descriptors(&[" ".into()]).is_err());
         assert!(GoalAdmission::require_distinct_descriptors(&["A".into(), "a".into()]).is_err());
         assert!(GoalAdmission::require_distinct_descriptors(&[" A ".into(), "a".into()]).is_err());
-        assert!(GoalAdmission::require_distinct_descriptors(&[
-            "browser-1".into(),
-            "browser-2".into(),
-            "browser-3".into()
-        ])
-        .is_ok());
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
+                "browser-1".into(),
+                "browser-2".into(),
+                "browser-3".into()
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -255,5 +257,31 @@ mod tests {
         unauthenticated.authenticated = false;
         assert!(GoalAdmission::require_independent_executors(&[first, unauthenticated]).is_err());
         assert!(GoalAdmission::require_independent_executors(&[]).is_err());
+    }
+
+    #[test]
+    fn executor_evidence_requires_nonempty_identity_and_real_process() {
+        let valid = VerifiedBrowserExecutor {
+            process_id: 42,
+            profile_path: "C:/profiles/primary".into(),
+            account_identity: "owner".into(),
+            authenticated: true,
+        };
+        for invalid in [
+            VerifiedBrowserExecutor {
+                process_id: 0,
+                ..valid.clone()
+            },
+            VerifiedBrowserExecutor {
+                profile_path: "  ".into(),
+                ..valid.clone()
+            },
+            VerifiedBrowserExecutor {
+                account_identity: "  ".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(GoalAdmission::require_independent_executors(&[invalid]).is_err());
+        }
     }
 }
