@@ -42,6 +42,26 @@ pub(crate) fn next_verified_lane<T>(
     None
 }
 
+/// Dispatch only on an authenticated, idle executor. A busy lane retains its
+/// queue entries until the in-flight action has a definitive outcome.
+pub(crate) fn next_idle_verified_lane<T>(
+    queue: &VecDeque<T>,
+    cursor: usize,
+    authenticated_executors: &[bool],
+    busy_lanes: &[bool],
+    assigned_lane: impl FnMut(&T) -> Option<usize>,
+) -> Option<(usize, usize)> {
+    if authenticated_executors.len() != busy_lanes.len() {
+        return None;
+    }
+    let available = authenticated_executors
+        .iter()
+        .zip(busy_lanes)
+        .map(|(authenticated, busy)| *authenticated && !*busy)
+        .collect::<Vec<_>>();
+    next_verified_lane(queue, cursor, &available, assigned_lane)
+}
+
 /// Stable explicit canary ownership; never migrate tasks by modulo/hash.
 #[cfg(test)]
 pub fn owns(task_key: &str, canary_key: Option<&str>, lane: usize) -> bool {
@@ -64,9 +84,10 @@ pub fn owns_operation(
     }
 }
 
-/// In a two-task pilot, all persisted tasks except the exact two selected
-/// keys are excluded from both workers. Pairing and renewal of the selected
-/// secondary task still belong to primary, never migrate accepted Sends.
+/// The two-task pilot pins every operation for the selected secondary task
+/// to its own browser, including creation, pairing and renewal. Legacy mode
+/// below retains the original primary-only pairing behavior.
+/// Never enable this routing without first checking accepted in-flight Sends.
 pub fn owns_operation_in_pilot(
     task_key: &str,
     pilot_primary_key: Option<&str>,
@@ -78,9 +99,7 @@ pub fn owns_operation_in_pilot(
         if primary == task_key {
             return lane == 0;
         }
-        if canary_key != Some(task_key) {
-            return false;
-        }
+        return canary_key == Some(task_key) && lane == 1;
     }
     owns_operation(task_key, canary_key, lane, eligible_offline)
 }
@@ -125,6 +144,23 @@ pub fn first_in_lane<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn busy_lane_cannot_receive_another_goal_or_steal_queued_work() {
+        let queue = VecDeque::from([(Some(0), "inflight-followup"), (Some(1), "ready")]);
+        assert_eq!(
+            next_idle_verified_lane(&queue, 0, &[true, true], &[true, false], |item| item.0),
+            Some((1, 0))
+        );
+        assert_eq!(
+            next_idle_verified_lane(&queue, 0, &[true, true], &[true, true], |item| item.0),
+            None
+        );
+        assert_eq!(
+            next_idle_verified_lane(&queue, 0, &[true, true], &[false], |item| item.0),
+            None
+        );
+        assert_eq!(queue.len(), 2);
+    }
     #[test]
     fn round_robin_is_bounded_and_preserves_lane_affinity() {
         let queue = VecDeque::from([(0, "a"), (0, "b"), (2, "c"), (1, "d")]);
@@ -220,11 +256,18 @@ mod tests {
             )),
             Some(1)
         );
-        assert!(owns_operation_in_pilot(
+        assert!(!owns_operation_in_pilot(
             "pilot-two",
             Some("pilot-one"),
             Some("pilot-two"),
             0,
+            false
+        ));
+        assert!(owns_operation_in_pilot(
+            "pilot-two",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            1,
             false
         ));
         assert!(!owns_operation_in_pilot(
@@ -259,6 +302,51 @@ mod tests {
             first_operation_in_pilot_lane(&queue, None, Some("pilot-two"), 0, |s| (s, true)),
             Some(0)
         );
+    }
+    #[test]
+    fn pilot_creation_pairing_and_renewal_stay_with_the_secondary_task() {
+        // The flag is false for creation, verification and renewal; the
+        // strict pilot must still keep every secondary-task operation on 1.
+        let queue = VecDeque::from([
+            ("secondary", false),
+            ("primary", false),
+            ("legacy", true),
+            ("secondary", true),
+            ("secondary", false),
+        ]);
+        assert_eq!(
+            first_operation_in_pilot_lane(&queue, Some("primary"), Some("secondary"), 0, |item| (
+                item.0, item.1
+            ),),
+            Some(1)
+        );
+        assert_eq!(
+            first_operation_in_pilot_lane(&queue, Some("primary"), Some("secondary"), 1, |item| (
+                item.0, item.1
+            ),),
+            Some(0)
+        );
+        assert!(owns_operation_in_pilot(
+            "secondary",
+            Some("primary"),
+            Some("secondary"),
+            1,
+            false
+        ));
+        assert!(!owns_operation_in_pilot(
+            "secondary",
+            Some("primary"),
+            Some("secondary"),
+            0,
+            false
+        ));
+        assert!(!owns_operation_in_pilot(
+            "legacy",
+            Some("primary"),
+            Some("secondary"),
+            0,
+            false
+        ));
     }
     #[test]
     fn single_lane_preserves_original_order() {
@@ -306,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_canary_pairing_and_turn_renewal_remain_primary() {
+    fn legacy_canary_pairing_and_turn_renewal_remain_primary() {
         let queue = VecDeque::from([
             ("selected", false), // Pairing on lane 1
             ("selected", true),  // Offline work on lane 2
