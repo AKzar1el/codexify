@@ -1,4 +1,5 @@
 mod companion;
+mod goal_admission;
 mod install;
 mod lane_affinity;
 mod model_fallback;

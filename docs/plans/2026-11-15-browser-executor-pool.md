@@ -1,6 +1,6 @@
 # Codexify browser executor pool — staged engineering plan
 
-Status: **feature-gated two-lane scheduler and cross-process Send gate implemented in source, compiled and tested; production still uses one executor.** Do not enable the canary until both companions are independently authenticated and the patched binary/runtime passes release and health gates.
+Status (2026-11-16): **Two-browser pilot deployed and independently authenticated.** Native service health, distinct companion PIDs, matching account/Send-gate fingerprints and the two paired pilot keys verified. Both goals have accepted idle offline-goal receipts. Full overlapping execution/throughput proof remains outstanding. Earlier sections below are historical implementation notes, not current production status.
 Date: 2026-11-15. Existing production path: Rust `AgentAutomationSupervisor` global `VecDeque<AutomationExecution>` and `run_lock`; one private-profile Chrome/Electron companion.
 
 ## User objective
@@ -517,3 +517,50 @@ Goal events / hourly wake-ups
   handoff, do not configure either task key, restart the service, or declare
   concurrent success. Never use the unpaired existing reliability-lab goal as
   a substitute for a genuinely paired new ChatGPT scheduled conversation.
+
+## Browser-count goal admission and the path to five (2026-11-16)
+
+- User policy: **one admitted runnable goal per independently verified browser executor**.
+  Two live browsers means two admitted goal keys, never three. A configured
+  goal is a *backlog item*, not an additional running browser. Do not create
+  more browser profiles, accounts or scheduled ChatGPT automations to evade
+  this limit or provider rate limits.
+- Live two-key pilot assigns primary
+  `871577bcf73a2d1900af5917203096d21fd425049bdbdaea3fc6df3ed754e680`
+  and secondary
+  `87eace6deb0af5d26b4b5f5e7d23d34d5129ce8a495d67a77ebba1b02b0b3e4b`.
+  Installed native binary SHA-256
+  `BDF78E7B84A6052748B7108D3807949162851956633678AC8A4A1637B0146366`.
+  At 11:40 CET the Windows Codexify task was Running and HTTP health was
+  `ok`; primary PID 13772 and secondary PID 21148 had separate authenticated
+  sessions, the same account fingerprint, and identical enabled provider
+  Send-gate fingerprint.
+- The new `goal_admission.rs` separates **persisted goal state** from
+  **admitted runnable slots**, with an explicit distinct-key list bounded
+  by available configured browser executor seats. During the two-key pilot,
+  native `goal_set`/`goal_resume`, owner `/goal set`/`/goal run` and direct
+  store activation refuse unassigned task keys. New chats may preserve goals
+  as `Configured`, but not automatically start them beyond capacity. Rejected
+  updates leave existing state, revision, action receipts and handoffs unchanged;
+  idempotent owner-command replays are still read-only.
+- Historical revenue goals may still have persisted `Active` status. The
+  feature-gated native pilot **does not dispatch them**. Never bulk-stop,
+  clear or rewrite those historical statuses merely to make an activity
+  counter smaller: some accepted Sends/handoffs still await reconciliation.
+  Operator UI must distinguish `persisted_active` from
+  `admitted_runnable` and from `currently_executing`.
+- Browser loss does not promote a queued task or migrate an accepted Send
+  to another profile. A lost or unverified executor has no usable Send lane;
+  its assigned goal remains reserved/frozen for recovery. Admission capacity
+  cannot exceed independently verified executor availability during rollout.
+- The admission abstraction and tests already handle five distinct goal keys
+  with five executor seats and reject the sixth or any duplicate. **Only two
+  native browser workers are implemented today**. Scaling to three then five
+  still requires adding isolated descriptors/profiles, owner-approved stable
+  assignments, separate worker locks, and live crash/Send-concurrency tests;
+  do not claim five executable lanes based on a generic admission unit test.
+- Goal division during pilot: primary owns native scheduler capacity, queue
+  isolation, safe restart and instrumentation; secondary owns browser-companion
+  selectors, tab churn, real-browser checks and accepted-Send/handoff safety.
+  Each must preserve the other's working files and avoid competing git
+  checkouts or parallel production restarts.

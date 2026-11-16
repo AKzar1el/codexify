@@ -853,6 +853,7 @@ pub struct AgentAutomationStore {
     automatic_retries: bool,
     retry_timings: RetryTimings,
     pub(super) usage_options: crate::usage_analytics::Options,
+    goal_admission: Option<super::goal_admission::GoalAdmission>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,7 +870,7 @@ impl AgentAutomationStore {
         let root = crate::memory::task_state_dir(config).join("chats");
         let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
-            .map(|store| store.with_notifications(config))
+            .and_then(|store| store.with_notifications(config))
     }
 
     pub fn for_state_root(config: &AppConfig, state_root: &Path) -> Result<Self, String> {
@@ -879,7 +880,7 @@ impl AgentAutomationStore {
         let root = state_root.join("chats");
         let pairing_index_root = pairing_index_root(config, &root);
         Self::new_with_pairing_index(root, pairing_index_root)
-            .map(|store| store.with_notifications(config))
+            .and_then(|store| store.with_notifications(config))
     }
 
     pub fn new(root: PathBuf) -> Result<Self, String> {
@@ -914,10 +915,11 @@ impl AgentAutomationStore {
             automatic_retries: true,
             retry_timings: RetryTimings::default(),
             usage_options: Default::default(),
+            goal_admission: None,
         })
     }
 
-    fn with_notifications(mut self, config: &AppConfig) -> Self {
+    fn with_notifications(mut self, config: &AppConfig) -> Result<Self, String> {
         self.offline_after_ms = config.markdown_chat.offline_after_ms();
         self.notifications = config.markdown_chat.notifications.clone();
         self.renewal_config = config.markdown_chat.turn_renewal.clone();
@@ -925,13 +927,25 @@ impl AgentAutomationStore {
         self.automatic_retries = config.markdown_chat.automation.automatic_retries;
         self.retry_timings = config.markdown_chat.automation.retry_timings.clone();
         self.usage_options = crate::usage_analytics::Options::from_config(config);
+        if let Some(primary) = &config.markdown_chat.automation.pilot_primary_task_key {
+            let secondary = config
+                .markdown_chat
+                .automation
+                .canary_task_key
+                .as_ref()
+                .ok_or("Two-browser goal admission requires the second task key")?;
+            self.goal_admission = Some(super::goal_admission::GoalAdmission::new(
+                vec![primary.clone(), secondary.clone()],
+                2,
+            )?);
+        }
         self.notification_workspace = config
             .work_dir
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        self
+        Ok(self)
     }
 
     pub(crate) async fn notify_state(
@@ -1210,7 +1224,22 @@ impl AgentAutomationStore {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<GoalRecord, String> {
+        self.require_goal_slot(task)?;
         self.mutate(task, |state| start_goal(state, expected_revision, now_ms))
+    }
+
+    /// A configured goal is allowed to wait, but never becomes runnable
+    /// without its explicitly assigned browser executor.
+    pub(crate) fn is_goal_admitted(&self, task: &ConversationIdentity) -> bool {
+        self.goal_admission
+            .as_ref()
+            .is_none_or(|admission| admission.is_assigned(task.stable_key()))
+    }
+
+    fn require_goal_slot(&self, task: &ConversationIdentity) -> Result<(), String> {
+        self.goal_admission.as_ref().map_or(Ok(()), |admission| {
+            admission.require_slot(task.stable_key())
+        })
     }
 
     pub fn stop_goal(
@@ -1367,6 +1396,13 @@ impl AgentAutomationStore {
                 let mut receipt = record.receipt.clone();
                 receipt.replayed = true;
                 return Ok(receipt);
+            }
+
+            if matches!(
+                command,
+                OwnerGoalCommand::Set { .. } | OwnerGoalCommand::Run
+            ) {
+                self.require_goal_slot(task)?;
             }
 
             if let Some(expected_revision) = expected_revision {
@@ -4505,6 +4541,78 @@ fn valid_opaque(value: &str) -> bool {
 
 fn bounded_private(value: &str) -> bool {
     value.len() <= MAX_PRIVATE_TEXT_BYTES && !value.contains('\0')
+}
+
+#[cfg(test)]
+mod goal_admission_tests {
+    use super::*;
+
+    #[test]
+    fn two_reserved_seats_deny_third_activation_and_preserve_legacy_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let unrestricted = AgentAutomationStore::new(state_root.clone()).unwrap();
+        let primary = ConversationIdentity::from_openai_session("pilot-primary").unwrap();
+        let secondary = ConversationIdentity::from_openai_session("pilot-secondary").unwrap();
+        let parked = ConversationIdentity::from_openai_session("legacy-frozen-goal").unwrap();
+
+        let legacy = unrestricted
+            .set_goal(&parked, "Preserve legacy progress", 100)
+            .unwrap();
+        unrestricted
+            .run_goal(&parked, legacy.revision, 110)
+            .unwrap();
+        let before = unrestricted.load(&parked).unwrap();
+
+        let mut bounded = AgentAutomationStore::new(state_root).unwrap();
+        bounded.goal_admission = Some(
+            super::super::goal_admission::GoalAdmission::new(
+                vec![
+                    primary.stable_key().to_owned(),
+                    secondary.stable_key().to_owned(),
+                ],
+                2,
+            )
+            .unwrap(),
+        );
+
+        for task in [&primary, &secondary] {
+            let receipt = bounded
+                .apply_owner_goal_command(
+                    task,
+                    "activate-accepted-seat",
+                    OwnerGoalCommand::Set {
+                        markdown: "Do safe lane work".into(),
+                    },
+                    120,
+                )
+                .unwrap();
+            assert_eq!(receipt.goal.unwrap().status, GoalStatus::Active);
+        }
+        let rejected = bounded.apply_owner_goal_command(
+            &parked,
+            "third-not-admitted",
+            OwnerGoalCommand::Set {
+                markdown: "Do not replace the old goal".into(),
+            },
+            130,
+        );
+        assert!(rejected.unwrap_err().contains("slots are reserved"));
+        assert_eq!(bounded.load(&parked).unwrap().goal, before.goal);
+        assert_eq!(bounded.load(&parked).unwrap().action, before.action);
+
+        let waiting = ConversationIdentity::from_openai_session("future-sixth-goal").unwrap();
+        let configured = bounded.set_goal(&waiting, "Waiting safely", 140).unwrap();
+        assert_eq!(configured.status, GoalStatus::Configured);
+        assert!(!bounded.is_goal_admitted(&waiting));
+        assert!(
+            bounded
+                .run_goal(&waiting, configured.revision, 150)
+                .is_err()
+        );
+        let reloaded = bounded.load(&waiting).unwrap();
+        assert_eq!(reloaded.goal.unwrap().status, GoalStatus::Configured);
+    }
 }
 
 #[cfg(test)]

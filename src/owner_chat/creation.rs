@@ -452,7 +452,9 @@ pub(super) async fn create_chat(
                     .set_goal(&task, markdown, crate::markdown_chat::now_ms())
                     .map_err(internal_error)?,
             };
-            if goal.status == crate::agent_automation::GoalStatus::Configured {
+            if goal.status == crate::agent_automation::GoalStatus::Configured
+                && store.is_goal_admitted(&task)
+            {
                 store
                     .run_goal(&task, goal.revision, crate::markdown_chat::now_ms())
                     .map_err(internal_error)?;
