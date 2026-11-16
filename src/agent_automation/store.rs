@@ -335,6 +335,8 @@ pub struct AutomationTaskState {
     offline_response_grace_ms: u64,
     #[serde(skip_serializing_if = "super::turn_renewal::TurnRenewalState::is_empty")]
     pub turn_renewal: super::turn_renewal::TurnRenewalState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_terminal_handoffs: Vec<super::turn_renewal::RetiredTerminalHandoff>,
     #[serde(default)]
     owner_goal_requests: Vec<OwnerGoalRequestRecord>,
 }
@@ -356,6 +358,7 @@ impl Default for AutomationTaskState {
             retry_timings: RetryTimings::default(),
             offline_response_grace_ms: 0,
             turn_renewal: Default::default(),
+            retired_terminal_handoffs: Vec::new(),
             owner_goal_requests: Vec::new(),
         }
     }
@@ -1188,6 +1191,16 @@ impl AgentAutomationStore {
     ) -> Result<GoalRecord, String> {
         validate_goal_markdown(markdown)?;
         self.mutate(task, |state| {
+            let previous_handoff_retired = if state.goal.as_ref().is_some_and(|goal| {
+                matches!(goal.status, GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error)
+            }) && state.turn_renewal.handoff.is_some() {
+                if !super::turn_renewal::retire_obsolete_terminal_handoff(state, now_ms) {
+                    return Err("A previous goal still has an unverified or active handoff; preserve its Send and resolve it before replacing the goal".into());
+                }
+                true
+            } else {
+                false
+            };
             let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
                 goal.revision
                     .checked_add(1)
@@ -1211,7 +1224,7 @@ impl AgentAutomationStore {
             };
             state.goal = Some(goal.clone());
             state.goal_wake = GoalWakeState::default();
-            if state.action.goal_revision.is_some() {
+            if previous_handoff_retired || state.action.goal_revision.is_some() {
                 state.action = AutomationActionState::default();
             }
             Ok(goal)
@@ -1417,6 +1430,16 @@ impl AgentAutomationStore {
             let mut updated_active_goal = false;
             let (kind, goal) = match command {
                 OwnerGoalCommand::Set { markdown } => {
+                    let previous_handoff_retired = if state.goal.as_ref().is_some_and(|goal| {
+                        matches!(goal.status, GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error)
+                    }) && state.turn_renewal.handoff.is_some() {
+                        if !super::turn_renewal::retire_obsolete_terminal_handoff(state, now_ms) {
+                            return Err("A previous goal still has an unverified or active handoff; preserve its Send and resolve it before replacing the goal".into());
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
                         goal.revision
                             .checked_add(1)
@@ -1445,7 +1468,7 @@ impl AgentAutomationStore {
                     };
                     state.goal = Some(goal.clone());
                     state.goal_wake = GoalWakeState::default();
-                    if state.action.goal_revision.is_some() {
+                    if previous_handoff_retired || state.action.goal_revision.is_some() {
                         state.action = AutomationActionState::default();
                     }
                     (OwnerGoalCommandKind::Set, Some(goal))
@@ -4161,6 +4184,26 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     }
     validate_action(&state.action)?;
     validate_goal_wake(&state.goal_wake)?;
+    if state.retired_terminal_handoffs.len() > super::turn_renewal::MAX_RETIRED_TERMINAL_HANDOFFS {
+        return Err("Agent automation retired handoff history is too large".into());
+    }
+    for retired in &state.retired_terminal_handoffs {
+        let Some(handoff) = retired.renewal.handoff.as_ref() else {
+            return Err("Retired handoff is missing its original receipt".into());
+        };
+        if !matches!(
+            retired.goal_status,
+            GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error
+        ) || handoff.report_complete
+            || handoff.requested_at_ms <= retired.goal_finished_at_ms
+            || retired.retired_at_ms < handoff.requested_at_ms
+            || retired.action.send_accepted != Some(true)
+            || retired.action.status != AutomationActionStatus::Idle
+        {
+            return Err("Retired terminal-goal handoff history is invalid".into());
+        }
+        validate_action(&retired.action)?;
+    }
     if let Some(previous) = &state.suspended_retry {
         validate_action(&previous.action)?;
         validate_goal_wake(&previous.goal_wake)?;

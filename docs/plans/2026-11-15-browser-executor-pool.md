@@ -614,3 +614,26 @@ It does not attempt to reconnect an action by sending the prompt again.
   changes their status. The new watchdog covers **lane 2 only**, not the native
   primary executor, and must be generalized/tested before three-to-five lanes
   exist. The one-admitted-runnable-goal-per-verified-browser rule remains.
+
+## Terminal-goal renewal reconciliation (2026-11-16)
+
+- Root cause verified from the pilot's saved state: secondary goal revision 3
+  finished around 12:53 CET but requested a time-based renewal around 13:54 CET.
+  No active goal remained to deliver its final handoff, so proof stayed false
+  for hours. Primary goal revision 2 eventually verified its genuine renewal.
+- Renewal is now suppressed for completed, blocked, paused and errored goals.
+  Goal-free chats retain their normal time-based renewal behavior.
+- A post-finish handoff may be retired only when the prior goal is terminal,
+  the accepted Send is idle, the handoff remains unverified, and its request
+  occurred strictly after goal completion. Its original Send and handoff
+  records are archived with reportComplete=false. Retirement is not proof of
+  delivery and never issues a Retry or Send.
+- A new owner goal revision performs the same guarded archival atomically or
+  rejects unsafe old handoffs. Active, pre-finish and in-flight handoffs remain
+  protected. Regression fixtures cover idempotency, state preservation and
+  archive persistence, including replacement by an authorized new goal.
+- This is a native executable change; editing source cannot fix the installed
+  service. Build and deploy only with a separately launched guarded Windows
+  maintenance operation after both browser actions are safe. Never restart
+  Codexify from a child of its own MCP tunnel. Verify archival and a real
+  subsequent goal turn before claiming live reconciliation is complete.
