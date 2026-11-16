@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "cloudflare-api": {
+      "type": "streamable-http",
+      "url": "https://mcp.cloudflare.com/mcp",
+      "bearerTokenEnvVar": "CLOUDFLARE_API_TOKEN",
+      "disabled": true,
+      "mode": "direct",
+      "startupTimeoutSec": 20,
+      "toolTimeoutSec": 60,
+      "requestLimits": {
+        "maxConcurrentRequests": 2,
+        "maxPendingRequests": 4,
+        "failureThreshold": 3,
+        "recoveryDelayMs": 30000,
+        "slowCancellationMs": 60000
+      }
+    }
+  }
+}

@@ -1,0 +1,46 @@
+name: MCP conformance (isolated)
+
+on:
+  push:
+    branches: [feat/mcp-conformance-cloudflare-20261116]
+    paths:
+      - .github/workflows/mcp-conformance.yml
+      - scripts/run-mcp-conformance.mjs
+      - scripts/test-mcp-integration-config.mjs
+      - examples/mcp/cloudflare.code-mode.json
+      - docs/MCP-INTEGRATIONS.md
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Conformance smoke scenario to run"
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - server-initialize
+          - tools-list
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate Cloudflare MCP opt-in fragment
+        run: node --test scripts/test-mcp-integration-config.mjs
+      - name: Build isolated Codexify test binary
+        run: cargo build --locked --bin codexify
+      - name: Run official MCP conformance smoke tests
+        env:
+          CI: "true"
+          CODEXIFY_CONFORMANCE_SCENARIOS: ${{ inputs.scenario }}
+        run: node scripts/run-mcp-conformance.mjs
