@@ -56,6 +56,22 @@ impl GoalAdmission {
             .position(|key| key == task_key)
     }
 
+    /// A reservation is not an execution permit. A lane is runnable only
+    /// when its exact executor has been independently authenticated. Missing
+    /// health evidence is fail-closed; another lane never takes its work.
+    pub(crate) fn runnable_lane(
+        &self,
+        task_key: &str,
+        authenticated_executors: &[bool],
+    ) -> Option<usize> {
+        let lane = self.lane_index(task_key)?;
+        authenticated_executors
+            .get(lane)
+            .copied()
+            .filter(|ready| *ready)
+            .map(|_| lane)
+    }
+
     pub(crate) fn is_assigned(&self, task_key: &str) -> bool {
         self.assigned_task_keys.iter().any(|key| key == task_key)
     }
@@ -116,5 +132,25 @@ mod tests {
         // A failed executor must not cause the remaining goals to be
         // reindexed or a waiting goal to be promoted.
         assert_eq!(admission.lane_index(&key(2)), Some(2));
+    }
+
+    #[test]
+    fn executor_loss_fails_closed_without_cross_lane_takeover() {
+        let admission = GoalAdmission::new(vec![key(1), key(2), key(3)], 3).unwrap();
+        assert_eq!(
+            admission.runnable_lane(&key(1), &[true, true, true]),
+            Some(0)
+        );
+        assert_eq!(admission.runnable_lane(&key(2), &[true, false, true]), None);
+        assert_eq!(
+            admission.runnable_lane(&key(3), &[true, false, true]),
+            Some(2)
+        );
+        assert_eq!(admission.runnable_lane(&key(2), &[true]), None);
+        assert_eq!(admission.runnable_lane(&key(4), &[true, true, true]), None);
+        assert_eq!(
+            admission.runnable_lane(&key(2), &[true, true, true]),
+            Some(1)
+        );
     }
 }
