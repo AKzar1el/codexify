@@ -840,14 +840,13 @@ impl AgentAutomationSupervisor {
         primary_key: String,
         canary_key: String,
     ) -> Result<Arc<Self>, String> {
-        if primary_key.len() != 64
-            || !primary_key
-                .bytes()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            || primary_key == canary_key
-        {
-            return Err("Two-task pilot needs distinct verified stable task keys".into());
-        }
+        // Keep the existing two-browser pilot behavior, but share the exact
+        // stable-key admission invariant with the future multi-lane scheduler.
+        // This validates reservations, not the companion's live identity.
+        super::goal_admission::GoalAdmission::new(
+            vec![primary_key.clone(), canary_key.clone()],
+            2,
+        )?;
         let mut supervisor = Self::new_with_canary_lane(config, executor, canary_key)?;
         Arc::get_mut(&mut supervisor)
             .ok_or("Pilot supervisor unexpectedly shared")?
