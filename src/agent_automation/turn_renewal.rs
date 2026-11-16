@@ -134,10 +134,9 @@ pub struct RetiredTerminalHandoff {
 
 pub(super) const MAX_RETIRED_TERMINAL_HANDOFFS: usize = 16;
 
-pub(super) fn retire_obsolete_terminal_handoff(
-    state: &mut super::AutomationTaskState,
-    now_ms: u64,
-) -> bool {
+/// Check an already loaded snapshot without acquiring a write lock or
+/// republishing automation.json on every scheduler tick.
+pub(super) fn can_retire_obsolete_terminal_handoff(state: &super::AutomationTaskState) -> bool {
     let Some(goal) = state.goal.as_ref() else {
         return false;
     };
@@ -160,6 +159,23 @@ pub(super) fn retire_obsolete_terminal_handoff(
     {
         return false;
     }
+    true
+}
+
+pub(super) fn retire_obsolete_terminal_handoff(
+    state: &mut super::AutomationTaskState,
+    now_ms: u64,
+) -> bool {
+    if !can_retire_obsolete_terminal_handoff(state) {
+        return false;
+    }
+    let goal = state
+        .goal
+        .as_ref()
+        .expect("eligibility requires terminal goal");
+    let finished_at_ms = goal
+        .finished_at_ms
+        .expect("eligibility requires finish time");
     state
         .retired_terminal_handoffs
         .push(RetiredTerminalHandoff {
@@ -204,6 +220,11 @@ impl AgentAutomationStore {
         task: &ConversationIdentity,
         now_ms: u64,
     ) -> Result<bool, String> {
+        // mutate() always persists state. Do not call it for an ineligible
+        // task; recheck eligibility under its lock to handle concurrent state.
+        if !can_retire_obsolete_terminal_handoff(&self.load(task)?) {
+            return Ok(false);
+        }
         self.mutate(task, |state| {
             Ok(retire_obsolete_terminal_handoff(state, now_ms))
         })
@@ -754,9 +775,11 @@ mod delivery_timeout_handoff_tests {
     fn post_completion_handoff_is_archived_unverified_and_never_resends() {
         let (_root, store, task) = finished_goal_with_post_finish_handoff();
         let old = store.load(&task).unwrap();
+        assert!(can_retire_obsolete_terminal_handoff(&old));
         assert!(store.retire_finished_goal_handoff(&task, 6_000).unwrap());
         assert!(!store.retire_finished_goal_handoff(&task, 6_001).unwrap());
         let recovered = store.load(&task).unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(&recovered));
         assert!(recovered.turn_renewal.is_empty());
         assert_eq!(recovered.goal, old.goal);
         assert_eq!(recovered.action, old.action);
@@ -836,7 +859,18 @@ mod delivery_timeout_handoff_tests {
                 Ok(())
             })
             .unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(
+            &store.load(&task).unwrap()
+        ));
+        let state_file = store.task_directory(&task).unwrap().join("automation.json");
+        let before = std::fs::metadata(&state_file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(75));
         assert!(!store.retire_finished_goal_handoff(&task, 6_000).unwrap());
+        assert_eq!(
+            before,
+            std::fs::metadata(&state_file).unwrap().modified().unwrap(),
+            "an ineligible scheduler tick must not republish automation state"
+        );
         store
             .mutate(&task, |state| {
                 state.goal.as_mut().unwrap().status = GoalStatus::Completed;
@@ -846,6 +880,9 @@ mod delivery_timeout_handoff_tests {
                 Ok(())
             })
             .unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(
+            &store.load(&task).unwrap()
+        ));
         assert!(!store.retire_finished_goal_handoff(&task, 6_000).unwrap());
         assert_eq!(
             store.load(&task).unwrap().retired_terminal_handoffs.len(),

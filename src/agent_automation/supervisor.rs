@@ -2090,9 +2090,10 @@ impl AgentAutomationSupervisor {
             // A terminal goal cannot produce a new model handoff. Archive a
             // mistakenly requested post-finish renewal as unverified evidence,
             // rather than blocking the slot or pretending its final was sent.
-            if task
-                .store
-                .retire_finished_goal_handoff(&task.task, now_ms)?
+            if super::turn_renewal::can_retire_obsolete_terminal_handoff(&state)
+                && task
+                    .store
+                    .retire_finished_goal_handoff(&task.task, now_ms)?
             {
                 state = task.store.load(&task.task)?;
             }
