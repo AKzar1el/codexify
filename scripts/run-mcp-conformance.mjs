@@ -106,8 +106,7 @@ try {
     projectCatalog: { codexConfig: { enabled: false }, entries: [] },
     skills: { enabled: false },
     memory: { enabled: false },
-    mcpServers: {},
-    openaiTunnels: []
+    mcpServers: {}
   }, null, 2));
   server = spawn(binary, ["--config", configPath, "--work-dir", workspace, "--port", String(port)], {
     cwd: scratch,
