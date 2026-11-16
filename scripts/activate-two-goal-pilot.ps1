@@ -26,7 +26,11 @@ foreach($f in @(Get-ChildItem -LiteralPath $statesRoot -Filter automation.json -
     if ($identified.ContainsKey($title)) { throw "Duplicate task claims pilot identity: $title" }
     $key=$f.Directory.Name
     if ($key -notmatch '^[a-f0-9]{64}$') { throw "Pilot has invalid stable task key: $title" }
-    $handoff=$s.turnRenewal.handoff
+    $handoff=$null
+    if ($s.PSObject.Properties['turnRenewal'] -and $null -ne $s.turnRenewal -and
+        $s.turnRenewal.PSObject.Properties['handoff']) {
+      $handoff=$s.turnRenewal.handoff
+    }
     $paired=[bool]($s.pairing.verifiedOwnerGeneration -and $s.pairing.canonicalUrl -and $s.pairing.accountFingerprint)
     $safe=[bool]($paired -and $s.goal.status -eq 'active' -and
       (-not $handoff -or $handoff.reportComplete) -and
