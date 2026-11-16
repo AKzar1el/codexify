@@ -92,7 +92,7 @@ if ($source -notmatch '(?s)if \(\$ForceMaintenance\) \{\s*# Stop the supervisor 
 if ($source -notmatch '(?s)if \(\$ForceMaintenance -and .*?-or \$WaitForFleetQuiet\)\)') {
     throw 'Forced mode must disallow incompatible switches'
 }
-if ($source -notmatch '(?s)AssertReadyForInstall \(Preflight\)\s*if \(\$CanaryTaskKey\) \{.*?AssertCanaryBelongsToPairedGoal \$CanaryTaskKey\s*AssertTwoBrowsersGuarded\s*\}\s*Report .stopping.') {
+if ($source -notmatch '(?s)AssertReadyForInstall \(Preflight\)\s*if \(\$CanaryTaskKey\) \{.*?AssertCanaryBelongsToPairedGoal \$CanaryTaskKey.*?AssertTwoBrowsersGuarded\s*\}\s*Report .stopping.') {
     throw 'A selected canary must be revalidated immediately before service shutdown'
 }
 if ($source -notmatch '(?s)if \(\$activationConfigOnly\) \{\s*\[IO.File\]::Replace\(\$configStage, \$configFile, \$failedConfig, \$true\).*?\} else \{\s*\[IO.File\]::Replace\(\$stage, \$target, \$failed, \$true\)') {
@@ -101,5 +101,14 @@ if ($source -notmatch '(?s)if \(\$activationConfigOnly\) \{\s*\[IO.File\]::Repla
 if ($source -notmatch '(?s)\[IO.File\]::Replace\(\$restoreConfig, \$configFile.*?if \(-not \$activationConfigOnly\) \{.*?\[IO.File\]::Replace\(\$restoreAsar, \$asar') {
     throw 'Config-only rollback must avoid replacing the in-use browser bundle'
 }
+if ($source -notmatch '(?s)if \(\$PilotPrimaryTaskKey\) \{\s*\$automation \| Add-Member -NotePropertyName pilotPrimaryTaskKey' -or
+    $source -notmatch '(?s)AssertCanaryBelongsToPairedGoal \$CanaryTaskKey\s*if \(\$PilotPrimaryTaskKey\) \{ AssertCanaryBelongsToPairedGoal \$PilotPrimaryTaskKey \}') {
+    throw 'Two-task pilot must persist and reverify both exact paired goal identities'
+}
+if ($source -notmatch '(?s)if \(\$asarHash -ne \$installedAsarHash\) \{\s*\[IO.File\]::Replace\(\$asarStage, \$asar' -or
+    $source -notmatch '(?s)if \(\$asarHash -ne \$installedAsarHash\) \{\s*\[IO.File\]::Replace\(\$restoreAsar, \$asar') {
+    throw 'Pilot native upgrade must neither replace nor restore an unchanged live browser ASAR'
+}
+Write-Output 'PASS two-task pilot requires exact identities and avoids unnecessary browser swaps'
 Write-Output 'PASS forced shutdown, canary revalidation and parameter restrictions remain enforced'
 Write-Output 'FORCE_MAINTENANCE_GUARDS_PASS'

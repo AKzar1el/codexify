@@ -22,6 +22,40 @@ pub fn owns_operation(
     }
 }
 
+/// In a two-task pilot, all persisted tasks except the exact two selected
+/// keys are excluded from both workers. Pairing and renewal of the selected
+/// secondary task still belong to primary, never migrate accepted Sends.
+pub fn owns_operation_in_pilot(
+    task_key: &str,
+    pilot_primary_key: Option<&str>,
+    canary_key: Option<&str>,
+    lane: usize,
+    eligible_offline: bool,
+) -> bool {
+    if let Some(primary) = pilot_primary_key {
+        if primary == task_key {
+            return lane == 0;
+        }
+        if canary_key != Some(task_key) {
+            return false;
+        }
+    }
+    owns_operation(task_key, canary_key, lane, eligible_offline)
+}
+
+pub fn first_operation_in_pilot_lane<T>(
+    queue: &VecDeque<T>,
+    pilot_primary_key: Option<&str>,
+    canary_key: Option<&str>,
+    lane: usize,
+    route: impl Fn(&T) -> (&str, bool),
+) -> Option<usize> {
+    queue.iter().position(|entry| {
+        let (key, offline) = route(entry);
+        owns_operation_in_pilot(key, pilot_primary_key, canary_key, lane, offline)
+    })
+}
+
 pub fn first_operation_in_lane<T>(
     queue: &VecDeque<T>,
     canary_key: Option<&str>,
@@ -49,6 +83,67 @@ pub fn first_in_lane<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pilot_fences_old_goal_states_on_both_lanes_without_touching_their_records() {
+        let queue = VecDeque::from([
+            "old-unconfirmed",
+            "pilot-two",
+            "old-revenue",
+            "pilot-one",
+            "pilot-two",
+        ]);
+        assert_eq!(
+            first_operation_in_pilot_lane(&queue, Some("pilot-one"), Some("pilot-two"), 0, |s| (
+                s, true
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            first_operation_in_pilot_lane(&queue, Some("pilot-one"), Some("pilot-two"), 1, |s| (
+                s, true
+            )),
+            Some(1)
+        );
+        assert!(owns_operation_in_pilot(
+            "pilot-two",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            0,
+            false
+        ));
+        assert!(!owns_operation_in_pilot(
+            "pilot-two",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            0,
+            true
+        ));
+        assert!(!owns_operation_in_pilot(
+            "old-revenue",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            0,
+            false
+        ));
+        assert!(!owns_operation_in_pilot(
+            "old-revenue",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            1,
+            true
+        ));
+        assert!(!owns_operation_in_pilot(
+            "pilot-one",
+            Some("pilot-one"),
+            Some("pilot-two"),
+            1,
+            true
+        ));
+        assert_eq!(
+            first_operation_in_pilot_lane(&queue, None, Some("pilot-two"), 0, |s| (s, true)),
+            Some(0)
+        );
+    }
     #[test]
     fn single_lane_preserves_original_order() {
         let queue = VecDeque::from(["revenue", "canary", "new"]);

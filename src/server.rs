@@ -2106,12 +2106,19 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
                 )
                 .map_err(anyhow::Error::msg)?,
             );
-            Some(
-                crate::agent_automation::AgentAutomationSupervisor::new_with_canary_lane(
-                    base, executor, task_key,
-                )
-                .map_err(anyhow::Error::msg)?,
-            )
+            let pilot_primary = base.pilot_primary_task_key.clone();
+            Some(match pilot_primary {
+                Some(primary) =>
+                    crate::agent_automation::AgentAutomationSupervisor::new_with_two_task_pilot_lane(
+                        base, executor, primary, task_key,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                None =>
+                    crate::agent_automation::AgentAutomationSupervisor::new_with_canary_lane(
+                        base, executor, task_key,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+            })
         } else {
             if descriptor.is_some() {
                 return Err(anyhow::anyhow!(

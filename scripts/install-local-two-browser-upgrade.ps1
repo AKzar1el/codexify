@@ -13,6 +13,7 @@ param(
     [switch]$ForceMaintenance,
     [ValidateRange(1,120)][int]$WaitTimeoutMinutes = 60,
     [string]$CanaryTaskKey = '',
+    [string]$PilotPrimaryTaskKey = '',
     [string]$BackupDirectory
 )
 Set-StrictMode -Version Latest
@@ -193,6 +194,11 @@ function PrepareConfig([string]$destination) {
         throw 'Missing agentChat.automation configuration'
     }
     $automation = $settings.agentChat.automation
+    if ($automation.PSObject.Properties['pilotPrimaryTaskKey'] -and
+        $automation.pilotPrimaryTaskKey -and
+        $automation.pilotPrimaryTaskKey -ne $PilotPrimaryTaskKey) {
+        throw 'An existing two-task pilot primary differs from the requested owner'
+    }
     if ($automation.PSObject.Properties['canaryTaskKey'] -and
         $automation.canaryTaskKey -and
         $automation.canaryTaskKey -ne $CanaryTaskKey) {
@@ -208,11 +214,15 @@ function PrepareConfig([string]$destination) {
         $automation | Add-Member -NotePropertyName canaryTaskKey -NotePropertyValue $CanaryTaskKey -Force
         $automation | Add-Member -NotePropertyName lane2DescriptorPath -NotePropertyValue $lane2 -Force
     }
+    if ($PilotPrimaryTaskKey) {
+        $automation | Add-Member -NotePropertyName pilotPrimaryTaskKey -NotePropertyValue $PilotPrimaryTaskKey -Force
+    }
     $serialized = $settings | ConvertTo-Json -Depth 100
     [IO.File]::WriteAllText($destination,$serialized,[Text.UTF8Encoding]::new($false))
     $check = Get-Content -LiteralPath $destination -Raw | ConvertFrom-Json
     if ($check.agentChat.automation.providerSendGatePath -ne $sharedGate -or
-        ($CanaryTaskKey -and $check.agentChat.automation.canaryTaskKey -ne $CanaryTaskKey)) {
+        ($CanaryTaskKey -and $check.agentChat.automation.canaryTaskKey -ne $CanaryTaskKey) -or
+        ($PilotPrimaryTaskKey -and $check.agentChat.automation.pilotPrimaryTaskKey -ne $PilotPrimaryTaskKey)) {
         throw 'Staged configuration did not preserve the exact gate and task identities'
     }
 }
@@ -679,6 +689,10 @@ if ($WaitForCanarySafe -and (-not $Apply -or -not $ForceMaintenance -or -not $Ca
     $PreflightOnly -or $VerifyMaintenanceOnly -or $SelfTest -or $WaitForFleetQuiet)) {
     throw 'WaitForCanarySafe requires Apply, ForceMaintenance and an explicit CanaryTaskKey'
 }
+if ($PilotPrimaryTaskKey -and ($PilotPrimaryTaskKey -notmatch '^[a-f0-9]{64}$' -or
+    -not $CanaryTaskKey -or $PilotPrimaryTaskKey -eq $CanaryTaskKey)) {
+    throw 'PilotPrimaryTaskKey needs a distinct verified 64-character CanaryTaskKey'
+}
 if ($SelfTest) {
     if ($Apply -or $VerifyMaintenanceOnly -or $PreflightOnly) {
         throw 'SelfTest cannot be combined with deployment or preflight switches'
@@ -733,9 +747,11 @@ if ($ForceMaintenance) {
 }
 if ($WaitForCanarySafe) {
     WaitForCanaryWindow $CanaryTaskKey $WaitTimeoutMinutes
+    if ($PilotPrimaryTaskKey) { WaitForCanaryWindow $PilotPrimaryTaskKey $WaitTimeoutMinutes }
     AssertReadyForInstall (Preflight)
 } else {
     AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+    if ($PilotPrimaryTaskKey) { AssertCanaryBelongsToPairedGoal $PilotPrimaryTaskKey }
 }
 if ($CanaryTaskKey -and $CanaryTaskKey -notmatch '^[a-f0-9]{64}$') {
     throw 'Canary key must be the exact verified lowercase stable task key'
@@ -773,12 +789,14 @@ try {
     AssertBrowserIdleBeforeShutdown
     if ($WaitForCanarySafe) {
         WaitForCanaryWindow $CanaryTaskKey $WaitTimeoutMinutes
+        if ($PilotPrimaryTaskKey) { WaitForCanaryWindow $PilotPrimaryTaskKey $WaitTimeoutMinutes }
     }
     AssertReadyForInstall (Preflight)
     if ($CanaryTaskKey) {
         # Never route an existing task to a new browser after its state became
         # ambiguous while the release files were staged.
         AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+        if ($PilotPrimaryTaskKey) { AssertCanaryBelongsToPairedGoal $PilotPrimaryTaskKey }
         AssertTwoBrowsersGuarded
     }
     Report 'stopping' ('Guarded native/browser/config update; forced_worker_interruption=' + [bool]$ForceMaintenance)
@@ -814,6 +832,7 @@ try {
         # The native supervisor is now stopped. Refuse to migrate a canary
         # whose state became in-flight during the shutdown race.
         AssertCanaryBelongsToPairedGoal $CanaryTaskKey
+        if ($PilotPrimaryTaskKey) { AssertCanaryBelongsToPairedGoal $PilotPrimaryTaskKey }
     }
     $replaced = $true
     if ($activationConfigOnly) {
@@ -821,7 +840,11 @@ try {
         Report 'config_only' 'Activated a selected canary without replacing in-use native or browser runtime files'
     } else {
         [IO.File]::Replace($stage, $target, $failed, $true)
-        [IO.File]::Replace($asarStage, $asar, $failedAsar, $true)
+        # Lane 2 can keep the shared browser bundle open when its bytes are
+        # already identical. Never replace a live ASAR just to upgrade native.
+        if ($asarHash -ne $installedAsarHash) {
+            [IO.File]::Replace($asarStage, $asar, $failedAsar, $true)
+        }
         [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
     }
     if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $hash -or
@@ -833,7 +856,7 @@ try {
     WaitForReady
     EnsureBrowserReady
     AssertEnabledBrowserGates $CanaryTaskKey
-    Report 'service_healthy' ('Native service and required browser Send gates verified; canary_enabled='+[bool]$CanaryTaskKey)
+    Report 'service_healthy' ('Native service and required browser Send gates verified; canary_enabled='+[bool]$CanaryTaskKey+' pilot_two_task_enabled='+[bool]$PilotPrimaryTaskKey)
 } catch {
     $reason = $_.Exception.Message
     Report 'failed' $reason
@@ -851,7 +874,9 @@ try {
                 $restoreBinary = Join-Path (Split-Path $target -Parent) ".codexify-restore-$runId.exe"
                 StageFile $previousAsar $restoreAsar
                 StageFile $previous $restoreBinary
-                [IO.File]::Replace($restoreAsar, $asar, (Join-Path $backup 'failed-restore-app.asar'), $true)
+                if ($asarHash -ne $installedAsarHash) {
+                    [IO.File]::Replace($restoreAsar, $asar, (Join-Path $backup 'failed-restore-app.asar'), $true)
+                }
                 [IO.File]::Replace($restoreBinary, $target, $failed, $true)
             }
             foreach ($pair in @(@($previousConfig,$configFile),@($previousAsar,$asar),@($previous,$target))) {

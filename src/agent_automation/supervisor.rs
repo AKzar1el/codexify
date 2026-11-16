@@ -742,6 +742,7 @@ pub struct AgentAutomationSupervisor {
     // of stalled handoffs must not poll ten ChatGPT tabs every 30 seconds.
     handoff_probe_budget: Mutex<HandoffProbeBudget>,
     canary_task_key: Option<String>,
+    pilot_primary_task_key: Option<String>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
     action_timeouts: ActionTimeouts,
@@ -831,6 +832,29 @@ impl AgentAutomationSupervisor {
         Ok(supervisor)
     }
 
+    /// Opt-in two-task smoke: allow only the selected primary and secondary
+    /// keys. Persisted old goals and their receipts are left untouched.
+    pub fn new_with_two_task_pilot_lane(
+        config: AgentAutomationConfig,
+        executor: Arc<dyn AutomationExecutor>,
+        primary_key: String,
+        canary_key: String,
+    ) -> Result<Arc<Self>, String> {
+        if primary_key.len() != 64
+            || !primary_key
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            || primary_key == canary_key
+        {
+            return Err("Two-task pilot needs distinct verified stable task keys".into());
+        }
+        let mut supervisor = Self::new_with_canary_lane(config, executor, canary_key)?;
+        Arc::get_mut(&mut supervisor)
+            .ok_or("Pilot supervisor unexpectedly shared")?
+            .pilot_primary_task_key = Some(primary_key);
+        Ok(supervisor)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_pairing_wait_timeout(
         config: AgentAutomationConfig,
@@ -872,6 +896,7 @@ impl AgentAutomationSupervisor {
             canary_run_lock: Mutex::new(()),
             handoff_probe_budget: Mutex::new(HandoffProbeBudget::default()),
             canary_task_key: None,
+            pilot_primary_task_key: None,
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
             approval_next_scan_ms: AtomicU64::new(0),
@@ -1858,6 +1883,18 @@ impl AgentAutomationSupervisor {
             .cloned()
             .collect::<Vec<_>>();
         for task in tasks {
+            if self
+                .pilot_primary_task_key
+                .as_deref()
+                .is_some_and(|primary| {
+                    primary != task.task.stable_key()
+                        && self.canary_task_key.as_deref() != Some(task.task.stable_key())
+                })
+            {
+                // Freeze legacy goal states, handoff probes and approval checks
+                // without altering their accepted Send receipts or journals.
+                continue;
+            }
             let activity = task.chat.offline_activity().await?;
             task.store.sync_goal_presence(
                 &task.task,
@@ -2942,8 +2979,9 @@ impl AgentAutomationSupervisor {
                             && queued.owner_generation == preferred.owner_generation
                             && queued.request.pairing_generation == preferred.generation
                             && execution_kind(queued) != AutomationActionKind::PairVerify
-                            && super::lane_affinity::owns_operation(
+                            && super::lane_affinity::owns_operation_in_pilot(
                                 &queued.task_key,
+                                self.pilot_primary_task_key.as_deref(),
                                 self.canary_task_key.as_deref(),
                                 usize::from(secondary),
                                 matches!(
@@ -2956,8 +2994,9 @@ impl AgentAutomationSupervisor {
                     });
                     position.and_then(|position| queue.remove(position))
                 } else {
-                    let position = super::lane_affinity::first_operation_in_lane(
+                    let position = super::lane_affinity::first_operation_in_pilot_lane(
                         &queue,
+                        self.pilot_primary_task_key.as_deref(),
                         self.canary_task_key.as_deref(),
                         usize::from(secondary),
                         |queued| {
@@ -3755,8 +3794,9 @@ impl AgentAutomationSupervisor {
         let tasks = self.tasks.read().await;
         let queue = self.queue.lock().await;
         queue.iter().any(|execution| {
-            if !super::lane_affinity::owns_operation(
+            if !super::lane_affinity::owns_operation_in_pilot(
                 &execution.task_key,
+                self.pilot_primary_task_key.as_deref(),
                 self.canary_task_key.as_deref(),
                 usize::from(secondary),
                 matches!(

@@ -485,3 +485,35 @@ Goal events / hourly wake-ups
   eligible as a canary yet. Creating an eleventh scheduled ChatGPT automation
   was rejected with `too_many_active_automations` (10/10 slots occupied).
   No revenue schedule or pairing state was modified to manufacture capacity.
+
+## Exactly two isolated pilots (2026-11-16)
+
+- At user request, paused **all 10 existing hourly Revenue Shot automations**
+  through the ChatGPT automation management API (every update confirmed).
+  None was deleted and their accepted Sends, journals, goals and branches
+  were left unchanged. Created only two hourly non-revenue pilot schedules:
+  `Codexify Lane 1 Pilot` at 10:15 Europe/Ljubljana and `Codexify Lane 2 Pilot`
+  at 10:20, staggered five minutes, under the plan's 10-slot limit. A manual
+  immediate-run request returned inline to the initiating conversation, **not**
+  two new paired tasks; pairing must be independently verified from the real
+  scheduled conversations before production routing can be activated.
+- Added opt-in `agentChat.automation.pilotPrimaryTaskKey` (distinct exact 64-char
+  key required alongside `canaryTaskKey`). Native startup builds an explicit
+  two-task pilot: scan skips legacy goal/handoff/approval activity **without
+  rewriting state**, both queues exclude all other keys, primary owns all
+  actions of the primary pilot plus pairing/renewal for the selected canary,
+  and secondary owns only selected canary offline chat/goal turns. The shared
+  atomic cross-process Send gate still serializes accepted Sends; one primary
+  goal and one secondary goal can be independent while previous states stay
+  conservatively frozen.
+- The guarded elevated installer accepts `-PilotPrimaryTaskKey <key>` together
+  with `-CanaryTaskKey <other-key>`; revalidates both genuinely paired active
+  goals before staging, after staging, and after native service shutdown.
+  A native-only upgrade avoids replacing the Electron ASAR when its hash
+  already matches the installed runtime (important while secondary is live).
+  Installer rollback and refusal on ambiguous accepted Sends remain in place.
+- **Activation gate:** Until each scheduled pilot gets its own unique local
+  automation.json state with verified owner pairing and no unconfirmed renewal
+  handoff, do not configure either task key, restart the service, or declare
+  concurrent success. Never use the unpaired existing reliability-lab goal as
+  a substitute for a genuinely paired new ChatGPT scheduled conversation.
