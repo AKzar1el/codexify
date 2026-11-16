@@ -131,6 +131,27 @@ function Test-CanaryReadyForUpgrade($state) {
         $state.action.kind -eq 'offline_goal' -and
         $state.action.status -eq 'idle' -and $state.action.sendAccepted -eq $true)
 }
+function Test-VerifiedUnsentFailedAction($state,[bool]$ownerAllowsInterruption) {
+    # Force maintenance may interrupt a goal that already failed *before*
+    # sending. This exception never applies to ambiguous or accepted Sends.
+    if (-not $ownerAllowsInterruption -or -not $state -or
+        -not $state.goal -or -not $state.action -or
+        $state.goal.status -ne 'active' -or
+        $state.action.kind -ne 'offline_goal' -or
+        $state.action.status -ne 'failed' -or
+        $state.action.sendAccepted -ne $false) { return $false }
+    $handoff = if ($state.PSObject.Properties['turnRenewal'] -and
+        $null -ne $state.turnRenewal -and
+        $state.turnRenewal.PSObject.Properties['handoff']) {
+        $state.turnRenewal.handoff
+    } else { $null }
+    if ($handoff -and $handoff.reportComplete -ne $true) { return $false }
+    $exactUnsentError = [string]$state.action.lastError
+    return ($exactUnsentError -in @(
+        'The shared ChatGPT window is not ready; check for an unsent draft or an ongoing response',
+        'ChatGPT did not stop the previous response; the new message was not sent'
+    ))
+}
 function ReadVerifiedCanaryState([string]$key) {
     if ($key -notmatch '^[a-f0-9]{64}$') {
         throw 'Canary key must be one verified 64-character stable task identity'
@@ -156,6 +177,12 @@ function ReadVerifiedCanaryState([string]$key) {
 function AssertCanaryBelongsToPairedGoal([string]$key) {
     if (-not $key) { return }
     $state = ReadVerifiedCanaryState $key
+    if (Test-VerifiedUnsentFailedAction $state ([bool]$ForceMaintenance)) {
+        # Keep the failed action's original receipt; do not clear a draft,
+        # retry the turn, or convert this into a successful Send.
+        Write-Warning 'Verified failed-before-Send action retained for owner recovery after force maintenance.'
+        return
+    }
     $actionStatus = [string]$state.action.status
     if ($actionStatus -notin @('idle','queued') -or
         ($actionStatus -eq 'queued' -and $state.action.sendAccepted -eq $true)) {
@@ -170,6 +197,11 @@ function WaitForCanaryWindow([string]$key,[int]$maximumMinutes) {
     while ($true) {
         $state = ReadVerifiedCanaryState $key
         $actionStatus = [string]$state.action.status
+        if (Test-VerifiedUnsentFailedAction $state ([bool]$ForceMaintenance)) {
+            AssertCanaryBelongsToPairedGoal $key
+            Write-Host 'CANARY_VERIFIED_UNSENT_FORCE_WINDOW'
+            return
+        }
         if ($actionStatus -in @('idle','queued')) {
             AssertCanaryBelongsToPairedGoal $key
             Write-Host 'CANARY_SAFE_WINDOW_CONFIRMED'
@@ -787,6 +819,42 @@ if ($SelfTest -or $HandoffGuardTest) {
     if (-not (Test-CanaryReadyForUpgrade $fixture)) {
         throw 'An active goal without a handoff must remain installable'
     }
+    # Owner-requested interruption may admit ONLY known failed-before-Send
+    # receipts. Accepted, ambiguous and unknown failures remain frozen.
+    $fixture.action.status = 'failed'
+    $fixture.action.sendAccepted = $false
+    $fixture.action | Add-Member -NotePropertyName lastError -NotePropertyValue 'The shared ChatGPT window is not ready; check for an unsent draft or an ongoing response'
+    if (-not (Test-VerifiedUnsentFailedAction $fixture $true)) {
+        throw 'Known failed-before-Send action must permit owner-authorized maintenance'
+    }
+    if (Test-VerifiedUnsentFailedAction $fixture $false) {
+        throw 'Normal maintenance must not override the failed-action guard'
+    }
+    $fixture.action.sendAccepted = $true
+    if (Test-VerifiedUnsentFailedAction $fixture $true) {
+        throw 'Accepted Send bypassed the owner-force exception'
+    }
+    $fixture.action.sendAccepted = $false
+    $fixture.action.status = 'ambiguous'
+    if (Test-VerifiedUnsentFailedAction $fixture $true) {
+        throw 'Ambiguous Send bypassed the owner-force exception'
+    }
+    $fixture.action.status = 'failed'
+    $fixture.action.lastError = 'Unknown browser delivery error'
+    if (Test-VerifiedUnsentFailedAction $fixture $true) {
+        throw 'Unknown browser failure bypassed the owner-force exception'
+    }
+    $fixture.action.lastError = 'ChatGPT did not stop the previous response; the new message was not sent'
+    if (-not (Test-VerifiedUnsentFailedAction $fixture $true)) {
+        throw 'Second verified unsent failure was unexpectedly rejected'
+    }
+    $fixture.turnRenewal = [pscustomobject]@{
+        handoff=[pscustomobject]@{reportComplete=$false}
+    }
+    if (Test-VerifiedUnsentFailedAction $fixture $true) {
+        throw 'Unverified active handoff bypassed the owner-force exception'
+    }
+    Write-Output 'OWNER_FORCE_VERIFIED_UNSENT_FIXTURE_PASS'
     $script:hash = 'new-native'
     $script:installedHash = 'old-native'
     $script:asarHash = 'unchanged-browser'
