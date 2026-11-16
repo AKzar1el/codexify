@@ -1,5 +1,23 @@
 use std::collections::VecDeque;
 
+/// Future multi-executor dispatch must be bounded by the snapshot queue
+/// length and must not promote work belonging to an unavailable lane.
+/// Returns the oldest eligible item without changing any other queue entry.
+pub(crate) fn take_oldest_verified_lane<T>(
+    queue: &mut VecDeque<T>,
+    lane: usize,
+    authenticated_executors: &[bool],
+    mut assigned_lane: impl FnMut(&T) -> Option<usize>,
+) -> Option<T> {
+    if !authenticated_executors.get(lane).copied().unwrap_or(false) {
+        return None;
+    }
+    let position = queue
+        .iter()
+        .position(|entry| assigned_lane(entry) == Some(lane))?;
+    queue.remove(position)
+}
+
 /// Stable explicit canary ownership; never migrate tasks by modulo/hash.
 #[cfg(test)]
 pub fn owns(task_key: &str, canary_key: Option<&str>, lane: usize) -> bool {
@@ -83,6 +101,32 @@ pub fn first_in_lane<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multi_lane_fifo_skips_unverified_executor_without_migrating_work() {
+        let mut queue = VecDeque::from([(2, "c1"), (1, "b1"), (0, "a1"), (2, "c2"), (1, "b2")]);
+        let lanes = [true, false, true];
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 1, &lanes, |entry| Some(entry.0)),
+            None
+        );
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 2, &lanes, |entry| Some(entry.0)),
+            Some((2, "c1"))
+        );
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 0, &lanes, |entry| Some(entry.0)),
+            Some((0, "a1"))
+        );
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 2, &lanes, |entry| Some(entry.0)),
+            Some((2, "c2"))
+        );
+        assert_eq!(queue, VecDeque::from([(1, "b1"), (1, "b2")]));
+        assert_eq!(
+            take_oldest_verified_lane(&mut queue, 1, &[true, true, true], |entry| Some(entry.0)),
+            Some((1, "b1"))
+        );
+    }
     #[test]
     fn pilot_fences_old_goal_states_on_both_lanes_without_touching_their_records() {
         let queue = VecDeque::from([
