@@ -153,7 +153,12 @@ async function closeServer(server: Server): Promise<void> {
 async function writeEvent(response: ServerResponse, value: unknown): Promise<void> {
   const line = `${JSON.stringify(value)}\n`;
   if (Buffer.byteLength(line) > MAX_EVENT_LINE_BYTES) throw new Error("Browser companion event is too large");
-  if (!response.write(line)) await once(response, "drain");
+  if(response.destroyed || response.writableEnded) return;
+  if (!response.write(line)) {
+    // A disconnected subscriber must not leave the event pump waiting forever
+    // for a drain that will never occur. The action itself remains authoritative.
+    await Promise.race([once(response,"drain"),once(response,"close")]);
+  }
 }
 
 async function route(

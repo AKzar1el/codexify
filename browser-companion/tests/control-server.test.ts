@@ -74,6 +74,44 @@ class BlockingDriver extends ImmediateDriver {
   }
 }
 
+test("disconnecting the event subscriber after accepted Send preserves the action and exact no-replay reattachment",async()=>{
+ let release!:()=>void,runs=0;
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ class DelayedDriver extends ImmediateDriver {
+  override async execute(execution:DriverExecution){
+   runs++;
+   execution.emit({type:"navigating"});
+   execution.emit({type:"model_verified",model:execution.request.model!,effort:execution.request.effort!});
+   execution.emit({type:"connector_verified"});
+   execution.emit({type:"send_accepted"});
+   await gate;
+   execution.emit({type:"generation_complete",finalMarkdown:"Verified final",canonicalUrl:execution.request.expectedUrl});
+  }
+ }
+ const root=await mkdtemp(join(tmpdir(),"browser-event-reattach-"));
+ const coordinator=new SingleWindowCoordinator(new DelayedDriver(),TEST_BUILD);
+ const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+ const headers={Authorization:`Bearer ${server.token}`};
+ try{
+  const request=executeBody();await coordinator.execute(request);
+  const deadline=Date.now()+2000;
+  while(!(await coordinator.action(request.actionId))?.sendAccepted){
+   expect(Date.now()).toBeLessThan(deadline);await Bun.sleep(5);
+  }
+  const abort=new AbortController();
+  const stream=await fetch(`${server.endpoint}/v1/actions/${request.actionId}/events?after=0`,{headers,signal:abort.signal});
+  expect(stream.status).toBe(200);abort.abort();
+  expect((await coordinator.action(request.actionId))?.sendAccepted).toBe(true);
+  release();
+  const resumed=await fetch(`${server.endpoint}/v1/actions/${request.actionId}/events?after=0`,{headers});
+  const events=(await resumed.text()).trim().split("\n").filter(Boolean).map(line=>JSON.parse(line));
+  expect(events.filter(event=>event.type==="send_accepted")).toHaveLength(1);
+  expect(events.at(-1)).toMatchObject({type:"generation_complete",finalMarkdown:"Verified final"});
+  expect(await coordinator.execute(request)).toMatchObject({sendAccepted:true});
+  expect(runs).toBe(1);
+ }finally{release();await server.close();}
+});
+
 test("provider Send gate capability is authenticated and reports only a path fingerprint",async()=>{
   const root=await mkdtemp(join(tmpdir(),"provider-gate-status-"));
   const coordinator=new SingleWindowCoordinator(new ImmediateDriver(),TEST_BUILD);
