@@ -31,6 +31,7 @@ $configFile = Join-Path $root 'codexify.config.json'
 $lane2 = Join-Path $root 'browser-lane2-canary\descriptor.json'
 $sharedGate = Join-Path $root 'browser-pool\send.lock'
 $preflightScript = Join-Path $PSScriptRoot 'preflight-two-browser-rollout.ps1'
+$secondaryMaintenanceScript = Join-Path $PSScriptRoot 'two-browser-secondary-maintenance.ps1'
 $port = 3000
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = if ($BackupDirectory) { $BackupDirectory } else { Join-Path $root "backups\two-browser-$runId" }
@@ -108,17 +109,26 @@ function AssertBrowserIdleBeforeShutdown() {
         throw "Browser is not idle: $($browser.state)"
     }
 }
+function Get-OptionalTurnHandoff($state) {
+    # Older goal records omit turnRenewal entirely. In StrictMode, direct
+    # access to that absent property throws before the force-maintenance guard
+    # can inspect the known failed-before-Send action. Read only if present.
+    if (-not $state -or -not $state.PSObject.Properties['turnRenewal']) {
+        return $null
+    }
+    $renewal = $state.PSObject.Properties['turnRenewal'].Value
+    if ($null -eq $renewal -or -not $renewal.PSObject.Properties['handoff']) {
+        return $null
+    }
+    return $renewal.PSObject.Properties['handoff'].Value
+}
 function Test-CanaryReadyForUpgrade($state) {
     if (-not $state -or -not $state.goal -or -not $state.action -or
         -not $state.pairing -or
         -not $state.pairing.verifiedOwnerGeneration -or
         -not $state.pairing.canonicalUrl -or
         -not $state.pairing.accountFingerprint) { return $false }
-    $handoff = if ($state.PSObject.Properties['turnRenewal'] -and
-        $null -ne $state.turnRenewal -and
-        $state.turnRenewal.PSObject.Properties['handoff']) {
-        $state.turnRenewal.handoff
-    } else { $null }
+    $handoff = Get-OptionalTurnHandoff $state
     if ($state.goal.status -eq 'active') {
         return (-not $handoff -or [bool]$handoff.reportComplete)
     }
@@ -140,16 +150,36 @@ function Test-VerifiedUnsentFailedAction($state,[bool]$ownerAllowsInterruption) 
         $state.action.kind -ne 'offline_goal' -or
         $state.action.status -ne 'failed' -or
         $state.action.sendAccepted -ne $false) { return $false }
-    $handoff = if ($state.PSObject.Properties['turnRenewal'] -and
-        $null -ne $state.turnRenewal -and
-        $state.turnRenewal.PSObject.Properties['handoff']) {
-        $state.turnRenewal.handoff
-    } else { $null }
+    $handoff = Get-OptionalTurnHandoff $state
     if ($handoff -and $handoff.reportComplete -ne $true) { return $false }
     $exactUnsentError = [string]$state.action.lastError
     return ($exactUnsentError -in @(
         'The shared ChatGPT window is not ready; check for an unsent draft or an ongoing response',
         'ChatGPT did not stop the previous response; the new message was not sent'
+    ))
+}
+function Test-VerifiedUnsentInitialCreation($state,[bool]$ownerAllowsInterruption) {
+    # A strict two-lane pilot may require an upgrade precisely because
+    # initial chat creation failed before Send on an old browser lane.
+    # This exception ONLY preserves that failed record during explicit owner
+    # maintenance. It never retries, resets, pairs, or marks a Send accepted.
+    if (-not $ownerAllowsInterruption -or -not $state -or
+        -not $state.goal -or $state.goal.status -ne 'active' -or
+        -not $state.action -or $state.action.kind -ne 'pair_verify' -or
+        $state.action.status -ne 'failed' -or $state.action.sendAccepted -ne $false -or
+        -not $state.pairing -or $state.pairing.creatingChat -ne $true -or
+        $state.pairing.verifiedOwnerGeneration -or $state.pairing.canonicalUrl -or
+        -not $state.pairing.pending -or -not $state.pairing.accountFingerprint -or
+        -not $state.pairing.candidateUrl -or
+        [long]$state.action.pairingGeneration -ne [long]$state.pairing.generation) {
+        return $false
+    }
+    if (Get-OptionalTurnHandoff $state) { return $false }
+    # Only the two actually observed pre-Send errors qualify. A generic
+    # unknown error must not silently qualify for forced maintenance.
+    return ([string]$state.action.lastError -in @(
+        'ChatGPT did not open its pairing effort picker (step: picker_open)',
+        'Browser companion operation failed'
     ))
 }
 function ReadVerifiedCanaryState([string]$key) {
@@ -169,7 +199,8 @@ function ReadVerifiedCanaryState([string]$key) {
         throw 'Canary identity was not found in exactly one local project state'
     }
     $state = Get-Content -LiteralPath $matches[0] -Raw | ConvertFrom-Json
-    if (-not (Test-CanaryReadyForUpgrade $state)) {
+    if (-not (Test-CanaryReadyForUpgrade $state) -and
+        -not (Test-VerifiedUnsentInitialCreation $state ([bool]$ForceMaintenance))) {
         throw 'Canary is neither a verified active goal with a reconciled handoff nor a strictly idle completed goal with a post-finish orphan'
     }
     return $state
@@ -177,6 +208,10 @@ function ReadVerifiedCanaryState([string]$key) {
 function AssertCanaryBelongsToPairedGoal([string]$key) {
     if (-not $key) { return }
     $state = ReadVerifiedCanaryState $key
+    if (Test-VerifiedUnsentInitialCreation $state ([bool]$ForceMaintenance)) {
+        Write-Warning 'Owner-authorized unverified initial-chat creation failed before Send; state retained unchanged for post-upgrade recovery.'
+        return
+    }
     if (Test-VerifiedUnsentFailedAction $state ([bool]$ForceMaintenance)) {
         # Keep the failed action's original receipt; do not clear a draft,
         # retry the turn, or convert this into a successful Send.
@@ -197,6 +232,11 @@ function WaitForCanaryWindow([string]$key,[int]$maximumMinutes) {
     while ($true) {
         $state = ReadVerifiedCanaryState $key
         $actionStatus = [string]$state.action.status
+        if (Test-VerifiedUnsentInitialCreation $state ([bool]$ForceMaintenance)) {
+            AssertCanaryBelongsToPairedGoal $key
+            Write-Host 'CANARY_VERIFIED_UNSENT_CREATION_FORCE_WINDOW'
+            return
+        }
         if (Test-VerifiedUnsentFailedAction $state ([bool]$ForceMaintenance)) {
             AssertCanaryBelongsToPairedGoal $key
             Write-Host 'CANARY_VERIFIED_UNSENT_FORCE_WINDOW'
@@ -603,6 +643,19 @@ function AssertTwoBrowsersGuarded() {
         throw 'Independent browser accounts or Send gate fingerprints do not match'
     }
 }
+function InvokeSecondaryMaintenance([string]$phase) {
+    if (-not $secondaryAccountForUpgrade -or -not $secondaryGateForUpgrade) {
+        throw 'Verified secondary browser identity was not captured before shutdown'
+    }
+    if (-not (Test-Path -LiteralPath $secondaryMaintenanceScript -PathType Leaf)) {
+        throw 'The independently verified secondary shutdown/restart helper is missing'
+    }
+    $shell = Join-Path $PSHOME 'powershell.exe'
+    & $shell -NoProfile -ExecutionPolicy Bypass -File $secondaryMaintenanceScript `
+        -Phase $phase -Apply -ExpectedAccount $secondaryAccountForUpgrade `
+        -ExpectedGate $secondaryGateForUpgrade
+    CheckExit "Secondary browser maintenance phase $phase"
+}
 function AssertEnabledBrowserGates([string]$canaryKey) {
     if ($canaryKey) {
         # A live canary must share the exact Send gate across both authenticated
@@ -855,6 +908,67 @@ if ($SelfTest -or $HandoffGuardTest) {
         throw 'Unverified active handoff bypassed the owner-force exception'
     }
     Write-Output 'OWNER_FORCE_VERIFIED_UNSENT_FIXTURE_PASS'
+    $uncreated = [pscustomobject]@{
+        goal = [pscustomobject]@{status='active'}
+        action = [pscustomobject]@{
+            kind='pair_verify'; status='failed'; pairingGeneration=[long]3
+            sendAccepted=$false
+            lastError='ChatGPT did not open its pairing effort picker (step: picker_open)'
+        }
+        pairing = [pscustomobject]@{
+            creatingChat=$true; generation=[long]3
+            verifiedOwnerGeneration=$null; canonicalUrl=$null
+            pending=[pscustomobject]@{generation=[long]3;ownerGeneration=[long]1}
+            accountFingerprint='verified-test-account'
+            candidateUrl='https://chatgpt.com/'
+        }
+        turnRenewal=$null
+    }
+    if (-not (Test-VerifiedUnsentInitialCreation $uncreated $true)) {
+        throw 'Known unsent initial creation must allow owner-authorized upgrade'
+    }
+    # Real pre-upgrade task JSON omits turnRenewal entirely. Exercise that
+    # exact shape under StrictMode instead of only a present-but-null fixture.
+    $uncreated.PSObject.Properties.Remove('turnRenewal')
+    if (-not (Test-VerifiedUnsentInitialCreation $uncreated $true)) {
+        throw 'Missing optional turnRenewal must not reject a proven unsent creation'
+    }
+    $uncreated | Add-Member -NotePropertyName turnRenewal -NotePropertyValue ([pscustomobject]@{})
+    if (-not (Test-VerifiedUnsentInitialCreation $uncreated $true)) {
+        throw 'Missing optional nested handoff must not reject a proven unsent creation'
+    }
+    $uncreated.turnRenewal | Add-Member -NotePropertyName handoff -NotePropertyValue ([pscustomobject]@{reportComplete=$false})
+    if (Test-VerifiedUnsentInitialCreation $uncreated $true) {
+        throw 'Unreconciled handoff must still block a forced installation'
+    }
+    $uncreated.turnRenewal = $null
+    if (Test-VerifiedUnsentInitialCreation $uncreated $false) {
+        throw 'Normal maintenance incorrectly admitted an unverified initial creation'
+    }
+    $uncreated.action.lastError='Browser companion operation failed'
+    if (-not (Test-VerifiedUnsentInitialCreation $uncreated $true)) {
+        throw 'Second observed unsent initial creation was not recognized'
+    }
+    $uncreated.action.sendAccepted=$true
+    if (Test-VerifiedUnsentInitialCreation $uncreated $true) {
+        throw 'Accepted initial creation bypassed force safety'
+    }
+    $uncreated.action.sendAccepted=$false
+    $uncreated.action.status='ambiguous'
+    if (Test-VerifiedUnsentInitialCreation $uncreated $true) {
+        throw 'Ambiguous initial creation bypassed force safety'
+    }
+    $uncreated.action.status='failed'
+    $uncreated.action.lastError='Unknown browser error'
+    if (Test-VerifiedUnsentInitialCreation $uncreated $true) {
+        throw 'Unknown initial creation bypassed force safety'
+    }
+    $uncreated.action.lastError='Browser companion operation failed'
+    $uncreated.pairing.verifiedOwnerGeneration=1
+    if (Test-VerifiedUnsentInitialCreation $uncreated $true) {
+        throw 'Previously verified pairing bypassed the strict initial-creation guard'
+    }
+    Write-Output 'OWNER_FORCE_UNSENT_CREATION_FIXTURE_PASS'
     $script:hash = 'new-native'
     $script:installedHash = 'old-native'
     $script:asarHash = 'unchanged-browser'
@@ -946,6 +1060,12 @@ New-Item -ItemType Directory -Path $backup -Force | Out-Null
 $replaced = $false
 $serviceStopped = $false
 $browserStopAttempted = $false
+$serviceRestarted = $false
+$secondaryStopped = $false
+$secondaryStarted = $false
+$secondaryAccountForUpgrade = $null
+$secondaryGateForUpgrade = $null
+$replaceBrowserBundle = [bool]($asarHash -ne $installedAsarHash)
 try {
     StageFile $target $previous
     StageFile $asar $previousAsar
@@ -971,6 +1091,11 @@ try {
         AssertCanaryBelongsToPairedGoal $CanaryTaskKey
         if ($PilotPrimaryTaskKey) { AssertCanaryBelongsToPairedGoal $PilotPrimaryTaskKey }
         AssertTwoBrowsersGuarded
+        if ($replaceBrowserBundle) {
+            $proof = BrowserProof $lane2
+            $secondaryAccountForUpgrade = [string]$proof.account
+            $secondaryGateForUpgrade = [string]$proof.gate
+        }
     }
     Report 'stopping' ('Guarded native/browser/config update; forced_worker_interruption=' + [bool]$ForceMaintenance)
     # Set this before running disable: Task Scheduler can stop the service
@@ -985,6 +1110,10 @@ try {
         $browserStopAttempted = $true
         & $target browser stop-for-restart
         CheckExit 'Prepare browser for service restart'
+        if ($CanaryTaskKey -and $replaceBrowserBundle) {
+            InvokeSecondaryMaintenance 'Stop'
+            $secondaryStopped = $true
+        }
     } else {
         $browserStopAttempted = $true
         & $target browser stop-for-restart
@@ -992,6 +1121,10 @@ try {
         $serviceStopped = $true
         & $target service disable
         CheckExit 'Stop scheduled service'
+        if ($CanaryTaskKey -and $replaceBrowserBundle) {
+            InvokeSecondaryMaintenance 'Stop'
+            $secondaryStopped = $true
+        }
     }
     WaitForOldListener
     WaitForVerifiedServiceProcessesExit
@@ -1012,10 +1145,12 @@ try {
         [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
         Report 'config_only' 'Activated a selected canary without replacing in-use native or browser runtime files'
     } else {
-        [IO.File]::Replace($stage, $target, $failed, $true)
+        if ($hash -ne $installedHash) {
+            [IO.File]::Replace($stage, $target, $failed, $true)
+        }
         # Lane 2 can keep the shared browser bundle open when its bytes are
         # already identical. Never replace a live ASAR just to upgrade native.
-        if ($asarHash -ne $installedAsarHash) {
+        if ($replaceBrowserBundle) {
             [IO.File]::Replace($asarStage, $asar, $failedAsar, $true)
         }
         [IO.File]::Replace($configStage, $configFile, $failedConfig, $true)
@@ -1024,8 +1159,13 @@ try {
         (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash -ne $asarHash) {
         throw 'Installed native or browser checksum mismatch'
     }
+    if ($secondaryStopped) {
+        InvokeSecondaryMaintenance 'Start'
+        $secondaryStarted = $true
+    }
     & $target service enable
     CheckExit 'Enable scheduled service'
+    $serviceRestarted = $true
     WaitForReady
     EnsureBrowserReady
     AssertEnabledBrowserGates $CanaryTaskKey
@@ -1035,22 +1175,36 @@ try {
     Report 'failed' $reason
     if ($replaced) {
         try {
+            if ($serviceRestarted) {
+                throw 'Service already restarted: automatic rollback would risk interrupting a new accepted Send; inspect the installed state before further maintenance'
+            }
             try { & $target browser stop-for-restart | Out-Null } catch {}
             & $target service disable
             WaitForOldListener
             WaitForVerifiedServiceProcessesExit
+            if ($secondaryStarted) {
+                InvokeSecondaryMaintenance 'Stop'
+                $secondaryStarted = $false
+            }
             $restoreConfig = Join-Path (Split-Path $configFile -Parent) ".codexify-restore-$runId.json"
-            StageFile $previousConfig $restoreConfig
-            [IO.File]::Replace($restoreConfig, $configFile, (Join-Path $backup 'failed-restore-config.json'), $true)
+            if ((Get-FileHash -LiteralPath $previousConfig -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $configFile -Algorithm SHA256).Hash) {
+                StageFile $previousConfig $restoreConfig
+                [IO.File]::Replace($restoreConfig, $configFile, (Join-Path $backup 'failed-restore-config.json'), $true)
+            }
             if (-not $activationConfigOnly) {
                 $restoreAsar = Join-Path (Split-Path $asar -Parent) ".codexify-restore-$runId.asar"
                 $restoreBinary = Join-Path (Split-Path $target -Parent) ".codexify-restore-$runId.exe"
-                StageFile $previousAsar $restoreAsar
-                StageFile $previous $restoreBinary
-                if ($asarHash -ne $installedAsarHash) {
+                if ((Get-FileHash -LiteralPath $previousAsar -Algorithm SHA256).Hash -ne
+                    (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash) {
+                    StageFile $previousAsar $restoreAsar
                     [IO.File]::Replace($restoreAsar, $asar, (Join-Path $backup 'failed-restore-app.asar'), $true)
                 }
-                [IO.File]::Replace($restoreBinary, $target, $failed, $true)
+                if ((Get-FileHash -LiteralPath $previous -Algorithm SHA256).Hash -ne
+                    (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) {
+                    StageFile $previous $restoreBinary
+                    [IO.File]::Replace($restoreBinary, $target, $failed, $true)
+                }
             }
             foreach ($pair in @(@($previousConfig,$configFile),@($previousAsar,$asar),@($previous,$target))) {
                 if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne
@@ -1058,12 +1212,16 @@ try {
                     throw 'Rollback file checksum did not match its backup'
                 }
             }
+            if ($secondaryStopped) {
+                InvokeSecondaryMaintenance 'Start'
+                $secondaryStarted = $true
+            }
             Report 'rolled_back' 'Original native binary, browser runtime and config verified or restored'
         } catch {
             Report 'rollback_blocked' $_.Exception.Message
         }
     }
-    if ($serviceStopped) {
+    if ($serviceStopped -and -not $serviceRestarted) {
         try { & $target service enable; & $target service wait-ready --port $port --timeout-ms 120000; EnsureBrowserReady } catch {}
     } elseif ($browserStopAttempted) {
         # The prior service is still running, but stop-for-restart might have
