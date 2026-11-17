@@ -1,9 +1,27 @@
 use std::collections::HashSet;
 
-// Windows accepts either separator and case-insensitive path aliases. This
-// lexical check is not a replacement for trusted canonical-path probing.
+// Windows accepts either separator and case-insensitive path aliases. Fold
+// redundant separators and "." before comparing labels, but never resolve
+// ".." without trusted filesystem evidence. This lexical check is not a
+// replacement for trusted canonical-path probing.
 fn normalized_path_label(path: &str) -> String {
-    path.trim().replace('\\', "/").to_lowercase()
+    let path = path.trim().replace('\\', "/").to_lowercase();
+    let prefix = if path.starts_with("//") {
+        "//"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    format!("{prefix}{}", parts.join("/"))
+}
+
+fn has_parent_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 /// A verified browser executor must have its own process and profile.
@@ -45,6 +63,7 @@ impl GoalAdmission {
                 || executor.process_id == 0
                 || account.is_empty()
                 || executor.profile_path.trim().is_empty()
+                || has_parent_segment(&executor.profile_path)
                 || !processes.insert(executor.process_id)
                 || !profiles.insert(normalized_path_label(&executor.profile_path))
                 || expected_account.is_some_and(|expected| expected != account)
@@ -62,15 +81,15 @@ impl GoalAdmission {
     /// existence and authenticated process identity must be checked separately
     /// at dispatch; distinct paths alone are never proof of a live browser.
     pub(crate) fn require_distinct_descriptors(descriptors: &[String]) -> Result<(), String> {
-        if descriptors.is_empty()
-            || descriptors.iter().any(|path| path.trim().is_empty())
-            || descriptors.iter().enumerate().any(|(index, path)| {
-                descriptors[..index]
-                    .iter()
-                    .any(|previous| normalized_path_label(previous) == normalized_path_label(path))
-            })
-        {
+        if descriptors.is_empty() {
             return Err("Browser lanes require nonempty, distinct descriptor paths".into());
+        }
+        let mut seen = HashSet::with_capacity(descriptors.len());
+        for path in descriptors {
+            let normalized = normalized_path_label(path);
+            if normalized.is_empty() || has_parent_segment(path) || !seen.insert(normalized) {
+                return Err("Browser lanes require nonempty, distinct descriptor paths".into());
+            }
         }
         Ok(())
     }
@@ -357,6 +376,33 @@ mod tests {
         );
         assert!(
             GoalAdmission::require_distinct_descriptors(&[
+                "C:/profiles/one/descriptor.json".into(),
+                "c:\\profiles\\one\\.\\descriptor.json".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
+                "C:/profiles/one//descriptor.json".into(),
+                "c:/profiles/one/descriptor.json".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
+                "//server/share/descriptor.json".into(),
+                "\\\\SERVER\\share\\.\\descriptor.json".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
+                "C:/profiles/one/../two/descriptor.json".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            GoalAdmission::require_distinct_descriptors(&[
                 "browser-1".into(),
                 "browser-2".into(),
                 "browser-3".into()
@@ -397,6 +443,17 @@ mod tests {
         separator_alias.profile_path = "C:\\profiles\\ONE".into();
         assert!(
             GoalAdmission::require_independent_executors(&[first.clone(), separator_alias])
+                .is_err()
+        );
+        let mut dotted_alias = second.clone();
+        dotted_alias.profile_path = "C:/profiles/one//./".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), dotted_alias]).is_err()
+        );
+        let mut parent_traversal = second.clone();
+        parent_traversal.profile_path = "C:/profiles/one/../two".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), parent_traversal])
                 .is_err()
         );
         let mut wrong_account = second.clone();
