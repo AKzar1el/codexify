@@ -178,6 +178,14 @@ pub struct AgentAutomationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_simplicity: Option<BrowserSimplicity>,
     pub recovery_enhancements: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canary_task_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pilot_primary_task_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane2_descriptor_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_send_gate_path: Option<String>,
 }
 
 impl Default for AgentAutomationConfig {
@@ -204,6 +212,10 @@ impl Default for AgentAutomationConfig {
             minimal_ui: false,
             browser_simplicity: None,
             recovery_enhancements: false,
+            canary_task_key: None,
+            pilot_primary_task_key: None,
+            lane2_descriptor_path: None,
+            provider_send_gate_path: None,
         }
     }
 }
@@ -227,6 +239,41 @@ impl AgentAutomationConfig {
 
     fn validate(&self) -> Result<(), String> {
         self.retry_timings.validate()?;
+        // The dual-process pilot is opt-in. Existing single-browser settings
+        // remain valid and retain the v2.4 action-page scheduler.
+        let valid_key = |value: &str| {
+            value.len() == 64
+                && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        if self.canary_task_key.as_deref().is_some_and(|key| !valid_key(key)) {
+            return Err("agentChat.automation.canaryTaskKey requires an exact lowercase 64-character task key".into());
+        }
+        if let Some(primary) = self.pilot_primary_task_key.as_deref() {
+            if !valid_key(primary) || self.canary_task_key.as_deref().is_none_or(|canary| canary == primary) {
+                return Err("agentChat.automation.pilotPrimaryTaskKey requires a distinct valid canaryTaskKey".into());
+            }
+        }
+        if self.canary_task_key.is_some() &&
+            (self.lane2_descriptor_path.is_none() || self.provider_send_gate_path.is_none()) {
+            return Err("The second browser requires lane2DescriptorPath and providerSendGatePath".into());
+        }
+        if self.canary_task_key.is_none() &&
+            (self.lane2_descriptor_path.is_some() || self.pilot_primary_task_key.is_some()) {
+            return Err("A lane2 descriptor or pilot primary task requires canaryTaskKey".into());
+        }
+        if self.pilot_primary_task_key.is_some() && self.browser_action_lanes != 1 {
+            return Err("The isolated two-process pilot requires one action page per browser process".into());
+        }
+        for (name, value) in [
+            ("lane2DescriptorPath", &self.lane2_descriptor_path),
+            ("providerSendGatePath", &self.provider_send_gate_path),
+        ] {
+            if let Some(value) = value {
+                if value.len() > 4096 || !std::path::Path::new(value).is_absolute() || value.contains('\0') {
+                    return Err(format!("agentChat.automation.{name} must be an absolute path"));
+                }
+            }
+        }
         if !(1..=4).contains(&self.browser_action_lanes) {
             return Err("agentChat.automation.browserActionLanes must be between 1 and 4".into());
         }

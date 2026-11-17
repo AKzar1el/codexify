@@ -1,6 +1,7 @@
 pub mod activity_guard;
 pub mod agents;
 mod companion;
+mod goal_admission;
 pub mod conversation_recovery;
 pub mod goal_blocking;
 mod install;

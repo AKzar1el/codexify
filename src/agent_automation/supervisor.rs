@@ -225,6 +225,16 @@ pub trait AutomationExecutor: Send + Sync {
     ) -> Result<bool, String> {
         Ok(false)
     }
+    async fn approve_pending_conversation_for_task(
+        &self,
+        _task_key: &str,
+        _eligible_offline: bool,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        self.approve_pending_conversation(url, account, connector_name).await
+    }
     async fn inspect_pending_materialization(
         &self,
         _url: &str,
@@ -524,6 +534,34 @@ impl AutomationExecutor for BrowserAutomationExecutor {
     ) -> Result<bool, String> {
         self.check_pending_approval(url, account, connector_name, false)
             .await
+    }
+    async fn approve_pending_conversation_for_task(
+        &self,
+        task_key: &str,
+        eligible_offline: bool,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+    ) -> Result<bool, String> {
+        if !self.config.auto_approve_tool_calls {
+            return Ok(false);
+        }
+        // A separate companion must approve in its *own* authenticated page.
+        if self.secondary.as_ref().is_some_and(|(key,_)| key == task_key)
+            && (eligible_offline || self.config.pilot_primary_task_key.is_some())
+        {
+            let client = BrowserCompanionClient::from_config(
+                self.config_for_task_key(task_key, eligible_offline),
+            )?;
+            let cancellation = CancellationToken::new();
+            let receipt = tokio::time::timeout(
+                Duration::from_secs(6),
+                client.approve_pending_conversation(url, account, connector_name, &cancellation),
+            ).await;
+            cancellation.cancel();
+            return receipt.map_err(|_| "Second browser approval observation timed out".to_string())?;
+        }
+        self.check_pending_approval(url, account, connector_name, false).await
     }
     async fn inspect_pending_materialization(
         &self,
@@ -1001,6 +1039,9 @@ pub struct AgentAutomationSupervisor {
     scan_lock: Mutex<()>,
     run_lock: RwLock<()>,
     run_slots: Semaphore,
+    canary_run_lock: Mutex<()>,
+    canary_task_key: Option<String>,
+    pilot_primary_task_key: Option<String>,
     task_run_locks: std::sync::Mutex<HashMap<String, Weak<Mutex<()>>>>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
@@ -1225,6 +1266,9 @@ impl AgentAutomationSupervisor {
             scan_lock: Mutex::new(()),
             run_lock: RwLock::new(()),
             run_slots: Semaphore::new(lanes),
+            canary_run_lock: Mutex::new(()),
+            canary_task_key: None,
+            pilot_primary_task_key: None,
             task_run_locks: std::sync::Mutex::new(HashMap::new()),
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
@@ -2744,7 +2788,7 @@ impl AgentAutomationSupervisor {
                     }
                 }
                 if !handoff.report_complete {
-                    let handoff_proven = if let (Some(url), Some(account)) = (
+                    if let (Some(url), Some(account)) = (
                         state.pairing.canonical_url.as_deref(),
                         state.pairing.account_fingerprint.as_deref(),
                     ) && state.pairing.verified_owner_generation == Some(task.owner_generation)
@@ -2796,7 +2840,7 @@ impl AgentAutomationSupervisor {
                             && !activity.is_online(now_ms, task.store.offline_after_ms())
                             && now_ms.saturating_sub(handoff.requested_at_ms) >= 30 * 60_000
                             && let Ok(_browser_guard) =
-                                self.try_run_guard_for_task(task.task.stable_key(), false)
+                                self.run_lock.try_write()
                             && task
                                 .store
                                 .mark_unverified_handoff_stalled(&task.task, &state, now_ms)?
@@ -3485,11 +3529,26 @@ impl AgentAutomationSupervisor {
     }
 
     pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
-        let _slot = self
-            .run_slots
-            .acquire()
-            .await
-            .map_err(|_| "Browser dispatch is closed")?;
+        self.run_next_for_lane(now_ms, false).await
+    }
+
+    async fn run_next_for_lane(
+        &self,
+        now_ms: u64,
+        secondary: bool,
+    ) -> Result<Option<CompanionActionSnapshot>, String> {
+        // The second Chrome process owns its exact task seat and its lock.
+        // Keep v2.4's page-pool semaphore and shared recovery read guard.
+        let _secondary_guard = if secondary {
+            Some(self.canary_run_lock.lock().await)
+        } else {
+            None
+        };
+        let _slot = if secondary {
+            None
+        } else {
+            Some(self.run_slots.acquire().await.map_err(|_| "Browser dispatch is closed")?)
+        };
         let _run_guard = self.run_lock.read().await;
         let mut reservation = None;
         let outcome = self
@@ -4525,6 +4584,9 @@ impl AgentAutomationSupervisor {
         Ok(Some(snapshot))
     }
 
+    async fn has_ready_action(&self, now_ms: u64) -> bool {
+        self.has_ready_action_for_lane(now_ms, false).await
+    }
     async fn has_ready_action_for_lane(&self, now_ms: u64, secondary: bool) -> bool {
         if !self.schema_refresh_ready() {
             return false;
@@ -4533,6 +4595,18 @@ impl AgentAutomationSupervisor {
         let queue = self.queue.lock().await;
         queue.iter().any(|execution| {
             !self.execution_has_lease(execution)
+                && super::lane_affinity::owns_operation_in_pilot(
+                    &execution.task_key,
+                    self.pilot_primary_task_key.as_deref(),
+                    self.canary_task_key.as_deref(),
+                    usize::from(secondary),
+                    matches!(
+                        execution_kind(execution),
+                        AutomationActionKind::OfflineChat
+                            | AutomationActionKind::OfflineGoal
+                            | AutomationActionKind::OfflineCombined
+                    ),
+                )
                 && tasks
                     .get(&execution.task_key)
                     .and_then(|task| task.store.load(&task.task).ok())
