@@ -1075,34 +1075,50 @@ export class ChatGptBrowserDriver implements BrowserDriver {
           throw new BrowserCompanionError('ChatGPT changed the prepared continuation after Stop','external_interference');
         if(await generationRunning(page))throw new BrowserCompanionError("ChatGPT's previous turn is still running; the continuation was not sent","editor_unavailable");
       }
-      if(this.surface.requireSubmissionNetworkProof)submissionNetwork=observeSubmissionNetwork(page);
-      submissionSlot.markSent();
-      this.draftRecovery.beforeSend(execution.request.actionId);
-      sendActivated = true;
-      if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
-      step("clicking Send");
-      submissionSettlesAt = Date.now() + 5_000;
-      await send.click({ timeout:10_000, signal:execution.signal });
-      submissionSlot.release();submissionSlot=undefined;
-      execution.emit({type:"submission_progress",step:"send_clicked"});
-      submissionSettlesAt = Date.now() + 5_000;
-      step("confirming Send acceptance");
-      try {
-        await Promise.all([
-          waitForSubmissionAcceptance(page, baseline, Date.now() + 25_000, execution.signal),
-          submissionNetwork?.wait(execution.signal),
-        ]);
-      } catch (error) {
-        if(error instanceof BrowserCompanionError&&error.code==="conversation_limit")throw error;
-        throw new BrowserCompanionError(
-          error instanceof BrowserCompanionError ? error.message : "ChatGPT Send may have been accepted, but semantic acceptance could not be proven",
-          "ambiguous_send",
-          { sendAccepted:true, cause:error },
-        );
-      }
-      sendAccepted = true;
-      this.draftRecovery.forget(execution.request.actionId);
-      execution.emit({ type:"send_accepted" });
+      // Capture the locally admitted slot before entering the async global gate.
+      // The outer cleanup still owns submissionSlot if admission fails pre-Send.
+      const gatedSubmissionSlot=submissionSlot;
+      if(!gatedSubmissionSlot)throw new BrowserCompanionError(
+        "The local submission reservation ended before global Send admission","external_interference");
+      await withSharedProviderSendGate(execution.request.actionId,execution.signal,async()=>{
+        // Waiting for another browser process can invalidate the selected
+        // conversation, account, or draft. Prove all three again before Send.
+        if ((await readChatGptAccount(page)).fingerprint !== execution.request.expectedAccountFingerprint
+          || (!creating && canonicalChatGptConversationUrl(page.url()) !== canonicalUrl)
+          || await composerText(await activeComposer(page,3_000,execution.signal)) !== execution.renderedPrompt) {
+          throw new BrowserCompanionError("ChatGPT account, destination or draft changed before global Send admission","external_interference");
+        }
+        await throwIfConversationApproval(page);
+        execution.signal.throwIfAborted();
+        if(this.surface.requireSubmissionNetworkProof)submissionNetwork=observeSubmissionNetwork(page);
+        gatedSubmissionSlot.markSent();
+        this.draftRecovery.beforeSend(execution.request.actionId);
+        sendActivated = true;
+        if(this.pendingSubmission?.actionId===execution.request.actionId)this.pendingSubmission.mayHaveSent=true;
+        step("clicking Send");
+        submissionSettlesAt = Date.now() + 5_000;
+        await send.click({ timeout:10_000, signal:execution.signal });
+        gatedSubmissionSlot.release();submissionSlot=undefined;
+        execution.emit({type:"submission_progress",step:"send_clicked"});
+        submissionSettlesAt = Date.now() + 5_000;
+        step("confirming Send acceptance");
+        try {
+          await Promise.all([
+            waitForSubmissionAcceptance(page, baseline, Date.now() + 25_000, execution.signal),
+            submissionNetwork?.wait(execution.signal),
+          ]);
+        } catch (error) {
+          if(error instanceof BrowserCompanionError&&error.code==="conversation_limit")throw error;
+          throw new BrowserCompanionError(
+            error instanceof BrowserCompanionError ? error.message : "ChatGPT Send may have been accepted, but semantic acceptance could not be proven",
+            "ambiguous_send",
+            { sendAccepted:true, cause:error },
+          );
+        }
+        sendAccepted = true;
+        this.draftRecovery.forget(execution.request.actionId);
+        execution.emit({ type:"send_accepted" });
+      });
       if (creating) {
         const created = new URL(await createdChatUrl(page, execution.signal)); created.search = ""; created.hash = ""; canonicalUrl = created.href;
         // Persist the actual chat identity before model restoration can fail or time out.

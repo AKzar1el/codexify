@@ -154,12 +154,7 @@ async function closeServer(server: Server): Promise<void> {
 async function writeEvent(response: ServerResponse, value: unknown): Promise<void> {
   const line = `${JSON.stringify(value)}\n`;
   if (Buffer.byteLength(line) > MAX_EVENT_LINE_BYTES) throw new Error("Browser companion event is too large");
-  if(response.destroyed || response.writableEnded) return;
-  if (!response.write(line)) {
-    // A disconnected subscriber must not leave the event pump waiting forever
-    // for a drain that will never occur. The action itself remains authoritative.
-    await Promise.race([once(response,"drain"),once(response,"close")]);
-  }
+  if (!response.write(line)) await once(response, "drain");
 }
 
 async function route(
@@ -174,11 +169,6 @@ async function route(
   const operation = new AbortController();
   request.once("aborted",()=>operation.abort());
   response.once("close",()=>{ if(!response.writableEnded)operation.abort(); });
-  // A client can disconnect after its request body was fully received.
-  // That does not emit IncomingMessage.aborted in all Node/Bun runtimes.
-  const clientClosed=()=>operation.abort();
-  request.socket.once("close",clientClosed);
-  response.once("finish",()=>request.socket.off("close",clientClosed));
   if(request.method === "GET" && url.pathname === "/v1/liveness") {
     json(response,200,await coordinator.liveness());return;
   }
@@ -190,7 +180,18 @@ async function route(
     const value=z.strictObject({css:z.string().max(32768)}).parse(await readJson(request));
     json(response,200,await coordinator.setPresentationStyle(value.css,operation.signal));return;
   }
-  if (request.method === "GET" && url.pathname === "/v1/health") {
+  if(request.method === "GET" && url.pathname === "/v1/send-gate/status") {
+    // Authenticated private endpoint: compare digests, never expose paths,
+    // browser cookies, tokens, or the lock file's owner.
+    const gate=process.env.CODEXIFY_BROWSER_SEND_GATE_PATH;
+    json(response,200,{
+      protocolVersion:PROTOCOL_VERSION,
+      build:coordinator.build,
+      enabled:Boolean(gate),
+      pathFingerprint:gate?createHash("sha256").update(gate).digest("hex"):null,
+    });
+    return;
+  }  if (request.method === "GET" && url.pathname === "/v1/health") {
     json(response, 200, await (url.searchParams.get("ready")==="1"?coordinator.readyHealth():coordinator.health()));
     return;
   }
@@ -205,8 +206,8 @@ async function route(
     return;
   }
   if (request.method === "POST" && url.pathname === "/v1/account/plan") {
-    const body=z.strictObject({epoch:z.string().min(1).max(128),passive:z.boolean().optional()}).parse(await readJson(request));
-    try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal,body.passive??false));}
+    const body=z.strictObject({epoch:z.string().min(1).max(128)}).parse(await readJson(request));
+    try {json(response,200,await coordinator.accountPlan(body.epoch,operation.signal));}
     catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Browser companion is busy");throw error;}return;
   }
   if(request.method==="POST"&&url.pathname==="/v1/navigation/availability") {
@@ -281,11 +282,7 @@ async function route(
     response.setHeader("Connection", "keep-alive");
     response.flushHeaders();
     const cancellation = new AbortController();
-    const disconnect = () => cancellation.abort();
-    // IncomingMessage.close means the request body was received, not that
-    // the NDJSON response subscriber disconnected.
-    response.once("close", disconnect);
-    request.socket.once("close", disconnect);
+    request.once("close", () => cancellation.abort());
     const heartbeat = setInterval(() => { if (!response.destroyed) response.write("\n"); }, HEARTBEAT_MS);
     heartbeat.unref();
     try {
@@ -295,8 +292,6 @@ async function route(
       response.end();
     } finally {
       clearInterval(heartbeat);
-      response.off("close", disconnect);
-      request.socket.off("close", disconnect);
     }
     return;
   }
