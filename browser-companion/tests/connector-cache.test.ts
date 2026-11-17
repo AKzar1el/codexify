@@ -11,7 +11,10 @@ test("connector identities persist across restarts and stay bound to account and
     const restarted=new ConnectorAppCache(path);
     expect(restarted.get(account,"My connector")).toBe("asdk_app_fixture");
     expect(restarted.get("b".repeat(64),"My connector")).toBeUndefined();expect(restarted.get(account,"Other")).toBeUndefined();
-    expect(lstatSync(path).mode&0o777).toBe(0o600);
+    // Windows Node/Bun st_mode reports synthesized POSIX bits, not the
+    // effective file ACL. Keep the strict mode check where it is meaningful.
+    if(process.platform!=="win32")expect(lstatSync(path).mode&0o777).toBe(0o600);
+    else expect(lstatSync(path).isFile()).toBeTrue();
     cache.rememberAllowAllSummary(account,"My connector","Permiso Permitir todo");
     expect(new ConnectorAppCache(path).getAllowAllSummary(account,"My connector")).toBe("Permiso Permitir todo");
     expect(cache.getAllowAllSummary("b".repeat(64),"My connector")).toBeUndefined();

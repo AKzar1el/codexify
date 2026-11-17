@@ -45,6 +45,15 @@ function runChecked(command, args, options = {}) {
   return result;
 }
 
+function archiveTool() {
+  if (process.platform !== "win32") return "tar";
+  // Some nvm-windows/PowerShell environments drop System32 from PATH.
+  // Windows ships bsdtar there; use it directly rather than assuming PATH.
+  const executable = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  if (!fs.existsSync(executable)) throw new Error("Windows System32 tar.exe is unavailable");
+  return executable;
+}
+
 function singleDirectory(parent, predicate, label) {
   const matches = fs.readdirSync(parent, { withFileTypes:true })
     .filter(entry => entry.isDirectory() && predicate(entry.name))
@@ -177,9 +186,9 @@ try {
   const artifact = path.join(artifactsDirectory, artifactName);
   fs.rmSync(artifact, { force:true });
   if (targetPlatform === "win32") {
-    runChecked("tar", ["-a", "-cf", artifact, "-C", packageStage, packageRootName]);
+    runChecked(archiveTool(), ["-a", "-cf", artifact, "-C", packageStage, packageRootName]);
   } else {
-    runChecked("tar", ["-czf", artifact, "-C", packageStage, packageRootName], {
+    runChecked(archiveTool(), ["-czf", artifact, "-C", packageStage, packageRootName], {
       env:{ ...process.env, COPYFILE_DISABLE:"1" },
     });
   }
