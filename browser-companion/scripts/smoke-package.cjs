@@ -3,6 +3,7 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { archiveTool } = require("./archive-tool.cjs");
 
 const root = path.resolve(__dirname, "..");
 const repositoryRoot = path.resolve(root, "..");
@@ -30,12 +31,6 @@ function run(command, args, options = {}) {
   if (result.status !== 0) {
     throw new Error(`${command} failed with status ${result.status ?? "unknown"}: ${result.stderr?.trim() || result.stdout?.trim() || "no output"}`);
   }
-}
-function archiveTool() {
-  if (process.platform !== "win32") return "tar";
-  const executable = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
-  if (!fs.existsSync(executable)) throw new Error("Windows System32 tar.exe is unavailable");
-  return executable;
 }
 
 const version = cargoVersion();

@@ -4,6 +4,8 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { archiveTool } = require("./archive-tool.cjs");
+const { resolveBunExecutable } = require("./bun-executable.cjs");
 const { installChrome } = require("./install-chrome.cjs");
 const { stageWindowsApplication } = require("./package-stage.cjs");
 
@@ -44,15 +46,6 @@ function runChecked(command, args, options = {}) {
     throw new Error(`${command} failed with status ${result.status ?? "unknown"}`);
   }
   return result;
-}
-
-function archiveTool() {
-  if (process.platform !== "win32") return "tar";
-  // Some nvm-windows/PowerShell environments drop System32 from PATH.
-  // Windows ships bsdtar there; use it directly rather than assuming PATH.
-  const executable = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
-  if (!fs.existsSync(executable)) throw new Error("Windows System32 tar.exe is unavailable");
-  return executable;
 }
 
 function singleDirectory(parent, predicate, label) {
@@ -112,7 +105,7 @@ const appRoot = path.join(packageRoot, "app");
 
 try {
   const browserRoot = installChrome(targetPlatform, targetArch);
-  runChecked("bun", ["run", "build"]);
+  runChecked(resolveBunExecutable(), ["run", "build"]);
   const builderConfig = path.join(scratch, "electron-builder.json");
   fs.writeFileSync(builderConfig, JSON.stringify({
     ...packageManifest.build,
@@ -191,7 +184,7 @@ try {
   fs.rmSync(artifact, { force:true });
   if (targetPlatform === "win32") {
     const zipOptions=process.env.CODEXIFY_BROWSER_FAST_LOCAL_PACKAGE==="1"?["--options","zip:compression-level=1"]:[];
-    runChecked("tar", ["-a", "-cf", artifact,...zipOptions, "-C", packageStage, packageRootName]);
+    runChecked(archiveTool(), ["-a", "-cf", artifact,...zipOptions, "-C", packageStage, packageRootName]);
   } else {
     runChecked(archiveTool(), ["-czf", artifact, "-C", packageStage, packageRootName], {
       env:{ ...process.env, COPYFILE_DISABLE:"1" },
