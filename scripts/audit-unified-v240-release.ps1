@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [switch]$SelfTest,
+    [switch]$ArchiveOnly,
     [string]$ArchivePath,
     [string]$NativeBinaryPath,
     [string]$SchemaPath,
@@ -121,20 +122,34 @@ if($SelfTest){
     } finally {Remove-Item -LiteralPath $tmp -Force -Recurse -ErrorAction SilentlyContinue}
     return
 }
-if(-not $ArchivePath -or -not $NativeBinaryPath -or -not $SchemaPath){throw 'ArchivePath, NativeBinaryPath and SchemaPath are required'}
-$native=Get-Item -LiteralPath $NativeBinaryPath -ErrorAction Stop
+if(-not $ArchivePath -or -not $SchemaPath -or (-not $ArchiveOnly -and -not $NativeBinaryPath)){
+    throw 'ArchivePath and SchemaPath, plus NativeBinaryPath unless ArchiveOnly, are required'
+}
 $schema=Get-Item -LiteralPath $SchemaPath -ErrorAction Stop
-if($native.PSIsContainer -or $schema.PSIsContainer -or
-    ($native.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-    ($schema.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Native binary and schema must be regular files'}
-$observed=((& $native.FullName --version 2>&1)|Out-String).Trim()
-if($LASTEXITCODE -ne 0 -or $observed -notmatch ('(^|[^0-9])'+[regex]::Escape($Version)+'([^0-9]|$)')){
-    throw 'Native executable version does not match the package'
+if($schema.PSIsContainer -or ($schema.Attributes -band [IO.FileAttributes]::ReparsePoint)){
+    throw 'Protocol schema must be a regular file'
 }
 $hash=(Get-FileHash -LiteralPath $schema.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 $package=VerifyArchive $ArchivePath $Version $hash
-$package|Add-Member -NotePropertyName nativeSha256 -NotePropertyValue ((Get-FileHash -LiteralPath $native.FullName -Algorithm SHA256).Hash.ToLowerInvariant())
-$package|Add-Member -NotePropertyName nativeVersionVerified -NotePropertyValue $true
+if($ArchiveOnly){
+    $package|Add-Member -NotePropertyName nativeVersionVerified -NotePropertyValue $false
+}else{
+    $native=Get-Item -LiteralPath $NativeBinaryPath -ErrorAction Stop
+    if($native.PSIsContainer -or ($native.Attributes -band [IO.FileAttributes]::ReparsePoint)){
+        throw 'Native executable must be a regular file'
+    }
+    # Codexify does not implement --version. Doctor is read-only and emits
+    # the compile-time version even when optional diagnostics are unhealthy.
+    $raw=(& $native.FullName doctor --json 2>$null |Out-String).Trim()
+    if(-not $raw){throw 'Native doctor version report is unavailable'}
+    $doctor=$raw|ConvertFrom-Json -ErrorAction Stop
+    if([string]$doctor.version -cne $Version){
+        throw 'Native executable version does not match the package'
+    }
+    $package|Add-Member -NotePropertyName nativeSha256 -NotePropertyValue ((Get-FileHash -LiteralPath $native.FullName -Algorithm SHA256).Hash.ToLowerInvariant())
+    $package|Add-Member -NotePropertyName nativeVersionVerified -NotePropertyValue $true
+}
 $package|Add-Member -NotePropertyName readOnly -NotePropertyValue $true
+# Matching artifacts alone do not mean a service maintenance window is safe.
 $package|Add-Member -NotePropertyName safeToInstall -NotePropertyValue $false
 $package|ConvertTo-Json -Depth 3
