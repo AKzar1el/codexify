@@ -133,6 +133,23 @@ impl GoalAdmission {
             .map(|_| lane)
     }
 
+    /// A persisted reservation alone cannot run: its exact authenticated
+    /// executor must also be idle. A mismatched health snapshot fails closed.
+    pub(crate) fn runnable_idle_lane(
+        &self,
+        task_key: &str,
+        authenticated_executors: &[bool],
+        busy_lanes: &[bool],
+    ) -> Option<usize> {
+        if authenticated_executors.len() != busy_lanes.len()
+            || authenticated_executors.len() != self.assigned_task_keys.len()
+        {
+            return None;
+        }
+        let lane = self.runnable_lane(task_key, authenticated_executors)?;
+        (!busy_lanes[lane]).then_some(lane)
+    }
+
     pub(crate) fn is_assigned(&self, task_key: &str) -> bool {
         self.assigned_task_keys.iter().any(|key| key == task_key)
     }
@@ -193,6 +210,36 @@ mod tests {
         // A failed executor must not cause the remaining goals to be
         // reindexed or a waiting goal to be promoted.
         assert_eq!(admission.lane_index(&key(2)), Some(2));
+    }
+
+    #[test]
+    fn idle_admission_rejects_busy_missing_and_stale_health_snapshots() {
+        let admission = GoalAdmission::new(vec![key(1), key(2), key(3)], 3).unwrap();
+        assert_eq!(
+            admission.runnable_idle_lane(&key(1), &[true, true, true], &[false, true, false]),
+            Some(0)
+        );
+        assert_eq!(
+            admission.runnable_idle_lane(&key(2), &[true, true, true], &[false, true, false]),
+            None
+        );
+        assert_eq!(
+            admission.runnable_idle_lane(&key(3), &[true, true, false], &[false, false, false]),
+            None
+        );
+        assert_eq!(
+            admission.runnable_idle_lane(&key(1), &[true], &[false]),
+            None
+        );
+        assert_eq!(
+            admission.runnable_idle_lane(&key(1), &[true, true, true], &[false, false]),
+            None
+        );
+        assert_eq!(
+            admission.runnable_idle_lane(&key(4), &[true, true, true], &[false, false, false]),
+            None
+        );
+        assert_eq!(admission.lane_index(&key(2)), Some(1));
     }
 
     #[test]
