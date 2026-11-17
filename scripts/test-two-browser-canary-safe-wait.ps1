@@ -11,6 +11,19 @@ $fn = @($ast.FindAll({param($node)
 },$true))
 if ($fn.Count -ne 1) { throw 'Canary safe-window wait is missing' }
 Invoke-Expression $fn[0].Extent.Text
+# The extracted install function reads parameters and related predicates that
+# normally exist in the installer's script scope. Load their real definitions
+# rather than replacing production safeguards with permissive mock stubs.
+$ForceMaintenance = $false
+foreach ($dependency in @('Test-VerifiedUnsentInitialCreation','Test-VerifiedUnsentFailedAction')) {
+    $definition = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $dependency
+    },$true))
+    if ($definition.Count -ne 1) { throw "Canary fixture dependency missing: $dependency" }
+    Invoke-Expression $definition[0].Extent.Text
+}
 $script:statuses = @()
 $script:attempts = 0
 $script:sleeps = 0
@@ -88,10 +101,10 @@ if (-not $timedOut -or $script:attempts -ne 1 -or $script:sleeps -ne 0) {
 }
 Write-Output 'PASS bounded wait expires without starting installation'
 $source = Get-Content -LiteralPath $path -Raw
-if ($source -notmatch '(?s)if \(\$WaitForCanarySafe\) \{\s*WaitForCanaryWindow \$CanaryTaskKey \$WaitTimeoutMinutes\s*AssertReadyForInstall \(Preflight\)') {
+if ($source -notmatch '(?s)if \(\$WaitForCanarySafe\) \{\s*WaitForCanaryWindow \$CanaryTaskKey \$WaitTimeoutMinutes\s*if \(\$PilotPrimaryTaskKey\) \{ WaitForCanaryWindow \$PilotPrimaryTaskKey \$WaitTimeoutMinutes \}\s*AssertReadyForInstall \(Preflight\)') {
     throw 'The initial wait must recheck all installation gates'
 }
-if ($source -notmatch '(?s)Report .backed_up.*?if \(\$WaitForCanarySafe\) \{\s*WaitForCanaryWindow \$CanaryTaskKey \$WaitTimeoutMinutes\s*\}\s*AssertReadyForInstall \(Preflight\)') {
+if ($source -notmatch '(?s)Report .backed_up.*?if \(\$WaitForCanarySafe\) \{\s*WaitForCanaryWindow \$CanaryTaskKey \$WaitTimeoutMinutes\s*if \(\$PilotPrimaryTaskKey\) \{ WaitForCanaryWindow \$PilotPrimaryTaskKey \$WaitTimeoutMinutes \}\s*\}\s*AssertReadyForInstall \(Preflight\)') {
     throw 'The installer must recheck the canary after staging'
 }
 if ($source -notmatch '(?s)if \(\$still.Count\).*?if \(\$CanaryTaskKey\) \{\s*# The native supervisor is now stopped.*?AssertCanaryBelongsToPairedGoal \$CanaryTaskKey') {

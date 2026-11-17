@@ -17,6 +17,7 @@ $fn = $ast.FindAll({
 }, $true) | Select-Object -First 1
 if (-not $fn) { throw 'Idle guard function missing from installer' }
 Invoke-Expression $fn.Extent.Text
+$AllowActiveWorkers = $false # The extracted installer guard normally receives this parameter
 
 $root = Join-Path $env:TEMP ('codexify-mock-idle-' + [guid]::NewGuid().ToString('N'))
 New-Item -Path $root -ItemType Directory -Force | Out-Null
