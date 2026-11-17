@@ -145,6 +145,29 @@ pub fn first_in_lane<T>(
 mod tests {
     use super::*;
     #[test]
+    fn five_lane_round_robin_skips_busy_and_unauthenticated_without_starvation() {
+        let queue = VecDeque::from([
+            (Some(0), "a"),
+            (Some(1), "b"),
+            (Some(2), "c"),
+            (Some(3), "d"),
+            (Some(4), "e"),
+            (None, "uncertain-send"),
+        ]);
+        let authenticated = [true, true, false, true, true];
+        let busy = [false, true, false, false, false];
+        let mut cursor = 0;
+        for expected in [0, 3, 4, 0, 3, 4] {
+            let (lane, next) =
+                next_idle_verified_lane(&queue, cursor, &authenticated, &busy, |item| item.0)
+                    .expect("at least one verified idle lane");
+            assert_eq!(lane, expected);
+            cursor = next;
+        }
+        assert_eq!(queue.len(), 6);
+        assert_eq!(queue[5].1, "uncertain-send");
+    }
+    #[test]
     fn busy_lane_cannot_receive_another_goal_or_steal_queued_work() {
         let queue = VecDeque::from([(Some(0), "inflight-followup"), (Some(1), "ready")]);
         assert_eq!(
