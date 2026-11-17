@@ -143,6 +143,56 @@ test("startup preserves a restored ChatGPT conversation without loading home",as
   expect(await surface.selectConversation('https://chatgpt.com/c/restored')).toBe(shared as unknown as Page);
 });
 
+test("eight Agent Chats reuse one signed-in Chrome context without sharing their tabs",async()=>{
+  const {surface,fake}=await createSurface();
+  const keys=Array.from({length:8},(_,index)=>(index+1).toString(16).padStart(64,"0"));
+  const lanes=await Promise.all(keys.map(key=>surface.forTask(key)));
+  const pages=await Promise.all(lanes.map(lane=>lane.page()));
+  expect(new Set(pages).size).toBe(8);
+  expect(pages.every(page=>page.context()===fake as unknown as BrowserContext)).toBeTrue();
+  expect(fake.tabs).toHaveLength(9); // one control page, eight task pages
+  expect(launchSpy).toHaveBeenCalledTimes(1);
+  expect(await surface.forTask(keys[0]!)).toBe(lanes[0]);
+  expect(await surface.page()).toBe(fake.tabs[0] as unknown as Page);
+});
+
+test("a task tab refuses to navigate another task's conversation",async()=>{
+  const {surface}=await createSurface();
+  const laneA=await surface.forTask("a".repeat(64));
+  const laneB=await surface.forTask("b".repeat(64));
+  const pageA=await openGoal(laneA,"https://chatgpt.com/c/goal-a");
+  await expect(openGoal(laneB,"https://chatgpt.com/c/goal-a"))
+    .rejects.toMatchObject({code:"external_interference"});
+  await expect(openGoal(surface,"https://chatgpt.com/c/goal-a"))
+    .rejects.toMatchObject({code:"external_interference"});
+  const pageB=await openGoal(laneB,"https://chatgpt.com/c/goal-b");
+  expect(pageA).not.toBe(pageB);
+  expect(pageA.url()).toBe("https://chatgpt.com/c/goal-a");
+});
+
+test("closing a task surface never closes another task or the shared signed-in browser",async()=>{
+  const {surface,fake}=await createSurface();
+  const laneA=await surface.forTask("a".repeat(64));
+  const laneB=await surface.forTask("b".repeat(64));
+  await laneA.close();
+  await laneA.closed;
+  expect(fake.closed).toBeFalse();
+  expect(await laneB.page()).toBeDefined();
+  expect(await surface.page()).toBeDefined();
+  await expect(laneA.page()).rejects.toMatchObject({code:"external_interference"});
+  // A closed lane must not silently acquire a different tab after an ambiguous Send.
+  expect(await surface.forTask("a".repeat(64))).toBe(laneA);
+});
+
+test("task tabs reject invalid identity and bound allocations",async()=>{
+  const {surface}=await createSurface();
+  await expect(surface.forTask("not-a-task-key")).rejects.toThrow("invalid");
+  for(let i=1;i<=16;i++) {
+    await surface.forTask(i.toString(16).padStart(64,"0"));
+  }
+  await expect(surface.forTask("f".repeat(64))).rejects.toThrow("capacity");
+});
+
 test("background launch retains Patchright's transport and private profile without a startup URL", async () => {
   const args = await backgroundChromeArgs(fakeExecutablePath);
   expect(args).toContain(`--user-data-dir=${fakeExecutablePath}`);

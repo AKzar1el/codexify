@@ -26,19 +26,36 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
   private selectedPage:Page;
   private draftPage?:Page;
   private static readonly MAX_TABS=32;
+  private static readonly MAX_TASK_TABS=16;
+  private readonly taskSurfaces=new Map<string,Promise<ChromeSingleWindowSurface>>();
+  private readonly delegatedPages=new Set<Page>();
+  private taskTabCreationTail:Promise<void>=Promise.resolve();
+  private onPageClosed?:()=>void;
 
-  private constructor(private readonly context: BrowserContext, private readonly controlPage: Page) {
+  private constructor(
+    private readonly context: BrowserContext,
+    private readonly controlPage: Page,
+    private readonly ownsContext=true,
+    private readonly ownedPages?:Set<Page>,
+    private readonly delegatedByParent?:Set<Page>,
+    private readonly parentClosed?:Promise<void>,
+    private readonly tabCreationGate:{tail:Promise<void>}={tail:Promise.resolve()},
+  ) {
     this.selectedPage=controlPage;
     this.closed = new Promise(resolveClosed => {
       const closed = () => { this.contextClosed = true; resolveClosed(); };
-      context.once("close", closed);
+      if(ownsContext)context.once("close", closed);
+      else if(parentClosed)void parentClosed.then(closed);
       const pageClosed = () => {
         // Closing the last window can leave Chrome's background process alive.
         // Let the launcher exit so the next action can start a fresh window.
-        if (context.pages().every(page => page.isClosed())) closed();
+        if (ownedPages
+          ? [...ownedPages].every(page => page.isClosed())
+          : context.pages().every(page => page.isClosed())) closed();
       };
+      this.onPageClosed=pageClosed;
       controlPage.once("close", pageClosed);
-      context.on("page", page => page.once("close", pageClosed));
+      if(ownsContext)context.on("page", page => page.once("close", pageClosed));
     });
   }
 
@@ -60,9 +77,59 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
 
   private async newTab():Promise<Page> {
     if(this.contextClosed)throw new BrowserCompanionError("The ChatGPT browser was closed","external_interference");
-    if(this.context.pages().filter(page=>!page.isClosed()).length>=ChromeSingleWindowSurface.MAX_TABS)
-      throw new BrowserCompanionError("The browser has reached its safe 32-tab limit; close unused tabs before creating more","external_interference");
-    return ChromeSingleWindowSurface.backgroundTab(this.context);
+    let release!:()=>void;
+    const wait=this.tabCreationGate.tail;
+    const next=new Promise<void>(resolve=>{release=resolve;});
+    this.tabCreationGate.tail=wait.then(()=>next,()=>next);
+    await wait;
+    try {
+      if(this.context.pages().filter(page=>!page.isClosed()).length>=ChromeSingleWindowSurface.MAX_TABS)
+        throw new BrowserCompanionError("The browser has reached its safe 32-tab limit; close unused tabs before creating more","external_interference");
+      const page=await ChromeSingleWindowSurface.backgroundTab(this.context);
+      this.ownedPages?.add(page);
+      this.delegatedByParent?.add(page);
+      if(!this.ownsContext&&this.onPageClosed)page.once("close",this.onPageClosed);
+      return page;
+    } finally { release(); }
+  }
+
+  /**
+   * One authenticated Chrome profile, but a pinned page and independent
+   * browser surface for each task. This is a building block for the future
+   * multi-lane supervisor; the current two-lane routing stays unchanged.
+   */
+  async forTask(taskKey:string):Promise<ChromeSingleWindowSurface> {
+    if(!this.ownsContext)throw new Error("A task cannot allocate another task's browser tab");
+    if(!/^[a-f0-9]{64}$/.test(taskKey))throw new Error("Agent Chat task key is invalid");
+    const existing=this.taskSurfaces.get(taskKey);
+    if(existing)return existing;
+    if(this.taskSurfaces.size>=ChromeSingleWindowSurface.MAX_TASK_TABS)
+      throw new Error("Agent Chat task tab capacity reached");
+    // A page-created event is not tagged with the requesting task. Serialize
+    // task allocations to prevent two concurrent calls claiming one tab.
+    const pending=this.taskTabCreationTail.then(async()=>{
+      await this.page();
+      const page=await this.newTab();
+      this.delegatedPages.add(page);
+      const child=new ChromeSingleWindowSurface(
+        this.context,page,false,new Set([page]),this.delegatedPages,this.closed,this.tabCreationGate,
+      );
+      try {
+        await child.navigate(CHATGPT_HOME);
+        return child;
+      } catch(error) {
+        this.delegatedPages.delete(page);
+        await page.close().catch(()=>{});
+        throw error;
+      }
+    });
+    this.taskTabCreationTail=pending.then(()=>{},()=>{});
+    this.taskSurfaces.set(taskKey,pending);
+    try {return await pending;}
+    catch(error) {
+      if(this.taskSurfaces.get(taskKey)===pending)this.taskSurfaces.delete(taskKey);
+      throw error;
+    }
   }
 
   private static conversationKey(url:string):string|null {
@@ -108,7 +175,9 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
   }
 
   async page(): Promise<Page> {
-    if(this.contextClosed||this.selectedPage.isClosed()||!this.context.pages().includes(this.selectedPage))
+    if(this.contextClosed||this.selectedPage.isClosed()||!this.context.pages().includes(this.selectedPage)
+      ||(this.ownedPages&&!this.ownedPages.has(this.selectedPage))
+      ||(this.ownsContext&&this.delegatedPages.has(this.selectedPage)))
       throw new BrowserCompanionError("The selected ChatGPT tab was closed or replaced","external_interference");
     return this.selectedPage;
   }
@@ -137,8 +206,13 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     if(signal?.aborted)throw new DOMException("Browser action aborted","AbortError");
     const key=ChromeSingleWindowSurface.conversationKey(url);
     if(!key)throw new BrowserCompanionError("A goal tab requires an exact ChatGPT conversation URL","conversation_unavailable");
-    const matches=this.context.pages().filter(page=>!page.isClosed()
+    const allMatches=this.context.pages().filter(page=>!page.isClosed()
       &&ChromeSingleWindowSurface.conversationKey(page.url())===key);
+    const matches=allMatches.filter(page=>this.ownsContext
+      ? !this.delegatedPages.has(page)
+      : this.ownedPages?.has(page));
+    if(matches.length!==allMatches.length)
+      throw new BrowserCompanionError("ChatGPT conversation belongs to another Agent Chat tab","external_interference");
     if(matches.length>1)throw new BrowserCompanionError("Multiple tabs show the same ChatGPT conversation; select a unique target","external_interference");
     if(matches.length===1){this.selectedPage=matches[0]!;return this.page();}
     // A handoff or goal retry during the global load cooldown used to open
@@ -200,6 +274,10 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
   }
 
   async close(): Promise<void> {
-    await this.context.close();
+    if(this.ownsContext)await this.context.close();
+    else {
+      await Promise.all([...(this.ownedPages??[])].map(page=>page.close().catch(()=>{})));
+      for(const page of this.ownedPages??[])this.delegatedByParent?.delete(page);
+    }
   }
 }

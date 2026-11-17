@@ -263,7 +263,7 @@ async function collect(coordinator: SingleWindowCoordinator, actionId: string): 
 
 test("only an explicitly manual action bypasses navigation cooldown and still requires its verified account",async()=>{
   let current="https://chatgpt.com/";const loads:string[]=[],context={} as BrowserContext;
-  const page={context:()=>context,url:()=>current,goto:async(url:string)=>{current=url;loads.push(url);return {status:()=>200};}} as unknown as Page;
+  const page={context:()=>context,url:()=>current,goto:async(url:string)=>{current=url;loads.push(url);return {status:()=>200,headerValue:async()=>null};}} as unknown as Page;
   await navigatePage(page,"https://chatgpt.com/c/existing");
   class NavigationDriver extends DeferredDriver {
     override async execute(execution:DriverExecution):Promise<void>{
