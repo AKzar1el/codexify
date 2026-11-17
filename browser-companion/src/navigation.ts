@@ -115,6 +115,14 @@ export function isChatGptPage(value:string):boolean {
   try {return new URL(value).origin === "https://chatgpt.com";} catch {return false;}
 }
 
+/** Cloudflare's documented, unambiguous challenge-response header.
+ * Do not infer challenges from ordinary HTTP 403/503 errors or page text.
+ * This checks responses only; it never solves challenges or exports cookies.
+ */
+export function isCloudflareChallengeHeader(value:string|null):boolean {
+  return value?.trim().toLowerCase()==="challenge";
+}
+
 export async function navigatePage(page:Page,url:string,options:{signal?:AbortSignal;timeout?:number;reload?:boolean}={}):Promise<void> {
   options.signal?.throwIfAborted();
   const target = new URL(url);
@@ -145,6 +153,17 @@ export async function navigatePage(page:Page,url:string,options:{signal?:AbortSi
     }
     const settings={waitUntil:"domcontentloaded" as const,timeout:options.timeout??60_000,signal:options.signal};
     const response=options.reload?await page.reload(settings):await page.goto(target.href,settings);
+    if(target.origin==="https://chatgpt.com" && response
+      && isCloudflareChallengeHeader(await response.headerValue("cf-mitigated"))) {
+      // A challenged document is not evidence of a selector change or a
+      // successful transcript load. Preserve the shared recovery budget, and
+      // require manual verification in the original signed-in browser.
+      if(conversation)recordConversationUnavailable(page);
+      throw new BrowserCompanionError(
+        "ChatGPT returned a Cloudflare verification challenge; finish verification in the existing browser before retrying",
+        "external_interference",
+      );
+    }
     if(response?.status()===429){
       const retryAfter=await response.headerValue("retry-after");
       if(conversation)recordLoadRateLimit(page,retryAfter);

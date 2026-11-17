@@ -1,16 +1,17 @@
 import {afterEach,expect,setSystemTime,test} from "bun:test";
 import type {BrowserContext,Page} from "patchright";
-import {configureNavigationTimings,navigatePage,recordConversationAvailable,recordConversationUnavailable,withConversationCooldownBypass,conversationLoadAvailableAt} from "../src/navigation";
+import {configureNavigationTimings,navigatePage,recordConversationAvailable,recordConversationUnavailable,withConversationCooldownBypass,conversationLoadAvailableAt,isCloudflareChallengeHeader} from "../src/navigation";
 
 class NavigationPage {
   current="https://chatgpt.com/";
   loads:string[]=[];
   responseCode=200;
   retryAfter:string|null=null;
+  cloudflareChallenge:string|null=null;
   constructor(readonly owner={} as BrowserContext){}
   context=()=>this.owner;
   url=()=>this.current;
-  async goto(url:string){this.current=url;this.loads.push(url);return {status:()=>this.responseCode,headerValue:async()=>this.retryAfter};}
+  async goto(url:string){this.current=url;this.loads.push(url);return {status:()=>this.responseCode,headerValue:async(name:string)=>name==="cf-mitigated"?this.cloudflareChallenge:name==="retry-after"?this.retryAfter:null};}
   reload=()=>this.goto(this.current);
   asPage=()=>this as unknown as Page;
 }
@@ -126,6 +127,30 @@ test("a billing-only rate limit does not block unrelated conversation loads",asy
   const page=new NavigationPage();page.responseCode=429;
   await expect(navigatePage(page.asPage(),'https://chatgpt.com/settings/billing')).rejects.toMatchObject({code:'rate_limited'});
   page.responseCode=200;await navigatePage(page.asPage(),'https://chatgpt.com/c/first');expect(page.loads).toHaveLength(2);
+});
+
+test("Cloudflare verification is identified by its header, not by HTTP status or page text",async()=>{
+  expect(isCloudflareChallengeHeader(" challenge ")).toBeTrue();
+  expect(isCloudflareChallengeHeader("CHALLENGE")).toBeTrue();
+  for(const value of [null,"","blocked","captcha","cf-challenge"])expect(isCloudflareChallengeHeader(value)).toBeFalse();
+  const page=new NavigationPage();page.responseCode=200;page.cloudflareChallenge="challenge";
+  await expect(navigatePage(page.asPage(),"https://chatgpt.com/c/challenged"))
+    .rejects.toMatchObject({code:"external_interference",sendAccepted:false});
+  expect(page.loads).toEqual(["https://chatgpt.com/c/challenged"]);
+  page.cloudflareChallenge=null;
+  // The challenge must not trigger repeated browser launches or discard the
+  // existing 5-minute shared conversation recovery budget.
+  await expect(navigatePage(page.asPage(),"https://chatgpt.com/c/other"))
+    .rejects.toMatchObject({code:"conversation_cooldown"});
+  expect(page.loads).toHaveLength(1);
+});
+
+test("ordinary HTTP 403 and challenges from other websites do not trigger ChatGPT challenge handling",async()=>{
+  const ordinary=new NavigationPage();ordinary.responseCode=403;
+  await navigatePage(ordinary.asPage(),"https://chatgpt.com/c/ordinary");
+  const other=new NavigationPage();other.responseCode=403;other.cloudflareChallenge="challenge";
+  await navigatePage(other.asPage(),"https://example.com/protected");
+  expect(other.loads).toEqual(["https://example.com/protected"]);
 });
 
 test("Retry-After HTTP dates are honored and unrelated browser profiles are independent",async()=>{
