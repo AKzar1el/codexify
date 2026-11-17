@@ -7,9 +7,14 @@ import type { SingleBrowserSurface } from "./chatgpt-driver";
 import { BrowserCompanionError } from "./errors";
 import { backgroundChromeArgs } from "./background-chrome";
 import {prepareRequestBlockList,requestBlockListArgs,verifyRequestBlockList} from "./request-block-list";
-import {assertConversationLoadAvailableBeforeTab,isChatGptPage,navigatePage,observeConversationLoadResponses} from "./navigation";
+import {isChatGptPage,navigatePage,observeConversationRateLimits,observeConversationLoadResponses} from "./navigation";
 import {installChatModeCompatibility} from "./chat-mode";
-import {canonicalChatGptConversationUrl,validateChatGptConversationUrl} from "./protocol";
+import {browserSimplicityFromEnvironment,parseBrowserSimplicity,installMinimalChatGptPage,styleRestoredChatGptPage,type BrowserSimplicity} from "./minimal-page";
+import {recoverOrphanedWindowsChrome} from "./windows-chrome-recovery";
+import {normalizeWindowsRendererPriorities} from "./windows-priority";
+import {readPresentationCss,savePresentationCss,validatePresentationCss} from "./presentation-style";
+import {createHash} from "node:crypto";
+import {maintainRendererMemory} from "./renderer-memory";
 
 const CHATGPT_HOME = "https://chatgpt.com/";
 
@@ -17,46 +22,46 @@ export interface ChromeSurfaceOptions {
   profilePath: string;
   executablePath: string;
   requestBlockList?: readonly string[];
+  managedRuntimeRoot?: string;
+  presentationCssPath?:string;
+  minimalUi?:boolean;
+  browserSimplicity?:BrowserSimplicity;
+  /** Total owned action pages in this profile, including the primary page. */
+  actionLaneLimit?:number;
+}
+
+interface SurfaceContextState {
+  contextClosed:boolean;
+  closed:Promise<void>;
+  registeredLanePages:Set<Page>;
+  surfaces:Set<ChromeSingleWindowSurface>;
+  registration:Promise<void>;
+  pendingLaneCreations:number;
+  presentationUpdating:boolean;
+  presentationCssPath?:string;
+  presentationCss:string;
+  presentationRevision:number;
+  browserSimplicity:BrowserSimplicity;
+  actionLaneLimit:number;
+  closePromise?:Promise<void>;
 }
 
 export class ChromeSingleWindowSurface implements SingleBrowserSurface {
+  readonly requireSubmissionNetworkProof=true;
   readonly closed: Promise<void>;
-  private contextClosed = false;
   private actionActive = false;
-  private selectedPage:Page;
-  private draftPage?:Page;
-  private static readonly MAX_TABS=32;
-  private static readonly MAX_TASK_TABS=16;
-  private readonly taskSurfaces=new Map<string,Promise<ChromeSingleWindowSurface>>();
-  private readonly delegatedPages=new Set<Page>();
-  private taskTabCreationTail:Promise<void>=Promise.resolve();
-  private onPageClosed?:()=>void;
+  private closePromise?:Promise<void>;
 
-  private constructor(
-    private readonly context: BrowserContext,
-    private readonly controlPage: Page,
-    private readonly ownsContext=true,
-    private readonly ownedPages?:Set<Page>,
-    private readonly delegatedByParent?:Set<Page>,
-    private readonly parentClosed?:Promise<void>,
-    private readonly tabCreationGate:{tail:Promise<void>}={tail:Promise.resolve()},
-  ) {
-    this.selectedPage=controlPage;
-    this.closed = new Promise(resolveClosed => {
-      const closed = () => { this.contextClosed = true; resolveClosed(); };
-      if(ownsContext)context.once("close", closed);
-      else if(parentClosed)void parentClosed.then(closed);
-      const pageClosed = () => {
-        // Closing the last window can leave Chrome's background process alive.
-        // Let the launcher exit so the next action can start a fresh window.
-        if (ownedPages
-          ? [...ownedPages].every(page => page.isClosed())
-          : context.pages().every(page => page.isClosed())) closed();
-      };
-      this.onPageClosed=pageClosed;
-      controlPage.once("close", pageClosed);
-      if(ownsContext)context.on("page", page => page.once("close", pageClosed));
-    });
+  private constructor(private readonly context: BrowserContext, private readonly sharedPage: Page,
+    private readonly state:SurfaceContextState, private readonly ownsContext:boolean) {
+    state.registeredLanePages.add(sharedPage);
+    state.surfaces.add(this);
+    const pageClosed = new Promise<void>(resolveClosed => sharedPage.once("close", () => {
+      state.registeredLanePages.delete(sharedPage);
+      state.surfaces.delete(this);
+      resolveClosed();
+    }));
+    this.closed = ownsContext ? state.closed : Promise.race([state.closed,pageClosed]);
   }
 
   private static async backgroundTab(context:BrowserContext,newWindow=false):Promise<Page> {
@@ -143,30 +148,95 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
   }
 
   static async create(options: ChromeSurfaceOptions): Promise<ChromeSingleWindowSurface> {
+    const actionLaneLimit=options.actionLaneLimit??2;
+    if(!Number.isInteger(actionLaneLimit)||actionLaneLimit<1||actionLaneLimit>4)
+      throw new Error("Browser action lane limit must be between 1 and 4");
     const profilePath = resolve(options.profilePath);
     await mkdir(profilePath, { recursive:true, mode:0o700 });
+    await recoverOrphanedWindowsChrome({...options, profilePath}).catch(() => {
+      // A failed WMI probe must not prevent a normal browser from starting.
+      // If an orphan still owns the profile, Chrome's own lock fails closed.
+      console.warn("Could not inspect private Chrome startup recovery");
+    });
     const policy=await prepareRequestBlockList(profilePath,options.requestBlockList||[]);
+    const browserSimplicity=options.browserSimplicity !== undefined ? parseBrowserSimplicity(options.browserSimplicity)
+      : options.minimalUi !== undefined ? options.minimalUi ? "simplified" : "off" : browserSimplicityFromEnvironment();
+    const minimalUi=browserSimplicity !== "off";
+    const presentationCss=minimalUi?await readPresentationCss(options.presentationCssPath):"";
     const context = await chromium.launchPersistentContext(profilePath, {
       channel:"chrome",
       executablePath:resolve(options.executablePath),
       headless:false,
       viewport:null,
       ignoreDefaultArgs:true,
+      timeout:30_000,
+      ...(minimalUi ? {reducedMotion:"reduce" as const} : {}),
       args:requestBlockListArgs(await backgroundChromeArgs(profilePath),policy),
       // Keep Chrome's own browser headers and user agent.
     });
     try {
+      await normalizeWindowsRendererPriorities(context,options);
+      if (minimalUi) {
+        await installMinimalChatGptPage(context,presentationCss,0,browserSimplicity);
+      }
       await context.addInitScript(installChatModeCompatibility);
       await verifyRequestBlockList(context,policy);
-      // Preserve all restored ChatGPT conversations. The old single-tab code
-      // closed them and reused the same page for every goal, interrupting other
-      // conversations even though their local worktrees were independent.
-      for(const page of context.pages())observeConversationLoadResponses(page);
-      let control=context.pages().find(page=>!page.isClosed()&&page.url()==="about:blank");
-      if(!control)control=await ChromeSingleWindowSurface.backgroundTab(context,context.pages().length===0);
-      const surface=new ChromeSingleWindowSurface(context,control);
-      if(!isChatGptPage(control.url()))await surface.navigate(CHATGPT_HOME);
-      else await control.evaluate(installChatModeCompatibility,undefined,undefined,false);
+      let page = context.pages().find(page => isChatGptPage(page.url())) ?? context.pages()[0];
+      if (!page) {
+        const browser = context.browser();
+        if (!browser) throw new Error("Persistent Chrome did not expose its browser connection");
+        const session = await browser.newBrowserCDPSession();
+        try {
+          [page] = await Promise.all([
+            context.waitForEvent("page"),
+            session.send("Target.createTarget", { url:"about:blank", newWindow:true, background:true }),
+          ]);
+        } finally {
+          await session.detach();
+        }
+      }
+      // A dedicated profile can restore tabs from an interrupted previous run.
+      // Only explicitly created lanes may become additional action targets.
+      for (const restored of context.pages()) {
+        if (restored !== page) await restored.close();
+      }
+      let resolveClosed!:()=>void;
+      const state:SurfaceContextState={contextClosed:false,closed:new Promise(resolve=>{resolveClosed=resolve;}),
+        registeredLanePages:new Set(),surfaces:new Set(),registration:Promise.resolve(),pendingLaneCreations:0,
+        presentationUpdating:false,presentationCssPath:options.presentationCssPath,presentationCss,presentationRevision:0,
+        browserSimplicity,actionLaneLimit};
+      const closed=()=>{state.contextClosed=true;resolveClosed();};
+      context.once("close",closed);
+      const pageClosed=()=>{
+        // Closing the last window can leave Chrome's background process alive.
+        if(context.pages().every(page=>page.isClosed()))closed();
+      };
+      page.once("close",pageClosed);
+      context.on("page",page=>page.once("close",pageClosed));
+      const surface = new ChromeSingleWindowSurface(context,page,state,true);
+      observeConversationRateLimits(page);
+      observeConversationLoadResponses(page);
+      if(!isChatGptPage(page.url())) {
+        try {
+          await surface.navigate(CHATGPT_HOME);
+        } catch (error) {
+          // Chrome may restore/navigate its startup tab concurrently with the
+          // first goto. That navigation abort is not a browser crash. Recover
+          // once, before publishing the control server or accepting any Send.
+          if (!(error instanceof Error) || !/net::ERR_ABORTED|frame was detached/i.test(error.message)
+            || page.isClosed()) throw error;
+          if (isChatGptPage(page.url())) {
+            await page.waitForLoadState("domcontentloaded", {timeout:30_000});
+            if (!isChatGptPage(page.url())) throw error;
+          } else if (page.url() === "about:blank") {
+            await surface.navigate(CHATGPT_HOME);
+          } else throw error;
+        }
+      }
+      else {
+        await page.evaluate(installChatModeCompatibility, undefined, undefined, false);
+        if (minimalUi) await styleRestoredChatGptPage(page,presentationCss,0,browserSimplicity);
+      }
       return surface;
     } catch (error) {
       await context.close().catch(() => {});
@@ -175,62 +245,71 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
   }
 
   async page(): Promise<Page> {
-    if(this.contextClosed||this.selectedPage.isClosed()||!this.context.pages().includes(this.selectedPage)
-      ||(this.ownedPages&&!this.ownedPages.has(this.selectedPage))
-      ||(this.ownsContext&&this.delegatedPages.has(this.selectedPage)))
-      throw new BrowserCompanionError("The selected ChatGPT tab was closed or replaced","external_interference");
-    return this.selectedPage;
+    // newPage emits its page event before returning the exact new handle. Wait
+    // for registration so another lane does not mistake that gap for a popup.
+    await this.state.registration;
+    return this.ownedPage();
   }
 
-  async utilityPage():Promise<Page> {
-    if(this.contextClosed||this.controlPage.isClosed())
-      throw new BrowserCompanionError("The ChatGPT utility tab was closed","external_interference");
-    return this.controlPage;
-  }
-
-  async selectUtilityPage():Promise<Page> {
-    this.selectedPage=await this.utilityPage();
-    return this.selectedPage;
-  }
-
-  async newChatPage():Promise<Page> {
-    if(!this.draftPage||this.draftPage.isClosed()
-      ||ChromeSingleWindowSurface.conversationKey(this.draftPage.url())){
-      this.draftPage=await this.newTab();
+  private ownedPage():Page {
+    if (this.state.contextClosed || this.sharedPage.isClosed()) {
+      throw new BrowserCompanionError("The shared Chrome ChatGPT window was closed", "external_interference");
     }
-    this.selectedPage=this.draftPage;
-    return this.page();
+    const pages = this.context.pages().filter(page => !page.isClosed());
+    if (!pages.includes(this.sharedPage)||pages.some(page=>!this.state.registeredLanePages.has(page))) {
+      throw new BrowserCompanionError("Chrome exposed an unmanaged browser page outside the action lanes", "external_interference");
+    }
   }
 
-  async selectConversation(url:string,signal?:AbortSignal):Promise<Page> {
-    if(signal?.aborted)throw new DOMException("Browser action aborted","AbortError");
-    const key=ChromeSingleWindowSurface.conversationKey(url);
-    if(!key)throw new BrowserCompanionError("A goal tab requires an exact ChatGPT conversation URL","conversation_unavailable");
-    const allMatches=this.context.pages().filter(page=>!page.isClosed()
-      &&ChromeSingleWindowSurface.conversationKey(page.url())===key);
-    const matches=allMatches.filter(page=>this.ownsContext
-      ? !this.delegatedPages.has(page)
-      : this.ownedPages?.has(page));
-    if(matches.length!==allMatches.length)
-      throw new BrowserCompanionError("ChatGPT conversation belongs to another Agent Chat tab","external_interference");
-    if(matches.length>1)throw new BrowserCompanionError("Multiple tabs show the same ChatGPT conversation; select a unique target","external_interference");
-    if(matches.length===1){this.selectedPage=matches[0]!;return this.page();}
-    // A handoff or goal retry during the global load cooldown used to open
-    // about:blank and immediately close it. Reject before creating a tab.
-    assertConversationLoadAvailableBeforeTab(this.selectedPage,url);
-    const previous=this.selectedPage;
-    const page=await this.newTab();
-    this.selectedPage=page;
+  async createActionLane():Promise<ChromeSingleWindowSurface> {
+    if(!this.ownsContext)throw new Error("Only the primary browser surface can create action lanes");
+    if(this.state.presentationUpdating)throw new BrowserCompanionError("Browser presentation is being updated");
+    const previous=this.state.registration;
+    let release!:()=>void;
+    this.state.registration=new Promise(resolve=>{release=resolve;});
+    this.state.pendingLaneCreations++;
+    let page:Page|undefined;
     try {
-      await navigatePage(page,url,{signal});
-      return page;
-    }catch(error) {
-      // A global conversation-load cooldown may refuse navigation before any
-      // document is loaded. Do not strand blank goal tabs on every retry.
-      if(!page.isClosed())await page.close().catch(()=>{});
-      this.selectedPage=previous;
+      await previous;
+      this.ownedPage();
+      if(this.state.registeredLanePages.size>=this.state.actionLaneLimit)
+        throw new BrowserCompanionError("Browser action lane capacity is already allocated");
+      page=await this.context.newPage();
+      const lane=new ChromeSingleWindowSurface(this.context,page,this.state,false);
+      observeConversationRateLimits(page);observeConversationLoadResponses(page);
+      release();
+      await lane.navigate(CHATGPT_HOME);
+      if(this.state.browserSimplicity!=="off")
+        await styleRestoredChatGptPage(page,this.state.presentationCss,this.state.presentationRevision,this.state.browserSimplicity);
+      return lane;
+    }catch(error){
+      if(page&&!page.isClosed())await page.close().catch(()=>{});
       throw error;
-    }
+    }finally{release();this.state.pendingLaneCreations--;}
+  }
+
+  async setPresentationStyle(css:string,signal?:AbortSignal) {
+    signal?.throwIfAborted();validatePresentationCss(css);
+    const state=this.state;
+    if(state.presentationUpdating||state.pendingLaneCreations||[...state.surfaces].some(surface=>surface.actionActive))
+      throw new BrowserCompanionError("Browser companion is busy with an action");
+    if(!state.presentationCssPath||state.browserSimplicity === "off")throw new Error("Enable browser simplifications in settings before changing fast presentation");
+    state.presentationUpdating=true;
+    try {
+      const page=await this.page();
+      const pages=[...state.registeredLanePages];
+      if(pages.some(page=>!isChatGptPage(page.url())))throw new Error("Fast presentation requires the ChatGPT page");
+      await page.evaluate(value=>{const sheet=new CSSStyleSheet();sheet.replaceSync(value);if(value.trim()&&!sheet.cssRules.length)throw new Error("No valid CSS rules");},css);
+      signal?.throwIfAborted();
+      if(css!==state.presentationCss){
+        await savePresentationCss(state.presentationCssPath,css);
+        state.presentationCss=css;state.presentationRevision++;
+        // Revision checks make init-script ordering irrelevant on later loads.
+        await installMinimalChatGptPage(this.context,css,state.presentationRevision,state.browserSimplicity);
+      }
+      await Promise.all(pages.map(page=>styleRestoredChatGptPage(page,css,state.presentationRevision,state.browserSimplicity)));
+      return {applied:true,revision:state.presentationRevision,sha256:createHash("sha256").update(css).digest("hex")};
+    }finally{state.presentationUpdating=false;}
   }
 
   async navigate(url: string, signal?: AbortSignal): Promise<Page> {
@@ -245,7 +324,6 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
       return page;
     await navigatePage(page,target.href,{signal});
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
-    await page.waitForLoadState("domcontentloaded", { timeout:30_000,signal }).catch(error => { if(signal?.aborted)throw error; });
     return page;
   }
 
@@ -265,19 +343,31 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
 
   async beginAction(): Promise<void> {
     if (this.actionActive) throw new Error("The shared browser window already owns an action");
-    await this.page();
+    if(this.state.presentationUpdating)throw new BrowserCompanionError("Browser presentation is being updated");
     this.actionActive = true;
+    try {await this.page();}catch(error){this.actionActive=false;throw error;}
   }
 
   async endAction(): Promise<void> {
-    this.actionActive = false;
+    // Keep the action lease through occasional cleanup, never during Send or
+    // response observation. Low-memory pages incur one small read per minute.
+    try {await maintainRendererMemory(await this.page());}
+    catch { /* A page closing during cleanup preserves the action result. */ }
+    finally {this.actionActive = false;}
+  }
+
+  /** Retire one failed action page without terminating healthy sibling lanes. */
+  async closeActionPage():Promise<void> {
+    this.closePromise??=this.sharedPage.isClosed()?Promise.resolve():this.sharedPage.close();
+    await this.closePromise;
   }
 
   async close(): Promise<void> {
-    if(this.ownsContext)await this.context.close();
-    else {
-      await Promise.all([...(this.ownedPages??[])].map(page=>page.close().catch(()=>{})));
-      for(const page of this.ownedPages??[])this.delegatedByParent?.delete(page);
+    if(this.ownsContext){
+      this.state.closePromise??=this.context.close();
+      await this.state.closePromise;
+    }else{
+      await this.closeActionPage();
     }
   }
 }

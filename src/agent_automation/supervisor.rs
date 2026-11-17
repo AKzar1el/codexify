@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::companion::{
@@ -17,11 +17,120 @@ use super::store::{MAX_CHAT_MIRROR_IDS, MAX_PRIVATE_TEXT_BYTES, QueueFailure};
 use super::{
     AcceptedChatBatch, ActionPrompt, AgentAutomationStore, AutomationActionKind,
     AutomationActionStatus, BrowserCompanionClient, CompanionActionSnapshot, CompanionActionState,
-    CompanionEvent, CompanionEventKind, CompanionSessionStatus, CompanionUnreadMessage,
-    ExecuteActionRequest, GoalStatus,
+    CompanionEvent, CompanionEventKind, CompanionHealth, CompanionSessionStatus,
+    CompanionUnreadMessage, ExecuteActionRequest, GoalStatus,
 };
+
+// Contention for the single shared Chrome window is not a failed Send.
+// Preserve the queued action (with a fresh idempotency key on retry) instead
+// of exhausting each conversation's failure budget while another chat runs.
+fn shared_browser_waiting(health: &CompanionHealth, action_id: &str) -> CompanionActionSnapshot {
+    CompanionActionSnapshot {
+        protocol_version: health.protocol_version,
+        build: health.build.clone(),
+        action_id: action_id.to_string(),
+        state: CompanionActionState::Waiting,
+        send_accepted: false,
+        canonical_url: None,
+        selected: None,
+        last_event_sequence: 0,
+        cooldown_until_ms: Some(crate::markdown_chat::now_ms().saturating_add(1_000)),
+        attention: None,
+    }
+}
+
+fn shared_browser_observation_wait(
+    health: &CompanionHealth,
+    action_id: &str,
+) -> Option<CompanionActionSnapshot> {
+    let same_action = health.owns_action(action_id);
+    // Read-only navigation/maintenance can own the UI lease without an action
+    // ID. Its busy snapshot may have no account proof until the read settles.
+    // Preserve uncertainty for an existing action, and defer new work only.
+    (!same_action
+        && (health.free_action_slots() == 0
+            && (health.active_action_id.is_some() || !health.active_action_ids.is_empty())
+            || health.status == CompanionSessionStatus::Busy && !health.authenticated))
+        .then(|| shared_browser_waiting(health, action_id))
+}
+
+#[cfg(test)]
+mod browser_session_observation_tests {
+    use super::*;
+
+    #[test]
+    fn busy_observations_wait_without_claiming_authentication_failure() {
+        let mut health = CompanionHealth {
+            protocol_version: 1,
+            kind: "codexify-browser-companion".into(),
+            build: "test".into(),
+            status: CompanionSessionStatus::Busy,
+            authenticated: false,
+            account_fingerprint: None,
+            active_action_id: None,
+            action_capacity: None,
+            available_action_slots: None,
+            active_action_ids: Vec::new(),
+        };
+        let waiting = shared_browser_observation_wait(&health, "queued-action")
+            .expect("An observation holding the UI lease has no account proof yet");
+        assert_eq!(waiting.state, CompanionActionState::Waiting);
+        assert!(!waiting.send_accepted);
+        assert_eq!(waiting.action_id, "queued-action");
+        assert!(waiting.cooldown_until_ms.is_some());
+
+        // The existing action must retain uncertainty if its account disappears.
+        health.active_action_id = Some("queued-action".into());
+        assert!(shared_browser_observation_wait(&health, "queued-action").is_none());
+        health.active_action_id = Some("other-action".into());
+        assert!(shared_browser_observation_wait(&health, "queued-action").is_some());
+
+        // Genuine sign-in failures and account changes still reach account checks.
+        health.active_action_id = None;
+        health.status = CompanionSessionStatus::AuthenticationRequired;
+        assert!(shared_browser_observation_wait(&health, "queued-action").is_none());
+        health.status = CompanionSessionStatus::Idle;
+        assert!(shared_browser_observation_wait(&health, "queued-action").is_none());
+        health.status = CompanionSessionStatus::Busy;
+        health.authenticated = true;
+        health.account_fingerprint = Some("different-account".into());
+        assert!(shared_browser_observation_wait(&health, "queued-action").is_none());
+    }
+
+    #[test]
+    fn advertised_free_pages_do_not_wait_for_an_unrelated_action() {
+        let health: CompanionHealth = serde_json::from_value(serde_json::json!({
+            "protocolVersion":1,"kind":"codexify-browser-companion","build":"test",
+            "status":"idle","authenticated":true,"accountFingerprint":"same-account",
+            "activeActionId":"page-one","actionCapacity":2,"availableActionSlots":1,
+            "activeActionIds":["page-one"]
+        }))
+        .unwrap();
+        assert!(shared_browser_observation_wait(&health, "page-two").is_none());
+        assert!(health.owns_action("page-one"));
+        let mut full = health.clone();
+        full.available_action_slots = Some(0);
+        full.status = CompanionSessionStatus::Busy;
+        assert!(shared_browser_observation_wait(&full, "page-two").is_some());
+        full.active_action_ids.push("page-two".into());
+        assert!(
+            shared_browser_observation_wait(&full, "page-two").is_none(),
+            "the exact active action must reconcile without replaying"
+        );
+        let mut warming = health;
+        warming.authenticated = false;
+        warming.account_fingerprint = None;
+        warming.status = CompanionSessionStatus::Busy;
+        assert!(
+            shared_browser_observation_wait(&warming, "page-two").is_some(),
+            "a free page does not replace fresh account proof"
+        );
+    }
+}
 use crate::markdown_chat::{AgentAutomationConfig, ChatFile};
 use crate::project_bindings::ConversationIdentity;
+
+const TURN_HANDOFF_PROBE_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone)]
 pub struct AutomationExecution {
@@ -80,6 +189,10 @@ pub struct AutomationLiveState {
 
 #[async_trait]
 pub trait AutomationExecutor: Send + Sync {
+    /// Legacy/synthetic executors retain exclusive dispatch unless they opt in.
+    fn max_parallel_actions(&self) -> usize {
+        1
+    }
     fn supports_pairing_reservation(&self) -> bool {
         false
     }
@@ -112,17 +225,15 @@ pub trait AutomationExecutor: Send + Sync {
     ) -> Result<bool, String> {
         Ok(false)
     }
-    async fn approve_pending_conversation_for_task(
+    async fn inspect_pending_materialization(
         &self,
-        _task_key: &str,
-        _eligible_offline: bool,
-        url: &str,
-        account: &str,
-        connector_name: &str,
+        _url: &str,
+        _account: &str,
+        _connector_name: &str,
     ) -> Result<bool, String> {
-        self.approve_pending_conversation(url, account, connector_name)
-            .await
+        Ok(false)
     }
+
     async fn turn_handoff_complete(
         &self,
         _url: &str,
@@ -169,6 +280,12 @@ pub trait AutomationExecutor: Send + Sync {
         account_fingerprint: &str,
     ) -> Result<Option<CompanionActionSnapshot>, String> {
         self.retained_action(action_id, account_fingerprint).await
+    }
+
+    /// Only a fresh, authenticated idle browser can prove an action absent.
+    /// Unsupported observers and failed observations provide no such proof.
+    async fn missing_goal_start(&self, _action_id: &str, _account: &str) -> Result<bool, String> {
+        Ok(false)
     }
 
     async fn execute(
@@ -305,10 +422,49 @@ impl BrowserAutomationExecutor {
             .ensure_running(cancellation)
             .await
     }
+
+    async fn check_pending_approval(
+        &self,
+        url: &str,
+        account: &str,
+        connector_name: &str,
+        allow_navigation: bool,
+    ) -> Result<bool, String> {
+        if !self.config.auto_approve_tool_calls {
+            return Ok(false);
+        }
+        let lifecycle = super::BrowserCompanionControl::new(&self.config)?.public_status();
+        if lifecycle["manuallyStopped"] == true || lifecycle["waitingForServerRestart"] == true {
+            return if allow_navigation {
+                Err("Materialization inspection deferred while the browser is stopped".into())
+            } else {
+                Ok(false)
+            };
+        }
+        // Reuse an existing companion without starting or revealing it.
+        let client = BrowserCompanionClient::from_config(&self.config)?;
+        let cancellation = CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(if allow_navigation { 35 } else { 6 }),
+            client.approve_pending_conversation_with_navigation(
+                url,
+                account,
+                connector_name,
+                allow_navigation,
+                &cancellation,
+            ),
+        )
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| "ChatGPT approval check timed out".to_string())?
+    }
 }
 
 #[async_trait]
 impl AutomationExecutor for BrowserAutomationExecutor {
+    fn max_parallel_actions(&self) -> usize {
+        self.config.browser_action_lanes.clamp(1, 4)
+    }
     fn supports_pairing_reservation(&self) -> bool {
         true
     }
@@ -366,24 +522,17 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         account: &str,
         connector_name: &str,
     ) -> Result<bool, String> {
-        self.approve_from_config(&self.config, url, account, connector_name)
+        self.check_pending_approval(url, account, connector_name, false)
             .await
     }
-    async fn approve_pending_conversation_for_task(
+    async fn inspect_pending_materialization(
         &self,
-        task_key: &str,
-        eligible_offline: bool,
         url: &str,
         account: &str,
         connector_name: &str,
     ) -> Result<bool, String> {
-        self.approve_from_config(
-            self.config_for_task_key(task_key, eligible_offline),
-            url,
-            account,
-            connector_name,
-        )
-        .await
+        self.check_pending_approval(url, account, connector_name, true)
+            .await
     }
     async fn turn_handoff_complete(
         &self,
@@ -391,28 +540,20 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         account: &str,
         handoff_id: &str,
     ) -> Result<bool, String> {
+        // Observations must not launch/restart a browser or run lifecycle
+        // maintenance ahead of actual work in the shared browser queue.
         let cancellation = CancellationToken::new();
-        let client = self.ready_client_for(&self.config, &cancellation).await?;
-        client
-            .turn_handoff_complete(url, account, handoff_id, &cancellation)
-            .await
-    }
-    async fn turn_handoff_complete_for_task(
-        &self,
-        task_key: &str,
-        url: &str,
-        account: &str,
-        handoff_id: &str,
-    ) -> Result<bool, String> {
-        // A secondary task must never inspect another task's primary tab.
-        // The independent companion is already running and validates the
-        // requested conversation and account before it reports completion.
-        let client =
-            BrowserCompanionClient::from_config(self.config_for_task_key(task_key, false))?;
-        let cancellation = CancellationToken::new();
-        client
-            .turn_handoff_complete(url, account, handoff_id, &cancellation)
-            .await
+        let client = BrowserCompanionClient::from_config(&self.config)?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(14),
+            client.turn_handoff_complete(url, account, handoff_id, &cancellation),
+        )
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| {
+            "Handoff observation timed out; preserving the live browser and accepted action"
+                .to_string()
+        })?
     }
     async fn prepare_new_chat(
         &self,
@@ -491,6 +632,30 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         .await
     }
 
+    async fn missing_goal_start(&self, action_id: &str, account: &str) -> Result<bool, String> {
+        let client = BrowserCompanionClient::from_config(&self.config)?;
+        let cancellation = CancellationToken::new();
+        let health = client.health(&cancellation).await?;
+        if !health.authenticated || health.account_fingerprint.as_deref() != Some(account) {
+            return Err("Goal start recovery could not verify the signed-in account".into());
+        }
+        if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() {
+            return Ok(false);
+        }
+        if client
+            .action_optional(action_id, &cancellation)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let after = client.health(&cancellation).await?;
+        Ok(after.authenticated
+            && after.account_fingerprint.as_deref() == Some(account)
+            && after.status == CompanionSessionStatus::Idle
+            && after.active_action_id.is_none())
+    }
+
     async fn execute(
         &self,
         execution: AutomationExecution,
@@ -565,9 +730,32 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             }
         }
         let health = client
-            .health(&cancellation)
+            .ready_health(&cancellation)
             .await
             .map_err(|message| execution_error(message, false))?;
+        let same_action = health.owns_action(&execution.request.action_id);
+        // During another chat's navigation the session API may temporarily
+        // have no account proof. Yield before interpreting that transient
+        // result as a sign-in failure for this queued conversation.
+        if let Some(waiting) =
+            shared_browser_observation_wait(&health, &execution.request.action_id)
+        {
+            return Ok(waiting);
+        }
+        if same_action
+            && (!health.authenticated
+                || health.status == CompanionSessionStatus::Unavailable
+                || health.account_fingerprint.as_deref()
+                    != Some(execution.account_fingerprint.as_str()))
+        {
+            // This action already owns the browser. Missing session proof is
+            // not evidence that its earlier Send failed; preserve uncertainty
+            // so an access retry cannot create a duplicate with a new ID.
+            return Err(execution_error(
+                "The active browser action could not verify its account during recovery".into(),
+                true,
+            ));
+        }
         if health.status == CompanionSessionStatus::Unavailable {
             return Err(execution_error(
                 "Browser companion is unavailable; its Chrome window is not ready".into(),
@@ -600,12 +788,6 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             .pairing_continuation_of
             .as_deref()
             .is_some_and(|parent| health.active_action_id.as_deref() == Some(parent));
-        if health.active_action_id.is_some() && !pairing_continuation {
-            return Err(execution_error(
-                "Browser companion is busy with another action".into(),
-                false,
-            ));
-        }
         // Only the companion can prove and replace an unchanged verification draft.
         // Let it perform that check for pairing; ordinary work still requires an idle window.
         let replacing_pairing = matches!(
@@ -613,11 +795,19 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             ActionPrompt::PairVerify { .. } | ActionPrompt::CreateChat { .. }
         );
         if health.status != CompanionSessionStatus::Idle
+            && !(health.status == CompanionSessionStatus::Busy && health.free_action_slots() > 0)
             && !pairing_continuation
             && !recover_authentication
+            && !same_action
             && !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
             && !(replacing_pairing && health.status == CompanionSessionStatus::Busy)
         {
+            if health.status == CompanionSessionStatus::Busy {
+                return Ok(shared_browser_waiting(
+                    &health,
+                    &execution.request.action_id,
+                ));
+            }
             return Err(execution_error(
                 "The shared ChatGPT window is not ready; check for an unsent draft or an ongoing response".into(),
                 false,
@@ -809,18 +999,16 @@ pub struct AgentAutomationSupervisor {
     tasks: RwLock<HashMap<String, AutomationTaskHandle>>,
     queue: Mutex<VecDeque<AutomationExecution>>,
     scan_lock: Mutex<()>,
-    run_lock: Mutex<()>,
-    canary_run_lock: Mutex<()>,
-    // Rate-limit handoff read probes independently of Send admission. A fleet
-    // of stalled handoffs must not poll ten ChatGPT tabs every 30 seconds.
-    handoff_probe_budget: Mutex<HandoffProbeBudget>,
-    canary_task_key: Option<String>,
-    pilot_primary_task_key: Option<String>,
+    run_lock: RwLock<()>,
+    run_slots: Semaphore,
+    task_run_locks: std::sync::Mutex<HashMap<String, Weak<Mutex<()>>>>,
     live: RwLock<HashMap<String, AutomationLiveState>>,
     wake: Arc<Notify>,
     action_timeouts: ActionTimeouts,
     approval_next_scan_ms: AtomicU64,
+    approval_scan_cursor: AtomicU64,
     next_retry_scan_ms: AtomicU64,
+    activity: super::activity_guard::ActivityGuard,
     rollover: OnceLock<ConversationRolloverContext>,
     pairing_wait_timeout: Duration,
 }
@@ -872,6 +1060,76 @@ struct ActionTimeouts {
     start: Duration,
     progress: Duration,
     total: Duration,
+}
+
+/// Exclusive browser preparation plus task stability until recovery commits.
+/// Scans skip this task while owner pause/cancel operations remain available.
+pub(crate) struct RecoveryPreparationLease<'a> {
+    supervisor: &'a AgentAutomationSupervisor,
+    _run: tokio::sync::RwLockWriteGuard<'a, ()>,
+    _task: OwnedMutexGuard<()>,
+    cancellation: CancellationToken,
+    deadline: tokio::time::Instant,
+}
+
+impl Drop for RecoveryPreparationLease<'_> {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl RecoveryPreparationLease<'_> {
+    pub(crate) fn ensure_live(&self) -> Result<(), String> {
+        if self.cancellation.is_cancelled() || tokio::time::Instant::now() >= self.deadline {
+            Err("New-chat preparation timed out; the original conversation was preserved".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) async fn prepare_verified_new_chat(
+        &self,
+        project_url: Option<&str>,
+    ) -> Result<(super::CapabilityCatalog, CompanionHealth), String> {
+        self.ensure_live()?;
+        let prepared = tokio::time::timeout_at(self.deadline, async {
+            let catalog = self.supervisor.executor
+                .prepare_new_chat(project_url, self.cancellation.clone()).await?;
+            let client = BrowserCompanionClient::from_config(&self.supervisor.config)?;
+            loop {
+                let health = client.ready_health(&self.cancellation).await?;
+                // Ready health waits for real proof. Older companions can
+                // still return warming; retain our lease within its deadline.
+                if health.status == CompanionSessionStatus::Busy && health.active_action_id.is_none()
+                    && (!health.authenticated || health.account_fingerprint.as_deref() == Some(catalog.account_fingerprint.as_str())) {
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => return Err("New-chat preparation was cancelled".into()),
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+                    }
+                }
+                if health.status != CompanionSessionStatus::Idle || health.active_action_id.is_some() || !health.authenticated
+                    || health.account_fingerprint.as_deref() != Some(catalog.account_fingerprint.as_str())
+                {
+                    return Err("ChatGPT account or browser changed while preparing recovery".into());
+                }
+                return Ok((catalog, health));
+            }
+        }).await;
+        match prepared {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => {
+                self.cancellation.cancel();
+                Err(error)
+            }
+            Err(_) => {
+                self.cancellation.cancel();
+                Err(
+                    "New-chat preparation timed out; the original conversation was preserved"
+                        .into(),
+                )
+            }
+        }
+    }
 }
 
 pub struct AutomationSupervisorWorker {
@@ -958,21 +1216,22 @@ impl AgentAutomationSupervisor {
         progress: Duration,
         total: Duration,
     ) -> Arc<Self> {
+        let lanes = executor.max_parallel_actions().clamp(1, 4);
         Arc::new(Self {
             config,
             executor,
             tasks: RwLock::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             scan_lock: Mutex::new(()),
-            run_lock: Mutex::new(()),
-            canary_run_lock: Mutex::new(()),
-            handoff_probe_budget: Mutex::new(HandoffProbeBudget::default()),
-            canary_task_key: None,
-            pilot_primary_task_key: None,
+            run_lock: RwLock::new(()),
+            run_slots: Semaphore::new(lanes),
+            task_run_locks: std::sync::Mutex::new(HashMap::new()),
             live: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
             approval_next_scan_ms: AtomicU64::new(0),
+            approval_scan_cursor: AtomicU64::new(0),
             next_retry_scan_ms: AtomicU64::new(0),
+            activity: Default::default(),
             rollover: OnceLock::new(),
             pairing_wait_timeout: Duration::from_secs(90),
             action_timeouts: ActionTimeouts {
@@ -1218,6 +1477,9 @@ impl AgentAutomationSupervisor {
         let supervisor = self.clone();
         let task = tokio::spawn(async move {
             loop {
+                // This scan observes all notifications already received. Leave
+                // notifications arriving during it for the dispatch boundary.
+                let _ = supervisor.take_work_notification().await;
                 if let Err(error) = supervisor.scan_once(crate::markdown_chat::now_ms()).await {
                     tracing::warn!(%error, "agent automation scan failed");
                 }
@@ -1227,23 +1489,64 @@ impl AgentAutomationSupervisor {
                         state["manuallyStopped"] == true || state["waitingForServerRestart"] == true
                     });
                 if !browser_paused {
+                    let mut next_work_scan = tokio::time::Instant::now() + Duration::from_secs(30);
+                    let mut runners = tokio::task::JoinSet::new();
+                    let lanes = supervisor.executor.max_parallel_actions().clamp(1, 4);
                     loop {
-                        match supervisor.run_next(crate::markdown_chat::now_ms()).await {
-                            Ok(Some(_)) => {}
-                            Ok(None)
-                                if supervisor
-                                    .has_ready_action_for_lane(
-                                        crate::markdown_chat::now_ms(),
-                                        false,
-                                    )
-                                    .await =>
+                        let paused = super::BrowserCompanionControl::new(&supervisor.config)
+                            .is_ok_and(|control| {
+                                let state = control.public_status();
+                                state["manuallyStopped"] == true
+                                    || state["waitingForServerRestart"] == true
+                            });
+                        while !paused
+                            && runners.len() < lanes
+                            && supervisor
+                                .has_ready_action(crate::markdown_chat::now_ms())
+                                .await
+                        {
+                            let worker = supervisor.clone();
+                            runners.spawn(async move {
+                                worker.run_next(crate::markdown_chat::now_ms()).await
+                            });
+                        }
+                        if runners.is_empty() {
+                            break;
+                        }
+                        tokio::select! {
+                            result=runners.join_next()=>{
+                                match result {
+                                    Some(Ok(Err(error)))=>tracing::warn!(%error,"agent automation action failed"),
+                                    Some(Err(error))=>tracing::warn!(%error,"agent automation runner stopped"),
+                                    _=>{}
+                                }
+                                // A notice may have arrived while this chat was
+                                // leased and its earlier scan deliberately skipped.
+                                if let Err(error)=supervisor.scan_once_inner(crate::markdown_chat::now_ms(),false).await {
+                                    tracing::warn!(%error,"agent automation completion scan failed");
+                                }
+                                next_work_scan=tokio::time::Instant::now()+Duration::from_secs(30);
+                            },
+                            _=supervisor.wake.notified()=>{
+                                if let Err(error)=supervisor.scan_once_inner(crate::markdown_chat::now_ms(),false).await {
+                                    tracing::warn!(%error,"agent automation work scan failed");
+                                }
+                                next_work_scan=tokio::time::Instant::now()+Duration::from_secs(30);
+                            },
+                            _=tokio::time::sleep_until(next_work_scan)=>{}
+                        }
+                        // Discover steering while another independent page is
+                        // still preparing. No action is interrupted or replayed.
+                        if supervisor.take_work_notification().await
+                            || tokio::time::Instant::now() >= next_work_scan
+                        {
+                            if let Err(error) = supervisor
+                                .scan_once_inner(crate::markdown_chat::now_ms(), false)
+                                .await
                             {
-                                continue;
+                                tracing::warn!(%error, "agent automation work scan failed");
                             }
-                            Ok(None) => break,
-                            Err(error) => {
-                                tracing::warn!(%error, "agent automation action failed");
-                            }
+                            next_work_scan = tokio::time::Instant::now() + Duration::from_secs(30);
                         }
                     }
                 }
@@ -1288,6 +1591,14 @@ impl AgentAutomationSupervisor {
 
     pub fn notify(&self) {
         self.wake.notify_one();
+    }
+
+    async fn take_work_notification(&self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.wake.notified() => true,
+            _ = std::future::ready(()) => false,
+        }
     }
 
     pub(crate) async fn is_registered(&self, task: &ConversationIdentity) -> bool {
@@ -1381,6 +1692,19 @@ impl AgentAutomationSupervisor {
         {
             task.owner_generation = pending.owner_generation;
         }
+        if state
+            .pairing
+            .verified_owner_generation
+            .is_some_and(|generation| generation > task.owner_generation)
+            || self
+                .tasks
+                .read()
+                .await
+                .get(task.task.stable_key())
+                .is_some_and(|current| current.owner_generation > task.owner_generation)
+        {
+            return Ok(());
+        }
         let owner_changed = state
             .pairing
             .verified_owner_generation
@@ -1389,7 +1713,12 @@ impl AgentAutomationSupervisor {
                 .pairing
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.owner_generation != task.owner_generation);
+                .is_some_and(|pending| pending.owner_generation != task.owner_generation)
+            || state
+                .turn_renewal
+                .send
+                .as_ref()
+                .is_some_and(|send| send.owner_generation != task.owner_generation);
         let orphaned_pairing = first_registration
             && matches!(
                 state.action.status,
@@ -1453,10 +1782,14 @@ impl AgentAutomationSupervisor {
                 tracing::warn!(%error, "could not reconcile agent message acknowledgment");
             }
         }
-        self.tasks
-            .write()
-            .await
-            .insert(task.task.stable_key().to_string(), task);
+        let mut tasks = self.tasks.write().await;
+        if !tasks
+            .get(task.task.stable_key())
+            .is_some_and(|current| current.owner_generation > task.owner_generation)
+        {
+            tasks.insert(task.task.stable_key().to_string(), task);
+        }
+        drop(tasks);
         self.notify();
         Ok(())
     }
@@ -1465,12 +1798,83 @@ impl AgentAutomationSupervisor {
         &self,
         project_url: Option<&str>,
     ) -> Result<super::CapabilityCatalog, String> {
+        self.prepare_new_chat_cancellable(project_url, &CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn recovery_preparation_lease(
+        &self,
+        task: &ConversationIdentity,
+    ) -> Result<RecoveryPreparationLease<'_>, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let (run, task) = tokio::time::timeout_at(deadline, async {
+            // The exclusive lane gate drains current actions fairly. Scans
+            // never await that gate; owner stop/pause need no task lease.
+            let run = self.run_lock.write().await;
+            let task = self.task_execution_lock(task).lock_owned().await;
+            (run, task)
+        })
+        .await
+        .map_err(|_| {
+            "New-chat preparation timed out; retry when the browser is available".to_string()
+        })?;
+        Ok(RecoveryPreparationLease {
+            supervisor: self,
+            _run: run,
+            _task: task,
+            cancellation: CancellationToken::new(),
+            deadline,
+        })
+    }
+
+    /// Keep account validation in the same browser lease as model discovery.
+    /// A queued worker's navigation can temporarily remove account proof.
+    pub async fn prepare_verified_new_chat(
+        &self,
+        project_url: Option<&str>,
+    ) -> Result<(super::CapabilityCatalog, CompanionHealth), String> {
         let cancellation = CancellationToken::new();
         let result = tokio::time::timeout(Duration::from_secs(180), async {
-            let _guard = self.run_lock.lock().await;
-            self.executor
+            let _guard = self.run_lock.write().await;
+            let catalog = self
+                .executor
                 .prepare_new_chat(project_url, cancellation.clone())
-                .await
+                .await?;
+            let health = BrowserCompanionClient::from_config(&self.config)?
+                .health(&cancellation)
+                .await?;
+            if !health.authenticated
+                || health.account_fingerprint.as_deref()
+                    != Some(catalog.account_fingerprint.as_str())
+            {
+                return Err("ChatGPT account changed while preparing the new chat".into());
+            }
+            Ok((catalog, health))
+        })
+        .await;
+        cancellation.cancel();
+        result.map_err(|_| {
+            "New-chat preparation timed out; retry when the browser is available".to_string()
+        })?
+    }
+
+    pub async fn prepare_new_chat_cancellable(
+        &self,
+        project_url: Option<&str>,
+        caller: &CancellationToken,
+    ) -> Result<super::CapabilityCatalog, String> {
+        let cancellation = caller.child_token();
+        let result = tokio::time::timeout(Duration::from_secs(180), async {
+            let _guard = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("Agent setup was cancelled".into()),
+                guard = self.run_lock.write() => guard,
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err("Agent setup was cancelled".into()),
+                result = self.executor.prepare_new_chat(project_url, cancellation.clone()) => result,
+            }
         })
         .await;
         cancellation.cancel();
@@ -1481,6 +1885,12 @@ impl AgentAutomationSupervisor {
 
     pub async fn queued_count(&self) -> usize {
         self.queue.lock().await.len()
+    }
+
+    /// Counters for loads, sends, recoveries, renewals and worker turns, plus
+    /// the automatic-activity circuit breaker state.
+    pub fn activity_snapshot(&self, now_ms: u64) -> super::ActivitySnapshot {
+        self.activity.snapshot(now_ms)
     }
 
     pub async fn queue_position(&self, task: &ConversationIdentity) -> Option<(usize, usize)> {
@@ -1575,7 +1985,7 @@ impl AgentAutomationSupervisor {
         // dispatch before rebuilding it, rather than racing a just-popped Send.
         let run_guard = self
             .run_lock
-            .try_lock()
+            .try_write()
             .map_err(|_| "The browser action already started or left the queue")?;
         handle
             .store
@@ -1621,7 +2031,7 @@ impl AgentAutomationSupervisor {
             // Serialize with dispatch before cancelling that pending intent.
             Some(
                 self.run_lock
-                    .try_lock()
+                    .try_write()
                     .map_err(|_| "The browser action already started or left the queue")?,
             )
         } else {
@@ -1671,7 +2081,7 @@ impl AgentAutomationSupervisor {
             }
             Some(
                 self.run_lock
-                    .try_lock()
+                    .try_write()
                     .map_err(|_| "The browser action already started or left the queue")?,
             )
         } else {
@@ -1937,62 +2347,118 @@ impl AgentAutomationSupervisor {
         )
     }
 
-    fn try_run_guard_for_task(
+    fn schedule_handoff_observation(
         &self,
-        task_key: &str,
-        legacy_canary_offline: bool,
-    ) -> Result<tokio::sync::MutexGuard<'_, ()>, tokio::sync::TryLockError> {
-        let secondary = self.canary_task_key.as_deref() == Some(task_key)
-            && (self.pilot_primary_task_key.is_some() || legacy_canary_offline);
-        if secondary {
-            self.canary_run_lock.try_lock()
-        } else {
-            self.run_lock.try_lock()
+        handoff: &super::turn_renewal::TurnHandoff,
+        now_ms: u64,
+    ) {
+        if handoff.report_complete {
+            return;
         }
+        let first_probe = handoff
+            .requested_at_ms
+            .saturating_add(TURN_HANDOFF_PROBE_INTERVAL_MS);
+        let next_probe = if now_ms < first_probe {
+            first_probe
+        } else {
+            now_ms.saturating_add(TURN_HANDOFF_PROBE_INTERVAL_MS)
+        };
+        // Report observation is independent of tool auto-approval. Otherwise
+        // that opt-out silently adds the normal 30-second idle scan to handoffs.
+        self.next_retry_scan_ms
+            .fetch_min(next_probe, Ordering::Relaxed);
     }
 
     pub async fn scan_once(&self, now_ms: u64) -> Result<(), String> {
+        self.scan_once_inner(now_ms, true).await
+    }
+
+    async fn scan_once_inner(&self, now_ms: u64, browser_observations: bool) -> Result<(), String> {
         let _scan_guard = self.scan_lock.lock().await;
-        self.next_retry_scan_ms
-            .store(now_ms.saturating_add(30_000), Ordering::Relaxed);
-        let check_approvals = self.config.auto_approve_tool_calls
+        if browser_observations {
+            self.next_retry_scan_ms
+                .store(now_ms.saturating_add(30_000), Ordering::Relaxed);
+        } else {
+            // Preserve the pending full-scan/approval deadline when returning
+            // from the queue; a lightweight scan must not postpone it.
+            self.next_retry_scan_ms
+                .fetch_min(now_ms.saturating_add(30_000), Ordering::Relaxed);
+        }
+        let check_approvals = browser_observations
+            && self.config.auto_approve_tool_calls
             && now_ms >= self.approval_next_scan_ms.load(Ordering::Relaxed);
         if check_approvals {
             self.approval_next_scan_ms
                 .store(now_ms.saturating_add(5_000), Ordering::Relaxed);
+            self.next_retry_scan_ms
+                .fetch_min(now_ms.saturating_add(5_000), Ordering::Relaxed);
+        } else if browser_observations && self.config.auto_approve_tool_calls {
+            // An early work notification must not replace the already scheduled
+            // approval observation with the general 30-second idle deadline.
+            self.next_retry_scan_ms.fetch_min(
+                self.approval_next_scan_ms.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
-        let tasks = self
+        let mut tasks = self
             .tasks
             .read()
             .await
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        tasks.sort_by(|a, b| a.task.stable_key().cmp(b.task.stable_key()));
+        if check_approvals && !tasks.is_empty() {
+            let offset = (self.approval_scan_cursor.fetch_add(1, Ordering::Relaxed)
+                % (tasks.len() as u64)) as usize;
+            tasks.rotate_left(offset);
+        }
+        let mut approval_probed = false;
         for task in tasks {
-            if self
-                .pilot_primary_task_key
-                .as_deref()
-                .is_some_and(|primary| {
-                    primary != task.task.stable_key()
-                        && self.canary_task_key.as_deref() != Some(task.task.stable_key())
-                })
-            {
-                // Freeze legacy goal states, handoff probes and approval checks
-                // without altering their accepted Send receipts or journals.
+            // A snapshot/queue scan may run while another page is submitting.
+            // Do not replace that chat's persisted action underneath its Send.
+            let Some(_task_scan_guard) =
+                self.try_lock_keys(vec![format!("task:{}", task.task.stable_key())])
+            else {
+                // An agent's acknowledgment of the exact fenced batch still
+                // settles an uncertain send. Reconciliation only changes an
+                // unchanged Ambiguous/Failed/Stalled action, never a live Send.
+                if let Ok(activity) = task.chat.offline_activity().await
+                    && !activity.agent_stop_requested
+                    && let Ok(state) = task.store.load(&task.task)
+                    && let Err(error) = self.reconcile_chat_delivery(&task, &state, now_ms).await
+                {
+                    tracing::warn!(%error, "could not reconcile an acknowledged chat delivery");
+                }
                 continue;
-            }
-            let activity = task.chat.offline_activity().await?;
-            task.store.sync_goal_presence(
+            };
+            let activity = match task.chat.offline_activity().await {
+                Ok(activity) => activity,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read activity for browser automation task");
+                    continue;
+                }
+            };
+            if let Err(error) = task.store.sync_goal_presence(
                 &task.task,
                 activity.last_call_for_presence(now_ms),
                 activity.agent_waiting_until_ms,
                 activity.agent_stop_requested,
                 now_ms,
-            )?;
-            let mut state = task.store.load(&task.task)?;
+            ) {
+                tracing::warn!(%error, "could not sync goal for browser automation task");
+                continue;
+            }
+            let mut state = match task.store.load(&task.task) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(%error, "could not load browser automation task state");
+                    continue;
+                }
+            };
             if state.action.conversation_load_rate_limited
                 && let Some(action_id) = state.action.id.as_deref()
-                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
+                && let Ok(_run_guard) = self.run_lock.try_write()
                 && self
                     .queue_load_rate_limit_recovery(&task, action_id, now_ms)
                     .await?
@@ -2006,9 +2472,7 @@ impl AgentAutomationSupervisor {
                     task.store
                         .clear_schema_rollover_hold(&task.task, &state.pairing)?;
                     state = task.store.load(&task.task)?;
-                } else if let Ok(_run_guard) =
-                    self.try_run_guard_for_task(task.task.stable_key(), false)
-                {
+                } else if let Ok(_run_guard) = self.run_lock.try_write() {
                     self.queue_replacement_conversation(&task, &state, true, now_ms)
                         .await?;
                 }
@@ -2018,8 +2482,7 @@ impl AgentAutomationSupervisor {
             }
             if state.action.status == AutomationActionStatus::ConversationLimit {
                 if let Some(action_id) = state.action.id.as_deref()
-                    && let Ok(_run_guard) =
-                        self.try_run_guard_for_task(task.task.stable_key(), false)
+                    && let Ok(_run_guard) = self.run_lock.try_write()
                 {
                     self.queue_conversation_rollover(&task, action_id, now_ms)
                         .await?;
@@ -2030,7 +2493,7 @@ impl AgentAutomationSupervisor {
                 && state.action.status == AutomationActionStatus::Queued
                 && state.action.automatic_retry_in_progress
                 && let Some(action_id) = state.action.id.as_deref()
-                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
+                && let Ok(_run_guard) = self.run_lock.try_write()
                 && task
                     .store
                     .restore_disabled_queued_retry(&task.task, action_id)?
@@ -2108,41 +2571,22 @@ impl AgentAutomationSupervisor {
                 state = task.store.load(&task.task)?;
             }
             if check_approvals
+                && !approval_probed
                 && !activity.agent_stop_requested
+                && (activity.materialization_pending
+                    || state
+                        .goal
+                        .as_ref()
+                        .is_none_or(|goal| goal.status == GoalStatus::Active)
+                    || state.action.status == AutomationActionStatus::ApprovalRequired
+                    || !task.chat.unread_snapshot().await?.messages.is_empty())
                 && state.pairing.verified_owner_generation == Some(task.owner_generation)
                 && let (Some(url), Some(account), Some(connector)) = (
                     state.pairing.canonical_url.as_deref(),
                     state.pairing.account_fingerprint.as_deref(),
                     task.store.connector_name(&self.config.connector_name)?,
                 )
-                && let Ok(_run_guard) = self.try_run_guard_for_task(
-                    task.task.stable_key(),
-                    matches!(
-                        state.action.kind,
-                        Some(
-                            AutomationActionKind::OfflineChat
-                                | AutomationActionKind::OfflineGoal
-                                | AutomationActionKind::OfflineCombined
-                        )
-                    ),
-                )
-                && let Ok(true) = self
-                    .executor
-                    .approve_pending_conversation_for_task(
-                        task.task.stable_key(),
-                        matches!(
-                            state.action.kind,
-                            Some(
-                                AutomationActionKind::OfflineChat
-                                    | AutomationActionKind::OfflineGoal
-                                    | AutomationActionKind::OfflineCombined
-                            )
-                        ),
-                        url,
-                        account,
-                        &connector,
-                    )
-                    .await
+                && let Ok(_run_guard) = self.run_lock.try_write()
             {
                 let epoch = activity
                     .activity_epoch
@@ -2153,9 +2597,33 @@ impl AgentAutomationSupervisor {
                 } else {
                     activity.activity_sequence
                 };
-                self.record_approved_resume(&task, &state, epoch, sequence, now_ms)
-                    .await?;
-                continue;
+                approval_probed = true;
+                let visit = activity.materialization_pending
+                    && !activity.is_online(now_ms, task.store.offline_after_ms())
+                    && activity
+                        .agent_waiting_until_ms
+                        .is_none_or(|until| now_ms >= until);
+                let approval = if visit {
+                    self.executor
+                        .inspect_pending_materialization(url, account, &connector)
+                        .await
+                } else {
+                    self.executor
+                        .approve_pending_conversation(url, account, &connector)
+                        .await
+                };
+                if activity.materialization_pending
+                    && (visit && approval.is_ok() || matches!(approval, Ok(true)))
+                {
+                    task.chat
+                        .finish_materialization_check(epoch, sequence)
+                        .await?;
+                }
+                if matches!(approval, Ok(true)) {
+                    self.record_approved_resume(&task, &state, epoch, sequence, now_ms)
+                        .await?;
+                    continue;
+                }
             }
             let activity_epoch = activity
                 .activity_epoch
@@ -2199,7 +2667,12 @@ impl AgentAutomationSupervisor {
                 renewal_enabled,
                 now_ms,
             );
+            let renewal_goal_inactive = state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status != GoalStatus::Active);
             let renewal_invalid = activity.agent_stop_requested
+                || renewal_goal_inactive
                 || !renewal_enabled
                 || state.turn_renewal.send.as_ref().is_some_and(|send| {
                     send.owner_generation != task.owner_generation
@@ -2207,7 +2680,8 @@ impl AgentAutomationSupervisor {
                 });
             if renewal_invalid
                 && (state.turn_renewal.handoff.is_some()
-                    || activity.agent_stop_requested && state.turn_renewal.send.is_some())
+                    || (activity.agent_stop_requested || renewal_goal_inactive)
+                        && state.turn_renewal.send.is_some())
             {
                 task.store.clear_turn_renewal(&task.task)?;
                 self.queue.lock().await.retain(|q| {
@@ -2217,6 +2691,10 @@ impl AgentAutomationSupervisor {
                 state = task.store.load(&task.task)?;
             }
             if let Some(handoff) = state.turn_renewal.handoff.clone() {
+                self.schedule_handoff_observation(&handoff, now_ms);
+                if !browser_observations {
+                    continue;
+                }
                 if state.action.kind == Some(AutomationActionKind::TurnRenewal) {
                     let retry_goal = handoff.report_complete
                         && state
@@ -2238,8 +2716,7 @@ impl AgentAutomationSupervisor {
                         if let (Some(url), Some(account)) = (
                             state.pairing.canonical_url.as_deref(),
                             state.pairing.account_fingerprint.as_deref(),
-                        ) && let Ok(_browser_guard) =
-                            self.try_run_guard_for_task(task.task.stable_key(), false)
+                        ) && let Ok(_browser_guard) = self.run_lock.try_write()
                             && let Ok(Ok(true)) = tokio::time::timeout(
                                 Duration::from_secs(15),
                                 self.executor.turn_handoff_complete_for_task(
@@ -2262,12 +2739,7 @@ impl AgentAutomationSupervisor {
                         } else {
                             continue;
                         }
-                    } else if super::turn_renewal::handoff_has_accepted_continuation(
-                        &state, &handoff,
-                    ) {
-                        // A *newer* accepted continuation owns this handoff.
-                        // An accepted renewal Send alone does not prove that
-                        // ChatGPT delivered its final handoff report.
+                    } else if state.action.send_accepted == Some(true) && handoff.report_complete {
                         continue;
                     }
                 }
@@ -2275,36 +2747,50 @@ impl AgentAutomationSupervisor {
                     let handoff_proven = if let (Some(url), Some(account)) = (
                         state.pairing.canonical_url.as_deref(),
                         state.pairing.account_fingerprint.as_deref(),
-                    ) && state.pairing.verified_owner_generation
-                        == Some(task.owner_generation)
-                        && now_ms.saturating_sub(handoff.requested_at_ms) >= 5_000
-                        && let Ok(_browser_guard) =
-                            self.try_run_guard_for_task(task.task.stable_key(), false)
-                        && self
-                            .handoff_probe_budget
-                            .lock()
-                            .await
-                            .claim(task.task.stable_key(), now_ms)
-                    {
-                        matches!(
-                            tokio::time::timeout(
-                                Duration::from_secs(15),
-                                self.executor.turn_handoff_complete_for_task(
-                                    task.task.stable_key(),
-                                    url,
-                                    account,
-                                    &handoff.id,
-                                ),
-                            )
-                            .await,
-                            Ok(Ok(true))
+                    ) && state.pairing.verified_owner_generation == Some(task.owner_generation)
+                        && now_ms.saturating_sub(handoff.requested_at_ms)
+                            >= TURN_HANDOFF_PROBE_INTERVAL_MS
+                        && let Ok(_browser_guard) = self.run_lock.try_write()
+                        && let Ok(Ok(complete)) = tokio::time::timeout(
+                            Duration::from_secs(15),
+                            self.executor
+                                .turn_handoff_complete(url, account, &handoff.id),
                         )
-                    } else {
-                        false
-                    };
-                    if handoff_proven {
-                        task.store.confirm_turn_handoff(&task.task, &handoff.id)?;
-                        state = task.store.load(&task.task)?;
+                        .await
+                    {
+                        if complete {
+                            task.store.confirm_turn_handoff(&task.task, &handoff.id)?;
+                            state = task.store.load(&task.task)?;
+                        } else {
+                            // A failed observation/timeout never authorizes recovery.
+                            // After a real negative probe, re-read native activity so
+                            // long commands, tool waits and explicit stops stay owned.
+                            let fresh = task.chat.offline_activity().await?;
+                            if !fresh.agent_stop_requested
+                                && !fresh.is_online(now_ms, task.store.offline_after_ms())
+                                && fresh
+                                    .agent_waiting_until_ms
+                                    .is_none_or(|until| now_ms >= until)
+                                && !super::turn_analytics::native_call_recent_or_running(
+                                    task.task.stable_key(),
+                                    task.owner_generation,
+                                    now_ms,
+                                )
+                                && !crate::exec_sessions::conversation_has_running_commands(
+                                    &task.task,
+                                )
+                                && task.store.recover_stalled_goal_handoff(
+                                    &task.task,
+                                    &state,
+                                    fresh.last_call_at_ms,
+                                    now_ms,
+                                )?
+                            {
+                                state = task.store.load(&task.task)?;
+                            } else {
+                                continue;
+                            }
+                        }
                     } else {
                         if state.action.kind == Some(AutomationActionKind::TurnRenewal)
                             && !activity.is_online(now_ms, task.store.offline_after_ms())
@@ -2382,8 +2868,7 @@ impl AgentAutomationSupervisor {
                 // retry is retired only while the worker cannot start its Send.
                 let queued = state.action.status == AutomationActionStatus::Queued;
                 let run_guard = if queued {
-                    self.try_run_guard_for_task(task.task.stable_key(), false)
-                        .ok()
+                    self.run_lock.try_write().ok()
                 } else {
                     None
                 };
@@ -2422,6 +2907,12 @@ impl AgentAutomationSupervisor {
             if activity.agent_stop_requested
                 || !renewing
                     && (activity.is_online(now_ms, task.store.offline_after_ms())
+                        || super::turn_analytics::native_call_recent_or_running(
+                            task.task.stable_key(),
+                            task.owner_generation,
+                            now_ms,
+                        )
+                        || crate::exec_sessions::conversation_has_running_commands(&task.task)
                         || activity
                             .agent_waiting_until_ms
                             .is_some_and(|until| now_ms < until))
@@ -2434,7 +2925,8 @@ impl AgentAutomationSupervisor {
             if state.pairing.verified_owner_generation != Some(task.owner_generation) {
                 continue;
             }
-            if state.action.kind == Some(AutomationActionKind::OfflineGoal)
+            if browser_observations
+                && state.action.kind == Some(AutomationActionKind::OfflineGoal)
                 && matches!(
                     state.action.status,
                     AutomationActionStatus::Navigating
@@ -2450,7 +2942,7 @@ impl AgentAutomationSupervisor {
                         .as_deref()
                         .or(state.selection.account_fingerprint.as_deref()),
                 )
-                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), true)
+                && let Ok(_run_guard) = self.run_lock.try_write()
             {
                 // The old observer may have disappeared during a service restart. Recover only
                 // an exact, completed goal-only receipt; never replay an uncertain user send.
@@ -2502,6 +2994,53 @@ impl AgentAutomationSupervisor {
             else {
                 continue;
             };
+            // A saved pre-Send goal start can outlive the previous browser owner.
+            // A missing receipt is proof only after an idle same-account 404.
+            // Retain uncertainty; the normal goal recovery path creates a new turn.
+            if browser_observations
+                && task.store.recovery_enhancements
+                && state.action.kind == Some(AutomationActionKind::OfflineGoal)
+                && state.action.status == AutomationActionStatus::Navigating
+                && state.action.send_accepted == Some(false)
+                && !state.action.goal_turn_counted
+                && state.action.updated_at_ms.is_some_and(|started| {
+                    now_ms.saturating_sub(started)
+                        >= self.action_timeouts.start.as_millis().min(u64::MAX as u128) as u64
+                })
+                && self.live_state(&task.task).await.is_none()
+                && self.queue_position(&task.task).await.is_none()
+                && let (Some(id), Some(account)) = (
+                    state.action.id.as_deref(),
+                    state.pairing.account_fingerprint.as_deref(),
+                )
+                && let Ok(_guard) = self.run_lock.try_write()
+                && let Ok(Ok(true)) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.executor.missing_goal_start(id, account),
+                )
+                .await
+            {
+                let fresh = task.chat.offline_activity().await?;
+                if !fresh.agent_stop_requested
+                    && !fresh.is_online(now_ms, task.store.offline_after_ms())
+                    && fresh
+                        .agent_waiting_until_ms
+                        .is_none_or(|until| now_ms >= until)
+                    && !super::turn_analytics::native_call_recent_or_running(
+                        task.task.stable_key(),
+                        task.owner_generation,
+                        now_ms,
+                    )
+                    && !crate::exec_sessions::conversation_has_running_commands(&task.task)
+                    && task.store.reconcile_missing_goal_start(
+                        &task.task,
+                        &state,
+                        task.owner_generation,
+                    )?
+                {
+                    state = task.store.load(&task.task)?;
+                }
+            }
             let obsolete_action =
                 renewing && state.action.kind != Some(AutomationActionKind::TurnRenewal);
             if !obsolete_action
@@ -2515,7 +3054,7 @@ impl AgentAutomationSupervisor {
                     now_ms.saturating_sub(started)
                         >= self.action_timeouts.total.as_millis().min(u64::MAX as u128) as u64
                 })
-                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
+                && let Ok(_run_guard) = self.run_lock.try_write()
                 && task
                     .store
                     .expire_unobserved_action(&task.task, &state.action)?
@@ -2881,20 +3420,77 @@ impl AgentAutomationSupervisor {
         Ok(())
     }
 
-    pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
-        self.run_next_for_lane(now_ms, false).await
+    fn execution_lock_keys(execution: &AutomationExecution) -> Vec<String> {
+        let mut keys = vec![format!("task:{}", execution.task_key)];
+        if !matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
+            && let Ok(url) = super::companion::canonical_chatgpt_conversation_url(
+                &execution.request.expected_url,
+            )
+        {
+            keys.push(format!("conversation:{url}"));
+        }
+        keys
     }
 
-    async fn run_next_for_lane(
+    fn try_execution_lease(
         &self,
-        now_ms: u64,
-        secondary: bool,
-    ) -> Result<Option<CompanionActionSnapshot>, String> {
-        let _run_guard = if secondary {
-            self.canary_run_lock.lock().await
-        } else {
-            self.run_lock.lock().await
-        };
+        execution: &AutomationExecution,
+    ) -> Option<Vec<OwnedMutexGuard<()>>> {
+        self.try_lock_keys(Self::execution_lock_keys(execution))
+    }
+
+    fn task_execution_lock(&self, task: &ConversationIdentity) -> Arc<Mutex<()>> {
+        let key = format!("task:{}", task.stable_key());
+        let mut locks = self
+            .task_run_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        })
+    }
+
+    fn try_lock_keys(&self, keys: Vec<String>) -> Option<Vec<OwnedMutexGuard<()>>> {
+        let mut locks = self
+            .task_run_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let mut guards = Vec::new();
+        for key in keys {
+            let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            });
+            guards.push(lock.try_lock_owned().ok()?);
+        }
+        Some(guards)
+    }
+
+    fn execution_has_lease(&self, execution: &AutomationExecution) -> bool {
+        let locks = self
+            .task_run_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Self::execution_lock_keys(execution).iter().any(|key| {
+            locks
+                .get(key)
+                .and_then(Weak::upgrade)
+                .is_some_and(|lock| lock.try_lock_owned().is_err())
+        })
+    }
+
+    pub async fn run_next(&self, now_ms: u64) -> Result<Option<CompanionActionSnapshot>, String> {
+        let _slot = self
+            .run_slots
+            .acquire()
+            .await
+            .map_err(|_| "Browser dispatch is closed")?;
+        let _run_guard = self.run_lock.read().await;
         let mut reservation = None;
         let outcome = self
             .run_next_locked(now_ms, None, &mut reservation, secondary)
@@ -3078,7 +3674,7 @@ impl AgentAutomationSupervisor {
     ) -> Result<Option<CompanionActionSnapshot>, String> {
         let maximum_candidates = self.queue.lock().await.len();
         let mut considered = 0;
-        let (mut execution, task) = loop {
+        let (mut execution, task, _task_guards, activity_class) = loop {
             if considered >= maximum_candidates {
                 return Ok(None);
             }
@@ -3129,6 +3725,10 @@ impl AgentAutomationSupervisor {
             let Some(mut execution) = next else {
                 return Ok(None);
             };
+            let Some(task_guards) = self.try_execution_lease(&execution) else {
+                self.queue.lock().await.push_back(execution);
+                continue;
+            };
             if let Some(preferred) = preferred {
                 execution.request.pairing_continuation_of = Some(preferred.action_id.clone());
             }
@@ -3177,8 +3777,30 @@ impl AgentAutomationSupervisor {
                     }
                 }
             }
-            let cooldown = task.store.load(&task.task)?.browser_cooldown_until_ms();
+            let (cooldown, worker) = match task.store.load(&task.task) {
+                Ok(state) => (
+                    state.browser_cooldown_until_ms(),
+                    state.agents.parent_task_key.is_some(),
+                ),
+                Err(error) => {
+                    // A transient unreadable state must not silently drop a
+                    // queued user message. Keep its original action identity
+                    // but also avoid blocking unrelated ready conversations.
+                    // The candidate count bounds this skip if all chats fail.
+                    tracing::warn!(%error, "could not inspect queued browser action state");
+                    self.queue.lock().await.push_back(execution);
+                    continue;
+                }
+            };
             if let Some(until) = cooldown.filter(|until| now_ms < *until) {
+                self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
+                self.queue.lock().await.push_back(execution);
+                continue;
+            }
+            // Automatic work waits while the circuit breaker is open; owner
+            // messages and setup are never held.
+            let activity_class = activity_class(&execution, worker);
+            if let Some(until) = self.activity.hold_until(activity_class, now_ms) {
                 self.next_retry_scan_ms.fetch_min(until, Ordering::Relaxed);
                 self.queue.lock().await.push_back(execution);
                 continue;
@@ -3276,7 +3898,7 @@ impl AgentAutomationSupervisor {
                     now_ms,
                 )?;
             }
-            break (execution, task);
+            break (execution, task, task_guards, activity_class);
         };
 
         if let Some(context) = self.rollover.get()
@@ -3351,6 +3973,7 @@ impl AgentAutomationSupervisor {
         );
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
+        self.activity.record_dispatch(activity_class, now_ms);
         let execute = self
             .executor
             .execute(execution.clone(), events_tx, cancellation.clone());
@@ -3477,6 +4100,9 @@ impl AgentAutomationSupervisor {
                     }
                     self.clear_live_if_action(&execution).await;
                     return Ok(Some(snapshot));
+                }
+                if snapshot.send_accepted {
+                    self.activity.record_send(now_ms);
                 }
                 if snapshot.send_accepted
                     && matches!(execution.request.prompt, ActionPrompt::CreateChat { .. })
@@ -3906,28 +4532,15 @@ impl AgentAutomationSupervisor {
         let tasks = self.tasks.read().await;
         let queue = self.queue.lock().await;
         queue.iter().any(|execution| {
-            if !super::lane_affinity::owns_operation_in_pilot(
-                &execution.task_key,
-                self.pilot_primary_task_key.as_deref(),
-                self.canary_task_key.as_deref(),
-                usize::from(secondary),
-                matches!(
-                    execution_kind(execution),
-                    AutomationActionKind::OfflineChat
-                        | AutomationActionKind::OfflineGoal
-                        | AutomationActionKind::OfflineCombined
-                ),
-            ) {
-                return false;
-            }
-            tasks
-                .get(&execution.task_key)
-                .and_then(|task| task.store.load(&task.task).ok())
-                .is_none_or(|state| {
-                    state
-                        .browser_cooldown_until_ms()
-                        .is_none_or(|until| now_ms >= until)
-                })
+            !self.execution_has_lease(execution)
+                && tasks
+                    .get(&execution.task_key)
+                    .and_then(|task| task.store.load(&task.task).ok())
+                    .is_some_and(|state| {
+                        state
+                            .browser_cooldown_until_ms()
+                            .is_none_or(|until| now_ms >= until)
+                    })
         })
     }
 
@@ -4477,6 +5090,79 @@ mod model_fallback_snapshot_tests {
 #[cfg(test)]
 mod retry_wake_tests {
     use super::*;
+    #[tokio::test]
+    async fn early_work_scan_keeps_the_existing_approval_wake_deadline() {
+        let config = AgentAutomationConfig {
+            auto_approve_tool_calls: true,
+            ..Default::default()
+        };
+        let supervisor = AgentAutomationSupervisor::new(
+            config.clone(),
+            Arc::new(BrowserAutomationExecutor::new(config)),
+        );
+        supervisor.scan_once(1_000).await.unwrap();
+        assert_eq!(supervisor.retry_scan_delay(1_000), Duration::from_secs(5));
+        supervisor.scan_once(2_000).await.unwrap();
+        assert_eq!(supervisor.retry_scan_delay(2_000), Duration::from_secs(4));
+        assert_eq!(
+            supervisor.approval_next_scan_ms.load(Ordering::Relaxed),
+            6_000
+        );
+        supervisor.scan_once(5_999).await.unwrap();
+        assert_eq!(supervisor.retry_scan_delay(5_999), Duration::from_millis(1));
+        supervisor.scan_once(6_000).await.unwrap();
+        assert_eq!(supervisor.retry_scan_delay(6_000), Duration::from_secs(5));
+        assert_eq!(
+            supervisor.approval_next_scan_ms.load(Ordering::Relaxed),
+            11_000
+        );
+    }
+    #[test]
+    fn pending_handoff_observation_wakes_without_enabling_tool_auto_approval() {
+        let config = AgentAutomationConfig {
+            auto_approve_tool_calls: false,
+            ..Default::default()
+        };
+        let supervisor = AgentAutomationSupervisor::new(
+            config.clone(),
+            Arc::new(BrowserAutomationExecutor::new(config)),
+        );
+        let mut handoff = super::super::turn_renewal::TurnHandoff {
+            id: "pending-report".into(),
+            requested_at_ms: 1_000,
+            report_complete: false,
+        };
+        supervisor
+            .next_retry_scan_ms
+            .store(31_000, Ordering::Relaxed);
+        supervisor.schedule_handoff_observation(&handoff, 1_500);
+        assert_eq!(
+            supervisor.retry_scan_delay(1_500),
+            Duration::from_millis(4_500)
+        );
+        // A report still being written gets a bounded subsequent check, never
+        // a zero-delay spin or the ordinary 30-second idle wait.
+        supervisor
+            .next_retry_scan_ms
+            .store(36_000, Ordering::Relaxed);
+        supervisor.schedule_handoff_observation(&handoff, 6_000);
+        assert_eq!(supervisor.retry_scan_delay(6_000), Duration::from_secs(5));
+        supervisor
+            .next_retry_scan_ms
+            .store(6_250, Ordering::Relaxed);
+        supervisor.schedule_handoff_observation(&handoff, 6_000);
+        assert_eq!(
+            supervisor.retry_scan_delay(6_000),
+            Duration::from_millis(250)
+        );
+        handoff.report_complete = true;
+        supervisor
+            .next_retry_scan_ms
+            .store(36_000, Ordering::Relaxed);
+        supervisor.schedule_handoff_observation(&handoff, 6_000);
+        assert_eq!(supervisor.retry_scan_delay(6_000), Duration::from_secs(30));
+        assert!(!supervisor.config.auto_approve_tool_calls);
+    }
     #[test]
     fn handoff_read_probes_are_global_and_per_task_throttled() {
         let mut budget = HandoffProbeBudget::default();
@@ -4668,6 +5354,13 @@ async fn execution_matches(
     let activity = task.chat.offline_activity().await?;
     let renewing =
         if let ActionPrompt::TurnRenewal { ref handoff_id } = execution.request.prompt {
+            if state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status != GoalStatus::Active)
+            {
+                return Ok(false);
+            }
             let config = task.store.turn_renewal_settings()?;
             if !state.turn_renewal.send.as_ref().is_some_and(|send| {
                 config.enabled_for(send.model.as_deref(), send.effort.as_deref())
@@ -4691,6 +5384,12 @@ async fn execution_matches(
     if activity.agent_stop_requested
         || !renewing
             && (activity.is_online(now_ms, task.store.offline_after_ms())
+                || super::turn_analytics::native_call_recent_or_running(
+                    task.task.stable_key(),
+                    task.owner_generation,
+                    now_ms,
+                )
+                || crate::exec_sessions::conversation_has_running_commands(&task.task)
                 || activity
                     .agent_waiting_until_ms
                     .is_some_and(|until| now_ms < until))
@@ -4767,6 +5466,134 @@ fn execution_kind(execution: &AutomationExecution) -> AutomationActionKind {
         ActionPrompt::OfflineChat { .. } => AutomationActionKind::OfflineChat,
         ActionPrompt::OfflineGoal { .. } => AutomationActionKind::OfflineGoal,
         ActionPrompt::OfflineCombined { .. } => AutomationActionKind::OfflineCombined,
+    }
+}
+
+fn activity_class(
+    execution: &AutomationExecution,
+    worker: bool,
+) -> super::activity_guard::ActivityClass {
+    use super::activity_guard::ActivityClass;
+    if execution.activity_epoch == "conversation-rollover" {
+        return ActivityClass::Recovery;
+    }
+    match execution_kind(execution) {
+        AutomationActionKind::PairVerify
+        | AutomationActionKind::OfflineChat
+        | AutomationActionKind::OfflineCombined => ActivityClass::Owner,
+        AutomationActionKind::TurnRenewal => ActivityClass::Renewal,
+        AutomationActionKind::OfflineGoal if worker => ActivityClass::WorkerTurn,
+        AutomationActionKind::OfflineGoal => ActivityClass::Recovery,
+    }
+}
+
+#[cfg(test)]
+mod activity_policy_tests {
+    use super::*;
+    use crate::agent_automation::activity_guard::{ActivityClass, ActivityGuard};
+
+    fn execution(prompt: ActionPrompt) -> AutomationExecution {
+        AutomationExecution {
+            task_key: "worker-chat".into(),
+            owner_generation: 1,
+            account_fingerprint: "fixture-account".into(),
+            catalog_revision: "fixture".into(),
+            activity_epoch: "owner-message".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 0,
+            unread_message_ids: vec!["owner-message".into()],
+            transcript_revision: "fixture".into(),
+            pairing_commit: None,
+            request: ExecuteActionRequest {
+                action_id: "fixture".into(),
+                idempotency_key: "fixture".into(),
+                url: "https://chatgpt.com/c/worker".into(),
+                pairing_generation: 1,
+                connector_name: "Fixture".into(),
+                model: None,
+                effort: None,
+                expected_account_fingerprint: "fixture-account".into(),
+                prompt,
+                expected_url: "https://chatgpt.com/c/worker".into(),
+                auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
+                retain_pairing_window: false,
+                pairing_continuation_of: None,
+                agent_ticket: None,
+            },
+        }
+    }
+
+    fn open_breaker() -> ActivityGuard {
+        let guard = ActivityGuard::default();
+        for offset in 0..12 {
+            guard.record_dispatch(ActivityClass::Recovery, 1_000_000 + offset);
+        }
+        assert!(guard.snapshot(1_000_020).breaker_open);
+        guard
+    }
+
+    #[test]
+    fn owner_messages_and_setup_bypass_an_open_breaker_in_worker_chats() {
+        let guard = open_breaker();
+        for prompt in [
+            ActionPrompt::OfflineChat {
+                batch_id: "owner-batch".into(),
+                messages: vec![CompanionUnreadMessage {
+                    id: "owner-message".into(),
+                    markdown: "Read this correction".into(),
+                }],
+            },
+            ActionPrompt::OfflineCombined {
+                batch_id: "owner-goal-batch".into(),
+                messages: vec![CompanionUnreadMessage {
+                    id: "owner-message".into(),
+                    markdown: "Read this correction".into(),
+                }],
+                goal_revision: 1,
+            },
+            ActionPrompt::PairVerify {
+                reference: "fixture".into(),
+            },
+            ActionPrompt::CreateChat {
+                continuation_token: "fixture".into(),
+                reference: "fixture".into(),
+                setup_reference: None,
+            },
+        ] {
+            let execution = execution(prompt);
+            for worker in [false, true] {
+                let class = activity_class(&execution, worker);
+                assert_eq!(class, ActivityClass::Owner);
+                assert_eq!(guard.hold_until(class, 1_000_020), None);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_worker_turns_recoveries_and_renewals_stay_held() {
+        let guard = open_breaker();
+        let goal = execution(ActionPrompt::OfflineGoal { goal_revision: 1 });
+        assert_eq!(activity_class(&goal, true), ActivityClass::WorkerTurn);
+        assert_eq!(activity_class(&goal, false), ActivityClass::Recovery);
+        let renewal = execution(ActionPrompt::TaskContinuation {});
+        assert_eq!(activity_class(&renewal, true), ActivityClass::Renewal);
+        let mut rollover = execution(ActionPrompt::CreateChat {
+            continuation_token: "fixture".into(),
+            reference: "fixture".into(),
+            setup_reference: None,
+        });
+        rollover.activity_epoch = "conversation-rollover".into();
+        assert_eq!(activity_class(&rollover, true), ActivityClass::Recovery);
+        for execution in [goal, renewal, rollover] {
+            for worker in [false, true] {
+                assert!(
+                    guard
+                        .hold_until(activity_class(&execution, worker), 1_000_020)
+                        .is_some()
+                );
+            }
+        }
     }
 }
 

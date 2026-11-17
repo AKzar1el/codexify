@@ -56,6 +56,7 @@ jobs:
           bun run install:chrome
           CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/chrome-surface.test.ts ./tests/capability-discovery.test.ts ./tests/picker-layouts.test.ts ./tests/account-settings.test.ts
           CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/conversation-approval.test.ts
+          CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/response-delivery-timeout.test.ts
           CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/conversation-unavailable.test.ts -t 'transcript API 429s'
           CODEXIFY_TEST_BROWSER_COMPANION_CHROME=1 xvfb-run -a bun test ./tests/pairing-submit.test.ts -t 'offline Stop resumes the captured|late Stop dialog during message preparation|Japanese lazy picker|conversation length|conversation-length|task continuation|re-pairing sends'
           bun run package
@@ -130,7 +131,7 @@ jobs:
   diff-widget:
     name: Diff widget layout (Chromium and WebKit)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -188,6 +189,14 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-windows-installer.ps1
+
+      - name: Test graceful browser update guards on Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/test-windows-chrome-profile-exit.ps1
+          ./scripts/test-windows-browser-graceful-update.ps1
+          ./scripts/test-windows-browser-graceful-update.ps1 -ChromeNeverExits
 
       - name: Test service contracts
         run: cargo test --all-targets service

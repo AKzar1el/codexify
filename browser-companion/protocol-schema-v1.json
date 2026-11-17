@@ -3,6 +3,13 @@
   "kind": "codexify-browser-companion",
   "fieldNaming": "camelCase",
   "strictObjects": true,
+  "parallelActionPages": {
+    "actionCapacity": "optional integer 1..4; absent means one legacy page",
+    "availableActionSlots": "optional integer 0..4; capacity is not authentication authority",
+    "activeActionIds": "optional list of at most four opaque action IDs; accepted and uncertain actions retain page ownership",
+    "readyHealth": "GET /v1/health?ready=1 awaits fresh idle-page session proof; ordinary health remains bounded and passive",
+    "ordering": "one action per canonical conversation; maintenance drains all page lanes; global HTTP429 and actual Send spacing remain shared"
+  },
   "buildBinding": "<component-version>+protocol.<sha256-of-this-file>",
   "endpoints": [
     "GET /v1/health",
@@ -176,7 +183,8 @@
   "conversationApproval": {
     "request": ["url", "expectedAccountFingerprint", "connectorName"],
     "response": ["protocolVersion", "build", "approved"],
-    "scope": "Current verified conversation and its configured connector only; no navigation or message submission",
+    "optionalRequest": {"allowNavigation":"boolean, default false; visit the paired conversation only for an offline pending file materialization check"},
+    "scope": "Verified conversation and its configured connector only; passive checks never navigate, explicit materialization checks may navigate without submitting a message",
     "policy": "Core calls only while autoApproveToolCalls is enabled; checks yield to browser actions"
   },
   "navigationDeferral": {

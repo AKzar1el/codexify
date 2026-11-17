@@ -1,5 +1,8 @@
+pub mod activity_guard;
+pub mod agents;
 mod companion;
-mod goal_admission;
+pub mod conversation_recovery;
+pub mod goal_blocking;
 mod install;
 mod lane_affinity;
 mod model_fallback;
@@ -10,6 +13,7 @@ mod supervisor;
 pub(crate) mod turn_analytics;
 pub mod turn_renewal;
 
+pub use activity_guard::ActivitySnapshot;
 pub use recovery::{
     BrowserCompanionControl, BrowserRecoveryWorker, watch as watch_browser_companion,
 };
