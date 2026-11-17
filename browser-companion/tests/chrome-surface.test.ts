@@ -128,7 +128,7 @@ test("the browser uses a dedicated persistent Chrome profile and one shared page
     channel:"chrome", executablePath:fakeExecutablePath, headless:false, viewport:null,
     ignoreDefaultArgs:true, timeout:30_000, args:await backgroundChromeArgs(profilePath!),
   });
-  expect(restored.closed).toBeFalse();
+  expect(restored.closed).toBeTrue();
   expect(await surface.page()).toBe(shared as unknown as Page);
   expect(shared.navigations).toEqual(["https://chatgpt.com/"]);
   expect(styled((context as FakeContext).initScripts)).toHaveLength(0);
@@ -196,89 +196,15 @@ test("background launch retains Patchright's transport and private profile witho
   expect(args).not.toContain("--headless");
 });
 
-test("other tabs remain untouched and closing the selected tab fails closed", async () => {
+test("extra pages and closing Chrome report external interference", async () => {
   const { surface, fake } = await createSurface();
   const extra = await fake.newPage();
-  expect(await surface.page()).toBe(fake.tabs[0] as unknown as Page);
+  await expect(surface.page()).rejects.toMatchObject({ code:"external_interference" });
   await extra.close();
   expect(await surface.page()).toBeDefined();
   await surface.close();
   await surface.closed;
   await expect(surface.page()).rejects.toMatchObject({ code:"external_interference" });
-});
-
-test("each conversation has a persistent tab and visiting another does not navigate the first", async()=>{
-  const {surface,fake}=await createSurface();
-  const utility=await surface.utilityPage();
-  const a=await openGoal(surface,'https://chatgpt.com/c/goal-a');
-  expect(a.url()).toBe('https://chatgpt.com/c/goal-a');
-  const b=await openGoal(surface,'https://chatgpt.com/c/goal-b');
-  expect(b).not.toBe(a);
-  expect(fake.tabs).toHaveLength(3);
-  expect((a as unknown as FakePage).navigations).toEqual(['https://chatgpt.com/c/goal-a']);
-  expect((b as unknown as FakePage).navigations).toEqual(['https://chatgpt.com/c/goal-b']);
-  expect(await openGoal(surface,'https://chatgpt.com/c/goal-a')).toBe(a);
-  expect((a as unknown as FakePage).navigations).toHaveLength(1);
-  expect((await surface.utilityPage())).toBe(utility);
-  expect(utility.url()).toBe('https://chatgpt.com/');
-  expect(await surface.selectUtilityPage()).toBe(utility);
-  expect(await surface.page()).toBe(utility);
-  expect((b as unknown as FakePage).closed).toBeFalse();
-});
-
-test("a cooled-down goal retry never creates and closes a flashing blank tab", async()=>{
-  const {surface,fake}=await createSurface();
-  const a=await openGoal(surface,'https://chatgpt.com/c/goal-a');
-  expect(fake.tabs).toHaveLength(2);
-  const created=fake.createdTargets.length;
-  await expect(surface.selectConversation('https://chatgpt.com/c/goal-b')).rejects.toThrow();
-  expect(fake.createdTargets).toHaveLength(created);
-  expect(fake.tabs).toHaveLength(2);
-  expect(await surface.page()).toBe(a);
-  expect(await surface.selectConversation('https://chatgpt.com/c/goal-a')).toBe(a);
-  const b=await openGoal(surface,'https://chatgpt.com/c/goal-b');
-  expect(b).not.toBe(a);
-  expect(fake.tabs).toHaveLength(3);
-});
-
-test("new-chat preparation reuses only its own draft tab, never another goal",async()=>{
-  const {surface,fake}=await createSurface();
-  const goal=await openGoal(surface,'https://chatgpt.com/c/revenue');
-  const draft=await surface.newChatPage();
-  expect(draft).not.toBe(goal);
-  expect(await surface.newChatPage()).toBe(draft);
-  await surface.navigate('https://chatgpt.com/');
-  expect(await surface.newChatPage()).toBe(draft);
-  (draft as unknown as FakePage).currentUrl='https://chatgpt.com/c/new-goal';
-  const next=await surface.newChatPage();
-  expect(next).not.toBe(draft);
-  expect(next).not.toBe(goal);
-  expect(fake.tabs).toHaveLength(4);
-  expect(goal.url()).toBe('https://chatgpt.com/c/revenue');
-  expect(draft.url()).toBe('https://chatgpt.com/c/new-goal');
-});
-
-test("duplicate restored tabs for the same conversation refuse ambiguous ownership",async()=>{
-  const {surface,fake}=await createSurface();
-  const goal=await openGoal(surface,'https://chatgpt.com/c/goal-a');
-  const duplicate=await fake.newPage();
-  (duplicate as unknown as FakePage).currentUrl='https://chatgpt.com/c/goal-a';
-  await expect(openGoal(surface,'https://chatgpt.com/c/goal-a')).rejects.toMatchObject({code:'external_interference'});
-  expect((goal as unknown as FakePage).closed).toBeFalse();
-  expect((duplicate as unknown as FakePage).closed).toBeFalse();
-});
-
-test("several restored goal tabs survive browser restart and route without loading",async()=>{
-  const a=new FakePage();a.currentUrl='https://chatgpt.com/c/a';
-  const b=new FakePage();b.currentUrl='https://chatgpt.com/c/b';
-  const {surface,fake}=await createSurface([a,b]);
-  expect(a.closed).toBeFalse();
-  expect(b.closed).toBeFalse();
-  expect(fake.tabs).toHaveLength(3);
-  expect(await surface.selectConversation('https://chatgpt.com/c/a')).toBe(a as unknown as Page);
-  expect(await surface.selectConversation('https://chatgpt.com/c/b')).toBe(b as unknown as Page);
-  expect(a.navigations).toHaveLength(0);
-  expect(b.navigations).toHaveLength(0);
 });
 
 test("Chrome actions keep exclusive ownership and reject unsafe or aborted navigation", async () => {

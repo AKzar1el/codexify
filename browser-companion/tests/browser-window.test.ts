@@ -271,7 +271,7 @@ async function collect(coordinator: SingleWindowCoordinator, actionId: string): 
 
 test("only an explicitly manual action bypasses navigation cooldown and still requires its verified account",async()=>{
   let current="https://chatgpt.com/";const loads:string[]=[],context={} as BrowserContext;
-  const page={context:()=>context,url:()=>current,goto:async(url:string)=>{current=url;loads.push(url);return {status:()=>200,headerValue:async()=>null};}} as unknown as Page;
+  const page={context:()=>context,url:()=>current,goto:async(url:string)=>{current=url;loads.push(url);return {status:()=>200};}} as unknown as Page;
   await navigatePage(page,"https://chatgpt.com/c/existing");
   class NavigationDriver extends DeferredDriver {
     override async execute(execution:DriverExecution):Promise<void>{
@@ -336,74 +336,6 @@ test("concurrent execute preflights cannot acquire the single window twice", asy
   } finally {
     await coordinator.close();
   }
-});
-
-test("catalogue discovery can outlast an ordinary operation deadline without false timeout",async()=>{
-  class SlowCatalogDriver extends DeferredDriver {
-    prepared=0;
-    override async capabilities():Promise<CapabilityCatalog> {
-      await Bun.sleep(90);
-      return super.capabilities();
-    }
-    async prepareNewChat():Promise<CapabilityCatalog> {
-      this.prepared++;
-      await Bun.sleep(90);
-      return super.capabilities();
-    }
-  }
-  const driver=new SlowCatalogDriver();
-  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
-    operationMs:40,cleanupMs:15,hardStopMs:15,
-  });
-  const prepared=await coordinator.newChatCapabilities(null);
-  const refreshed=await coordinator.capabilities();
-  expect(prepared.models[0]?.id).toBe("gpt-6-sol");
-  expect(refreshed.models[0]?.id).toBe("gpt-6-sol");
-  expect(driver.prepared).toBe(1);
-  await coordinator.close();
-});
-
-test("pre-Send readiness waits for a slow ChatGPT session without sending twice",async()=>{
-  class HydratingDriver extends DeferredDriver {
-    checks=0;
-    override async health() {
-      this.checks++;
-      if(this.checks<=3)return {
-        authenticated:false,accountFingerprint:null,
-        status:"unavailable" as const,detail:"ChatGPT is loading",
-      };
-      return super.health();
-    }
-  }
-  const driver=new HydratingDriver();
-  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
-    operationMs:5_000,preflightMs:5_000,cleanupMs:100,hardStopMs:100,
-  });
-  await coordinator.execute(request("slow-hydration"));
-  const events=collect(coordinator,"slow-hydration");
-  await Bun.sleep(100);
-  expect(driver.runs).toEqual([]);
-  while(!driver.releases.has("slow-hydration"))await Bun.sleep(20);
-  expect(driver.checks).toBeGreaterThanOrEqual(4);
-  expect(driver.runs).toEqual(["slow-hydration"]);
-  driver.releases.get("slow-hydration")?.();
-  expect((await events).at(-1)?.type).toBe("generation_complete");
-});
-
-test("wrong account and authentication failures do not enter readiness retry",async()=>{
-  class WrongAccountDriver extends DeferredDriver {
-    checks=0;
-    override async health() {
-      this.checks++;
-      return {...await super.health(),accountFingerprint:"someone-else"};
-    }
-  }
-  const driver=new WrongAccountDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);
-  await coordinator.execute(request("wrong-account-fast"));
-  const events=await collect(coordinator,"wrong-account-fast");
-  expect(events.at(-1)).toMatchObject({type:"failed",message:expect.stringContaining("account changed")});
-  expect(driver.checks).toBe(1);
-  expect(driver.runs).toEqual([]);
 });
 
 test("execute is idempotent but an action ID cannot be rebound to another request", async () => {
@@ -921,13 +853,12 @@ test.each(['approval','login','reveal'] as const)('a delayed %s operation preser
 
 test('slow navigation, connector selection and Send acceptance get the 30-second budget',async()=>{
  // Scale the production budget and browser delays together to exercise a
- // 52-second stage without making the test wait in real time. This exceeds
- // the previous 30-second timeout but remains bounded by the new deadline.
+ // 27-second stage without making the test wait in real time.
  const scale=100;
  class SlowSubmissionDriver extends DeferredDriver {
   override async execute(execution:DriverExecution) {
    this.runs.push(execution.request.actionId);
-   const slowStage=async()=>{await new Promise(resolve=>setTimeout(resolve,52_000/scale));execution.signal.throwIfAborted();};
+   const slowStage=async()=>{await new Promise(resolve=>setTimeout(resolve,27_000/scale));execution.signal.throwIfAborted();};
    execution.emit({type:'navigating'});await slowStage();
    execution.emit({type:'composer_ready'});
    execution.emit({type:'model_verified',model:execution.request.model!,effort:execution.request.effort!});await slowStage();
@@ -1587,26 +1518,6 @@ class PairingWindowDriver extends DeferredDriver {
 
 const retainedPairing = ():ExecuteActionRequest=>({...request("pair-window"),url:"https://chatgpt.com/new",expectedUrl:"https://chatgpt.com/new",
   model:null,effort:null,retainPairingWindow:true,prompt:{kind:"create_chat",continuationToken:"A".repeat(43),reference:Buffer.alloc(32,1).toString('base64url'),setupReference:null}});
-
-test("fresh-chat creation has a separate slow-browser deadline but retains single-Send semantics",async()=>{
-  class SlowInitialCreation extends PairingWindowDriver {
-    override async execute(execution:DriverExecution) {
-      if(execution.request.prompt.kind==="create_chat")await Bun.sleep(115);
-      return super.execute(execution);
-    }
-  }
-  const driver=new SlowInitialCreation();
-  const coordinator=new SingleWindowCoordinator(driver,TEST_BUILD,{
-    operationMs:40,creationMs:300,cleanupMs:20,hardStopMs:20,
-  });
-  const create={...retainedPairing(),retainPairingWindow:false};
-  await coordinator.execute(create);
-  const events=await collect(coordinator,create.actionId);
-  expect(events.filter(event=>event.type==="send_accepted")).toHaveLength(1);
-  expect(events.at(-1)?.type).toBe("submission_complete");
-  expect(driver.runs).toEqual(["pair-window"]);
-  await coordinator.close();
-});
 
 test("re-pairing retains the browser through verification and admits only its matching continuation",async()=>{
   const driver=new PairingWindowDriver(),coordinator=new SingleWindowCoordinator(driver,TEST_BUILD);

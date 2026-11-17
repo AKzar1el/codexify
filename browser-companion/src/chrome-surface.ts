@@ -64,89 +64,6 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     this.closed = ownsContext ? state.closed : Promise.race([state.closed,pageClosed]);
   }
 
-  private static async backgroundTab(context:BrowserContext,newWindow=false):Promise<Page> {
-    const browser=context.browser();
-    if(!browser)throw new Error("Persistent Chrome did not expose its browser connection");
-    const session=await browser.newBrowserCDPSession();
-    try {
-      const [page]=await Promise.all([
-        context.waitForEvent("page"),
-        session.send("Target.createTarget",{
-          url:"about:blank",background:true,...(newWindow?{newWindow:true}:{}),
-        }),
-      ]);
-      observeConversationLoadResponses(page);
-      return page;
-    } finally { await session.detach(); }
-  }
-
-  private async newTab():Promise<Page> {
-    if(this.contextClosed)throw new BrowserCompanionError("The ChatGPT browser was closed","external_interference");
-    let release!:()=>void;
-    const wait=this.tabCreationGate.tail;
-    const next=new Promise<void>(resolve=>{release=resolve;});
-    this.tabCreationGate.tail=wait.then(()=>next,()=>next);
-    await wait;
-    try {
-      if(this.context.pages().filter(page=>!page.isClosed()).length>=ChromeSingleWindowSurface.MAX_TABS)
-        throw new BrowserCompanionError("The browser has reached its safe 32-tab limit; close unused tabs before creating more","external_interference");
-      const page=await ChromeSingleWindowSurface.backgroundTab(this.context);
-      this.ownedPages?.add(page);
-      this.delegatedByParent?.add(page);
-      if(!this.ownsContext&&this.onPageClosed)page.once("close",this.onPageClosed);
-      return page;
-    } finally { release(); }
-  }
-
-  /**
-   * One authenticated Chrome profile, but a pinned page and independent
-   * browser surface for each task. This is a building block for the future
-   * multi-lane supervisor; the current two-lane routing stays unchanged.
-   */
-  async forTask(taskKey:string):Promise<ChromeSingleWindowSurface> {
-    if(!this.ownsContext)throw new Error("A task cannot allocate another task's browser tab");
-    if(!/^[a-f0-9]{64}$/.test(taskKey))throw new Error("Agent Chat task key is invalid");
-    const existing=this.taskSurfaces.get(taskKey);
-    if(existing)return existing;
-    if(this.taskSurfaces.size>=ChromeSingleWindowSurface.MAX_TASK_TABS)
-      throw new Error("Agent Chat task tab capacity reached");
-    // A page-created event is not tagged with the requesting task. Serialize
-    // task allocations to prevent two concurrent calls claiming one tab.
-    const pending=this.taskTabCreationTail.then(async()=>{
-      await this.page();
-      const page=await this.newTab();
-      this.delegatedPages.add(page);
-      const child=new ChromeSingleWindowSurface(
-        this.context,page,false,new Set([page]),this.delegatedPages,this.closed,this.tabCreationGate,
-      );
-      try {
-        await child.navigate(CHATGPT_HOME);
-        return child;
-      } catch(error) {
-        this.delegatedPages.delete(page);
-        await page.close().catch(()=>{});
-        throw error;
-      }
-    });
-    this.taskTabCreationTail=pending.then(()=>{},()=>{});
-    this.taskSurfaces.set(taskKey,pending);
-    try {return await pending;}
-    catch(error) {
-      if(this.taskSurfaces.get(taskKey)===pending)this.taskSurfaces.delete(taskKey);
-      throw error;
-    }
-  }
-
-  private static conversationKey(url:string):string|null {
-    try {
-      validateChatGptConversationUrl(url);
-      const pathname=new URL(url).pathname;
-      if(!/^\/(?:g\/[^/]+\/)?c\/[^/]+\/?$/.test(pathname)
-        || /\/c\/local-chatgpt(?::|%3a)/i.test(pathname))return null;
-      return canonicalChatGptConversationUrl(url);
-    }catch{return null;}
-  }
-
   static async create(options: ChromeSurfaceOptions): Promise<ChromeSingleWindowSurface> {
     const actionLaneLimit=options.actionLaneLimit??2;
     if(!Number.isInteger(actionLaneLimit)||actionLaneLimit<1||actionLaneLimit>4)
@@ -259,6 +176,7 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     if (!pages.includes(this.sharedPage)||pages.some(page=>!this.state.registeredLanePages.has(page))) {
       throw new BrowserCompanionError("Chrome exposed an unmanaged browser page outside the action lanes", "external_interference");
     }
+    return this.sharedPage;
   }
 
   async createActionLane():Promise<ChromeSingleWindowSurface> {
@@ -316,12 +234,7 @@ export class ChromeSingleWindowSurface implements SingleBrowserSurface {
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
     const target = new URL(url);
     if (target.protocol !== "https:") throw new Error("Browser window navigation requires HTTPS");
-    const page=ChromeSingleWindowSurface.conversationKey(target.href)
-      ?await this.selectConversation(target.href,signal)
-      :await this.page();
-    if(ChromeSingleWindowSurface.conversationKey(target.href)
-      &&ChromeSingleWindowSurface.conversationKey(page.url())===ChromeSingleWindowSurface.conversationKey(target.href))
-      return page;
+    const page = await this.page();
     await navigatePage(page,target.href,{signal});
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
     return page;

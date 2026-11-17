@@ -83,7 +83,7 @@ export interface BrowserDriver {
   }>;
   capabilities(signal?: AbortSignal): Promise<CapabilityCatalog>;
   prepareNewChat?(projectUrl:string | null, signal?: AbortSignal): Promise<CapabilityCatalog>;
-  accountPlan?(epoch:string, signal?: AbortSignal, passive?:boolean): Promise<import("./account-settings").AccountPlan>;
+  accountPlan?(epoch:string, signal?: AbortSignal): Promise<import("./account-settings").AccountPlan>;
   navigationAvailability?(url:string):Promise<number|null>;
   turnHandoffComplete?(url:string,account:string,handoffId:string,signal?:AbortSignal):Promise<boolean>;
   refreshConnector?(name:string, signal?: AbortSignal): Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}>;

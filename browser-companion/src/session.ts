@@ -342,12 +342,7 @@ export async function moveChatGptEffortSlider(
   let state = await readChatGptEffortSnapshot(menu.sliderContainer,1_000,signal);
   const { min, max } = state;
   if (target < min || target > max || !state.available[target - min]) throw new Error("ChatGPT locks the requested effort");
-  const menuItem = menu.slider.locator("xpath=ancestor::*[@role='menuitem'][1]");
-  const thumbFocusable = await menu.slider.evaluate(element => {
-    if (element.getAttribute("aria-hidden") === "true") return false;
-    const index = element.getAttribute("tabindex");
-    return index !== null ? Number(index) >= 0 : element.matches("input, button, select, textarea, a[href]");
-  }).catch(() => false);
+  const control = menu.slider.locator("xpath=ancestor::*[@role='menuitem'][1]");
   while (state.value !== target) {
     if (signal?.aborted) throw new DOMException("Browser action aborted", "AbortError");
     const direction = Math.sign(target - state.value);
@@ -363,20 +358,6 @@ export async function moveChatGptEffortSlider(
     if ((state.value - before) * direction <= 0 || (state.value - target) * direction > 0) {
       throw new Error("ChatGPT did not move its effort slider toward the requested position");
     }
-    if (!advanced) {
-      // Some picker layouts ignore both keyboard targets but accept a trusted
-      // pointer event on the visible track. Do not synthesize ARIA value changes.
-      const track = menu.sliderContainer.locator('[data-orientation="horizontal"]').filter({visible:true}).first();
-      const box = await track.boundingBox().catch(() => null);
-      if (box && box.width >= 28 && max > min) {
-        const margin = Math.min(14, box.width / 4);
-        const ratio = (target - min) / (max - min);
-        const position = {x:margin + (box.width - 2 * margin) * ratio, y:box.height / 2};
-        await track.click({position,timeout:1_500,signal}).catch(() => {});
-        advanced = await moved();
-      }
-    }
-    if (!advanced) throw new Error("ChatGPT did not move its effort slider toward the requested position");
   }
 }
 
