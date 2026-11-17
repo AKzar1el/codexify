@@ -7,8 +7,8 @@ fn normalized_path_label(path: &str) -> String {
 }
 
 /// A verified browser executor must have its own process and profile.
-/// Account identity is intentionally allowed to match across lanes: the
-/// authenticated user can legitimately run multiple independent browsers.
+/// Account identity must match across lanes: the authenticated user may run
+/// multiple independent browsers, but an unrelated account cannot join.
 /// This is evidence supplied by a trusted runtime probe, not a self-attested
 /// descriptor from the queued task.
 #[derive(Debug, Clone)]
@@ -38,19 +38,23 @@ impl GoalAdmission {
         }
         let mut processes = HashSet::new();
         let mut profiles = HashSet::new();
+        let mut expected_account: Option<&str> = None;
         for executor in executors {
+            let account = executor.account_identity.trim();
             if !executor.authenticated
                 || executor.process_id == 0
-                || executor.account_identity.trim().is_empty()
+                || account.is_empty()
                 || executor.profile_path.trim().is_empty()
                 || !processes.insert(executor.process_id)
                 || !profiles.insert(normalized_path_label(&executor.profile_path))
+                || expected_account.is_some_and(|expected| expected != account)
             {
                 return Err(
                     "Browser executors require distinct authenticated processes and profiles"
                         .into(),
                 );
             }
+            expected_account = Some(account);
         }
         Ok(())
     }
@@ -318,6 +322,16 @@ mod tests {
         assert!(
             GoalAdmission::require_independent_executors(&[first.clone(), separator_alias])
                 .is_err()
+        );
+        let mut wrong_account = second.clone();
+        wrong_account.account_identity = "other-user".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), wrong_account]).is_err()
+        );
+        let mut padded_account = second.clone();
+        padded_account.account_identity = " same-user ".into();
+        assert!(
+            GoalAdmission::require_independent_executors(&[first.clone(), padded_account]).is_ok()
         );
         let mut unauthenticated = second;
         unauthenticated.authenticated = false;
