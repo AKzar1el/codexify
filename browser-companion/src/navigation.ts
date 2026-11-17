@@ -191,16 +191,6 @@ export function conversationLoadAvailableAt(page:Page,url:string):number|null {
   return at>Date.now()?at:null;
 }
 
-/** Reject a forbidden conversation load before opening a disposable Chrome tab.
- * navigatePage still enforces this budget after tab selection, so concurrent
- * requests cannot bypass the shared rate limit during the async gap.
- */
-export function assertConversationLoadAvailableBeforeTab(page:Page,url:string):void {
-  if(cooldownBypass.getStore())return;
-  const at=conversationLoadAvailableAt(page,url);
-  if(at!==null)throw new ConversationCooldownError(at);
-}
-
 export function recordConversationUnavailable(page:Page):void {
   const key=conversationKey(new URL(page.url()));if(!key)return;
   const budget=navigationBudget(page.context());
@@ -273,8 +263,14 @@ export async function navigatePage(page:Page,url:string,options:{signal?:AbortSi
     // navigation does not reliably cancel on an AbortSignal on every platform.
     const settings={waitUntil:"domcontentloaded" as const,timeout:options.timeout??15_000,signal:options.signal};
     const response=options.reload?await page.reload(settings):await page.goto(target.href,settings);
-    if(target.origin==="https://chatgpt.com" && response
-      && isCloudflareChallengeHeader(await response.headerValue("cf-mitigated"))) {
+    // Some browser transports throw while reading headers. That must never
+    // mask an HTTP 429 diagnosis or bypass the existing cooldown.
+    let mitigation:string|null=null;
+    if(target.origin==="https://chatgpt.com" && response){
+      try { mitigation=await response.headerValue?.("cf-mitigated")??null; }
+      catch { /* No reliable Cloudflare challenge evidence. */ }
+    }
+    if(isCloudflareChallengeHeader(mitigation)) {
       // A challenged document is not evidence of a selector change or a
       // successful transcript load. Preserve the shared recovery budget, and
       // require manual verification in the original signed-in browser.
