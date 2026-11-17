@@ -154,6 +154,25 @@ impl GoalAdmission {
         (!busy_lanes[lane]).then_some(lane)
     }
 
+    /// Require a complete independently probed executor snapshot before
+    /// issuing a lane permit. Callers must obtain fresh evidence at dispatch;
+    /// this function cannot establish probe provenance or process liveness.
+    pub(crate) fn runnable_verified_idle_lane(
+        &self,
+        task_key: &str,
+        executors: &[VerifiedBrowserExecutor],
+        busy_lanes: &[bool],
+    ) -> Option<usize> {
+        if executors.len() != self.assigned_task_keys.len()
+            || busy_lanes.len() != executors.len()
+            || Self::require_independent_executors(executors).is_err()
+        {
+            return None;
+        }
+        let lane = self.lane_index(task_key)?;
+        (!busy_lanes[lane]).then_some(lane)
+    }
+
     pub(crate) fn is_assigned(&self, task_key: &str) -> bool {
         self.assigned_task_keys.iter().any(|key| key == task_key)
     }
@@ -244,6 +263,63 @@ mod tests {
             None
         );
         assert_eq!(admission.lane_index(&key(2)), Some(1));
+    }
+
+    #[test]
+    fn verified_idle_admission_rejects_partial_shared_and_wrong_account_evidence() {
+        let admission = GoalAdmission::new(vec![key(1), key(2)], 2).unwrap();
+        let first = VerifiedBrowserExecutor {
+            process_id: 100,
+            profile_path: "C:/profiles/first".into(),
+            account_identity: "owner".into(),
+            authenticated: true,
+        };
+        let second = VerifiedBrowserExecutor {
+            process_id: 200,
+            profile_path: "C:/profiles/second".into(),
+            account_identity: "owner".into(),
+            authenticated: true,
+        };
+        assert_eq!(
+            admission.runnable_verified_idle_lane(
+                &key(2),
+                &[first.clone(), second.clone()],
+                &[false, false]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            admission.runnable_verified_idle_lane(
+                &key(2),
+                &[first.clone(), second.clone()],
+                &[false, true]
+            ),
+            None
+        );
+        assert_eq!(
+            admission.runnable_verified_idle_lane(&key(1), &[first.clone()], &[false]),
+            None
+        );
+        let mut duplicate = second.clone();
+        duplicate.process_id = first.process_id;
+        assert_eq!(
+            admission.runnable_verified_idle_lane(
+                &key(1),
+                &[first.clone(), duplicate],
+                &[false, false]
+            ),
+            None
+        );
+        let mut wrong_account = second;
+        wrong_account.account_identity = "different".into();
+        assert_eq!(
+            admission.runnable_verified_idle_lane(
+                &key(1),
+                &[first, wrong_account],
+                &[false, false]
+            ),
+            None
+        );
     }
 
     #[test]
