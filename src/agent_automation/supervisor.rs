@@ -87,8 +87,22 @@ pub trait AutomationExecutor: Send + Sync {
     async fn release_pairing_window(&self, _action_id: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn release_pairing_window_for_task(
+        &self,
+        _task_key: &str,
+        action_id: &str,
+    ) -> Result<(), String> {
+        self.release_pairing_window(action_id).await
+    }
     async fn refresh_pairing_window(&self, _action_id: &str) -> Result<(), String> {
         Ok(())
+    }
+    async fn refresh_pairing_window_for_task(
+        &self,
+        _task_key: &str,
+        action_id: &str,
+    ) -> Result<(), String> {
+        self.refresh_pairing_window(action_id).await
     }
     async fn approve_pending_conversation(
         &self,
@@ -116,6 +130,15 @@ pub trait AutomationExecutor: Send + Sync {
         _handoff_id: &str,
     ) -> Result<bool, String> {
         Ok(false)
+    }
+    async fn turn_handoff_complete_for_task(
+        &self,
+        _task_key: &str,
+        url: &str,
+        account: &str,
+        handoff_id: &str,
+    ) -> Result<bool, String> {
+        self.turn_handoff_complete(url, account, handoff_id).await
     }
     async fn prepare_new_chat(
         &self,
@@ -177,12 +200,13 @@ impl BrowserAutomationExecutor {
         task_key: String,
         secondary_config: AgentAutomationConfig,
     ) -> Result<Self, String> {
-        if task_key.is_empty()
-            || task_key.len() > 256
-            || config.descriptor_path == secondary_config.descriptor_path
-        {
+        if task_key.is_empty() || task_key.len() > 256 {
             return Err("Second lane must have an exact task key and a distinct descriptor".into());
         }
+        super::goal_admission::GoalAdmission::require_distinct_descriptors(&[
+            config.descriptor_path.clone(),
+            secondary_config.descriptor_path.clone(),
+        ])?;
         Ok(Self {
             config,
             secondary: Some((task_key, secondary_config)),
@@ -193,12 +217,13 @@ impl BrowserAutomationExecutor {
         self.secondary
             .as_ref()
             .is_some_and(|(key, _)| key == &execution.task_key)
-            && matches!(
-                &execution.request.prompt,
-                ActionPrompt::OfflineChat { .. }
-                    | ActionPrompt::OfflineGoal { .. }
-                    | ActionPrompt::OfflineCombined { .. }
-            )
+            && (self.config.pilot_primary_task_key.is_some()
+                || matches!(
+                    &execution.request.prompt,
+                    ActionPrompt::OfflineChat { .. }
+                        | ActionPrompt::OfflineGoal { .. }
+                        | ActionPrompt::OfflineCombined { .. }
+                ))
     }
 
     fn config_for(&self, execution: &AutomationExecution) -> &AgentAutomationConfig {
@@ -215,7 +240,10 @@ impl BrowserAutomationExecutor {
     ) -> &AgentAutomationConfig {
         self.secondary
             .as_ref()
-            .filter(|(key, _)| eligible_offline && key == task_key)
+            .filter(|(key, _)| {
+                key == task_key
+                    && (eligible_offline || self.config.pilot_primary_task_key.is_some())
+            })
             .map(|(_, config)| config)
             .unwrap_or(&self.config)
     }
@@ -294,6 +322,20 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         .await
         .map_err(|_| "Renewing the browser pairing reservation timed out".to_string())?
     }
+    async fn refresh_pairing_window_for_task(
+        &self,
+        task_key: &str,
+        action_id: &str,
+    ) -> Result<(), String> {
+        let client =
+            BrowserCompanionClient::from_config(self.config_for_task_key(task_key, false))?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.refresh_pairing_window(action_id),
+        )
+        .await
+        .map_err(|_| "Renewing this task's browser pairing reservation timed out".to_string())?
+    }
 
     async fn release_pairing_window(&self, action_id: &str) -> Result<(), String> {
         let client = BrowserCompanionClient::from_config(&self.config)?;
@@ -303,6 +345,20 @@ impl AutomationExecutor for BrowserAutomationExecutor {
         )
         .await
         .map_err(|_| "Releasing the browser window timed out".to_string())?
+    }
+    async fn release_pairing_window_for_task(
+        &self,
+        task_key: &str,
+        action_id: &str,
+    ) -> Result<(), String> {
+        let client =
+            BrowserCompanionClient::from_config(self.config_for_task_key(task_key, false))?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.release_pairing_window(action_id),
+        )
+        .await
+        .map_err(|_| "Releasing this task's browser pairing reservation timed out".to_string())?
     }
     async fn approve_pending_conversation(
         &self,
@@ -337,6 +393,23 @@ impl AutomationExecutor for BrowserAutomationExecutor {
     ) -> Result<bool, String> {
         let cancellation = CancellationToken::new();
         let client = self.ready_client_for(&self.config, &cancellation).await?;
+        client
+            .turn_handoff_complete(url, account, handoff_id, &cancellation)
+            .await
+    }
+    async fn turn_handoff_complete_for_task(
+        &self,
+        task_key: &str,
+        url: &str,
+        account: &str,
+        handoff_id: &str,
+    ) -> Result<bool, String> {
+        // A secondary task must never inspect another task's primary tab.
+        // The independent companion is already running and validates the
+        // requested conversation and account before it reports completion.
+        let client =
+            BrowserCompanionClient::from_config(self.config_for_task_key(task_key, false))?;
+        let cancellation = CancellationToken::new();
         client
             .turn_handoff_complete(url, account, handoff_id, &cancellation)
             .await
@@ -1864,6 +1937,20 @@ impl AgentAutomationSupervisor {
         )
     }
 
+    fn try_run_guard_for_task(
+        &self,
+        task_key: &str,
+        legacy_canary_offline: bool,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, tokio::sync::TryLockError> {
+        let secondary = self.canary_task_key.as_deref() == Some(task_key)
+            && (self.pilot_primary_task_key.is_some() || legacy_canary_offline);
+        if secondary {
+            self.canary_run_lock.try_lock()
+        } else {
+            self.run_lock.try_lock()
+        }
+    }
+
     pub async fn scan_once(&self, now_ms: u64) -> Result<(), String> {
         let _scan_guard = self.scan_lock.lock().await;
         self.next_retry_scan_ms
@@ -1905,7 +1992,7 @@ impl AgentAutomationSupervisor {
             let mut state = task.store.load(&task.task)?;
             if state.action.conversation_load_rate_limited
                 && let Some(action_id) = state.action.id.as_deref()
-                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
                 && self
                     .queue_load_rate_limit_recovery(&task, action_id, now_ms)
                     .await?
@@ -1919,7 +2006,9 @@ impl AgentAutomationSupervisor {
                     task.store
                         .clear_schema_rollover_hold(&task.task, &state.pairing)?;
                     state = task.store.load(&task.task)?;
-                } else if let Ok(_run_guard) = self.run_lock.try_lock() {
+                } else if let Ok(_run_guard) =
+                    self.try_run_guard_for_task(task.task.stable_key(), false)
+                {
                     self.queue_replacement_conversation(&task, &state, true, now_ms)
                         .await?;
                 }
@@ -1929,7 +2018,8 @@ impl AgentAutomationSupervisor {
             }
             if state.action.status == AutomationActionStatus::ConversationLimit {
                 if let Some(action_id) = state.action.id.as_deref()
-                    && let Ok(_run_guard) = self.run_lock.try_lock()
+                    && let Ok(_run_guard) =
+                        self.try_run_guard_for_task(task.task.stable_key(), false)
                 {
                     self.queue_conversation_rollover(&task, action_id, now_ms)
                         .await?;
@@ -1940,7 +2030,7 @@ impl AgentAutomationSupervisor {
                 && state.action.status == AutomationActionStatus::Queued
                 && state.action.automatic_retry_in_progress
                 && let Some(action_id) = state.action.id.as_deref()
-                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
                 && task
                     .store
                     .restore_disabled_queued_retry(&task.task, action_id)?
@@ -2025,20 +2115,17 @@ impl AgentAutomationSupervisor {
                     state.pairing.account_fingerprint.as_deref(),
                     task.store.connector_name(&self.config.connector_name)?,
                 )
-                && let Ok(_run_guard) = if self.canary_task_key.as_deref()
-                    == Some(task.task.stable_key())
-                    && matches!(
+                && let Ok(_run_guard) = self.try_run_guard_for_task(
+                    task.task.stable_key(),
+                    matches!(
                         state.action.kind,
                         Some(
                             AutomationActionKind::OfflineChat
                                 | AutomationActionKind::OfflineGoal
                                 | AutomationActionKind::OfflineCombined
                         )
-                    ) {
-                    self.canary_run_lock.try_lock()
-                } else {
-                    self.run_lock.try_lock()
-                }
+                    ),
+                )
                 && let Ok(true) = self
                     .executor
                     .approve_pending_conversation_for_task(
@@ -2151,11 +2238,16 @@ impl AgentAutomationSupervisor {
                         if let (Some(url), Some(account)) = (
                             state.pairing.canonical_url.as_deref(),
                             state.pairing.account_fingerprint.as_deref(),
-                        ) && let Ok(_browser_guard) = self.run_lock.try_lock()
+                        ) && let Ok(_browser_guard) =
+                            self.try_run_guard_for_task(task.task.stable_key(), false)
                             && let Ok(Ok(true)) = tokio::time::timeout(
                                 Duration::from_secs(15),
-                                self.executor
-                                    .turn_handoff_complete(url, account, &handoff.id),
+                                self.executor.turn_handoff_complete_for_task(
+                                    task.task.stable_key(),
+                                    url,
+                                    account,
+                                    &handoff.id,
+                                ),
                             )
                             .await
                             && task.store.retry_goal_turn_renewal(
@@ -2186,7 +2278,8 @@ impl AgentAutomationSupervisor {
                     ) && state.pairing.verified_owner_generation
                         == Some(task.owner_generation)
                         && now_ms.saturating_sub(handoff.requested_at_ms) >= 5_000
-                        && let Ok(_browser_guard) = self.run_lock.try_lock()
+                        && let Ok(_browser_guard) =
+                            self.try_run_guard_for_task(task.task.stable_key(), false)
                         && self
                             .handoff_probe_budget
                             .lock()
@@ -2196,8 +2289,12 @@ impl AgentAutomationSupervisor {
                         matches!(
                             tokio::time::timeout(
                                 Duration::from_secs(15),
-                                self.executor
-                                    .turn_handoff_complete(url, account, &handoff.id),
+                                self.executor.turn_handoff_complete_for_task(
+                                    task.task.stable_key(),
+                                    url,
+                                    account,
+                                    &handoff.id,
+                                ),
                             )
                             .await,
                             Ok(Ok(true))
@@ -2212,7 +2309,8 @@ impl AgentAutomationSupervisor {
                         if state.action.kind == Some(AutomationActionKind::TurnRenewal)
                             && !activity.is_online(now_ms, task.store.offline_after_ms())
                             && now_ms.saturating_sub(handoff.requested_at_ms) >= 30 * 60_000
-                            && let Ok(_browser_guard) = self.run_lock.try_lock()
+                            && let Ok(_browser_guard) =
+                                self.try_run_guard_for_task(task.task.stable_key(), false)
                             && task
                                 .store
                                 .mark_unverified_handoff_stalled(&task.task, &state, now_ms)?
@@ -2284,7 +2382,8 @@ impl AgentAutomationSupervisor {
                 // retry is retired only while the worker cannot start its Send.
                 let queued = state.action.status == AutomationActionStatus::Queued;
                 let run_guard = if queued {
-                    self.run_lock.try_lock().ok()
+                    self.try_run_guard_for_task(task.task.stable_key(), false)
+                        .ok()
                 } else {
                     None
                 };
@@ -2351,12 +2450,7 @@ impl AgentAutomationSupervisor {
                         .as_deref()
                         .or(state.selection.account_fingerprint.as_deref()),
                 )
-                && let Ok(_run_guard) =
-                    if self.canary_task_key.as_deref() == Some(task.task.stable_key()) {
-                        self.canary_run_lock.try_lock()
-                    } else {
-                        self.run_lock.try_lock()
-                    }
+                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), true)
             {
                 // The old observer may have disappeared during a service restart. Recover only
                 // an exact, completed goal-only receipt; never replay an uncertain user send.
@@ -2421,7 +2515,7 @@ impl AgentAutomationSupervisor {
                     now_ms.saturating_sub(started)
                         >= self.action_timeouts.total.as_millis().min(u64::MAX as u128) as u64
                 })
-                && let Ok(_run_guard) = self.run_lock.try_lock()
+                && let Ok(_run_guard) = self.try_run_guard_for_task(task.task.stable_key(), false)
                 && task
                     .store
                     .expire_unobserved_action(&task.task, &state.action)?
@@ -2821,7 +2915,10 @@ impl AgentAutomationSupervisor {
             }
             if let Err(error) = self
                 .executor
-                .release_pairing_window(&reservation.action_id)
+                .release_pairing_window_for_task(
+                    reservation.task.task.stable_key(),
+                    &reservation.action_id,
+                )
                 .await
             {
                 tracing::warn!(%error, "pairing browser reservation could not be released");
@@ -2880,7 +2977,10 @@ impl AgentAutomationSupervisor {
             }
             if tokio::time::Instant::now() >= refresh_at {
                 self.executor
-                    .refresh_pairing_window(&reservation.action_id)
+                    .refresh_pairing_window_for_task(
+                        reservation.task.task.stable_key(),
+                        &reservation.action_id,
+                    )
                     .await?;
                 refresh_at = tokio::time::Instant::now() + Duration::from_secs(20);
             }
@@ -2912,7 +3012,10 @@ impl AgentAutomationSupervisor {
                         break;
                     }
                     self.executor
-                        .refresh_pairing_window(&reservation.action_id)
+                        .refresh_pairing_window_for_task(
+                            reservation.task.task.stable_key(),
+                            &reservation.action_id,
+                        )
                         .await?;
                     let mut unused = None;
                     let attempted = self
@@ -4769,6 +4872,142 @@ fn unread_batch_id<'a>(
         hash.update(id.as_bytes());
     }
     format!("{:x}", hash.finalize())
+}
+
+#[cfg(test)]
+mod pilot_browser_route_tests {
+    use super::*;
+
+    #[test]
+    fn canary_rejects_descriptor_aliases_before_dispatch() {
+        let mut primary = AgentAutomationConfig::default();
+        primary.descriptor_path = "browser/primary.json".into();
+        let mut secondary = primary.clone();
+        secondary.descriptor_path = " BROWSER/PRIMARY.JSON ".into();
+        assert!(
+            BrowserAutomationExecutor::with_canary(primary.clone(), "b".repeat(64), secondary)
+                .is_err()
+        );
+        secondary = primary.clone();
+        secondary.descriptor_path = " ".into();
+        assert!(
+            BrowserAutomationExecutor::with_canary(primary, "b".repeat(64), secondary).is_err()
+        );
+    }
+
+    fn executor(pilot: bool) -> BrowserAutomationExecutor {
+        let mut primary = AgentAutomationConfig::default();
+        primary.descriptor_path = "primary/descriptor.json".into();
+        if pilot {
+            primary.pilot_primary_task_key = Some("a".repeat(64));
+        }
+        let mut secondary = primary.clone();
+        secondary.descriptor_path = "secondary/descriptor.json".into();
+        BrowserAutomationExecutor::with_canary(primary, "b".repeat(64), secondary).unwrap()
+    }
+
+    fn execution(prompt: ActionPrompt) -> AutomationExecution {
+        AutomationExecution {
+            task_key: "b".repeat(64),
+            owner_generation: 1,
+            account_fingerprint: "test-account".into(),
+            catalog_revision: "test".into(),
+            activity_epoch: "test".into(),
+            activity_sequence: 1,
+            tool_call_count_at_start: 0,
+            unread_message_ids: Vec::new(),
+            transcript_revision: String::new(),
+            pairing_commit: None,
+            request: ExecuteActionRequest {
+                action_id: "test-action".into(),
+                idempotency_key: "test-idempotency".into(),
+                url: "https://chatgpt.com/new".into(),
+                pairing_generation: 1,
+                connector_name: "Codexify".into(),
+                model: None,
+                effort: None,
+                expected_account_fingerprint: "test-account".into(),
+                prompt,
+                expected_url: "https://chatgpt.com/new".into(),
+                auto_approve_tool_calls: false,
+                bypass_conversation_cooldown: false,
+                retain_pairing_window: false,
+                pairing_continuation_of: None,
+                agent_ticket: None,
+            },
+        }
+    }
+
+    #[test]
+    fn strict_pilot_routes_creation_pairing_goal_and_renewal_to_second_companion() {
+        let executor = executor(true);
+        for prompt in [
+            ActionPrompt::CreateChat {
+                continuation_token: "test".into(),
+                reference: "test".into(),
+                setup_reference: None,
+            },
+            ActionPrompt::PairVerify {
+                reference: "test".into(),
+            },
+            ActionPrompt::OfflineGoal { goal_revision: 1 },
+            ActionPrompt::TurnRenewal {
+                handoff_id: "handoff".into(),
+            },
+            ActionPrompt::TaskContinuation {},
+        ] {
+            let action = execution(prompt);
+            assert!(executor.is_canary_action(&action));
+            assert_eq!(
+                executor.config_for(&action).descriptor_path,
+                "secondary/descriptor.json"
+            );
+        }
+        assert_eq!(
+            executor
+                .config_for_task_key(&"b".repeat(64), false)
+                .descriptor_path,
+            "secondary/descriptor.json"
+        );
+        assert_eq!(
+            executor
+                .config_for_task_key(&"a".repeat(64), true)
+                .descriptor_path,
+            "primary/descriptor.json"
+        );
+    }
+
+    #[test]
+    fn non_pilot_canary_keeps_original_primary_creation_and_pairing() {
+        let executor = executor(false);
+        assert!(
+            !executor.is_canary_action(&execution(ActionPrompt::PairVerify {
+                reference: "test".into(),
+            }))
+        );
+        assert!(
+            !executor.is_canary_action(&execution(ActionPrompt::CreateChat {
+                continuation_token: "test".into(),
+                reference: "test".into(),
+                setup_reference: None,
+            }))
+        );
+        assert!(
+            executor.is_canary_action(&execution(ActionPrompt::OfflineGoal { goal_revision: 1 }))
+        );
+        assert_eq!(
+            executor
+                .config_for_task_key(&"b".repeat(64), false)
+                .descriptor_path,
+            "primary/descriptor.json"
+        );
+        assert_eq!(
+            executor
+                .config_for_task_key(&"b".repeat(64), true)
+                .descriptor_path,
+            "secondary/descriptor.json"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
