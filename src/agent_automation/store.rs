@@ -946,21 +946,23 @@ impl AgentAutomationStore {
         self.automatic_retries = config.markdown_chat.automation.automatic_retries;
         self.retry_timings = config.markdown_chat.automation.retry_timings.clone();
         self.usage_options = crate::usage_analytics::Options::from_config(config);
-        if config.markdown_chat.automation.pilot_primary_task_key.is_none()
+        if config
+            .markdown_chat
+            .automation
+            .pilot_primary_task_key
+            .is_none()
             && config.markdown_chat.automation.canary_task_key.is_some()
         {
             return Err("Two-browser goal admission requires the primary task key".into());
         }
         if let Some(primary) = &config.markdown_chat.automation.pilot_primary_task_key {
-            let secondary = config
-                .markdown_chat
-                .automation
-                .canary_task_key
-                .as_ref()
-                .ok_or("Two-browser goal admission requires the second task key")?;
+            let mut assigned = vec![primary.clone()];
+            if let Some(secondary) = &config.markdown_chat.automation.canary_task_key {
+                assigned.push(secondary.clone());
+            }
+            let capacity = assigned.len();
             self.goal_admission = Some(super::goal_admission::GoalAdmission::new(
-                vec![primary.clone(), secondary.clone()],
-                2,
+                assigned, capacity,
             )?);
         }
         self.notification_workspace = config
@@ -5200,5 +5202,61 @@ mod windows_state_publication_tests {
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["version"], 1);
+    }
+}
+
+#[cfg(test)]
+mod one_goal_admission_tests {
+    use super::*;
+
+    #[test]
+    fn one_primary_goal_pins_admission_without_rewriting_other_active_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let primary = ConversationIdentity::from_openai_session("one-primary").unwrap();
+        let other = ConversationIdentity::from_openai_session("an-older-active-goal").unwrap();
+        let unrestricted = AgentAutomationStore::new(state_root.clone()).unwrap();
+        let saved = unrestricted
+            .set_goal(&other, "Keep historic goal state", 100)
+            .unwrap();
+        unrestricted.run_goal(&other, saved.revision, 110).unwrap();
+        let before = unrestricted.load(&other).unwrap();
+
+        let mut config = crate::config::default_config(temp.path().to_path_buf());
+        config.markdown_chat.automation.pilot_primary_task_key =
+            Some(primary.stable_key().to_owned());
+        let bounded = AgentAutomationStore::new(state_root)
+            .unwrap()
+            .with_notifications(&config)
+            .unwrap();
+        assert!(bounded.goal_admission.is_some());
+        assert!(
+            bounded
+                .apply_owner_goal_command(
+                    &primary,
+                    "one-primary-goal",
+                    OwnerGoalCommand::Set {
+                        markdown: "Work with one browser".into()
+                    },
+                    130,
+                )
+                .is_ok()
+        );
+        assert!(
+            bounded
+                .apply_owner_goal_command(
+                    &other,
+                    "blocked-other-goal",
+                    OwnerGoalCommand::Set {
+                        markdown: "Do not start another goal".into()
+                    },
+                    131,
+                )
+                .is_err()
+        );
+        let after = bounded.load(&other).unwrap();
+        assert_eq!(after.goal.status, before.goal.status);
+        assert_eq!(after.goal.revision, before.goal.revision);
+        assert_eq!(after.action.send_accepted, before.action.send_accepted);
     }
 }

@@ -233,7 +233,8 @@ pub trait AutomationExecutor: Send + Sync {
         account: &str,
         connector_name: &str,
     ) -> Result<bool, String> {
-        self.approve_pending_conversation(url, account, connector_name).await
+        self.approve_pending_conversation(url, account, connector_name)
+            .await
     }
     async fn inspect_pending_materialization(
         &self,
@@ -547,7 +548,10 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             return Ok(false);
         }
         // A separate companion must approve in its *own* authenticated page.
-        if self.secondary.as_ref().is_some_and(|(key,_)| key == task_key)
+        if self
+            .secondary
+            .as_ref()
+            .is_some_and(|(key, _)| key == task_key)
             && (eligible_offline || self.config.pilot_primary_task_key.is_some())
         {
             let client = BrowserCompanionClient::from_config(
@@ -557,11 +561,14 @@ impl AutomationExecutor for BrowserAutomationExecutor {
             let receipt = tokio::time::timeout(
                 Duration::from_secs(6),
                 client.approve_pending_conversation(url, account, connector_name, &cancellation),
-            ).await;
+            )
+            .await;
             cancellation.cancel();
-            return receipt.map_err(|_| "Second browser approval observation timed out".to_string())?;
+            return receipt
+                .map_err(|_| "Second browser approval observation timed out".to_string())?;
         }
-        self.check_pending_approval(url, account, connector_name, false).await
+        self.check_pending_approval(url, account, connector_name, false)
+            .await
     }
     async fn inspect_pending_materialization(
         &self,
@@ -1201,6 +1208,27 @@ impl AgentAutomationSupervisor {
         Arc::get_mut(&mut supervisor)
             .ok_or("New canary supervisor has unexpected shared ownership")?
             .canary_task_key = Some(task_key);
+        Ok(supervisor)
+    }
+
+    /// Use exactly one existing authenticated browser for one selected goal.
+    /// Other persisted goals and accepted Send/handoff receipts are not edited.
+    pub fn new_with_single_task_pilot_lane(
+        config: AgentAutomationConfig,
+        executor: Arc<dyn AutomationExecutor>,
+        primary_key: String,
+    ) -> Result<Arc<Self>, String> {
+        super::goal_admission::GoalAdmission::new(vec![primary_key.clone()], 1)?;
+        if config.canary_task_key.is_some()
+            || config.lane2_descriptor_path.is_some()
+            || config.browser_action_lanes != 1
+        {
+            return Err("Single-goal mode requires one browser and one action page".into());
+        }
+        let mut supervisor = Self::new(config, executor);
+        Arc::get_mut(&mut supervisor)
+            .ok_or("Single-goal supervisor unexpectedly shared")?
+            .pilot_primary_task_key = Some(primary_key);
         Ok(supervisor)
     }
 
@@ -2839,8 +2867,7 @@ impl AgentAutomationSupervisor {
                         if state.action.kind == Some(AutomationActionKind::TurnRenewal)
                             && !activity.is_online(now_ms, task.store.offline_after_ms())
                             && now_ms.saturating_sub(handoff.requested_at_ms) >= 30 * 60_000
-                            && let Ok(_browser_guard) =
-                                self.run_lock.try_write()
+                            && let Ok(_browser_guard) = self.run_lock.try_write()
                             && task
                                 .store
                                 .mark_unverified_handoff_stalled(&task.task, &state, now_ms)?
@@ -3547,7 +3574,12 @@ impl AgentAutomationSupervisor {
         let _slot = if secondary {
             None
         } else {
-            Some(self.run_slots.acquire().await.map_err(|_| "Browser dispatch is closed")?)
+            Some(
+                self.run_slots
+                    .acquire()
+                    .await
+                    .map_err(|_| "Browser dispatch is closed")?,
+            )
         };
         let _run_guard = self.run_lock.read().await;
         let mut reservation = None;
@@ -5054,6 +5086,68 @@ fn validate_terminal_snapshot(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod single_browser_pilot_tests {
+    use super::*;
+
+    #[test]
+    fn single_browser_pilot_selects_exactly_one_goal() {
+        let mut config = AgentAutomationConfig::default();
+        let primary = "a".repeat(64);
+        config.pilot_primary_task_key = Some(primary.clone());
+        let executor = Arc::new(BrowserAutomationExecutor::new(config.clone()));
+        let supervisor = AgentAutomationSupervisor::new_with_single_task_pilot_lane(
+            config,
+            executor,
+            primary.clone(),
+        )
+        .unwrap();
+        assert_eq!(supervisor.selected_primary_goal(), Some(primary.as_str()));
+        assert!(supervisor.canary_task_key.is_none());
+
+        let queue = VecDeque::from([
+            ("other".to_owned(), true),
+            (primary.clone(), true),
+            ("second-goal".to_owned(), true),
+        ]);
+        assert_eq!(
+            super::super::lane_affinity::first_operation_in_pilot_lane(
+                &queue,
+                Some(&primary),
+                None,
+                0,
+                |(task, eligible)| (task.as_str(), *eligible),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            super::super::lane_affinity::first_operation_in_pilot_lane(
+                &queue,
+                Some(&primary),
+                None,
+                1,
+                |(task, eligible)| (task.as_str(), *eligible),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn single_browser_pilot_rejects_hidden_secondary_configuration() {
+        let mut config = AgentAutomationConfig::default();
+        config.canary_task_key = Some("b".repeat(64));
+        let executor = Arc::new(BrowserAutomationExecutor::new(config.clone()));
+        assert!(
+            AgentAutomationSupervisor::new_with_single_task_pilot_lane(
+                config,
+                executor,
+                "a".repeat(64),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

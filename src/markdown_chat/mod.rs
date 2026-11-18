@@ -243,34 +243,54 @@ impl AgentAutomationConfig {
         // remain valid and retain the v2.4 action-page scheduler.
         let valid_key = |value: &str| {
             value.len() == 64
-                && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         };
-        if self.canary_task_key.as_deref().is_some_and(|key| !valid_key(key)) {
+        if self
+            .canary_task_key
+            .as_deref()
+            .is_some_and(|key| !valid_key(key))
+        {
             return Err("agentChat.automation.canaryTaskKey requires an exact lowercase 64-character task key".into());
         }
         if let Some(primary) = self.pilot_primary_task_key.as_deref() {
-            if !valid_key(primary) || self.canary_task_key.as_deref().is_none_or(|canary| canary == primary) {
-                return Err("agentChat.automation.pilotPrimaryTaskKey requires a distinct valid canaryTaskKey".into());
+            if !valid_key(primary)
+                || self
+                    .canary_task_key
+                    .as_deref()
+                    .is_some_and(|canary| canary == primary)
+            {
+                return Err("agentChat.automation.pilotPrimaryTaskKey must be one valid task key distinct from a configured canaryTaskKey".into());
             }
         }
-        if self.canary_task_key.is_some() &&
-            (self.lane2_descriptor_path.is_none() || self.provider_send_gate_path.is_none()) {
-            return Err("The second browser requires lane2DescriptorPath and providerSendGatePath".into());
+        if self.canary_task_key.is_some()
+            && (self.lane2_descriptor_path.is_none() || self.provider_send_gate_path.is_none())
+        {
+            return Err(
+                "The second browser requires lane2DescriptorPath and providerSendGatePath".into(),
+            );
         }
-        if self.canary_task_key.is_none() &&
-            (self.lane2_descriptor_path.is_some() || self.pilot_primary_task_key.is_some()) {
-            return Err("A lane2 descriptor or pilot primary task requires canaryTaskKey".into());
+        if self.canary_task_key.is_none() && self.lane2_descriptor_path.is_some() {
+            return Err("A lane2 descriptor requires canaryTaskKey".into());
         }
         if self.pilot_primary_task_key.is_some() && self.browser_action_lanes != 1 {
-            return Err("The isolated two-process pilot requires one action page per browser process".into());
+            return Err(
+                "The pinned-goal pilot requires one action page per browser process".into(),
+            );
         }
         for (name, value) in [
             ("lane2DescriptorPath", &self.lane2_descriptor_path),
             ("providerSendGatePath", &self.provider_send_gate_path),
         ] {
             if let Some(value) = value {
-                if value.len() > 4096 || !std::path::Path::new(value).is_absolute() || value.contains('\0') {
-                    return Err(format!("agentChat.automation.{name} must be an absolute path"));
+                if value.len() > 4096
+                    || !std::path::Path::new(value).is_absolute()
+                    || value.contains('\0')
+                {
+                    return Err(format!(
+                        "agentChat.automation.{name} must be an absolute path"
+                    ));
                 }
             }
         }
@@ -1164,6 +1184,27 @@ mod tests {
             config.provider_send_gate_path
         );
         config.canary_task_key = Some("NOT_A_VALID_KEY".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn one_primary_goal_without_a_secondary_descriptor_is_valid() {
+        let mut config = AgentAutomationConfig::default();
+        config.pilot_primary_task_key = Some("b".repeat(64));
+        assert!(config.validate().is_ok());
+        let restored: AgentAutomationConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.pilot_primary_task_key,
+            config.pilot_primary_task_key
+        );
+        assert!(restored.canary_task_key.is_none());
+        assert!(restored.lane2_descriptor_path.is_none());
+
+        config.pilot_primary_task_key = Some("NOT-A-TASK-KEY".into());
+        assert!(config.validate().is_err());
+        config.pilot_primary_task_key = Some("b".repeat(64));
+        config.canary_task_key = Some("b".repeat(64));
         assert!(config.validate().is_err());
     }
 

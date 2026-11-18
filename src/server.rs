@@ -2272,9 +2272,14 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
             let executor = Arc::new(crate::agent_automation::BrowserAutomationExecutor::new(
                 base.clone(),
             ));
-            Some(crate::agent_automation::AgentAutomationSupervisor::new(
-                base, executor,
-            ))
+            Some(match base.pilot_primary_task_key.clone() {
+                Some(primary) =>
+                    crate::agent_automation::AgentAutomationSupervisor::new_with_single_task_pilot_lane(
+                        base, executor, primary,
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                None => crate::agent_automation::AgentAutomationSupervisor::new(base, executor),
+            })
         }
     } else {
         None

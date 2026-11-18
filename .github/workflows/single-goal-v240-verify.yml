@@ -1,0 +1,122 @@
+# Branch-scoped single-goal compatibility verification.
+# No deploy, update, browser-control, or repository-write steps.
+name: Single-goal v2.4 verification (no deployment)
+on:
+  push:
+    branches:
+      - fix/single-goal-primary-v240-20261118
+permissions:
+  contents: read
+concurrency:
+  group: single-goal-v240-branch
+  cancel-in-progress: false
+jobs:
+  native-windows:
+    name: Native Rust tests and candidate artifact
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Scope and changed Rust formatting
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $allowed = @(
+            'src/markdown_chat/mod.rs',
+            'src/agent_automation/store.rs',
+            'src/agent_automation/supervisor.rs',
+            'src/server.rs',
+            '.github/workflows/single-goal-v240-verify.yml'
+          )
+          $changed = @(git diff --name-only HEAD^ HEAD)
+          foreach ($file in $changed) {
+            if ($file -notin $allowed) { throw "Unexpected changed file: $file" }
+          }
+          git diff --check HEAD^ HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Diff whitespace validation failed' }
+          rustfmt --check --edition 2024 --config skip_children=true src/markdown_chat/mod.rs src/agent_automation/store.rs src/agent_automation/supervisor.rs src/server.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Changed Rust source is not formatted' }
+      - name: Check complete Rust source and test targets
+        run: |
+          cargo check --locked --all-targets -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'cargo check failed' }
+      - name: Run focused single-goal admission regressions
+        run: |
+          cargo test --locked --lib one_primary_goal -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Primary key validation regression failed' }
+          cargo test --locked --lib single_browser_pilot_tests -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Single browser routing regression failed' }
+          cargo test --locked --lib one_goal_admission_tests -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Historical goal admission regression failed' }
+      - name: Run full Rust library regression suite
+        run: |
+          cargo test --locked --lib -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Full Rust library regression failed' }
+      - name: Build native Windows candidate for review only
+        run: |
+          cargo build --locked --release --bin codexify -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Release binary build failed' }
+          & .\target\release\codexify.exe --help | Select-Object -First 5
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate binary smoke check failed' }
+          Get-FileHash .\target\release\codexify.exe -Algorithm SHA256 | Format-List | Out-String | Write-Output
+      - name: Retain candidate executable without installing it
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexify-v240-single-goal-windows-native
+          path: target/release/codexify.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  browser-windows:
+    name: Companion compatibility, package and smoke
+    runs-on: windows-latest
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.4.0
+      - name: Install existing lockfile dependencies
+        working-directory: browser-companion
+        run: |
+          bun install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Bun lockfile install failed' }
+      - name: Verify companion TypeScript contracts
+        working-directory: browser-companion
+        run: |
+          bun run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Companion typecheck failed' }
+      - name: Package existing v2.4 Windows companion
+        working-directory: browser-companion
+        run: |
+          bun run package
+          if ($LASTEXITCODE -ne 0) { throw 'Companion package build failed' }
+      - name: Verify archive and package integrity
+        working-directory: browser-companion
+        run: |
+          bun run smoke:package
+          if ($LASTEXITCODE -ne 0) { throw 'Companion package smoke test failed' }
+          $archives = @(Get-ChildItem artifacts -Filter 'codexify-browser-v2.4.0-windows-x64.zip' -File)
+          if ($archives.Count -ne 1) { throw 'Expected exactly one v2.4 Windows browser archive' }
+          Get-FileHash $archives[0].FullName -Algorithm SHA256 | Format-List | Out-String | Write-Output
+      - name: Retain verified browser archive without installing it
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexify-v240-single-goal-windows-browser
+          path: browser-companion/artifacts/codexify-browser-v2.4.0-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 3
