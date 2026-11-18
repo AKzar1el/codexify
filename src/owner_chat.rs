@@ -1990,16 +1990,63 @@ async fn chat_send(
                     crate::markdown_chat::now_ms(),
                 )
                 .map_err(internal_error)?;
-            if receipt.updated_active_goal {
+            // A blocked goal can leave its agent in chat_await. Activating a new
+            // goal must deliver that changed intent to the waiting agent; merely
+            // notifying the offline supervisor cannot interrupt an input wait.
+            let wake_input_wait = if !receipt.updated_active_goal
+                && matches!(
+                    receipt.kind,
+                    crate::agent_automation::OwnerGoalCommandKind::Set
+                        | crate::agent_automation::OwnerGoalCommandKind::Run
+                )
+                && let Some(goal) = receipt
+                    .goal
+                    .as_ref()
+                    .filter(|goal| goal.status == crate::agent_automation::GoalStatus::Active)
+            {
+                // An idempotent retry may repair a lost notice, but an old
+                // request must never wake a later, different goal revision.
+                let current = context.store.load(&context.task).map_err(internal_error)?;
+                current.goal.as_ref().is_some_and(|saved| {
+                    saved.revision == goal.revision
+                        && saved.status == crate::agent_automation::GoalStatus::Active
+                }) && (context
+                    .chat
+                    .queue_input_required()
+                    .await
+                    .map_err(internal_error)?
+                    || context
+                        .chat
+                        .offline_activity()
+                        .await
+                        .map_err(internal_error)?
+                        .agent_waiting_until_ms
+                        .is_some_and(|until| until > crate::markdown_chat::now_ms()))
+            } else {
+                false
+            };
+            if receipt.updated_active_goal || wake_input_wait {
                 let goal = receipt.goal.as_ref().expect("updated active goal receipt");
                 let notification_id = format!(
                     "goal-update-{:x}",
                     Sha256::digest(body.request_id.as_bytes())
                 );
-                context.chat.append_user(notification_id, format!(
-                    "The goal has changed (revision {}). The new goal is:\n\n{}\n\nCall `goal_read` for the current revision and continue toward the updated goal.",
-                    goal.revision, goal.markdown,
-                )).await.map_err(internal_error)?;
+                let notice = if receipt.updated_active_goal {
+                    format!(
+                        "The goal has changed (revision {}). The new goal is:\n\n{}\n\nCall `goal_read` for the current revision and continue toward the updated goal.",
+                        goal.revision, goal.markdown,
+                    )
+                } else {
+                    format!(
+                        "The owner activated goal revision {} while this chat was waiting for input. The new active goal is:\n\n{}\n\nCall `goal_read` and continue the new goal; do not remain in the previous blocked goal's input wait.",
+                        goal.revision, goal.markdown,
+                    )
+                };
+                context
+                    .chat
+                    .append_user(notification_id, notice)
+                    .await
+                    .map_err(internal_error)?;
             }
             if !receipt.replayed
                 && matches!(
@@ -3991,6 +4038,8 @@ mod tests {
         config.markdown_chat.automation.enabled = true;
         config.markdown_chat.automation.connector_name = "Codexify".into();
         config.memory.dir = Some(temp.path().join("state").display().to_string());
+        let goal_store =
+            crate::agent_automation::AgentAutomationStore::for_config(&config).unwrap();
         let identity = ConversationIdentity::from_openai_session("owner-goal-api").unwrap();
         let chats = Arc::new(MarkdownChatStore::default());
         let chat = chats
@@ -4361,6 +4410,94 @@ mod tests {
             .unwrap();
         assert!(listed["chats"][0]["goalStatus"].is_null());
         assert!(listed["chats"][0]["goal"].is_null());
+
+        // A blocked goal's chat_await must not keep a newly activated goal
+        // waiting forever. The notification is a local owner wake, not a
+        // browser Send or a fabricated turn-renewal receipt.
+        let blocked: Value = client
+            .post(format!("{base}/api/chats/{id}/send"))
+            .bearer_auth("test-token")
+            .json(&json!({
+                "request_id": "goal-before-input-wait",
+                "message": "/goal set Old goal awaiting owner input"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let blocked_revision = blocked["_meta"][CHAT_WIDGET_META]["goal"]["revision"]
+            .as_u64()
+            .unwrap();
+        goal_store
+            .finish_goal(
+                &identity,
+                blocked_revision,
+                crate::agent_automation::GoalFinish::Blocked {
+                    reason: "Owner input required".into(),
+                },
+                crate::markdown_chat::now_ms(),
+            )
+            .unwrap();
+        // Drain earlier fixture messages so the new waiter really blocks.
+        let _ = chat.read(true).await.unwrap();
+        assert!(
+            !chat.queue_input_required().await.unwrap(),
+            "the old input wait should be observable through runtime state alone"
+        );
+        let waiter = chat.clone();
+        let waiting = tokio::spawn(async move {
+            waiter
+                .wait(
+                    std::time::Duration::from_secs(5),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            chat.offline_activity()
+                .await
+                .unwrap()
+                .agent_waiting_until_ms
+                .is_some(),
+            "the old chat_await must be active before a new goal is set"
+        );
+        let activate = || {
+            client
+                .post(format!("{base}/api/chats/{id}/send"))
+                .bearer_auth("test-token")
+                .json(&json!({
+                    "request_id": "replace-blocked-input-goal",
+                    "message": "/goal set Continue autonomous work after blocked input wait"
+                }))
+                .send()
+        };
+        let replacement: Value = activate().await.unwrap().json().await.unwrap();
+        assert_eq!(
+            replacement["_meta"][CHAT_WIDGET_META]["goal"]["revision"],
+            blocked_revision + 1
+        );
+        assert_eq!(
+            replacement["_meta"][CHAT_WIDGET_META]["goal"]["status"],
+            "active"
+        );
+        let wake = tokio::time::timeout(std::time::Duration::from_secs(7), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::markdown_chat::WaitOutcome::Message(delivered) = wake else {
+            panic!("new active goal did not wake the old blocked input wait");
+        };
+        assert!(delivered.text.contains("The owner activated goal revision"));
+        assert!(delivered.text.contains("Continue autonomous work"));
+        chat.queue_reply_received().await.unwrap();
+        assert!(!chat.queue_input_required().await.unwrap());
+        let replay: Value = activate().await.unwrap().json().await.unwrap();
+        assert_eq!(replay["_meta"][CHAT_WIDGET_META]["replayed"], true);
+        assert!(chat.unread_snapshot().await.unwrap().messages.is_empty());
         task.abort();
     }
 
