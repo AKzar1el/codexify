@@ -32,7 +32,7 @@ jobs:
       - name: Bound changes to durability and Windows tests
         run: |
           $ErrorActionPreference = 'Stop'
-          $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
+          $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','src/self_update.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
           $changed = @(git diff --name-only HEAD^ HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect commit scope' }
           foreach ($file in $changed) {
@@ -40,7 +40,7 @@ jobs:
           }
           git diff --check HEAD^ HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Whitespace errors' }
-          rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs
+          rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs src/self_update.rs
           if ($LASTEXITCODE -ne 0) { throw 'Rustfmt check failed' }
       - name: Validate native source and test compilation
         run: |
@@ -52,6 +52,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'State publication test failed' }
           cargo test --locked --lib rejects_ambiguous_matching_checkouts -j 2 -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Windows path test failed' }
+          cargo test --locked --lib windows_worker_reports_start_and_completes_a_unicode_file_update -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows status publication test failed' }
           cargo test --locked --lib browser_action_lanes_default_to_one_and_are_bounded -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Single browser lane default test failed' }
       - name: Run full Rust library regression suite

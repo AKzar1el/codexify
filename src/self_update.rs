@@ -625,6 +625,35 @@ fn read_status_record_from(
     status_dir: &Path,
     update_id: &str,
 ) -> anyhow::Result<UpdateStatusRecord> {
+    // An atomic status replacement can briefly hide its target on Windows.
+    // Retry only missing-file or sharing-violation errors, without changing
+    // the durable record or hiding a persistent failure.
+    #[cfg(windows)]
+    {
+        for _ in 0..6 {
+            match read_status_record_once(status_dir, update_id) {
+                Ok(record) => return Ok(record),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| {
+                            io.kind() == std::io::ErrorKind::NotFound
+                                || matches!(io.raw_os_error(), Some(32 | 33))
+                        }) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    read_status_record_once(status_dir, update_id)
+}
+
+fn read_status_record_once(
+    status_dir: &Path,
+    update_id: &str,
+) -> anyhow::Result<UpdateStatusRecord> {
     if !valid_update_id(update_id) {
         bail!("invalid update id");
     }

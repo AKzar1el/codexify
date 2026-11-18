@@ -19,6 +19,8 @@ needed to serialize actions.
 - Test transient/persistent sharing violations with old state preserved.
 - Make an existing ambiguous Git checkout test compare canonicalized paths
   on Windows, without changing real checkout selection.
+- Retry a brief Windows status-file rename gap during self-update reads,
+  bounded to missing-file or sharing-violation errors.
 - Run targeted and full library tests on Windows and stage a native binary,
   without performing a service installation.
 
