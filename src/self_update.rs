@@ -634,12 +634,10 @@ fn read_status_record_from(
             match read_status_record_once(status_dir, update_id) {
                 Ok(record) => return Ok(record),
                 Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| {
-                            io.kind() == std::io::ErrorKind::NotFound
-                                || matches!(io.raw_os_error(), Some(32 | 33))
-                        }) =>
+                    if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        io.kind() == std::io::ErrorKind::NotFound
+                            || matches!(io.raw_os_error(), Some(32 | 33))
+                    }) =>
                 {
                     std::thread::sleep(Duration::from_millis(20));
                 }
