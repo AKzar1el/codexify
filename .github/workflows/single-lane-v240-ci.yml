@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,12 +33,15 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','src/self_update.rs','src/owner_chat.rs','src/agent_automation/supervisor.rs','src/agent_automation/turn_renewal.rs','src/bridge.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
-          $changed = @(git diff --name-only HEAD^ HEAD)
+          $upstreamBase = 'b14eacde810531a451535ee546ca7e07c65c5a1d'
+          git merge-base --is-ancestor $upstreamBase HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Branch no longer descends from upstream v2.4.0; rebase required' }
+          $changed = @(git diff --name-only $upstreamBase HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect commit scope' }
           foreach ($file in $changed) {
             if ($file -notin $allowed) { throw "Unexpected changed file: $file" }
           }
-          git diff --check HEAD^ HEAD
+          git diff --check $upstreamBase HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Whitespace errors' }
           rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs src/self_update.rs src/owner_chat.rs src/agent_automation/supervisor.rs src/agent_automation/turn_renewal.rs src/bridge.rs
           if ($LASTEXITCODE -ne 0) { throw 'Rustfmt check failed' }
