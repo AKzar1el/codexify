@@ -2390,8 +2390,16 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("Multiple local checkouts match"), "{error}");
-        assert!(error.contains(first.to_string_lossy().as_ref()), "{error}");
-        assert!(error.contains(second.to_string_lossy().as_ref()), "{error}");
+        let canonical_first = fs::canonicalize(&first).unwrap();
+        let canonical_second = fs::canonicalize(&second).unwrap();
+        assert!(
+            error.contains(canonical_first.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(
+            error.contains(canonical_second.to_string_lossy().as_ref()),
+            "{error}"
+        );
     }
 
     #[tokio::test]

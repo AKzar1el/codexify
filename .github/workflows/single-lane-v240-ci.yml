@@ -1,0 +1,74 @@
+name: Single-lane v2.4 validation (no deployment)
+
+on:
+  push:
+    branches: [fix/single-lane-v240-stable-20261118]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-windows:
+    name: Verify single-lane native and durable goal state
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Bound changes to durability and Windows tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
+          $changed = @(git diff --name-only HEAD^ HEAD)
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect commit scope' }
+          foreach ($file in $changed) {
+            if ($file -notin $allowed) { throw "Unexpected changed file: $file" }
+          }
+          git diff --check HEAD^ HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace errors' }
+          rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Rustfmt check failed' }
+      - name: Validate native source and test compilation
+        run: |
+          cargo check --locked --all-targets -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo check failed' }
+      - name: Verify Windows locked file and canonical path regressions
+        run: |
+          cargo test --locked --lib windows_state_publication_tests -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'State publication test failed' }
+          cargo test --locked --lib rejects_ambiguous_matching_checkouts -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows path test failed' }
+          cargo test --locked --lib browser_action_lanes_default_to_one_and_are_bounded -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Single browser lane default test failed' }
+      - name: Run full Rust library regression suite
+        run: |
+          cargo test --locked --lib -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Full library tests failed' }
+      - name: Build official-v2.4-based native candidate without installing
+        run: |
+          cargo build --locked --release --bin codexify -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
+          & .\target\release\codexify.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Binary version smoke failed' }
+          Get-FileHash .\target\release\codexify.exe -Algorithm SHA256 | Format-List | Out-String | Write-Output
+      - name: Retain reviewed native candidate for one day
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexify-v240-minimal-single-lane-windows
+          path: target/release/codexify.exe
+          if-no-files-found: error
+          retention-days: 1
