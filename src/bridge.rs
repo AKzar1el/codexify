@@ -2533,12 +2533,14 @@ mod tests {
         );
         assert!(result.is_error);
         assert!(result.structured_content.is_none());
-        assert!(!result
-            .meta
-            .as_ref()
-            .unwrap()
-            .0
-            .contains_key("mcp/www_authenticate"));
+        assert!(
+            !result
+                .meta
+                .as_ref()
+                .unwrap()
+                .0
+                .contains_key("mcp/www_authenticate")
+        );
         let ToolContent::Text(message) = &result.content[0] else {
             panic!("expected safe text diagnostic");
         };
@@ -2547,8 +2549,8 @@ mod tests {
         assert!(!message.contains("auth.example.invalid"));
         assert!(!message.contains("do-not-log"));
         assert_eq!(
-            result.meta.as_ref().unwrap().0
-                ["io.github.devnoname120/codexify/upstream_auth_error"]["required_scope"],
+            result.meta.as_ref().unwrap().0["io.github.devnoname120/codexify/upstream_auth_error"]
+                ["required_scope"],
             json!("Account:Read")
         );
     }
