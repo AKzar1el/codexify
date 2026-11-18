@@ -4208,7 +4208,10 @@ fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), St
                     windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
                 );
                 if matches!(
-                    options.open(path).err().and_then(|error| error.raw_os_error()),
+                    options
+                        .open(path)
+                        .err()
+                        .and_then(|error| error.raw_os_error()),
                     Some(32 | 33)
                 ) {
                     false
