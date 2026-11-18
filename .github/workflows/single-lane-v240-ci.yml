@@ -49,10 +49,108 @@ jobs:
         run: |
           cargo check --locked --all-targets -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Cargo check failed' }
-      - name: Enforce upstream Clippy compatibility
+      - name: Reject new Clippy findings relative to pinned upstream v2.4
         run: |
-          cargo clippy --locked --all-targets -j 2 -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw 'Upstream Clippy strict check failed' }
+          $ErrorActionPreference = 'Stop'
+          $baselineSha = 'b14eacde810531a451535ee546ca7e07c65c5a1d'
+          $baselinePath = Join-Path $env:RUNNER_TEMP 'codexify-clippy-upstream-base'
+          if (Test-Path -LiteralPath $baselinePath) { throw 'Clippy baseline path is not empty' }
+          git worktree add --detach $baselinePath $baselineSha
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to open the exact upstream baseline' }
+          # Share dependency builds without modifying the user's live checkout.
+          $env:CARGO_TARGET_DIR = Join-Path $env:GITHUB_WORKSPACE 'target'
+          $baseLog = Join-Path $env:RUNNER_TEMP 'clippy-upstream.jsonl'
+          $headLog = Join-Path $env:RUNNER_TEMP 'clippy-candidate.jsonl'
+          try {
+            Push-Location $baselinePath
+            try {
+              cargo clippy --locked --all-targets -j 2 --message-format=json -- -D warnings 1> $baseLog
+              $baseExit = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+            cargo clippy --locked --all-targets -j 2 --message-format=json -- -D warnings 1> $headLog
+            $headExit = $LASTEXITCODE
+            function Get-FindingCounts {
+              param([string]$LogPath)
+              $counts = @{}
+              foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
+                if (-not $line.StartsWith('{')) { continue }
+                try { $entry = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($entry.reason -ne 'compiler-message') { continue }
+                $diagnostic = $entry.message
+                if ($diagnostic.level -notin @('error', 'warning')) { continue }
+                $primary = $diagnostic.spans | Where-Object { $_.is_primary } | Select-Object -First 1
+                $file = if ($null -ne $primary) { [string]$primary.file_name } else { '<unknown>' }
+                $file = $file -replace '\\', '/'
+                if ($file -match '((?:src|tests|examples)/.*)
+      - name: Verify Windows locked file and canonical path regressions
+        run: |
+          cargo test --locked --lib windows_state_publication_tests -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'State publication test failed' }
+          cargo test --locked --lib rejects_ambiguous_matching_checkouts -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows path test failed' }
+          cargo test --locked --lib windows_worker_reports_start_and_completes_a_unicode_file_update -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows status publication test failed' }
+          cargo test --locked --lib owner_goal_commands_are_authenticated_idempotent_local_and_visible_in_state -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Goal activation wake test failed' }
+          cargo test --locked --lib completed_goal_renewal_tests -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Terminal handoff retirement regression failed' }
+          cargo test --locked --lib browser_action_lanes_default_to_one_and_are_bounded -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Single browser lane default test failed' }
+      - name: Run MCP bridge authorization metadata regressions
+        run: |
+          cargo test --locked --lib bridge::tests:: -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'MCP authorization bridge tests failed' }
+      - name: Run full Rust library regression suite
+        run: |
+          cargo test --locked --lib -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Full library tests failed' }
+      - name: Build official-v2.4-based native candidate without installing
+        run: |
+          cargo build --locked --release --bin codexify -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
+          & .\target\release\codexify.exe --help | Select-Object -First 5
+          if ($LASTEXITCODE -ne 0) { throw 'Binary help smoke failed' }
+          Get-FileHash .\target\release\codexify.exe -Algorithm SHA256 | Format-List | Out-String | Write-Output
+      - name: Retain reviewed native candidate for one day
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexify-v240-minimal-single-lane-windows
+          path: target/release/codexify.exe
+          if-no-files-found: error
+          retention-days: 1
+) { $file = $Matches[1] }
+                $code = if ($null -ne $diagnostic.code) { [string]$diagnostic.code.code } else { '<no-code>' }
+                $key = "${file}|${code}|$($diagnostic.message)"
+                $counts[$key] = [int]$counts[$key] + 1
+              }
+              return $counts
+            }
+            $upstream = Get-FindingCounts $baseLog
+            $candidate = Get-FindingCounts $headLog
+            if ($baseExit -ne 0 -and $upstream.Count -eq 0) {
+              throw 'Upstream Clippy failed without structured diagnostics; baseline is unusable'
+            }
+            if ($headExit -ne 0 -and $candidate.Count -eq 0) {
+              throw 'Candidate Clippy failed without structured diagnostics'
+            }
+            $regressions = @()
+            foreach ($finding in $candidate.GetEnumerator()) {
+              $increase = $finding.Value - [int]$upstream[$finding.Key]
+              if ($increase -gt 0) { $regressions += "$($finding.Key) (+$increase)" }
+            }
+            Write-Output "Pinned upstream Clippy diagnostics: $((@($upstream.Values) | Measure-Object -Sum).Sum)"
+            Write-Output "Candidate Clippy diagnostics: $((@($candidate.Values) | Measure-Object -Sum).Sum)"
+            if ($regressions.Count -gt 0) {
+              $regressions | Sort-Object | ForEach-Object { Write-Output "NEW: $_" }
+              throw 'Candidate introduced Clippy/compiler diagnostic regressions'
+            }
+            Write-Output 'No new Clippy diagnostics relative to pinned upstream. Existing upstream warnings remain tracked, not claimed resolved.'
+          } finally {
+            git worktree remove -- $baselinePath
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Ephemeral runner baseline worktree cleanup failed' }
+          }
       - name: Verify Windows locked file and canonical path regressions
         run: |
           cargo test --locked --lib windows_state_publication_tests -j 2 -- --nocapture
