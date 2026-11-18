@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 pub(super) const INCOMPLETE_HANDOFF_ERROR: &str = "Turn handoff report did not complete; recovering the active goal in a new turn from saved progress";
 
 pub const NOTICE_FIELD: &str = "turn_renewal_required";
+pub(super) const UNVERIFIED_HANDOFF_WARNING: &str = "ChatGPT has not confirmed the final turn-renewal handoff after 30 minutes. The previous Send was accepted; Codexify did not click Retry or resend it.";
 pub const NOTICE_DESCRIPTION: &str = "Turn renewal overrides the ordinary non-terminal chat protocol: write the requested handoff as a normal final ChatGPT answer and end this turn. Codexify will continue automatically after that answer is complete.";
 
 pub(super) fn clear_pending_renewal(state: &mut AutomationTaskState) {
@@ -671,7 +672,7 @@ impl AgentAutomationStore {
 
 #[cfg(test)]
 mod completed_goal_renewal_tests {
-    use super::super::{GoalFinish, OwnerGoalCommand};
+    use super::super::OwnerGoalCommand;
     use super::*;
     use crate::agent_automation::GoalFinish;
 
