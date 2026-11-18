@@ -5104,7 +5104,7 @@ mod single_browser_pilot_tests {
             primary.clone(),
         )
         .unwrap();
-        assert_eq!(supervisor.selected_primary_goal(), Some(primary.as_str()));
+        assert_eq!(supervisor.pilot_primary_task_key.as_deref(), Some(primary.as_str()));
         assert!(supervisor.canary_task_key.is_none());
 
         let queue = VecDeque::from([
