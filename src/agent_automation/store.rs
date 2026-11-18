@@ -5255,8 +5255,8 @@ mod one_goal_admission_tests {
                 .is_err()
         );
         let after = bounded.load(&other).unwrap();
-        assert_eq!(after.goal.status, before.goal.status);
-        assert_eq!(after.goal.revision, before.goal.revision);
+        assert_eq!(after.goal.as_ref().unwrap().status, before.goal.as_ref().unwrap().status);
+        assert_eq!(after.goal.as_ref().unwrap().revision, before.goal.as_ref().unwrap().revision);
         assert_eq!(after.action.send_accepted, before.action.send_accepted);
     }
 }
