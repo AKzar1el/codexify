@@ -4265,7 +4265,36 @@ fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), St
     // atomic replacement and sync_all for identical bytes. Comparing the
     // serialized record also preserves migrations and ignores runtime-only
     // fields rather than confusing them with durable changes.
-    if read_private_record(path)?.as_deref() == Some(bytes.as_slice()) {
+    // An exclusive Windows reader can temporarily prevent the no-op comparison.
+    // In that specific case, preserve validation and let the atomic publisher's
+    // bounded sharing-violation retry decide whether replacement is safe.
+    let unchanged = match read_private_record(path) {
+        Ok(existing) => existing.as_deref() == Some(bytes.as_slice()),
+        Err(read_error) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let mut options = OpenOptions::new();
+                options.read(true);
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+                if matches!(
+                    options.open(path).err().and_then(|error| error.raw_os_error()),
+                    Some(32 | 33)
+                ) {
+                    false
+                } else {
+                    return Err(read_error);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(read_error);
+            }
+        }
+    };
+    if unchanged {
         return Ok(());
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
