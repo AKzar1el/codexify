@@ -62,8 +62,8 @@ jobs:
         run: |
           cargo build --locked --release --bin codexify -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
-          & .\target\release\codexify.exe --version
-          if ($LASTEXITCODE -ne 0) { throw 'Binary version smoke failed' }
+          & .\target\release\codexify.exe --help | Select-Object -First 5
+          if ($LASTEXITCODE -ne 0) { throw 'Binary help smoke failed' }
           Get-FileHash .\target\release\codexify.exe -Algorithm SHA256 | Format-List | Out-String | Write-Output
       - name: Retain reviewed native candidate for one day
         uses: actions/upload-artifact@v4
