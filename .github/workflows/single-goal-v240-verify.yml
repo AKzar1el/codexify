@@ -38,6 +38,7 @@ jobs:
             'src/markdown_chat/mod.rs',
             'src/agent_automation/store.rs',
             'src/agent_automation/supervisor.rs',
+            'src/project_clone.rs',
             'src/server.rs',
             '.github/workflows/single-goal-v240-verify.yml'
           )
@@ -47,7 +48,7 @@ jobs:
           }
           git diff --check HEAD^ HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Diff whitespace validation failed' }
-          rustfmt --check --edition 2024 --config skip_children=true src/markdown_chat/mod.rs src/agent_automation/store.rs src/agent_automation/supervisor.rs src/server.rs
+          rustfmt --check --edition 2024 --config skip_children=true src/markdown_chat/mod.rs src/agent_automation/store.rs src/agent_automation/supervisor.rs src/project_clone.rs src/server.rs
           if ($LASTEXITCODE -ne 0) { throw 'Changed Rust source is not formatted' }
       - name: Check complete Rust source and test targets
         run: |
