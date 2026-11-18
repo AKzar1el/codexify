@@ -137,6 +137,81 @@ pub struct TurnHandoff {
     pub requested_at_ms: u64,
     pub report_complete: bool,
 }
+
+/// A renewal requested after an already finished goal is not another task
+/// continuation. Keep its exact unverified receipt rather than claim that a
+/// final handoff was delivered or quietly discard the accepted Send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RetiredTerminalHandoff {
+    pub goal_revision: u64,
+    pub goal_status: GoalStatus,
+    pub goal_finished_at_ms: u64,
+    pub retired_at_ms: u64,
+    pub renewal: TurnRenewalState,
+    pub action: super::AutomationActionState,
+}
+
+pub(super) const MAX_RETIRED_TERMINAL_HANDOFFS: usize = 16;
+
+/// Check an already loaded snapshot without acquiring a write lock or
+/// republishing automation.json on every scheduler tick.
+pub(super) fn can_retire_obsolete_terminal_handoff(state: &super::AutomationTaskState) -> bool {
+    let Some(goal) = state.goal.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        goal.status,
+        GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error
+    ) {
+        return false;
+    }
+    let Some(finished_at_ms) = goal.finished_at_ms else {
+        return false;
+    };
+    let Some(handoff) = state.turn_renewal.handoff.as_ref() else {
+        return false;
+    };
+    if handoff.report_complete
+        || handoff.requested_at_ms <= finished_at_ms
+        || state.action.send_accepted != Some(true)
+        || state.action.status != AutomationActionStatus::Idle
+    {
+        return false;
+    }
+    true
+}
+
+pub(super) fn retire_obsolete_terminal_handoff(
+    state: &mut super::AutomationTaskState,
+    now_ms: u64,
+) -> bool {
+    if !can_retire_obsolete_terminal_handoff(state) {
+        return false;
+    }
+    let goal = state
+        .goal
+        .as_ref()
+        .expect("eligibility requires terminal goal");
+    let finished_at_ms = goal
+        .finished_at_ms
+        .expect("eligibility requires finish time");
+    state
+        .retired_terminal_handoffs
+        .push(RetiredTerminalHandoff {
+            goal_revision: goal.revision,
+            goal_status: goal.status,
+            goal_finished_at_ms: finished_at_ms,
+            retired_at_ms: now_ms,
+            renewal: state.turn_renewal.clone(),
+            action: state.action.clone(),
+        });
+    if state.retired_terminal_handoffs.len() > MAX_RETIRED_TERMINAL_HANDOFFS {
+        state.retired_terminal_handoffs.remove(0);
+    }
+    state.turn_renewal = TurnRenewalState::default();
+    true
+}
 impl TurnRenewalState {
     pub fn is_empty(&self) -> bool {
         self.send.is_none() && self.handoff.is_none() && self.resume_wait_until_ms.is_none()
@@ -144,6 +219,58 @@ impl TurnRenewalState {
 }
 
 impl AgentAutomationStore {
+    pub(crate) fn retire_finished_goal_handoff(
+        &self,
+        task: &ConversationIdentity,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        // mutate() always persists state. Do not call it for an ineligible
+        // task; recheck eligibility under its lock to handle concurrent state.
+        if !can_retire_obsolete_terminal_handoff(&self.load(task)?) {
+            return Ok(false);
+        }
+        self.mutate(task, |state| {
+            Ok(retire_obsolete_terminal_handoff(state, now_ms))
+        })
+    }
+
+    pub(super) fn mark_unverified_handoff_stalled(
+        &self,
+        task: &ConversationIdentity,
+        expected: &super::AutomationTaskState,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.mutate(task, |state| {
+            if state.action != expected.action
+                || state.turn_renewal.handoff != expected.turn_renewal.handoff
+                || state.action.kind != Some(AutomationActionKind::TurnRenewal)
+                || state.action.send_accepted != Some(true)
+                || !matches!(
+                    state.action.status,
+                    AutomationActionStatus::Idle
+                        | AutomationActionStatus::Navigating
+                        | AutomationActionStatus::Sending
+                        | AutomationActionStatus::Generating
+                )
+                || state.turn_renewal.handoff.as_ref().is_none_or(|handoff| {
+                    handoff.report_complete
+                        || now_ms.saturating_sub(handoff.requested_at_ms) < 30 * 60_000
+                })
+                || (state.action.status != AutomationActionStatus::Idle
+                    && state
+                        .action
+                        .updated_at_ms
+                        .is_none_or(|at| now_ms.saturating_sub(at) < 32 * 60_000))
+            {
+                return Ok(false);
+            }
+            // This is an observation failure, not an unsent user message.
+            // Preserve the accepted Send, action ID, and its original clock.
+            state.action.status = AutomationActionStatus::Stalled;
+            state.action.last_error = Some(UNVERIFIED_HANDOFF_WARNING.into());
+            Ok(true)
+        })
+    }
     pub fn turn_renewal_settings(&self) -> Result<TurnRenewalConfig, String> {
         crate::global_settings::turn_renewal_settings(
             self.settings_path.as_deref(),
@@ -336,8 +463,13 @@ impl AgentAutomationStore {
             return Ok(None);
         }
         self.mutate(task, |state| {
-            if state.goal.as_ref().is_some_and(|goal| goal.status != GoalStatus::Active) {
-                clear_pending_renewal(state);
+            // Once a goal is terminal, no model continuation is possible.
+            // Non-goal chats (goal=None) still use ordinary timed renewal.
+            if state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status != GoalStatus::Active)
+            {
                 return Ok(None);
             }
             let Some(send) = &state.turn_renewal.send else {return Ok(None)};
@@ -539,6 +671,7 @@ impl AgentAutomationStore {
 
 #[cfg(test)]
 mod completed_goal_renewal_tests {
+    use super::super::{GoalFinish, OwnerGoalCommand};
     use super::*;
     use crate::agent_automation::GoalFinish;
 
@@ -654,5 +787,194 @@ mod completed_goal_renewal_tests {
             assert_eq!(state.action, receipt);
             assert!(state.turn_renewal.is_empty());
         }
+    }
+
+    fn finished_goal_with_post_finish_handoff() -> (
+        tempfile::TempDir,
+        AgentAutomationStore,
+        ConversationIdentity,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = AgentAutomationStore::new(root.path().join("chats")).unwrap();
+        store.renewal_config.enabled = true;
+        let task =
+            ConversationIdentity::from_openai_session("completed-goal-stale-handoff").unwrap();
+        let goal = store.set_goal(&task, "Completed test goal", 100).unwrap();
+        store.run_goal(&task, goal.revision, 150).unwrap();
+        store
+            .finish_goal(
+                &task,
+                goal.revision,
+                GoalFinish::Completed {
+                    summary: Some("Verified work completed".into()),
+                },
+                3_000,
+            )
+            .unwrap();
+        store
+            .mutate(&task, |state| {
+                state.pairing.generation = 1;
+                state.pairing.verified_owner_generation = Some(0);
+                state.pairing.verified_at_ms = Some(200);
+                state.pairing.canonical_url =
+                    Some("https://chatgpt.com/c/completed-goal-stale-handoff".into());
+                state.action.id = Some("accepted-completed-goal".into());
+                state.action.kind = Some(AutomationActionKind::OfflineGoal);
+                state.action.goal_revision = Some(goal.revision);
+                state.action.status = AutomationActionStatus::Idle;
+                state.action.send_accepted = Some(true);
+                state.action.pairing_generation = Some(1);
+                state.turn_renewal.send = Some(TurnSend {
+                    action_id: "accepted-completed-goal".into(),
+                    at_ms: 250,
+                    model: Some("gpt-6-astra".into()),
+                    effort: Some("max".into()),
+                    pairing_generation: 1,
+                    owner_generation: 0,
+                });
+                state.turn_renewal.handoff = Some(TurnHandoff {
+                    id: "renew-completed-goal".into(),
+                    requested_at_ms: 4_000,
+                    report_complete: false,
+                });
+                Ok(())
+            })
+            .unwrap();
+        (root, store, task)
+    }
+
+    #[test]
+    fn a_finished_goal_does_not_emit_another_turn_handoff() {
+        let (_root, store, task) = finished_goal_with_post_finish_handoff();
+        let old = store.load(&task).unwrap();
+        assert!(
+            store
+                .turn_renewal_notice(&task, 99 * 60_000)
+                .unwrap()
+                .is_none(),
+            "expired send time must not renew an already completed goal"
+        );
+        let after = store.load(&task).unwrap();
+        assert_eq!(after.action, old.action);
+        assert_eq!(after.turn_renewal, old.turn_renewal);
+    }
+
+    #[test]
+    fn post_completion_handoff_is_archived_unverified_and_never_resends() {
+        let (_root, store, task) = finished_goal_with_post_finish_handoff();
+        let old = store.load(&task).unwrap();
+        assert!(can_retire_obsolete_terminal_handoff(&old));
+        assert!(store.retire_finished_goal_handoff(&task, 6_000).unwrap());
+        assert!(!store.retire_finished_goal_handoff(&task, 6_001).unwrap());
+        let recovered = store.load(&task).unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(&recovered));
+        assert!(recovered.turn_renewal.is_empty());
+        assert_eq!(recovered.goal, old.goal);
+        assert_eq!(recovered.action, old.action);
+        assert_eq!(recovered.retired_terminal_handoffs.len(), 1);
+        let receipt = &recovered.retired_terminal_handoffs[0];
+        assert_eq!(receipt.renewal, old.turn_renewal);
+        assert_eq!(receipt.action, old.action);
+        assert_eq!(receipt.goal_revision, 1);
+        assert!(!receipt.renewal.handoff.as_ref().unwrap().report_complete);
+        let json = serde_json::to_string(&recovered).unwrap();
+        let decoded: super::super::AutomationTaskState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.retired_terminal_handoffs,
+            recovered.retired_terminal_handoffs
+        );
+        let next = store
+            .apply_owner_goal_command(
+                &task,
+                "new-verified-work",
+                OwnerGoalCommand::Set {
+                    markdown: "New owner-approved work".into(),
+                },
+                7_000,
+            )
+            .unwrap();
+        assert_eq!(next.goal.unwrap().status, GoalStatus::Active);
+        assert_eq!(
+            store.load(&task).unwrap().retired_terminal_handoffs.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn owner_replacement_archives_stale_terminal_handoff_atomically() {
+        let (_root, store, task) = finished_goal_with_post_finish_handoff();
+        let receipt = store
+            .apply_owner_goal_command(
+                &task,
+                "supersede-stale-terminal",
+                OwnerGoalCommand::Set {
+                    markdown: "Continue new owner goal".into(),
+                },
+                6_000,
+            )
+            .unwrap();
+        assert_eq!(receipt.goal.unwrap().revision, 2);
+        let after = store.load(&task).unwrap();
+        assert!(after.turn_renewal.is_empty());
+        assert_eq!(after.retired_terminal_handoffs.len(), 1);
+        assert_eq!(
+            after.retired_terminal_handoffs[0]
+                .renewal
+                .handoff
+                .as_ref()
+                .unwrap()
+                .id,
+            "renew-completed-goal"
+        );
+        assert!(
+            !after.retired_terminal_handoffs[0]
+                .renewal
+                .handoff
+                .as_ref()
+                .unwrap()
+                .report_complete
+        );
+    }
+
+    #[test]
+    fn active_goal_and_pre_finish_handoffs_are_not_retired() {
+        let (_root, store, task) = finished_goal_with_post_finish_handoff();
+        store
+            .mutate(&task, |state| {
+                state.goal.as_mut().unwrap().status = GoalStatus::Active;
+                state.goal.as_mut().unwrap().finished_at_ms = None;
+                state.goal.as_mut().unwrap().summary = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(
+            &store.load(&task).unwrap()
+        ));
+        let state_file = store.task_directory(&task).unwrap().join("automation.json");
+        let before = std::fs::metadata(&state_file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        assert!(!store.retire_finished_goal_handoff(&task, 6_000).unwrap());
+        assert_eq!(
+            before,
+            std::fs::metadata(&state_file).unwrap().modified().unwrap(),
+            "an ineligible scheduler tick must not republish automation state"
+        );
+        store
+            .mutate(&task, |state| {
+                state.goal.as_mut().unwrap().status = GoalStatus::Completed;
+                state.goal.as_mut().unwrap().finished_at_ms = Some(3_000);
+                state.goal.as_mut().unwrap().summary = Some("Verified work completed".into());
+                state.turn_renewal.handoff.as_mut().unwrap().requested_at_ms = 2_900;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!can_retire_obsolete_terminal_handoff(
+            &store.load(&task).unwrap()
+        ));
+        assert!(!store.retire_finished_goal_handoff(&task, 6_000).unwrap());
+        assert_eq!(
+            store.load(&task).unwrap().retired_terminal_handoffs.len(),
+            0
+        );
     }
 }
