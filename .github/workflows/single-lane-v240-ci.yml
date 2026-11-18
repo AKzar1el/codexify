@@ -2,7 +2,7 @@ name: Single-lane v2.4 validation (no deployment)
 
 on:
   push:
-    branches: [fix/single-lane-v240-stable-20261118, fix/single-lane-v240-goal-parity-20261118]
+    branches: [fix/single-lane-v240-stable-20261118, fix/single-lane-v240-goal-parity-20261118, fix/godv5-cloudflare-oauth-meta-v240-20261118]
   workflow_dispatch:
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
       - name: Bound changes to durability and Windows tests
         run: |
           $ErrorActionPreference = 'Stop'
-          $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','src/self_update.rs','src/owner_chat.rs','src/agent_automation/supervisor.rs','src/agent_automation/turn_renewal.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
+          $allowed = @('src/agent_automation/store.rs','src/project_clone.rs','src/self_update.rs','src/owner_chat.rs','src/agent_automation/supervisor.rs','src/agent_automation/turn_renewal.rs','src/bridge.rs','.github/workflows/single-lane-v240-ci.yml','docs/SINGLE_LANE_V240_RECOVERY.md')
           $changed = @(git diff --name-only HEAD^ HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Failed to inspect commit scope' }
           foreach ($file in $changed) {
@@ -40,7 +40,7 @@ jobs:
           }
           git diff --check HEAD^ HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Whitespace errors' }
-          rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs src/self_update.rs src/owner_chat.rs src/agent_automation/supervisor.rs src/agent_automation/turn_renewal.rs
+          rustfmt --check --edition 2024 --config skip_children=true src/agent_automation/store.rs src/project_clone.rs src/self_update.rs src/owner_chat.rs src/agent_automation/supervisor.rs src/agent_automation/turn_renewal.rs src/bridge.rs
           if ($LASTEXITCODE -ne 0) { throw 'Rustfmt check failed' }
       - name: Validate native source and test compilation
         run: |
@@ -60,6 +60,10 @@ jobs:
           if (0 -ne 0) { throw 'Terminal handoff retirement regression failed' }
           cargo test --locked --lib browser_action_lanes_default_to_one_and_are_bounded -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Single browser lane default test failed' }
+      - name: Run MCP bridge authorization metadata regressions
+        run: |
+          cargo test --locked --lib bridge::tests:: -j 2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'MCP authorization bridge tests failed' }
       - name: Run full Rust library regression suite
         run: |
           cargo test --locked --lib -j 2
