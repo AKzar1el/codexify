@@ -49,6 +49,10 @@ jobs:
         run: |
           cargo check --locked --all-targets -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Cargo check failed' }
+      - name: Enforce upstream Clippy compatibility
+        run: |
+          cargo clippy --locked --all-targets -j 2 -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream Clippy strict check failed' }
       - name: Verify Windows locked file and canonical path regressions
         run: |
           cargo test --locked --lib windows_state_publication_tests -j 2 -- --nocapture
