@@ -134,7 +134,10 @@ fn forward_server_bound_tool_metadata(
 ) -> Option<MetaObject> {
     let mut meta = meta?;
     if server_bound_auth {
+        // These belong to the upstream MCP's identity, not the Codexify app.
+        // A bridged Cloudflare profile tool is not the God v5 profile tool.
         meta.0.remove("securitySchemes");
+        meta.0.remove("openai/profile");
     }
     (!meta.0.is_empty()).then_some(meta)
 }
@@ -1624,6 +1627,7 @@ mod tests {
             "securitySchemes".into(),
             json!([{"type": "oauth2", "scopes": ["account:read"]}]),
         );
+        tool_meta.0.insert("openai/profile".into(), json!(true));
         tools.push(
             rmcp::model::Tool::new(
                 "decompile_function",
@@ -2504,11 +2508,14 @@ mod tests {
         upstream
             .0
             .insert("vendor".into(), Value::String("fixture".into()));
+        upstream.0.insert("openai/profile".into(), json!(true));
         let existing = forward_server_bound_tool_metadata(Some(upstream.clone()), false).unwrap();
         assert!(existing.0.contains_key("securitySchemes"));
+        assert_eq!(existing.0.get("openai/profile"), Some(&json!(true)));
 
         let forwarded = forward_server_bound_tool_metadata(Some(upstream), true).unwrap();
         assert!(!forwarded.0.contains_key("securitySchemes"));
+        assert!(!forwarded.0.contains_key("openai/profile"));
         assert_eq!(forwarded.0.get("vendor"), Some(&json!("fixture")));
     }
 
@@ -2641,6 +2648,7 @@ mod tests {
         let meta = tool.meta().expect("unrelated upstream metadata retained");
         assert_eq!(meta.0.get("vendor"), Some(&json!("hex-rays")));
         assert!(!meta.0.contains_key("securitySchemes"));
+        assert!(!meta.0.contains_key("openai/profile"));
         assert_eq!(tool.annotations().unwrap().read_only_hint, Some(true));
 
         let response = call_bridge_tool(
