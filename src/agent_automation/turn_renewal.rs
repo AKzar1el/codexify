@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 pub(super) const INCOMPLETE_HANDOFF_ERROR: &str = "Turn handoff report did not complete; recovering the active goal in a new turn from saved progress";
 
 pub const NOTICE_FIELD: &str = "turn_renewal_required";
-pub(super) const UNVERIFIED_HANDOFF_WARNING: &str = "ChatGPT has not confirmed the final turn-renewal handoff after 30 minutes. The previous Send was accepted; Codexify did not click Retry or resend it.";
 pub const NOTICE_DESCRIPTION: &str = "Turn renewal overrides the ordinary non-terminal chat protocol: write the requested handoff as a normal final ChatGPT answer and end this turn. Codexify will continue automatically after that answer is complete.";
 
 pub(super) fn clear_pending_renewal(state: &mut AutomationTaskState) {
@@ -173,14 +172,10 @@ pub(super) fn can_retire_obsolete_terminal_handoff(state: &super::AutomationTask
     let Some(handoff) = state.turn_renewal.handoff.as_ref() else {
         return false;
     };
-    if handoff.report_complete
+    !(handoff.report_complete
         || handoff.requested_at_ms <= finished_at_ms
         || state.action.send_accepted != Some(true)
-        || state.action.status != AutomationActionStatus::Idle
-    {
-        return false;
-    }
-    true
+        || state.action.status != AutomationActionStatus::Idle)
 }
 
 pub(super) fn retire_obsolete_terminal_handoff(
@@ -235,43 +230,6 @@ impl AgentAutomationStore {
         })
     }
 
-    pub(super) fn mark_unverified_handoff_stalled(
-        &self,
-        task: &ConversationIdentity,
-        expected: &super::AutomationTaskState,
-        now_ms: u64,
-    ) -> Result<bool, String> {
-        self.mutate(task, |state| {
-            if state.action != expected.action
-                || state.turn_renewal.handoff != expected.turn_renewal.handoff
-                || state.action.kind != Some(AutomationActionKind::TurnRenewal)
-                || state.action.send_accepted != Some(true)
-                || !matches!(
-                    state.action.status,
-                    AutomationActionStatus::Idle
-                        | AutomationActionStatus::Navigating
-                        | AutomationActionStatus::Sending
-                        | AutomationActionStatus::Generating
-                )
-                || state.turn_renewal.handoff.as_ref().is_none_or(|handoff| {
-                    handoff.report_complete
-                        || now_ms.saturating_sub(handoff.requested_at_ms) < 30 * 60_000
-                })
-                || (state.action.status != AutomationActionStatus::Idle
-                    && state
-                        .action
-                        .updated_at_ms
-                        .is_none_or(|at| now_ms.saturating_sub(at) < 32 * 60_000))
-            {
-                return Ok(false);
-            }
-            // This is an observation failure, not an unsent user message.
-            // Preserve the accepted Send, action ID, and its original clock.
-            state.action.status = AutomationActionStatus::Stalled;
-            state.action.last_error = Some(UNVERIFIED_HANDOFF_WARNING.into());
-            Ok(true)
-        })
-    }
     pub fn turn_renewal_settings(&self) -> Result<TurnRenewalConfig, String> {
         crate::global_settings::turn_renewal_settings(
             self.settings_path.as_deref(),
