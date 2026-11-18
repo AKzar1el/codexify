@@ -4193,7 +4193,39 @@ fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), St
     // atomic replacement and sync_all for identical bytes. Comparing the
     // serialized record also preserves migrations and ignores runtime-only
     // fields rather than confusing them with durable changes.
-    if read_private_record(path)?.as_deref() == Some(bytes.as_slice()) {
+    // An exclusive Windows reader can temporarily prevent the no-op comparison.
+    // In that specific case, preserve validation and let the atomic publisher's
+    // bounded sharing-violation retry decide whether replacement is safe.
+    let unchanged = match read_private_record(path) {
+        Ok(existing) => existing.as_deref() == Some(bytes.as_slice()),
+        Err(read_error) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let mut options = OpenOptions::new();
+                options.read(true);
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+                if matches!(
+                    options
+                        .open(path)
+                        .err()
+                        .and_then(|error| error.raw_os_error()),
+                    Some(32 | 33)
+                ) {
+                    false
+                } else {
+                    return Err(read_error);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(read_error);
+            }
+        }
+    };
+    if unchanged {
         return Ok(());
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -5032,5 +5064,56 @@ mod schema_rollover_tests {
             );
             assert_eq!(std::fs::read(path).unwrap(), before, "{changed}");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_state_publication_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn transient_sharing_violation_does_not_lose_automation_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+
+        // Another Windows process can briefly open the old destination without
+        // FILE_SHARE_DELETE (e.g. antivirus or a file indexer). The new atomic
+        // replacement must preserve its temporary file until that handle exits.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let target = path.clone();
+        let publisher = std::thread::spawn(move || {
+            persist_private_record(&target, &serde_json::json!({"version":2}))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        drop(held);
+        publisher.join().unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 2);
+    }
+
+    #[test]
+    fn persistent_sharing_violation_fails_without_overwriting_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = persist_private_record(&path, &serde_json::json!({"version":2}))
+            .expect_err("permanent destination lock must remain a hard error");
+        assert!(error.contains("Could not publish agent automation state"));
+        drop(held);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
     }
 }
