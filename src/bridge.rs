@@ -116,10 +116,98 @@ struct BridgedTool {
     annotations: Option<ToolAnnotations>,
     icons: Option<Vec<Icon>>,
     meta: Option<MetaObject>,
+    server_bound_upstream_auth: bool,
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
     control: Arc<crate::upstream_control::UpstreamControl>,
     resources: Arc<BridgedResourceStore>,
+}
+
+/// Cloudflare and other remote MCPs can advertise their *own* OAuth requirements,
+/// even when Codexify already authenticates upstream using a configured bearer token.
+/// Forwarding those schemes as God v5 tool metadata causes ChatGPT to request OAuth
+/// for the wrong application (which has no upstream-browser setup URL).
+/// Keep other upstream metadata and do not alter tools without bound credentials.
+fn forward_server_bound_tool_metadata(
+    meta: Option<MetaObject>,
+    server_bound_auth: bool,
+) -> Option<MetaObject> {
+    let mut meta = meta?;
+    if server_bound_auth {
+        meta.0.remove("securitySchemes");
+    }
+    (!meta.0.is_empty()).then_some(meta)
+}
+
+/// Only display literal, bounded scope identifiers from an upstream challenge.
+/// Never forward resource_metadata URLs or raw WWW-Authenticate values.
+fn safe_declared_scope(challenge: &Value) -> Option<String> {
+    let headers: Vec<&str> = match challenge {
+        Value::String(header) => vec![header],
+        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    headers.into_iter().find_map(|header| {
+        let (_, remainder) = header.split_once("scope=\"")?;
+        let (scope, _) = remainder.split_once('"')?;
+        (!scope.is_empty()
+            && scope.len() <= 128
+            && scope.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.' | '/' | ' ')
+            }))
+        .then(|| scope.to_owned())
+    })
+}
+
+/// An upstream OAuth challenge is not a valid OAuth challenge for Codexify's
+/// already-authorized downstream MCP connection. Fail closed with a sanitized,
+/// structured upstream diagnostic rather than a broken ChatGPT relink action.
+fn sanitize_server_bound_auth_result(
+    mut result: ToolResult,
+    server_bound_auth: bool,
+) -> ToolResult {
+    if !server_bound_auth {
+        return result;
+    }
+    let challenge = result
+        .meta
+        .as_mut()
+        .and_then(|meta| meta.0.remove("mcp/www_authenticate"));
+    let Some(challenge) = challenge else {
+        return result;
+    };
+
+    let challenge_code = challenge.to_string().to_ascii_lowercase();
+    let code = if challenge_code.contains("insufficient_scope") {
+        "insufficient_scope"
+    } else if challenge_code.contains("invalid_token") {
+        "invalid_token"
+    } else {
+        "authorization_required"
+    };
+    let required_scope = safe_declared_scope(&challenge);
+    let scope_note = required_scope
+        .as_ref()
+        .map(|scope| format!(" Required scope: {scope}."))
+        .unwrap_or_default();
+
+    result.is_error = true;
+    result.structured_content = None;
+    result.content = vec![ToolContent::Text(format!(
+        "Upstream MCP authorization failed ({code}). Codexify already manages the \
+         upstream credential; verify the existing server-side token and its read \
+         permissions instead of using ChatGPT Connect.{scope_note}"
+    ))];
+    let meta = result.meta.get_or_insert_with(MetaObject::new);
+    meta.0.insert(
+        "io.github.devnoname120/codexify/upstream_auth_error".into(),
+        json!({
+            "code": code,
+            "credential_source": "server_bound",
+            "required_scope": required_scope
+        }),
+    );
+    result
 }
 
 impl BridgedTool {
@@ -131,7 +219,7 @@ impl BridgedTool {
             params = params.with_arguments(obj.clone());
         }
 
-        forward_tool_call(
+        let result = forward_tool_call(
             &self.peer,
             params,
             &self.server,
@@ -143,7 +231,8 @@ impl BridgedTool {
                 control: &self.control,
             },
         )
-        .await
+        .await;
+        sanitize_server_bound_auth_result(result, self.server_bound_upstream_auth)
     }
 }
 
@@ -585,6 +674,8 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                         );
                     }
                     McpToolExposure::Direct => {
+                        let server_bound_upstream_auth = spec.bearer_token_env_var.is_some()
+                            || configures_authorization_header(spec);
                         report.push(format!("{server_name} -> direct ({count} tool(s))"));
                         let mut used: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
@@ -616,7 +707,11 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                                     .map(|schema| Value::Object((*schema).clone())),
                                 annotations: tool.annotations,
                                 icons: tool.icons,
-                                meta: tool.meta,
+                                meta: forward_server_bound_tool_metadata(
+                                    tool.meta,
+                                    server_bound_upstream_auth,
+                                ),
+                                server_bound_upstream_auth,
                                 peer: peer.clone(),
                                 tool_timeout,
                                 control: control.clone(),
@@ -1525,6 +1620,10 @@ mod tests {
         tool_meta
             .0
             .insert("vendor".into(), Value::String("hex-rays".into()));
+        tool_meta.0.insert(
+            "securitySchemes".into(),
+            json!([{"type": "oauth2", "scopes": ["account:read"]}]),
+        );
         tools.push(
             rmcp::model::Tool::new(
                 "decompile_function",
@@ -2393,6 +2492,165 @@ mod tests {
         second_server_task.abort();
         let _ = first_server_task.await;
         let _ = second_server_task.await;
+    }
+
+    #[test]
+    fn server_bound_oauth_metadata_is_not_misadvertised_as_chatgpt_access() {
+        let mut upstream = MetaObject::new();
+        upstream.0.insert(
+            "securitySchemes".into(),
+            json!([{"type": "oauth2", "scopes": ["account:read"]}]),
+        );
+        upstream
+            .0
+            .insert("vendor".into(), Value::String("fixture".into()));
+        let existing = forward_server_bound_tool_metadata(Some(upstream.clone()), false).unwrap();
+        assert!(existing.0.contains_key("securitySchemes"));
+
+        let forwarded = forward_server_bound_tool_metadata(Some(upstream), true).unwrap();
+        assert!(!forwarded.0.contains_key("securitySchemes"));
+        assert_eq!(forwarded.0.get("vendor"), Some(&json!("fixture")));
+    }
+
+    fn upstream_auth_fixture(challenge: &str) -> ToolResult {
+        let mut result = ToolResult::error("Upstream declined authorization");
+        let mut meta = MetaObject::new();
+        meta.0
+            .insert("mcp/www_authenticate".into(), json!([challenge]));
+        result.meta = Some(meta);
+        result.structured_content = Some(json!({"untrusted": "private-fixture"}));
+        result
+    }
+
+    #[test]
+    fn insufficient_scope_returns_specific_safe_error_without_consent_url() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture(
+                "Bearer error=\"insufficient_scope\", scope=\"Account:Read\", \
+                 resource_metadata=\"https://auth.example.invalid/secret?token=do-not-log\"",
+            ),
+            true,
+        );
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(!result
+            .meta
+            .as_ref()
+            .unwrap()
+            .0
+            .contains_key("mcp/www_authenticate"));
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected safe text diagnostic");
+        };
+        assert!(message.contains("insufficient_scope"));
+        assert!(message.contains("Account:Read"));
+        assert!(!message.contains("auth.example.invalid"));
+        assert!(!message.contains("do-not-log"));
+        assert_eq!(
+            result.meta.as_ref().unwrap().0
+                ["io.github.devnoname120/codexify/upstream_auth_error"]["required_scope"],
+            json!("Account:Read")
+        );
+    }
+
+    #[test]
+    fn expired_upstream_grant_returns_recoverable_error_not_chatgpt_relink() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            true,
+        );
+        assert!(result.is_error);
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected error");
+        };
+        assert!(message.contains("invalid_token"));
+        assert!(message.contains("existing server-side token"));
+        assert!(!message.contains("https://"));
+    }
+
+    #[test]
+    fn malformed_upstream_consent_url_is_not_forwarded_to_downstream() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture(
+                "Bearer error=\"invalid_token\", resource_metadata=\"javascript:alert(1)\"",
+            ),
+            true,
+        );
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected error");
+        };
+        assert!(!message.contains("javascript:"));
+        assert!(!message.contains("resource_metadata"));
+        assert!(!result.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+    }
+
+    #[test]
+    fn repeated_upstream_denial_stays_stable_without_oauth_prompt() {
+        let first = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            true,
+        );
+        let second = sanitize_server_bound_auth_result(first, true);
+        assert!(second.is_error);
+        assert_eq!(second.content.len(), 1);
+        assert!(!second.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+    }
+
+    #[test]
+    fn unrelated_mcp_and_cloudflare_403_500_errors_are_not_rewritten() {
+        let unbound = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            false,
+        );
+        assert!(unbound.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+
+        for code in [403, 500] {
+            let message = format!("Cloudflare HTTP {code} test fixture");
+            let result = sanitize_server_bound_auth_result(ToolResult::error(&message), true);
+            let ToolContent::Text(actual) = &result.content[0] else {
+                panic!("expected original provider error");
+            };
+            assert_eq!(actual, &message);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mode_with_server_bound_auth_uses_existing_grant_without_oauth_meta() {
+        let (url, _calls, server_task) = spawn_catalog_upstream().await;
+        let mut config = crate::config::default_config(std::env::temp_dir());
+        config.mcp_servers.insert(
+            "cloudflare-api".to_string(),
+            McpServerSpec {
+                url: Some(url),
+                mode: Some(McpToolExposure::Direct),
+                http_headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer fixture-token".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let bridge = connect_upstreams(&config).await;
+        let tool = bridge
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "cloudflare_api__decompile_function")
+            .expect("Cloudflare mock tool should be exposed");
+        let meta = tool.meta().expect("unrelated upstream metadata retained");
+        assert_eq!(meta.0.get("vendor"), Some(&json!("hex-rays")));
+        assert!(!meta.0.contains_key("securitySchemes"));
+        assert_eq!(tool.annotations().unwrap().read_only_hint, Some(true));
+
+        let response = call_bridge_tool(
+            &bridge,
+            "cloudflare_api__decompile_function",
+            json!({"location": {"virtual_address": "0x01"}}),
+        )
+        .await;
+        assert!(!response.is_error);
+        drop(bridge);
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
