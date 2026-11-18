@@ -57,7 +57,7 @@ jobs:
           cargo test --locked --lib owner_goal_commands_are_authenticated_idempotent_local_and_visible_in_state -j 2 -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Goal activation wake test failed' }
           cargo test --locked --lib completed_goal_renewal_tests -j 2 -- --nocapture
-          if (0 -ne 0) { throw 'Terminal handoff retirement regression failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Terminal handoff retirement regression failed' }
           cargo test --locked --lib browser_action_lanes_default_to_one_and_are_bounded -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Single browser lane default test failed' }
       - name: Run MCP bridge authorization metadata regressions
