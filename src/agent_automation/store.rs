@@ -339,6 +339,8 @@ pub struct AutomationTaskState {
     offline_response_grace_ms: u64,
     #[serde(skip_serializing_if = "super::turn_renewal::TurnRenewalState::is_empty")]
     pub turn_renewal: super::turn_renewal::TurnRenewalState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_terminal_handoffs: Vec<super::turn_renewal::RetiredTerminalHandoff>,
     #[serde(default)]
     owner_goal_requests: Vec<OwnerGoalRequestRecord>,
 }
@@ -363,6 +365,7 @@ impl Default for AutomationTaskState {
             retry_timings: RetryTimings::default(),
             offline_response_grace_ms: 0,
             turn_renewal: Default::default(),
+            retired_terminal_handoffs: Vec::new(),
             owner_goal_requests: Vec::new(),
         }
     }
@@ -1190,6 +1193,16 @@ impl AgentAutomationStore {
     ) -> Result<GoalRecord, String> {
         validate_goal_markdown(markdown)?;
         self.mutate(task, |state| {
+            let previous_handoff_retired = if state.goal.as_ref().is_some_and(|goal| {
+                matches!(goal.status, GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error)
+            }) && state.turn_renewal.handoff.is_some() {
+                if !super::turn_renewal::retire_obsolete_terminal_handoff(state, now_ms) {
+                    return Err("A previous goal still has an unverified or active handoff; preserve its Send and resolve it before replacing the goal".into());
+                }
+                true
+            } else {
+                false
+            };
             let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
                 goal.revision
                     .checked_add(1)
@@ -1217,7 +1230,7 @@ impl AgentAutomationStore {
             state.agents.latest_report = None;
             state.agents.report_at_ms = None;
             state.goal_wake = GoalWakeState::default();
-            if state.action.goal_revision.is_some() {
+            if previous_handoff_retired || state.action.goal_revision.is_some() {
                 state.action = AutomationActionState::default();
             }
             Ok(goal)
@@ -1463,6 +1476,16 @@ impl AgentAutomationStore {
             let mut updated_active_goal = false;
             let (kind, goal) = match command {
                 OwnerGoalCommand::Set { markdown } => {
+                    let previous_handoff_retired = if state.goal.as_ref().is_some_and(|goal| {
+                        matches!(goal.status, GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error)
+                    }) && state.turn_renewal.handoff.is_some() {
+                        if !super::turn_renewal::retire_obsolete_terminal_handoff(state, now_ms) {
+                            return Err("A previous goal still has an unverified or active handoff; preserve its Send and resolve it before replacing the goal".into());
+                        }
+                        true
+                    } else {
+                        false
+                    };
                     let revision = state.goal.as_ref().map_or(Ok(1), |goal| {
                         goal.revision
                             .checked_add(1)
@@ -1510,7 +1533,7 @@ impl AgentAutomationStore {
                         && !state.action.automatic_retry_in_progress
                         && !state.action.automatic_retry_paused
                         && state.suspended_retry.is_none();
-                    if (!preserve_action && state.action.goal_revision.is_some()) || superseded_unsent_goal {
+                    if (!preserve_action && state.action.goal_revision.is_some()) || superseded_unsent_goal || previous_handoff_retired {
                         state.action = AutomationActionState::default();
                     }
                     (OwnerGoalCommandKind::Set, Some(goal))
@@ -4193,7 +4216,39 @@ fn persist_private_record(path: &Path, record: &impl Serialize) -> Result<(), St
     // atomic replacement and sync_all for identical bytes. Comparing the
     // serialized record also preserves migrations and ignores runtime-only
     // fields rather than confusing them with durable changes.
-    if read_private_record(path)?.as_deref() == Some(bytes.as_slice()) {
+    // An exclusive Windows reader can temporarily prevent the no-op comparison.
+    // In that specific case, preserve validation and let the atomic publisher's
+    // bounded sharing-violation retry decide whether replacement is safe.
+    let unchanged = match read_private_record(path) {
+        Ok(existing) => existing.as_deref() == Some(bytes.as_slice()),
+        Err(read_error) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let mut options = OpenOptions::new();
+                options.read(true);
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                );
+                if matches!(
+                    options
+                        .open(path)
+                        .err()
+                        .and_then(|error| error.raw_os_error()),
+                    Some(32 | 33)
+                ) {
+                    false
+                } else {
+                    return Err(read_error);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(read_error);
+            }
+        }
+    };
+    if unchanged {
         return Ok(());
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -4329,6 +4384,26 @@ fn validate_state(state: &AutomationTaskState) -> Result<(), String> {
     }
     validate_action(&state.action)?;
     validate_goal_wake(&state.goal_wake)?;
+    if state.retired_terminal_handoffs.len() > super::turn_renewal::MAX_RETIRED_TERMINAL_HANDOFFS {
+        return Err("Agent automation retired handoff history is too large".into());
+    }
+    for retired in &state.retired_terminal_handoffs {
+        let Some(handoff) = retired.renewal.handoff.as_ref() else {
+            return Err("Retired handoff is missing its original receipt".into());
+        };
+        if !matches!(
+            retired.goal_status,
+            GoalStatus::Completed | GoalStatus::Blocked | GoalStatus::Error
+        ) || handoff.report_complete
+            || handoff.requested_at_ms <= retired.goal_finished_at_ms
+            || retired.retired_at_ms < handoff.requested_at_ms
+            || retired.action.send_accepted != Some(true)
+            || retired.action.status != AutomationActionStatus::Idle
+        {
+            return Err("Retired terminal-goal handoff history is invalid".into());
+        }
+        validate_action(&retired.action)?;
+    }
     if let Some(previous) = &state.suspended_retry {
         validate_action(&previous.action)?;
         validate_goal_wake(&previous.goal_wake)?;
@@ -5032,5 +5107,56 @@ mod schema_rollover_tests {
             );
             assert_eq!(std::fs::read(path).unwrap(), before, "{changed}");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_state_publication_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn transient_sharing_violation_does_not_lose_automation_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+
+        // Another Windows process can briefly open the old destination without
+        // FILE_SHARE_DELETE (e.g. antivirus or a file indexer). The new atomic
+        // replacement must preserve its temporary file until that handle exits.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let target = path.clone();
+        let publisher = std::thread::spawn(move || {
+            persist_private_record(&target, &serde_json::json!({"version":2}))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        drop(held);
+        publisher.join().unwrap().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 2);
+    }
+
+    #[test]
+    fn persistent_sharing_violation_fails_without_overwriting_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        persist_private_record(&path, &serde_json::json!({"version":1})).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = persist_private_record(&path, &serde_json::json!({"version":2}))
+            .expect_err("permanent destination lock must remain a hard error");
+        assert!(error.contains("Could not publish agent automation state"));
+        drop(held);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
     }
 }
