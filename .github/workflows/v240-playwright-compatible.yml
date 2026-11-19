@@ -1,0 +1,72 @@
+name: v2.4 Playwright per-chat Windows candidate (validation only)
+
+on:
+  push:
+    branches:
+      - fix/v240-playwright-compatible-20261119
+
+permissions:
+  contents: read
+
+jobs:
+  windows-candidate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify source provenance and formatting
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git merge-base --is-ancestor ef323c124f73396e5c3cdada6f471c4b2783d910 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Missing verified v2.4 OAuth/goal baseline' }
+          git merge-base --is-ancestor cd4e483 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Missing per-chat Playwright isolation baseline' }
+          git diff --check ef323c124f73396e5c3cdada6f471c4b2783d910 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Diff whitespace validation failed' }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Rustfmt validation failed' }
+      - name: Validate all Rust test targets
+        run: |
+          cargo check --locked --tests -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Rust test targets do not compile' }
+      - name: Verify browser ownership and preserved Send gate
+        run: |
+          cargo test --locked --lib playwright_sessions::tests -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Per-chat browser ownership regression' }
+          cargo test --locked --lib provider_send_gate -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Provider Send gate compatibility regression' }
+          cargo test --locked --lib bridge::tests -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream MCP bridge regression' }
+      - name: Verify complete v2.4 library suite
+        run: |
+          cargo test --locked --lib -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Full library regression suite failed' }
+      - name: Build official v2.4-based Windows executable
+        run: |
+          cargo build --locked --release --bin codexify -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Windows native release build failed' }
+          & .\target\release\codexify.exe --help | Select-Object -First 5
+          if ($LASTEXITCODE -ne 0) { throw 'Built executable is not runnable' }
+          $sha = (Get-FileHash .\target\release\codexify.exe -Algorithm SHA256).Hash
+          Write-Output "Verified Windows candidate SHA256: $sha"
+      - name: Upload reviewable binary without installing
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexify-v240-playwright-compatible-windows
+          path: target/release/codexify.exe
+          if-no-files-found: error
+          retention-days: 1
