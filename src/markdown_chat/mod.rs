@@ -178,6 +178,10 @@ pub struct AgentAutomationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_simplicity: Option<BrowserSimplicity>,
     pub recovery_enhancements: bool,
+    /// Shared provider Send lock for the browser companion. This file may
+    /// be created on first use, so only the path itself is validated here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_send_gate_path: Option<String>,
 }
 
 impl Default for AgentAutomationConfig {
@@ -204,6 +208,7 @@ impl Default for AgentAutomationConfig {
             minimal_ui: false,
             browser_simplicity: None,
             recovery_enhancements: false,
+            provider_send_gate_path: None,
         }
     }
 }
@@ -227,6 +232,18 @@ impl AgentAutomationConfig {
 
     fn validate(&self) -> Result<(), String> {
         self.retry_timings.validate()?;
+        if let Some(path) = self.provider_send_gate_path.as_deref() {
+            if path.is_empty()
+                || path.len() > 4096
+                || path.contains('\0')
+                || !std::path::Path::new(path).is_absolute()
+            {
+                return Err(
+                    "agentChat.automation.providerSendGatePath must be an absolute path up to 4096 bytes"
+                        .into(),
+                );
+            }
+        }
         if !(1..=4).contains(&self.browser_action_lanes) {
             return Err("agentChat.automation.browserActionLanes must be between 1 and 4".into());
         }
@@ -773,6 +790,55 @@ pub(crate) async fn history_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_send_gate_path_preserves_live_config_without_requiring_a_lockfile() {
+        let target = std::env::temp_dir().join("codexify-provider-send-gate-uncreated.lock");
+        let path = target.to_string_lossy().into_owned();
+        let config: AgentAutomationConfig =
+            serde_json::from_value(serde_json::json!({"providerSendGatePath": path})).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.provider_send_gate_path.as_deref(),
+            Some(path.as_str())
+        );
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["providerSendGatePath"], path.as_str());
+        let restored: AgentAutomationConfig = serde_json::from_value(encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.provider_send_gate_path, Some(path));
+
+        let default = AgentAutomationConfig::default();
+        assert!(default.provider_send_gate_path.is_none());
+        let omitted = serde_json::to_value(default).unwrap();
+        assert!(omitted.get("providerSendGatePath").is_none());
+    }
+
+    #[test]
+    fn provider_send_gate_rejects_relative_nul_and_overlong_paths() {
+        for value in ["", "./send-gate.lock", "relative.lock", "bad\0path"] {
+            let config: AgentAutomationConfig =
+                serde_json::from_value(serde_json::json!({"providerSendGatePath": value})).unwrap();
+            assert!(config.validate().is_err(), "{value:?} must be rejected");
+        }
+        let overlong = std::env::temp_dir().join("x".repeat(4096));
+        let config: AgentAutomationConfig = serde_json::from_value(
+            serde_json::json!({"providerSendGatePath": overlong.to_string_lossy()}),
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn provider_send_gate_does_not_weaken_other_schema_validation() {
+        assert!(
+            serde_json::from_value::<AgentAutomationConfig>(
+                serde_json::json!({"unknownSendGateProperty": "unsafe"})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn browser_simplicity_levels_preserve_legacy_choices_and_validate_values() {
         for (value, expected) in [

@@ -2162,6 +2162,21 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
             Err(error) => tracing::warn!("managed-worktree cleanup skipped: {error}"),
         }
     }
+    // Persisted configuration remains the source of truth. The historical
+    // override exists for explicitly isolated canary launches; validate it
+    // before handing it to the browser companion.
+    if let Ok(path) = std::env::var("CODEXIFY_BROWSER_SEND_GATE_PATH") {
+        if path.is_empty()
+            || path.len() > 4096
+            || path.contains('\0')
+            || !std::path::Path::new(&path).is_absolute()
+        {
+            anyhow::bail!(
+                "CODEXIFY_BROWSER_SEND_GATE_PATH must be an absolute path up to 4096 bytes"
+            );
+        }
+        config.markdown_chat.automation.provider_send_gate_path = Some(path);
+    }
     let config = Arc::new(config);
     let _browser_recovery =
         crate::agent_automation::watch_browser_companion(&config.markdown_chat.automation);

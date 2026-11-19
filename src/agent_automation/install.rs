@@ -326,6 +326,11 @@ impl BrowserCompanionManager {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
+        // Preserve the original browser-companion Send gate. The lock file
+        // intentionally need not exist until the provider first uses it.
+        if let Some(path) = &self.config.provider_send_gate_path {
+            command.env("CODEXIFY_BROWSER_SEND_GATE_PATH", path);
+        }
         configure_detached_process(&mut command);
         let mut child = command
             .spawn()
