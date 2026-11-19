@@ -159,6 +159,11 @@ impl ScopedPlaywrightPool {
             return Err("invalid per-chat browser owner identity".into());
         }
         let mut spec = self.spec.clone();
+        // Managed Chromium can take longer than the generic 20-second MCP
+        // default to cold-start under desktop load. Keep explicit overrides.
+        if !self.extension && spec.startup_timeout_sec.is_none() {
+            spec.startup_timeout_sec = Some(60.0);
+        }
         if self.extension {
             load_extension_token(&mut spec)?;
             spec.env.insert(
@@ -345,6 +350,26 @@ mod tests {
             );
         }
         spec
+    }
+
+    #[test]
+    fn managed_playwright_cold_start_is_bounded_but_respects_owner_override() {
+        let initial = spec(false);
+        let pool = ScopedPlaywrightPool::new("playwright", &initial, &stub_config()).unwrap();
+        let discovery = pool.discovery_spec().unwrap();
+        assert_eq!(discovery.startup_timeout_sec, Some(60.0));
+        let owner = ConversationIdentity::from_openai_session("agent-a").unwrap();
+        assert_eq!(
+            pool.scoped_spec(&owner).unwrap().startup_timeout_sec,
+            Some(60.0)
+        );
+        let mut overridden = spec(false);
+        overridden.startup_timeout_sec = Some(95.0);
+        let pool = ScopedPlaywrightPool::new("playwright", &overridden, &stub_config()).unwrap();
+        assert_eq!(
+            pool.discovery_spec().unwrap().startup_timeout_sec,
+            Some(95.0)
+        );
     }
 
     #[test]

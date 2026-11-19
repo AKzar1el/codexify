@@ -703,50 +703,81 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let mut catalog_sources = Vec::new();
     let resources = Arc::new(BridgedResourceStore::new(config.artifact_egress.clone()));
 
-    // Deterministic order so logs and tool ordering are stable across runs.
-    let mut names: Vec<&String> = config.mcp_servers.keys().collect();
+    // Discover tool schemas concurrently, but in small bounded batches so
+    // launching local MCP children cannot exhaust RAM on a desktop host.
+    // Connection results are retained in sorted order for stable tool names,
+    // catalog ordering, and diagnostics. Per-chat Playwright still creates
+    // agent-owned browser processes only when that agent actually calls a tool.
+    const MAX_PARALLEL_UPSTREAM_STARTS: usize = 3;
+    let mut names: Vec<String> = config.mcp_servers.keys().cloned().collect();
     names.sort();
+    let source_config = Arc::new(config.clone());
+    let startup_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPSTREAM_STARTS));
+    let mut joins = tokio::task::JoinSet::new();
+    for (index, server_name) in names.iter().cloned().enumerate() {
+        let source_config = Arc::clone(&source_config);
+        let startup_slots = Arc::clone(&startup_slots);
+        joins.spawn(async move {
+            let _permit = match startup_slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return (index, None, Err("MCP startup limiter closed".into())),
+            };
+            let spec = &source_config.mcp_servers[&server_name];
+            if spec.disabled {
+                return (index, None, Err("disabled".into()));
+            }
+            let scoped_pool = if spec.session_scope == McpSessionScope::PerChat {
+                match crate::playwright_sessions::ScopedPlaywrightPool::new(
+                    &server_name,
+                    spec,
+                    &source_config,
+                ) {
+                    Ok(pool) => Some(Arc::new(pool)),
+                    Err(error) => return (index, None, Err(error)),
+                }
+            } else {
+                None
+            };
+            let discovery = match &scoped_pool {
+                Some(pool) => match pool.discovery_spec() {
+                    Ok(spec) => Some(spec),
+                    Err(error) => return (index, None, Err(error)),
+                },
+                None => None,
+            };
+            let spec_for_discovery = discovery.as_ref().unwrap_or(spec);
+            let connected = connect_one(&server_name, spec_for_discovery, &source_config).await;
+            (index, scoped_pool, connected)
+        });
+    }
+    // A child startup failure must not abort healthy unrelated MCP sources.
+    let mut results: Vec<_> = std::iter::repeat_with(|| None).take(names.len()).collect();
+    while let Some(result) = joins.join_next().await {
+        match result {
+            Ok((index, pool, connection)) => results[index] = Some((pool, connection)),
+            Err(error) => {
+                tracing::warn!("upstream initialization task failed without a result: {error}")
+            }
+        }
+    }
 
-    for server_name in names {
-        let spec = &config.mcp_servers[server_name];
+    for (index, server_name) in names.into_iter().enumerate() {
+        let spec = &config.mcp_servers[&server_name];
         if spec.disabled {
             report.push(format!("{server_name} -> disabled"));
             continue;
         }
-        let sanitized = sanitize(server_name);
+        let sanitized = sanitize(&server_name);
         let exposure = spec.exposure();
-
-        // Validate per-chat ownership and prepare an isolated schema-discovery
-        // browser before launching any extension. Without the token, skip the
-        // provider entirely: no accidental manual approval dialog.
-        let scoped_pool = if spec.session_scope == McpSessionScope::PerChat {
-            match crate::playwright_sessions::ScopedPlaywrightPool::new(server_name, spec, config) {
-                Ok(pool) => Some(Arc::new(pool)),
-                Err(error) => {
-                    report.push(format!("{server_name} -> FAILED: {error}"));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let discovery = match &scoped_pool {
-            Some(pool) => match pool.discovery_spec() {
-                Ok(spec) => Some(spec),
-                Err(error) => {
-                    report.push(format!("{server_name} -> FAILED: {error}"));
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let discovery_spec = discovery.as_ref().unwrap_or(spec);
-        match connect_one(server_name, discovery_spec, config).await {
+        let (scoped_pool, connection) = results[index]
+            .take()
+            .unwrap_or_else(|| (None, Err("MCP startup task failed".into())));
+        match connection {
             Ok((service, upstream_tools, tool_timeout)) => {
                 let peer = service.peer().clone();
                 let control = Arc::new(
                     crate::upstream_control::UpstreamControl::new(spec.request_limits.clone())
-                        .for_server(server_name, spec)
+                        .for_server(&server_name, spec)
                         .with_scoped_playwright(scoped_pool),
                 );
                 upstreams.insert(server_name.clone(), control.clone());
@@ -768,13 +799,13 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                             })
                             .collect();
 
-                        write_gateway_skill(config, server_name, &sanitized, &functions);
+                        write_gateway_skill(config, &server_name, &sanitized, &functions);
 
                         let leaked: &'static str = Box::leak(sanitized.clone().into_boxed_str());
                         tools.push(Box::new(GatewayTool {
                             name: leaked,
                             server: server_name.clone(),
-                            description: gateway_description(server_name, &functions),
+                            description: gateway_description(&server_name, &functions),
                             function_names: functions.iter().map(|f| f.name.clone()).collect(),
                             peer: peer.clone(),
                             tool_timeout,
@@ -3384,6 +3415,95 @@ mod tests {
         assert_eq!(control.snapshot()["state"], "unresponsive");
         drop(client);
         task.abort();
+    }
+
+    #[derive(Clone)]
+    struct DelayedCatalogMcp {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ServerHandler for DelayedCatalogMcp {
+        fn get_info(&self) -> ServerInfo {
+            InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(Implementation::new("delayed-catalog", "1.0.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, McpError> {
+            use std::sync::atomic::Ordering;
+            let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(count, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let schema = json!({"type":"object"}).as_object().unwrap().clone();
+            Ok(ListToolsResult::with_all_items(vec![
+                rmcp::model::Tool::new("noop", "No-op for bounded startup regression", schema),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn initializes_multiple_mcp_sources_concurrently_without_reordering_the_catalog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let upstream = DelayedCatalogMcp {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut http = StreamableHttpServerConfig::default();
+        http.json_response = true;
+        let service = StreamableHttpService::new(
+            move || Ok(upstream.clone()),
+            Arc::new(LocalSessionManager::default()),
+            http,
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, Router::new().nest_service("/mcp", service))
+                .await
+                .unwrap();
+        });
+        let mut config = crate::config::default_config(std::env::temp_dir());
+        for name in ["delta", "bravo", "alpha", "charlie"] {
+            config.mcp_servers.insert(
+                name.into(),
+                McpServerSpec {
+                    url: Some(format!("http://{address}/mcp")),
+                    transport: Some("http".into()),
+                    mode: Some(McpToolExposure::Direct),
+                    startup_timeout_sec: Some(5.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = connect_upstreams(&config).await;
+        assert_eq!(
+            bridge.services.len(),
+            4,
+            "all four MCP sources should connect"
+        );
+        let reported: Vec<_> = bridge
+            .report
+            .iter()
+            .map(|line| line.split_once(" ->").unwrap().0)
+            .collect();
+        assert_eq!(reported, ["alpha", "bravo", "charlie", "delta"]);
+        let maximum = peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&maximum),
+            "MCP cold-start requests must overlap without exceeding the three-slot limit: {maximum}"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        drop(bridge);
+        server_task.abort();
     }
 
     #[tokio::test]
