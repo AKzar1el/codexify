@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/v240-playwright-compatible-20261119
+      - fix/v240-playwright-parallel-startup-20261119
 
 permissions:
   contents: read
