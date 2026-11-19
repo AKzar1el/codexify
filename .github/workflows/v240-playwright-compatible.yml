@@ -5,6 +5,7 @@ on:
     branches:
       - fix/v240-playwright-compatible-20261119
       - fix/v240-playwright-parallel-startup-20261119
+      - fix/v240-configured-playwright-scope-20261119
 
 permissions:
   contents: read
@@ -44,6 +45,12 @@ jobs:
         run: |
           cargo check --locked --tests -j 2
           if ($LASTEXITCODE -ne 0) { throw 'Rust test targets do not compile' }
+      - name: Verify explicit per-chat configuration overlay
+        run: |
+          cargo test --locked --lib config::tests::explicit_playwright_session_scope_survives_json_overlay -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'Playwright sessionScope was silently downgraded to global' }
+          cargo test --locked --lib config::tests::explicit_scope_overlay_preserves_or_overrides_imported_scope -j 2
+          if ($LASTEXITCODE -ne 0) { throw 'MCP imported scope overlay regression' }
       - name: Verify browser ownership and preserved Send gate
         run: |
           cargo test --locked --lib playwright_sessions::tests -j 2
