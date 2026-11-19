@@ -2,7 +2,7 @@
 use crate::types::{McpRequestLimits, McpServerSpec};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::Instant;
@@ -125,6 +125,7 @@ struct State {
 pub(crate) struct UpstreamControl {
     limits: McpRequestLimits,
     playwright_mode: PlaywrightBackendMode,
+    pub(crate) scoped_playwright: Option<Arc<crate::playwright_sessions::ScopedPlaywrightPool>>,
     active: Semaphore,
     pending: Semaphore,
     state: Mutex<State>,
@@ -164,6 +165,7 @@ impl UpstreamControl {
             pending: Semaphore::new(limits.max_concurrent_requests + limits.max_pending_requests),
             limits,
             playwright_mode: PlaywrightBackendMode::Other,
+            scoped_playwright: None,
             state: Mutex::new(State::default()),
             unavailable: tokio::sync::watch::channel(false).0,
         }
@@ -171,6 +173,14 @@ impl UpstreamControl {
     /// Keep capability stable for this upstream connection and all exposure modes.
     pub(crate) fn for_server(mut self, name: &str, spec: &McpServerSpec) -> Self {
         self.playwright_mode = PlaywrightBackendMode::from_spec(name, spec);
+        self
+    }
+
+    pub(crate) fn with_scoped_playwright(
+        mut self,
+        pool: Option<Arc<crate::playwright_sessions::ScopedPlaywrightPool>>,
+    ) -> Self {
+        self.scoped_playwright = pool;
         self
     }
 

@@ -2006,6 +2006,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             disabled_tools: Some(vec!["write".to_string()]),
             mode: None,
+            session_scope: Default::default(),
             provenance: crate::types::McpServerProvenance::CodexConfig,
             request_limits: crate::types::McpRequestLimits::default(),
         }

@@ -32,7 +32,9 @@ use crate::bridged_resources::BridgedResourceStore;
 use crate::exec_sessions::SessionState;
 use crate::mcp_catalog::{CatalogSourceInput, build_catalog_tools};
 use crate::process_env::scrub_untrusted_child_env;
+use crate::project_bindings::ConversationIdentity;
 use crate::tool::{Tool, ToolBehavior, ToolCallIdentity, ToolRequestContext};
+use crate::types::McpSessionScope;
 use crate::types::{AppConfig, McpToolExposure, ToolContent, ToolResult};
 
 mod stderr;
@@ -123,7 +125,12 @@ struct BridgedTool {
 }
 
 impl BridgedTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        cancellation: Option<&CancellationToken>,
+        conversation: Option<&ConversationIdentity>,
+    ) -> ToolResult {
         let mut params = CallToolRequestParams::new(self.original_name.clone());
         if let Some(obj) = args.as_object()
             && !obj.is_empty()
@@ -141,6 +148,7 @@ impl BridgedTool {
             UpstreamCallContext {
                 resources: &self.resources,
                 control: &self.control,
+                conversation,
             },
         )
         .await
@@ -245,7 +253,7 @@ impl Tool for BridgedTool {
     }
 
     async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+        self.run(args, None, None).await
     }
 
     async fn call_with_context(
@@ -255,13 +263,22 @@ impl Tool for BridgedTool {
         _session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(
+            args,
+            Some(&context.cancellation),
+            context
+                .task_conversation
+                .as_ref()
+                .or(context.conversation.as_ref()),
+        )
+        .await
     }
 }
 
 pub(crate) struct UpstreamCallContext<'a> {
     pub(crate) resources: &'a BridgedResourceStore,
     pub(crate) control: &'a crate::upstream_control::UpstreamControl,
+    pub(crate) conversation: Option<&'a ConversationIdentity>,
 }
 
 pub(crate) async fn forward_tool_call(
@@ -273,13 +290,51 @@ pub(crate) async fn forward_tool_call(
     cancellation: Option<&CancellationToken>,
     context: UpstreamCallContext<'_>,
 ) -> ToolResult {
-    let UpstreamCallContext { resources, control } = context;
+    let UpstreamCallContext {
+        resources,
+        control,
+        conversation,
+    } = context;
     // This preflight is shared by direct, gateway and catalog MCP exposure.
     // Never send an isolation request to a browser extension as a fallback.
     if let Err(error) = control.check_browser_context_request(tool, &params) {
         return ToolResult::error(format!("Upstream MCP server '{server}': {error}"));
     }
     let isolated_requested = control.isolated_tab_requested(tool, &params);
+    // A scoped Playwright source never falls back to the global peer when the
+    // downstream caller lacks an authoritative task identity.
+    let scoped_connection = match &control.scoped_playwright {
+        Some(pool) => {
+            let scoped_call =
+                tokio::time::timeout(Duration::from_secs(90), pool.acquire(conversation));
+            let cancelled = cancellation.cloned().unwrap_or_default();
+            let response = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => {
+                    return ToolResult::error(format!(
+                        "Upstream MCP server '{server}': owner request cancelled before browser dispatch"
+                    ));
+                }
+                response = scoped_call => response,
+            };
+            match response {
+                Ok(Ok(connection)) => Some(connection),
+                Ok(Err(error)) => {
+                    return ToolResult::error(format!("Upstream MCP server '{server}': {error}"));
+                }
+                Err(_) => {
+                    return ToolResult::error(format!(
+                        "Upstream MCP server '{server}': per-chat browser startup timed out; no browser tool call dispatched"
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    let (peer, control) = match &scoped_connection {
+        Some(connection) => (&connection.peer, connection.control.as_ref()),
+        None => (peer, control),
+    };
     let timeout = tool_timeout.unwrap_or(Duration::from_secs(60));
     let deadline = tokio::time::Instant::now() + timeout;
     let token = cancellation.cloned().unwrap_or_default();
@@ -569,12 +624,38 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
         let sanitized = sanitize(server_name);
         let exposure = spec.exposure();
 
-        match connect_one(server_name, spec, config).await {
+        // Validate per-chat ownership and prepare an isolated schema-discovery
+        // browser before launching any extension. Without the token, skip the
+        // provider entirely: no accidental manual approval dialog.
+        let scoped_pool = if spec.session_scope == McpSessionScope::PerChat {
+            match crate::playwright_sessions::ScopedPlaywrightPool::new(server_name, spec, config) {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(error) => {
+                    report.push(format!("{server_name} -> FAILED: {error}"));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let discovery = match &scoped_pool {
+            Some(pool) => match pool.discovery_spec() {
+                Ok(spec) => Some(spec),
+                Err(error) => {
+                    report.push(format!("{server_name} -> FAILED: {error}"));
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let discovery_spec = discovery.as_ref().unwrap_or(spec);
+        match connect_one(server_name, discovery_spec, config).await {
             Ok((service, upstream_tools, tool_timeout)) => {
                 let peer = service.peer().clone();
                 let control = Arc::new(
                     crate::upstream_control::UpstreamControl::new(spec.request_limits.clone())
-                        .for_server(server_name, spec),
+                        .for_server(server_name, spec)
+                        .with_scoped_playwright(scoped_pool),
                 );
                 upstreams.insert(server_name.clone(), control.clone());
                 monitors.push(monitor_upstream(peer.clone(), control.clone()));
@@ -813,7 +894,12 @@ struct GatewayTool {
 }
 
 impl GatewayTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        cancellation: Option<&CancellationToken>,
+        conversation: Option<&ConversationIdentity>,
+    ) -> ToolResult {
         let Some(function) = args.get("function").and_then(|v| v.as_str()) else {
             return ToolResult::error("`function` is required (the name of the function to call)");
         };
@@ -849,6 +935,7 @@ impl GatewayTool {
             UpstreamCallContext {
                 resources: &self.resources,
                 control: &self.control,
+                conversation,
             },
         )
         .await
@@ -917,7 +1004,7 @@ impl Tool for GatewayTool {
     }
 
     async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+        self.run(args, None, None).await
     }
 
     async fn call_with_context(
@@ -927,12 +1014,20 @@ impl Tool for GatewayTool {
         _session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(
+            args,
+            Some(&context.cancellation),
+            context
+                .task_conversation
+                .as_ref()
+                .or(context.conversation.as_ref()),
+        )
+        .await
     }
 }
 
 /// Launch and initialise one upstream, returning its running service and tools.
-async fn connect_one(
+pub(crate) async fn connect_one(
     server_name: &str,
     spec: &crate::types::McpServerSpec,
     config: &AppConfig,
@@ -1155,7 +1250,7 @@ async fn connect_one_with_env(
     server_name: &str,
     spec: &crate::types::McpServerSpec,
     config: &AppConfig,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Send + Sync),
 ) -> Result<
     (
         RunningService<RoleClient, ()>,
@@ -1467,6 +1562,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &extension_control,
+                conversation: None,
             },
         )
         .await;
@@ -1484,6 +1580,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &full_control,
+                conversation: None,
             },
         )
         .await;
@@ -1500,6 +1597,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &cdp_control,
+                conversation: None,
             },
         )
         .await;
@@ -1522,6 +1620,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &extension_control,
+                conversation: None,
             },
         )
         .await;
@@ -2872,6 +2971,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -2889,6 +2989,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -2915,6 +3016,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -3001,6 +3103,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &control,
+                conversation: None,
             },
         );
         let fail = async {

@@ -355,6 +355,7 @@ fn codex_cli_server_to_spec(
             tools: server.enabled_tools,
             disabled_tools: server.disabled_tools,
             mode: None,
+            session_scope: Default::default(),
             provenance: McpServerProvenance::CodexCli,
             request_limits: crate::types::McpRequestLimits::default(),
         });
@@ -422,6 +423,7 @@ fn codex_cli_server_to_spec(
         tools: server.enabled_tools,
         disabled_tools: server.disabled_tools,
         mode: None,
+        session_scope: Default::default(),
         provenance: McpServerProvenance::CodexCli,
         request_limits: crate::types::McpRequestLimits::default(),
     })
@@ -626,6 +628,7 @@ fn parse_server(
                 tools,
                 disabled_tools,
                 mode: None,
+                session_scope: Default::default(),
                 provenance: McpServerProvenance::CodexConfig,
                 request_limits: crate::types::McpRequestLimits::default(),
             }),
@@ -675,6 +678,7 @@ fn parse_server(
             tools,
             disabled_tools,
             mode: None,
+            session_scope: Default::default(),
             provenance: McpServerProvenance::CodexConfig,
             request_limits: crate::types::McpRequestLimits::default(),
         }),
