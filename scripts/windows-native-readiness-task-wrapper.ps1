@@ -44,7 +44,6 @@ if($Deploy){
      @($task.Actions).Count -ne 1 -or
      $taskArguments -notlike '*windows-native-readiness-task-wrapper.ps1*' -or
      $taskArguments -notlike '*-Deploy*' -or
-     $taskArguments -notlike '*-InterruptNativeCommands*' -or
      $taskArguments -notlike ('*'+$ReportDirectory+'*') -or
      $taskArguments -notlike ('*'+$Candidate+'*')){
     throw 'Unverified task origin; refusing deployment from a direct elevated process'

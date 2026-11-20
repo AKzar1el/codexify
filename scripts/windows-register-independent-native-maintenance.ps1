@@ -3,6 +3,7 @@
 # Do not call the native installer directly from a Codexify tool or UAC child.
 param(
   [switch]$Deploy,
+  [switch]$InterruptNativeCommands,
   [string]$ExpectedCandidateSha256
 )
 $ErrorActionPreference = 'Stop'
@@ -89,7 +90,8 @@ $report = Join-Path $root ('backups\native-readiness-task-'+[DateTime]::UtcNow.T
 $engine = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+
   $wrapper+'" -Candidate "'+$candidate+'" -ReportDirectory "'+$report+
-  '" -ExpectedProfile "'+$profile+'" -Deploy -InterruptNativeCommands'
+  '" -ExpectedProfile "'+$profile+'" -Deploy'
+if($InterruptNativeCommands){$arguments += ' -InterruptNativeCommands'}
 $action = New-ScheduledTaskAction -Execute $engine -Argument $arguments -WorkingDirectory $PSScriptRoot
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 12) -MultipleInstances IgnoreNew
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
