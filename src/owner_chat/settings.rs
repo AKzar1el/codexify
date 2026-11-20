@@ -223,6 +223,36 @@ fn update_progress(current: Option<&Value>, intent: Option<&Value>) -> Option<Va
         .or_else(|| current.cloned())
 }
 
+/// A manually queued retry must remain visible even when an older durable
+/// schema refresh has failed. Conversely, a manual browser observation alone
+/// must not hide a still-failed schema barrier after it finishes.
+fn visible_connector_refresh(
+    schema: Option<Value>,
+    manual: Option<Value>,
+    recent: Option<Value>,
+    after_update: Option<Value>,
+) -> Option<Value> {
+    let in_progress = |value: &Value| {
+        matches!(
+            value["phase"].as_str(),
+            Some("queued" | "running" | "starting_browser" | "waiting_for_restart")
+        )
+    };
+    if let Some(value) = manual.as_ref().filter(|value| in_progress(value)) {
+        return Some(value.clone());
+    }
+    if let Some(value) = schema.as_ref().filter(|value| in_progress(value)) {
+        return Some(value.clone());
+    }
+    if let Some(value) = manual.as_ref().filter(|value| value["phase"] == "failed") {
+        return Some(value.clone());
+    }
+    if let Some(value) = schema.as_ref().filter(|value| value["phase"] == "failed") {
+        return Some(value.clone());
+    }
+    manual.or(recent).or(after_update).or(schema)
+}
+
 pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
     let latest = crate::self_update::inspect_latest_version().await;
     let latest = match latest {
@@ -235,23 +265,12 @@ pub(super) async fn status(State(state): State<OwnerState>) -> ApiResult {
     let global = state.global.lock().await;
     let update_intent = crate::global_settings::read_refresh_intent();
     let update = update_progress(global.update.as_ref(), update_intent.as_ref());
-    let refresh = schema
-        .as_ref()
-        .filter(|value| {
-            matches!(
-                value["phase"].as_str(),
-                Some("queued" | "running" | "starting_browser" | "waiting_for_restart" | "failed")
-            )
-        })
-        .cloned()
-        .or_else(|| {
-            global
-                .manual_refresh
-                .clone()
-                .or_else(|| global.refresh.clone())
-                .or_else(crate::global_settings::read_refresh_intent)
-        })
-        .or(schema);
+    let refresh = visible_connector_refresh(
+        schema,
+        global.manual_refresh.clone(),
+        global.refresh.clone(),
+        crate::global_settings::read_refresh_intent(),
+    );
     let plan = global.plan.clone();
     drop(global);
     let (_, readiness) = super::readiness::snapshot(&state, refresh.as_ref()).await;
@@ -562,6 +581,38 @@ mod tests {
             Some(preparing.clone())
         );
         assert_eq!(update_progress(None, None), None);
+    }
+    #[test]
+    fn manual_connector_retry_is_not_masked_by_old_schema_failure() {
+        let schema = json!({"phase":"failed","refreshId":"settings-old",
+            "result":{"error":"Old browser state changed"}});
+        let manual = json!({"phase":"queued","refreshId":"manual-new","source":"manual"});
+        assert_eq!(
+            visible_connector_refresh(Some(schema.clone()), Some(manual.clone()), None, None),
+            Some(manual.clone()),
+        );
+        let running = json!({"phase":"running","refreshId":"manual-new","source":"manual"});
+        assert_eq!(
+            visible_connector_refresh(Some(schema.clone()), Some(running.clone()), None, None),
+            Some(running),
+        );
+        let new_failure = json!({"phase":"failed","refreshId":"manual-new","source":"manual",
+            "result":{"error":"Current refresh failed"}});
+        assert_eq!(
+            visible_connector_refresh(Some(schema), Some(new_failure.clone()), None, None),
+            Some(new_failure),
+        );
+    }
+
+    #[test]
+    fn manual_completion_does_not_hide_an_unresolved_schema_barrier() {
+        let schema = json!({"phase":"failed","refreshId":"settings-old"});
+        let manual = json!({"phase":"completed","refreshId":"manual-new",
+            "result":{"refreshObserved":true,"schemaVerified":false}});
+        assert_eq!(
+            visible_connector_refresh(Some(schema.clone()), Some(manual), None, None),
+            Some(schema),
+        );
     }
     #[derive(Clone, Default)]
     struct RefreshFixture {

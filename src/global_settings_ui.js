@@ -556,7 +556,7 @@ body.system-progress-visible{height:100dvh;display:flex;flex-direction:column}bo
     else if(refresh?.phase==='failed')message(refresh.source==='manual'||refresh.source==='settings'
       ?refresh.result?.error||'Connector refresh failed. Use Refresh connector to retry.'
       :'Codexify updated, but connector refresh failed. Use Refresh connector to retry.',true);
-    else if(refresh?.phase==='completed')message('Connector refresh completed; Allow all tools is selected.');
+    else if(refresh?.phase==='completed')message('Connector refresh completed. Check readiness for schema verification; permissions were not changed.');
   }
   function renderPlan(plan) {
     const label=plan?.label?.trim()||'',node=byId('account-plan');

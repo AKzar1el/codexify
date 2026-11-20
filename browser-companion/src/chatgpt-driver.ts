@@ -602,6 +602,11 @@ export class ChatGptBrowserDriver implements BrowserDriver {
         console.error(`[connector-maintenance] ${label}: ${error.name}: ${detail}`);
       }
       const failure=asCompanionError(error);
+      // Typed browser conflicts previously disappeared behind a generic
+      // native HTTP 409. Record only the fixed phase label and failure code:
+      // never a tab URL, account identifier, connector name, or page text.
+      if(error instanceof BrowserCompanionError)
+        console.warn(`[connector-maintenance] ${label}: code=${failure.code}`);
       throw new BrowserCompanionError(`${label}: ${failure.message}`,failure.code,{cause:error});
     });
     const appId=await step("Identify connector",async(page,account,signal)=>{
