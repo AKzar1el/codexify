@@ -1083,12 +1083,17 @@ impl AgentAutomationSupervisor {
         {
             return Ok(false);
         }
-        let root = context
-            .bindings
-            .selected_project_root(&context.config, &task.task)?
-            .ok_or("The conversation continuation workspace is unavailable")?
-            .canonicalize()
-            .map_err(|_| "The conversation continuation workspace is unavailable")?;
+        // Historical chats can outlive ephemeral managed worktrees. A broken
+        // binding must fence *that* replacement, not abort the shared scan and
+        // starve unrelated, correctly bound automation goals.
+        let Some(root) = replacement_workspace_root(
+            task.task.stable_key(),
+            context
+                .bindings
+                .selected_project_root(&context.config, &task.task),
+        ) else {
+            return Ok(false);
+        };
         let token = context.continuations.issue_token_for_owner(
             &task.task,
             task.owner_generation,
@@ -4745,6 +4750,60 @@ fn failed_companion_status(code: &str) -> AutomationActionStatus {
         "conversation_limit" => AutomationActionStatus::ConversationLimit,
         "conversation_load_rate_limited" => AutomationActionStatus::RateLimited,
         _ => AutomationActionStatus::Failed,
+    }
+}
+
+/// An unavailable binding fences only this replacement. Treating it as a
+/// global scan error would prevent every other healthy task from dispatching.
+fn replacement_workspace_root(
+    task_key: &str,
+    selected: Result<Option<std::path::PathBuf>, String>,
+) -> Option<std::path::PathBuf> {
+    let selected = match selected {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            tracing::warn!(
+                task_key,
+                "deferred conversation replacement: no selected workspace"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(task_key, %error, "deferred conversation replacement: invalid workspace binding");
+            return None;
+        }
+    };
+    match selected.canonicalize() {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::warn!(task_key, %error, "deferred conversation replacement: workspace is unavailable");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod replacement_workspace_isolation_tests {
+    use super::replacement_workspace_root;
+    #[test]
+    fn missing_historical_binding_is_deferred_without_losing_healthy_workspace() {
+        let healthy = tempfile::tempdir().unwrap();
+        let valid = healthy.path().canonicalize().unwrap();
+        let missing = healthy.path().join("removed-worktree");
+        assert!(
+            replacement_workspace_root("old-chat", Err("missing historical binding".into()))
+                .is_none()
+        );
+        assert!(replacement_workspace_root("old-chat", Ok(None)).is_none());
+        assert!(replacement_workspace_root("old-chat", Ok(Some(missing.clone()))).is_none());
+        assert!(
+            !missing.exists(),
+            "no placeholder worktree may be manufactured"
+        );
+        assert_eq!(
+            replacement_workspace_root("valid-chat", Ok(Some(healthy.path().into()))),
+            Some(valid)
+        );
     }
 }
 
