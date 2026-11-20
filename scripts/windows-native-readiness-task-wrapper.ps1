@@ -25,6 +25,32 @@ $ancestor=if($parentPid){Get-CimInstance Win32_Process -Filter ('ProcessId='+$pa
 Record ('MAINTENANCE_MODE='+$(if($Deploy){'deploy'}else{'dryrun'})+
     ' SCRIPT_PID='+$PID+' PARENT_PID='+$parentPid+
     ' PARENT_IMAGE='+$(if($ancestor){$ancestor.Name}else{'unknown'}))
+$taskName='Codexify-Native-Readiness-Maintenance'
+if($Deploy){
+  # Start-Process -Verb RunAs from a Codexify tool can still belong to the
+  # service's Windows job. That elevated helper can die when the native server
+  # stops, leaving Task Scheduler disabled. Only an independently launched
+  # on-demand, highest-privilege Scheduled Task is allowed to deploy.
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal=[Security.Principal.WindowsPrincipal]::new($identity)
+  if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+    throw 'Deployment requires an elevated independent Task Scheduler launcher'
+  }
+  $task=Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction Stop
+  $taskArguments=[string]$task.Actions[0].Arguments
+  if(-not $ancestor -or $ancestor.Name -ine 'svchost.exe' -or
+     $task.State -ne 'Running' -or $task.Principal.RunLevel -ne 'Highest' -or
+     @($task.Triggers|Where-Object {$_}).Count -ne 0 -or
+     @($task.Actions).Count -ne 1 -or
+     $taskArguments -notlike '*windows-native-readiness-task-wrapper.ps1*' -or
+     $taskArguments -notlike '*-Deploy*' -or
+     $taskArguments -notlike '*-InterruptNativeCommands*' -or
+     $taskArguments -notlike ('*'+$ReportDirectory+'*') -or
+     $taskArguments -notlike ('*'+$Candidate+'*')){
+    throw 'Unverified task origin; refusing deployment from a direct elevated process'
+  }
+  Record 'INDEPENDENT_ELEVATED_TASK_ORIGIN_VERIFIED=true'
+}
 $installer=Join-Path $PSScriptRoot 'windows-deploy-native-readiness-fix.ps1'
 try {
   & $installer -Candidate $Candidate -Deploy:$Deploy -InterruptNativeCommands:$InterruptNativeCommands -ExpectedProfile $ExpectedProfile 2>&1 | ForEach-Object {
