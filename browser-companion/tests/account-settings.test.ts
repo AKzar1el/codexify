@@ -41,7 +41,8 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
  const browser=await chromium.launch({executablePath,headless:true});
  try {
   const context=await browser.newContext();const page=await context.newPage();let permission='read_only',refreshes=0,deletes=0,billingReads=0,failConnector=false,fastRefresh=false,replaceRefresh=false,refreshDelay=300,permissionVisits=0;const visits:string[]=[];
-  let planAccount='fixture-account',permissionLabel='Permiso',allowLabel='Permitir todo',originalHtml='<form><div id="prompt-textarea" contenteditable="true"></div></form>',sessionAvailable=true;
+  let planAccount='fixture-account',permissionLabel='Permiso',allowLabel='Permitir todo',originalHtml='<form><div id="prompt-textarea" contenteditable="true"></div></form>',sessionAvailable=true,collapsedPermissions=false;
+  let permissionMetadata:string|undefined,displayedPermission:string|undefined;
   const witness:{summary?:string;remember:(summary:string)=>void}={remember:summary=>witness.summary=summary};
   await page.context().route('https://chatgpt.com/**',async route=>{
    const path=new URL(route.request().url()).pathname;
@@ -49,12 +50,12 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
    if(path==='/api/auth/session')return route.fulfill({json:sessionAvailable?{user:{id:'fixture-user'},account:{id:new URL(route.request().frame().page().url()).pathname==='/settings/billing'?planAccount:'fixture-account',planType:'pro',structure:'personal'}}:{}});
    if(path==='/settings/billing'){billingReads++;return route.fulfill({contentType:'text/html; charset=utf-8',body:'<h2>ChatGPT Pro 200</h2>'});}
    if(path==='/c/original')return route.fulfill({contentType:'text/html; charset=utf-8',body:originalHtml});
-   if(path==='/set-permission'){permission='allow_all';return route.fulfill({json:{ok:true}});}
+   if(path==='/set-permission'){permission='allow_all';permissionMetadata=undefined;displayedPermission=undefined;return route.fulfill({json:{ok:true}});}
    if(path==='/refresh'){refreshes++;return route.fulfill({json:{ok:true}});}
    if(path==='/delete'){deletes++;return route.fulfill({json:{ok:true}});}
    if(path==='/')return route.fulfill({contentType:'text/html; charset=utf-8',body:'<form><div id="prompt-textarea" contenteditable="true"><span app-mention-path="app://'+(failConnector?'invalid':'asdk_app_fixture')+'" app-mention-display-name="Fixture connector" contenteditable="false">Fixture connector</span></div></form>'});
-   if(path.endsWith('/permissions')){permissionVisits++;return route.fulfill({contentType:'text/html; charset=utf-8',body:`<h2>Permissions</h2>${['Preguntar','Solo lectura','Bajo riesgo','Permitir todo'].map((label,index)=>`<div role="radio" tabindex="0" aria-checked="${permission==='allow_all'?index===3:index===1}" data-index="${index}">${label}</div>`).join('')}<script>document.querySelectorAll('[role=radio]').forEach(node=>node.onclick=async()=>{await fetch('/set-permission',{method:'POST'});document.querySelectorAll('[role=radio]').forEach(item=>item.setAttribute('aria-checked',String(item===node)));});</script>`});}
-   return route.fulfill({contentType:'text/html; charset=utf-8',body:`<section id="plugin-settings"><div hidden>Fixture connector</div><h2>Fixture connector</h2><button>Detalles</button><button style="color:rgb(255,0,0)">Quitar</button><section id="settings-cards"><div role="button" id="permission"><svg width="16" height="16"><path d="M1 1L10 10"/></svg><span>${permissionLabel}</span><span>Elegir permisos</span><span>${permission==='allow_all'?allowLabel:'Solo lectura'}</span></div><div id="choices" hidden>${['Preguntar','Solo lectura','Bajo riesgo','Permitir todo'].map((label,index)=>`<div role="radio" tabindex="0" aria-checked="${permission==='allow_all'?index===3:index===1}" data-index="${index}">${label}</div>`).join('')}</div><section id="manage"><div><span>Nombre</span><button>Editar nombre</button></div><div><span>Descripción</span><button>Editar descripción</button></div><div><span>Actualizar herramientas</span><button id="refresh">Actualizar herramientas</button></div><div><span>Eliminar</span><button style="color:rgb(255,0,0)" onclick="fetch('/delete',{method:'POST'})">Eliminar</button></div></section></section></section><script>document.getElementById('permission').onclick=()=>document.getElementById('choices').hidden=false;document.querySelectorAll('[role=radio]').forEach(node=>node.onclick=async()=>{await fetch('/set-permission',{method:'POST'});document.querySelectorAll('[role=radio]').forEach(item=>item.setAttribute('aria-checked',String(item===node)));document.getElementById('permission').textContent='Allow all';});document.getElementById('refresh').onclick=async function(){this.disabled=true;await fetch('/refresh',{method:'POST'});${replaceRefresh?'const fresh=this.cloneNode(true);fresh.disabled=false;fresh.removeAttribute("data-refresh-tools-target");this.replaceWith(fresh);':fastRefresh?'this.disabled=false;':`setTimeout(()=>this.disabled=false,${refreshDelay});`}};</script>`});
+   if(path.endsWith('/permissions')){permissionVisits++;const choices=['Preguntar','Solo lectura','Bajo riesgo','Permitir todo'].map((label,index)=>`<div role="radio" tabindex="0" aria-checked="${permission==='allow_all'?index===3:index===1}" data-index="${index}">${label}</div>`).join('');return route.fulfill({contentType:'text/html; charset=utf-8',body:`<h2>Permissions</h2>${collapsedPermissions?'<button data-action="plugin-permissions">Select permissions</button><section id="permission-options" hidden>':''}${choices}${collapsedPermissions?'</section>':''}<script>document.querySelector('[data-action=plugin-permissions]')?.addEventListener('click',()=>document.querySelector('#permission-options').hidden=false);document.querySelectorAll('[role=radio]').forEach(node=>node.onclick=async()=>{await fetch('/set-permission',{method:'POST'});document.querySelectorAll('[role=radio]').forEach(item=>item.setAttribute('aria-checked',String(item===node)));});</script>`});}
+   return route.fulfill({contentType:'text/html; charset=utf-8',body:`<section id="plugin-settings"><div hidden>Fixture connector</div><h2>Fixture connector</h2><button>Detalles</button><button style="color:rgb(255,0,0)">Quitar</button><section id="settings-cards"><div role="button" id="permission" ${permissionMetadata===undefined?'':`data-permission="${permissionMetadata}"`}><svg width="16" height="16"><path d="M1 1L10 10"/></svg><span>${permissionLabel}</span><span>Elegir permisos</span><span>${displayedPermission??(permission==='allow_all'?allowLabel:'Solo lectura')}</span></div><div id="choices" hidden>${['Preguntar','Solo lectura','Bajo riesgo','Permitir todo'].map((label,index)=>`<div role="radio" tabindex="0" aria-checked="${permission==='allow_all'?index===3:index===1}" data-index="${index}">${label}</div>`).join('')}</div><section id="manage"><div><span>Nombre</span><button>Editar nombre</button></div><div><span>Descripción</span><button>Editar descripción</button></div><div><span>Actualizar herramientas</span><button id="refresh">Actualizar herramientas</button></div><div><span>Eliminar</span><button style="color:rgb(255,0,0)" onclick="fetch('/delete',{method:'POST'})">Eliminar</button></div></section></section></section><script>document.getElementById('permission').onclick=()=>document.getElementById('choices').hidden=false;document.querySelectorAll('[role=radio]').forEach(node=>node.onclick=async()=>{await fetch('/set-permission',{method:'POST'});document.querySelectorAll('[role=radio]').forEach(item=>item.setAttribute('aria-checked',String(item===node)));document.getElementById('permission').textContent='Allow all';});document.getElementById('refresh').onclick=async function(){this.disabled=true;await fetch('/refresh',{method:'POST'});${replaceRefresh?'const fresh=this.cloneNode(true);fresh.disabled=false;fresh.removeAttribute("data-refresh-tools-target");this.replaceWith(fresh);':fastRefresh?'this.disabled=false;':`setTimeout(()=>this.disabled=false,${refreshDelay});`}};</script>`});
   });
   await page.goto('https://chatgpt.com/c/original');
   const plan=await readBillingPlan(page);expect(plan.label).toBe('Pro 20x');
@@ -62,7 +63,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
   expect(permission).toBe('allow_all');expect(refreshes).toBe(1);expect(deletes).toBe(0);
   const beforePermission=permissionVisits;visits.length=0;
   const again=await refreshConnectorTools(page,'Fixture connector',undefined,undefined,'asdk_app_fixture',witness);expect(again.permissionChanged).toBeFalse();expect(refreshes).toBe(2);expect(deletes).toBe(0);
-  expect(permissionVisits).toBe(beforePermission);expect(visits).toEqual([]); // Already on the verified settings page.
+  expect(permissionVisits).toBe(beforePermission);expect(visits).toEqual(['/settings/plugins-settings/plugin_asdk_app_fixture']); // A fresh settings document validates the grant.
   fastRefresh=true;replaceRefresh=true;await page.reload();await refreshConnectorTools(page,'Fixture connector',undefined,undefined,'asdk_app_fixture',witness);fastRefresh=false;replaceRefresh=false;expect(refreshes).toBe(3);
   await page.goto('https://chatgpt.com/c/original');
   let owned=false,beginCalls=0,endCalls=0;
@@ -77,14 +78,15 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
     await driver.accountPlan('startup-two');expect(billingReads-before).toBe(0);expect(page.url()).toBe(original);
     await driver.refreshConnector('Fixture connector');expect(page.url()).toBe(original);expect(refreshes).toBe(4);
     const permissionBeforeCached=permissionVisits;visits.length=0;
-    await driver.refreshConnector('Fixture connector');expect(visits).toEqual(['/settings/plugins-settings/plugin_asdk_app_fixture','/c/original']);
+    await driver.refreshConnector('Fixture connector');expect(visits).toEqual(['/settings/plugins-settings/plugin_asdk_app_fixture','/settings/plugins-settings/plugin_asdk_app_fixture','/c/original']);
     expect(permissionVisits).toBe(permissionBeforeCached);expect(refreshes).toBe(5);
-    // Completion can outlast one UI phase, while retaining exclusive ownership.
-    const coordinator=new SingleWindowCoordinator(driver,protocolBuild('queued-refresh-test'),{operationMs:1500,cleanupMs:100,hardStopMs:100});
+    // Maintenance still owns the tab while refresh finishes. Give the fixture
+    // realistic Windows Chrome navigation budgets; ownership is the invariant.
+    const coordinator=new SingleWindowCoordinator(driver,protocolBuild('queued-refresh-test'),{operationMs:10_000,cleanupMs:500,hardStopMs:250});
     refreshDelay=2200;
     const pendingRefresh=coordinator.refreshConnector('Fixture connector');
     const duplicate=expectFailure(coordinator.refreshConnector('Fixture connector'),'busy');
-    const waitStarted=async()=>{const started=Date.now();while(owned||!await page.evaluate(()=>document.querySelector('#refresh')?.matches(':disabled')===true)){if(Date.now()-started>1500)throw Error('Refresh did not start');await new Promise(resolve=>setTimeout(resolve,20));}};
+    const waitStarted=async()=>{const started=Date.now();while(owned||!await page.evaluate(()=>document.querySelector('#refresh')?.matches(':disabled')===true)){if(Date.now()-started>8_000)throw Error('Refresh did not start');await new Promise(resolve=>setTimeout(resolve,20));}};
     await waitStarted();await duplicate;
     await expectFailure(coordinator.refreshConnector('Other connector'),'busy');
     expect(owned).toBeFalse();expect((await coordinator.health()).status).toBe('busy');
@@ -106,16 +108,30 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
     await page.goto(original);
     const cancel=new AbortController(),cancelled=coordinator.refreshConnector('Fixture connector',cancel.signal);
     const cancellation=expectFailure(cancelled,'cancelled');await waitStarted();cancel.abort();await cancellation;
+    // A cancellation may be reported before its separately bounded restoration
+    // finishes, especially when Windows Chrome has a slow navigation.
+    const restoredBy=Date.now()+8_000;
+    while(page.url()!==original&&Date.now()<restoredBy)await new Promise(resolve=>setTimeout(resolve,50));
     expect(page.url()).toBe(original);expect((await coordinator.health()).status).toBe('idle');refreshDelay=300;
     permissionLabel='Autorisation';allowLabel='Tout autoriser';const beforeLocale=permissionVisits;
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeLocale+1); // Learn the new locale from checked radio state.
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeLocale+1); // Then the direct path needs no permissions visit.
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeLocale); // The selected value proves permission without reopening radios.
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeLocale);
     permissionLabel='Δικαιώματα';allowLabel='Να επιτρέπονται όλα';const beforeGreek=permissionVisits;
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeGreek+1);
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeGreek+1);
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeGreek);
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeGreek);
     permissionLabel='Autorizzazioni';allowLabel='Consenti tutto';const beforeItalian=permissionVisits;
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeItalian+1);
-    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeItalian+1);
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeItalian);
+    await driver.refreshConnector('Fixture connector');expect(permissionVisits).toBe(beforeItalian);
+    // A cached allow-all summary must not override fresh read-only metadata,
+    // even when the visible last leaf misleadingly says "Allow all actions".
+    permission='read_only';permissionMetadata='read_only';displayedPermission='Allow all actions';
+    permissionLabel='You can choose Allow all actions';collapsedPermissions=true;
+    const beforeCollapsed=permissionVisits,beforeRefresh=refreshes;
+    const recovered=await driver.refreshConnector('Fixture connector');
+    expect(recovered.permissionChanged).toBeTrue();
+    expect(permission).toBe('allow_all');expect(permissionVisits).toBe(beforeCollapsed+2);
+    expect(refreshes).toBe(beforeRefresh+1);expect(deletes).toBe(0);
+    collapsedPermissions=false;permissionLabel='Permiso';
     expect(newPage).not.toHaveBeenCalled();expect(addedPages).toBe(0);expect(context.pages()).toEqual(initialPages);expect(page.isClosed()).toBeFalse();
     // Passive account reads neither acquire a maintenance lease nor navigate.
     const beforePassive={beginCalls,endCalls,billingReads};visits.length=0;
@@ -177,7 +193,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("passive p
     expect(beginCalls).toBe(endCalls);expect(owned).toBeFalse();expect(newPage).not.toHaveBeenCalled();expect(addedPages).toBe(0);expect(context.pages()).toEqual(initialPages);
   } finally {newPage.mockRestore();}
  }finally{await browser.close();}
-},30000);
+},90_000);
 
 
 test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")("confirmed sign-out survives conversation errors while failed session reads remain unavailable",async()=>{

@@ -632,15 +632,16 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     void interrupted.catch(()=>{}); // Cancellation during preparation is handled by its bounded phase.
     try {
       const before=await phase("Inspect connector settings",(page,account,operationSignal)=>inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal));
-      const knownSummary=this.connectorApps.getAllowAllSummary(expectedAccount!,name);
-      const needsVerification=!before?.allowAll&&(!knownSummary||before?.summary!==knownSummary);
+      // A cached label is only a hint for diagnostics, never an authorization
+      // proof. Require a fresh, unambiguous permission state on this account.
+      const needsVerification=before?.allowAll!==true;
       let permissionChanged=false;
       if(needsVerification)permissionChanged=await phase("Verify connector permission",(page,account,operationSignal)=>setConnectorAllowAll(page,appId,account.fingerprint,operationSignal));
       observation=await phase("Start connector refresh",async(page,account,operationSignal)=>{
         if(needsVerification)await verifyConnectorAllowAll(page,appId,account.fingerprint,operationSignal);
         const current=await inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal);
-        if(!needsVerification&&!current?.allowAll&&(!knownSummary||current?.summary!==knownSummary))throw new BrowserCompanionError("Connector permission changed before refresh","external_interference");
-        if(current?.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
+        if(current?.allowAll!==true)throw new BrowserCompanionError("Connector permission could not be positively verified before refresh","external_interference");
+        if(current.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
         return beginConnectorToolRefresh(page,appId,name,account.fingerprint,operationSignal);
       });
       // The coordinator retains the shared window through confirmation and the

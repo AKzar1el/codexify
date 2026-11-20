@@ -186,6 +186,15 @@ async function markRefreshButton(page:Page):Promise<void> {
 
 async function allowAllChoice(page:Page,signal?:AbortSignal) {
   const radios=page.locator('[role="radio"],input[type="radio"]').filter({visible:true});
+  // Some versions render the permission choices only after opening the
+  // permission selector. Never guess which other button opens that selector.
+  if(await observeReadOnly(radios.count(),signal)===0){
+    const trigger=page.locator('[data-action="plugin-permissions"],[data-testid="plugin-permission-trigger"]').filter({visible:true});
+    if(await observeReadOnly(trigger.count(),signal)===1) {
+      signal?.throwIfAborted();
+      await trigger.click({timeout:3_000,signal});
+    }
+  }
   await radios.first().waitFor({state:"visible",timeout:10_000,signal});
   if(await observeReadOnly(radios.count(),signal)!==4)throw selectorDrift("ChatGPT permission choices changed; Allow all was not selected");
   const choice=radios.nth(3);
@@ -242,7 +251,7 @@ export async function identifyConnectorApp(page:Page,connectorName:string,expect
   return appId;
 }
 
-async function connectorPage(page:Page,appId:string,account:string,permissions:boolean,signal?:AbortSignal) {
+async function connectorPage(page:Page,appId:string,account:string,permissions:boolean,signal?:AbortSignal,reload=false) {
   signal?.throwIfAborted();
   const url=`https://chatgpt.com/settings/plugins-settings/plugin_${appId}${permissions?'/permissions':''}`;
   const assertPage=async()=>{
@@ -250,7 +259,9 @@ async function connectorPage(page:Page,appId:string,account:string,permissions:b
     if(new URL(page.url()).origin!=="https://chatgpt.com"||new URL(page.url()).pathname!==new URL(url).pathname)throw selectorDrift("ChatGPT changed the plugin page during connector maintenance");
     if((await readChatGptAccount(page,signal)).fingerprint!==account)throw selectorDrift("ChatGPT account changed during connector maintenance");
   };
-  await navigatePage(page,url,{timeout:30_000,signal});
+  // A reload is valid only when this is already the exact target page; on a
+  // different page, ordinary navigation also produces a fresh document.
+  await navigatePage(page,url,{timeout:30_000,signal,reload:reload&&page.url()===url});
   await assertPage();
   return assertPage;
 }
@@ -337,14 +348,24 @@ export async function requestConnectorToolRefresh(page:Page,appId:string,name:st
 }
 
 export async function verifyConnectorAllowAll(page:Page,appId:string,account:string,signal?:AbortSignal):Promise<void> {
-  await connectorPage(page,appId,account,true,signal);
+  // Do not count the radio's optimistic checked state as persisted permission.
+  // A new document must independently confirm the selection on this account.
+  await connectorPage(page,appId,account,true,signal,true);
   if(!await (await allowAllChoice(page,signal)).checked())throw selectorDrift("Allow all tools was not confirmed after reloading plugin settings");
 }
 
 export async function connectorPermissionSummary(page:Page,signal?:AbortSignal):Promise<{summary:string;allowAll:boolean}|null> {
-  return observeReadOnly(page.evaluate(()=>{
+  // These are *selected value* labels, not text to search for anywhere on the
+  // page: help text can describe an unselected "Allow all" option as well.
+  const allowAllLabels=[
+    "Allow all actions","Allow all tools","Never ask",
+    "Permitir todo","Tout autoriser","Να επιτρέπονται όλα",
+    "Consenti tutto","Dovoli vsa dejanja",
+  ];
+  return observeReadOnly(page.evaluate(labels=>{
     const candidates=new Set<Element>();
-    const direct=[...document.querySelectorAll('[data-permission],[data-action="plugin-permissions"],a[href$="/permissions"]')].filter(node=>node.getClientRects().length>0);
+    const directState=[...document.querySelectorAll('[data-permission],[data-current-permission]')].filter(node=>node.getClientRects().length>0);
+    const direct=directState.length?directState:[...document.querySelectorAll('[data-action="plugin-permissions"],a[href$="/permissions"]')].filter(node=>node.getClientRects().length>0);
     for(const node of direct)candidates.add(node);
     if(!candidates.size)for(const node of document.querySelectorAll('div,section')) {
       const controls=[...node.querySelectorAll('button,[role="button"]')].filter(button=>button.getClientRects().length>0);
@@ -360,15 +381,28 @@ export async function connectorPermissionSummary(page:Page,signal?:AbortSignal):
     }
     if(candidates.size!==1)return null;
     const control=[...candidates][0]!;
-    return {summary:(control.textContent??'').normalize('NFKC').replace(/\s+/g,' ').trim(),allowAll:control.getAttribute('data-permission')==='allow_all'};
-  }),signal);
+    const summary=(control.textContent??'').normalize('NFKC').replace(/\s+/g,' ').trim();
+    const permission=control.getAttribute('data-permission')??control.getAttribute('data-current-permission');
+    const leaves:string[]=[];
+    const walker=document.createTreeWalker(control,NodeFilter.SHOW_TEXT);
+    while(walker.nextNode()){
+      const text=walker.currentNode.textContent?.normalize('NFKC').replace(/\s+/g,' ').trim();
+      if(text&&walker.currentNode.parentElement?.getClientRects().length)leaves.push(text);
+    }
+    const selected=leaves.at(-1)?.toLocaleLowerCase('en-US');
+    const marked=permission==='allow_all'||permission==='full_access';
+    // Explicit non-allow permission metadata always wins over descriptive text.
+    return {summary,allowAll:marked||(permission===null&&Boolean(selected&&labels.some(label=>label.toLocaleLowerCase('en-US')===selected)))};
+  },allowAllLabels),signal);
 }
 
 export type PermissionWitness={summary?:string;remember:(summary:string)=>void};
 export async function inspectConnectorSettings(page:Page,appId:string,name:string,account:string,signal?:AbortSignal) {
   if(!/^asdk_app_[A-Za-z0-9_]{1,128}$/.test(appId))throw selectorDrift("Invalid connector App ID");
   traceRefresh("open settings");
-  const assertPage=await connectorPage(page,appId,account,false,signal);
+  // The same URL can still show stale React state after permissions change in
+  // another ChatGPT tab. Only a fresh document can prove current permissions.
+  const assertPage=await connectorPage(page,appId,account,false,signal,true);
   traceRefresh("settings opened");
   // The document can finish while settings still shows only a loading shell.
   // Hydration gets a bounded read inside the coordinator's existing phase
