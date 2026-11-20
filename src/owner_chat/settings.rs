@@ -201,7 +201,9 @@ pub(super) fn start(state: OwnerState) {
 
 pub(super) async fn health(State(state): State<OwnerState>) -> ApiResult {
     let schema = crate::global_settings::read_schema_intent(&state.config);
-    let (mut body, readiness) = super::readiness::snapshot(&state, schema.as_ref()).await;
+    let manual = state.global.lock().await.manual_refresh.clone();
+    let refresh = visible_connector_refresh(schema, manual, None, None);
+    let (mut body, readiness) = super::readiness::snapshot(&state, refresh.as_ref()).await;
     body["readiness"] = readiness;
     if let Some(automation) = &state.automation {
         body["automationActivity"] =
@@ -519,6 +521,32 @@ async fn set_manual_refresh_phase(
     }
 }
 
+fn check_manual_refresh_readiness(
+    health: &crate::agent_automation::CompanionHealth,
+) -> Result<(), String> {
+    use crate::agent_automation::CompanionSessionStatus;
+    match health.status {
+        CompanionSessionStatus::Busy => Err("Browser companion is busy".into()),
+        CompanionSessionStatus::Unavailable => {
+            Err("Browser companion is unavailable; check Browser settings".into())
+        }
+        CompanionSessionStatus::AuthenticationRequired => {
+            Err("ChatGPT sign-in is required in the browser companion".into())
+        }
+        CompanionSessionStatus::Idle if !health.authenticated => {
+            Err("ChatGPT sign-in could not be verified in the browser companion".into())
+        }
+        CompanionSessionStatus::Idle
+            if health.active_action_id.is_some()
+                || !health.active_action_ids.is_empty()
+                || health.free_action_slots() == 0 =>
+        {
+            Err("Browser companion is busy".into())
+        }
+        CompanionSessionStatus::Idle => Ok(()),
+    }
+}
+
 async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration) {
     loop {
         let result = async {
@@ -527,11 +555,7 @@ async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration
             // while Chrome is warming. The refresh scheduler needs the fresh
             // idle/account observation before deciding to requeue this job.
             let health = client.ready_health(&CancellationToken::new()).await?;
-            if health.active_action_id.is_some()
-                || health.status == crate::agent_automation::CompanionSessionStatus::Busy
-            {
-                return Err("Browser companion is busy".to_string());
-            }
+            check_manual_refresh_readiness(&health)?;
             set_manual_refresh_phase(&state, &id, "running", None).await;
             refresh_saved_connector(&state, &client).await
         }
@@ -612,6 +636,50 @@ mod tests {
         assert_eq!(
             visible_connector_refresh(Some(schema.clone()), Some(manual), None, None),
             Some(schema),
+        );
+    }
+    #[test]
+    fn manual_refresh_requires_a_fresh_authenticated_free_browser_lane() {
+        let fixture = |status: &str, authenticated: bool, slots: usize, active: Vec<&str>| {
+            serde_json::from_value::<crate::agent_automation::CompanionHealth>(json!({
+                "protocolVersion":1,"kind":"codexify-browser-companion",
+                "build":"test","status":status,"authenticated":authenticated,
+                "accountFingerprint":if authenticated {Some("account")} else {None},
+                "activeActionId":null,"activeActionIds":active,
+                "availableActionSlots":slots,"actionCapacity":1,
+            }))
+            .unwrap()
+        };
+        assert!(check_manual_refresh_readiness(&fixture("idle", true, 1, vec![])).is_ok());
+        assert!(
+            check_manual_refresh_readiness(&fixture("busy", true, 0, vec![]))
+                .unwrap_err()
+                .contains("busy")
+        );
+        assert!(
+            check_manual_refresh_readiness(&fixture("idle", true, 0, vec![]))
+                .unwrap_err()
+                .contains("busy")
+        );
+        assert!(
+            check_manual_refresh_readiness(&fixture("idle", true, 1, vec!["owned"]))
+                .unwrap_err()
+                .contains("busy")
+        );
+        assert!(
+            check_manual_refresh_readiness(&fixture("idle", false, 1, vec![]))
+                .unwrap_err()
+                .contains("sign-in")
+        );
+        assert!(
+            check_manual_refresh_readiness(&fixture("authentication_required", false, 0, vec![]))
+                .unwrap_err()
+                .contains("sign-in")
+        );
+        assert!(
+            check_manual_refresh_readiness(&fixture("unavailable", false, 0, vec![]))
+                .unwrap_err()
+                .contains("unavailable")
         );
     }
     #[derive(Clone, Default)]
