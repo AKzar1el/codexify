@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory=$true)][string]$Candidate,
   [Parameter(Mandatory=$true)][string]$ReportDirectory,
   [switch]$Deploy,
-  [switch]$InterruptNativeCommands
+  [switch]$InterruptNativeCommands,
+  [string]$ExpectedProfile
 )
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -26,7 +27,7 @@ Record ('MAINTENANCE_MODE='+$(if($Deploy){'deploy'}else{'dryrun'})+
     ' PARENT_IMAGE='+$(if($ancestor){$ancestor.Name}else{'unknown'}))
 $installer=Join-Path $PSScriptRoot 'windows-deploy-native-readiness-fix.ps1'
 try {
-  & $installer -Candidate $Candidate -Deploy:$Deploy -InterruptNativeCommands:$InterruptNativeCommands 2>&1 | ForEach-Object {
+  & $installer -Candidate $Candidate -Deploy:$Deploy -InterruptNativeCommands:$InterruptNativeCommands -ExpectedProfile $ExpectedProfile 2>&1 | ForEach-Object {
     $line=($_|Out-String).Trim()
     if($line){Record $line}
   }

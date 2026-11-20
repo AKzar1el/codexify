@@ -1,8 +1,17 @@
-param([Parameter(Mandatory=$true)][string]$Candidate,[switch]$Deploy,[switch]$InterruptNativeCommands)
+param(
+  [Parameter(Mandatory=$true)][string]$Candidate,
+  [switch]$Deploy,
+  [switch]$InterruptNativeCommands,
+  [string]$ExpectedProfile
+)
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $root=Join-Path $env:USERPROFILE '.codexify'
 $live=Join-Path $root 'bin\codexify.exe'
+if($ExpectedProfile -and
+   [IO.Path]::GetFullPath($env:USERPROFILE) -ine [IO.Path]::GetFullPath($ExpectedProfile)){
+  throw 'Administrator approval used a different Windows account; refusing to modify that profile'
+}
 $rootFull=[IO.Path]::GetFullPath($root)
 $candidateFull=[IO.Path]::GetFullPath($Candidate)
 $project=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -23,6 +32,11 @@ if(-not $Deploy){
   Write-Output ('DRY_RUN_INSTALLED_SHA='+$oldHash)
   Write-Output 'NO_SERVICE_OR_FILE_CHANGES=true'
   return
+}
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$principal=[Security.Principal.WindowsPrincipal]::new($identity)
+if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+  throw 'Administrator approval is required to manage the existing Codexify scheduled task'
 }
 # A native service replacement kills its owning Windows Job Object. When this
 # installer is spawned by a Codexify tool, it belongs to the same tree and
