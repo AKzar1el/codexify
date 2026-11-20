@@ -20,7 +20,8 @@ foreach($item in $all){
   if($path -ine $expected -and (-not $runtime -or -not $path.StartsWith($runtime,[StringComparison]::OrdinalIgnoreCase))){continue}
   $parent=$parents[[int]$item.ParentProcessId]
   # A PID reused after Chrome was created is not its owner.
-  if($parent -and $parent.CreationDate -le $item.CreationDate){continue}
+  # Compare UTC instants: local wall-clock times repeat during the DST fold.
+  if($parent -and $parent.CreationDate.ToUniversalTime() -le $item.CreationDate.ToUniversalTime()){continue}
   $profiles=[regex]::Matches($item.CommandLine,'(?:^|\s)(?:"--user-data-dir=([^"]+)"|--user-data-dir="([^"]+)"|--user-data-dir=([^\s"]+))(?=\s|$)')
   if($profiles.Count -ne 1){continue}
   $value=@($profiles[0].Groups[1].Value,$profiles[0].Groups[2].Value,$profiles[0].Groups[3].Value | Where-Object {$_})[0]
@@ -31,7 +32,7 @@ foreach($item in $all){
   $current=Get-CimInstance Win32_Process -Filter ("ProcessId="+[int]$item.ProcessId)
   if(-not $current -or $current.CreationDate -ne $item.CreationDate -or $current.ExecutablePath -ine $item.ExecutablePath -or $current.CommandLine -cne $item.CommandLine){continue}
   $parent=Get-CimInstance Win32_Process -Filter ("ProcessId="+[int]$current.ParentProcessId)
-  if($parent -and $parent.CreationDate -le $current.CreationDate){continue}
+  if($parent -and $parent.CreationDate.ToUniversalTime() -le $current.CreationDate.ToUniversalTime()){continue}
   $process=Get-Process -Id $current.ProcessId -ErrorAction SilentlyContinue
   if(-not $process){continue}
   try {
