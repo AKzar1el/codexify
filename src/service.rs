@@ -1042,15 +1042,40 @@ fn windows_start_script() -> String {
 fn windows_stop_script() -> String {
     let task = powershell_quote(WINDOWS_TASK);
     format!(
-        "$ErrorActionPreference = 'Stop'\n$task = Get-ScheduledTask -TaskName {task} -ErrorAction Stop\nStop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue\n"
+        "$ErrorActionPreference = 'Stop'\n$task = Get-ScheduledTask -TaskName {task} -ErrorAction Stop\nif ([string]$task.State -eq 'Running') {{ Stop-ScheduledTask -InputObject $task -ErrorAction Stop }}\n{}",
+        windows_verify_native_stopped_script()
     )
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn windows_verify_native_stopped_script() -> &'static str {
+    // Task Scheduler may mark the task Ready while the script's native
+    // supervisor and listener are still running. Never report a successful
+    // stop or launch another instance until the exact installed pair exits.
+    r#"$taskRoot = [string]$task.Actions[0].WorkingDirectory
+if ([string]::IsNullOrWhiteSpace($taskRoot) -or -not [IO.Path]::IsPathRooted($taskRoot)) {
+  throw 'Codexify scheduled task has no trusted working directory'
+}
+$nativeExecutable = [IO.Path]::GetFullPath((Join-Path $taskRoot 'bin\codexify.exe'))
+$stopDeadline = [DateTime]::UtcNow.AddSeconds(15)
+do {
+  $remainingNative = @(Get-CimInstance Win32_Process -Filter "Name='codexify.exe'" -ErrorAction Stop |
+    Where-Object { $_.ExecutablePath -ieq $nativeExecutable })
+  if ($remainingNative.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 500
+} while ([DateTime]::UtcNow -lt $stopDeadline)
+if ($remainingNative.Count -gt 0) {
+  $remainingIds = ($remainingNative.ProcessId -join ',')
+  throw "Codexify scheduled task stopped but native processes remain (PIDs: $remainingIds); refusing to report success or start a duplicate"
+}
+"#
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_restart_script() -> String {
-    let task = powershell_quote(WINDOWS_TASK);
     format!(
-        "$ErrorActionPreference = 'Stop'\n$task = Get-ScheduledTask -TaskName {task} -ErrorAction Stop\nStop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue\nStart-ScheduledTask -InputObject $task\n"
+        "{}Start-ScheduledTask -InputObject $task -ErrorAction Stop\n",
+        windows_stop_script()
     )
 }
 
@@ -2622,10 +2647,26 @@ mod tests {
         let stop = windows_stop_script();
         assert!(stop.contains("Stop-ScheduledTask"));
         assert!(!stop.contains("Start-ScheduledTask"));
+        assert!(stop.contains("if ([string]$task.State -eq 'Running')"));
+        assert!(stop.contains("Stop-ScheduledTask -InputObject $task -ErrorAction Stop"));
+        assert!(stop.contains("Get-CimInstance Win32_Process"));
+        assert!(stop.contains("native processes remain"));
+        assert!(
+            !stop.contains("Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue")
+        );
 
         let restart = windows_restart_script();
         assert!(restart.contains("Stop-ScheduledTask"));
         assert!(restart.contains("Start-ScheduledTask"));
+        let stop_check = restart.find("if ($remainingNative.Count -gt 0)").unwrap();
+        let start_task = restart
+            .find("Start-ScheduledTask -InputObject $task")
+            .unwrap();
+        assert!(
+            stop_check < start_task,
+            "restart must validate native exit first"
+        );
+        assert!(restart.contains("refusing to report success or start a duplicate"));
 
         for script in [start, stop, restart] {
             assert!(!script.contains("Enable-ScheduledTask"), "{script}");
