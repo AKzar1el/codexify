@@ -128,12 +128,40 @@ function Idle {
     return $true
   }catch{return $false}
 }
+function Browser-Has-No-Active-Send {
+  # During a native stop, its /health may legitimately stop responding and a
+  # read-only turn-handoff can reserve the only browser lane. Neither condition
+  # is proof of an in-flight Send. Fail closed on any unobservable browser lane
+  # or on an owned/pending Send or action cleanup.
+  try {
+    $path=Join-Path $root 'browser\descriptor.json'
+    if(-not(Test-Path -LiteralPath $path -PathType Leaf)){return $false}
+    $descriptor=Get-Content -LiteralPath $path -Raw|ConvertFrom-Json
+    $headers=@{Authorization='Bearer '+$descriptor.token}
+    $snapshot=Invoke-RestMethod -Uri ($descriptor.endpoint.TrimEnd('/')+'/v1/diagnostics/readiness') -Headers $headers -TimeoutSec 5
+    if($snapshot.closed -or $snapshot.maintenance -or -not $snapshot.lanes){return $false}
+    foreach($lane in $snapshot.lanes){
+      if($lane.activeAction -or $lane.pendingAction -or
+         $lane.actionCleanupPending -or $lane.connectorRefreshPending -or $lane.retired){
+        return $false
+      }
+    }
+    return $true
+  }catch{return $false}
+}
 function Stop-VerifiedUnresponsiveNativePair {
   # The installed service's Windows Stop-ScheduledTask script suppresses
   # errors, so a successful CLI receipt does not prove that its processes quit.
   # Only terminate the exact installed supervisor/listener pair that was
   # verified *before* invoking service stop, and only if no work is active.
-  if(-not(Idle)){throw 'Native/browser work became active; refusing forced native stop'}
+  if($InterruptNativeCommands){
+    if(-not(Browser-Has-No-Active-Send)){
+      throw 'Browser action ownership could not be ruled out; refusing forced native stop'
+    }
+    Write-Output 'NO_BROWSER_SEND_OWNERSHIP_VERIFIED=true'
+  } elseif(-not(Idle)){
+    throw 'Native/browser work became active; refusing forced native stop'
+  }
   $task=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
   if((-not $task.Settings.Enabled -and -not $script:taskTemporarilyDisabled) -or
      $task.Principal.LogonType -ne 'Interactive' -or
