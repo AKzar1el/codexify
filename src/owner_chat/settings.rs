@@ -504,7 +504,10 @@ async fn run_manual_refresh(state: OwnerState, id: String, retry_after: Duration
     loop {
         let result = async {
             let client = super::schema_refresh::refresh_client(&state.config).await?;
-            let health = client.health(&CancellationToken::new()).await?;
+            // Passive health is deliberately short-budgeted and may say `busy`
+            // while Chrome is warming. The refresh scheduler needs the fresh
+            // idle/account observation before deciding to requeue this job.
+            let health = client.ready_health(&CancellationToken::new()).await?;
             if health.active_action_id.is_some()
                 || health.status == crate::agent_automation::CompanionSessionStatus::Busy
             {
@@ -568,14 +571,19 @@ mod tests {
         successes: Arc<std::sync::atomic::AtomicUsize>,
         release: Arc<tokio::sync::Notify>,
     }
-    async fn refresh_health(State(fixture): State<RefreshFixture>) -> Json<Value> {
+    async fn refresh_health(
+        State(fixture): State<RefreshFixture>,
+        uri: axum::http::Uri,
+    ) -> Json<Value> {
         use std::sync::atomic::Ordering;
         fixture.health_calls.fetch_add(1, Ordering::SeqCst);
+        let mode = fixture.mode.load(Ordering::SeqCst);
+        let ready = uri.query().is_some_and(|query| query == "ready=1");
         Json(
             json!({"protocolVersion":1,"kind":"codexify-browser-companion",
             "build":format!("{}{}",env!("CARGO_PKG_VERSION"),crate::agent_automation::PROTOCOL_BUILD_SUFFIX),
             "authenticated":true,"accountFingerprint":"fixture-account","activeActionId":null,
-            "status":if fixture.mode.load(Ordering::SeqCst)==0 {"busy"} else {"idle"}}),
+            "status":if mode==0 || (mode==5 && !ready) {"busy"} else {"idle"}}),
         )
     }
     async fn fixture_refresh(
@@ -772,6 +780,32 @@ mod tests {
         assert_eq!(done["result"]["refreshObserved"], true);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.successes.load(Ordering::SeqCst), 1);
+        owner.abort();
+        companion.abort();
+    }
+    #[tokio::test]
+    async fn manual_refresh_does_not_starve_on_a_warming_passive_health_result() {
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir().unwrap();
+        let (state, fixture, base, owner, companion) = refresh_fixture(root.path()).await;
+        // Chrome can be idle and authenticated while the passive health probe
+        // returns `busy` because its short observation budget expired.
+        fixture.mode.store(5, Ordering::SeqCst);
+        let receipt: Value = reqwest::Client::new()
+            .post(format!("{base}/api/settings/refresh-connector"))
+            .bearer_auth("owner-test-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(receipt["phase"], "queued");
+        let done = wait_refresh_phase(&state, "completed").await;
+        assert_eq!(done["refreshId"], receipt["refreshId"]);
+        assert_eq!(done["result"]["refreshObserved"], true);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(fixture.health_calls.load(Ordering::SeqCst) >= 1);
         owner.abort();
         companion.abort();
     }
