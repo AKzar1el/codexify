@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Candidate,[switch]$Deploy)
+param([Parameter(Mandatory=$true)][string]$Candidate,[switch]$Deploy,[switch]$InterruptNativeCommands)
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $root=Join-Path $env:USERPROFILE '.codexify'
@@ -98,9 +98,12 @@ function Active-NativeChildCommands {
 function Idle {
   try {
     $h=Invoke-RestMethod -Uri 'http://127.0.0.1:3000/health' -TimeoutSec 5
-    if($h.status -ne 'ok' -or $h.filesystem.occupiedWorkerSlots -gt 0 -or $h.filesystem.queuedRequests -gt 0){return $false}
-    foreach($u in $h.upstreams.PSObject.Properties){if($u.Value.activeRequests -gt 0 -or $u.Value.queuedRequests -gt 0){return $false}}
-    if(Active-NativeChildCommands){return $false}
+    if($h.status -ne 'ok'){return $false}
+    if(-not $InterruptNativeCommands){
+      if($h.filesystem.occupiedWorkerSlots -gt 0 -or $h.filesystem.queuedRequests -gt 0){return $false}
+      foreach($u in $h.upstreams.PSObject.Properties){if($u.Value.activeRequests -gt 0 -or $u.Value.queuedRequests -gt 0){return $false}}
+      if(Active-NativeChildCommands){return $false}
+    }
     $desc=Join-Path $root 'browser\descriptor.json'
     if(Test-Path -LiteralPath $desc){
       $d=Get-Content -LiteralPath $desc -Raw|ConvertFrom-Json
@@ -157,6 +160,7 @@ $stopped=$false
 $replaced=$false
 try {
   Write-Output 'STAGE_VERIFIED=true'
+  if($InterruptNativeCommands){Write-Output 'AUTHORIZED_NATIVE_COMMAND_INTERRUPTION=true'}
   $deadline=[DateTime]::UtcNow.AddMinutes(3)
   while(-not(Idle) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Seconds 3}
   if(-not(Idle)){throw 'Native or browser activity remained busy; original service preserved'}
@@ -165,11 +169,26 @@ try {
     Where-Object {$_.ExecutablePath -ieq $live})
   $stopped=$true
   RunCli $live @('service','stop')
-  $deadline=[DateTime]::UtcNow.AddSeconds(9)
+  $deadline=[DateTime]::UtcNow.AddSeconds(7)
   while([DateTime]::UtcNow -lt $deadline){
     $p=@(Get-CimInstance Win32_Process -Filter "Name='codexify.exe'"|Where-Object {$_.ExecutablePath -ieq $live})
     if($p.Count -eq 0){break}
     Start-Sleep -Milliseconds 500
+  }
+  if($p.Count -gt 0){
+    # The CLI currently suppresses Stop-ScheduledTask errors and can report
+    # success while the scheduled task remains running. A real failure should
+    # not be ignored; explicitly stop the existing task from this independent
+    # maintenance process before falling back to the verified process pair.
+    try {
+      $task=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
+      Stop-ScheduledTask -InputObject $task -ErrorAction Stop
+      Write-Output 'SCHEDULED_TASK_STOP_REQUESTED=true'
+    } catch {
+      Write-Output ('SCHEDULED_TASK_STOP_FAILED='+$_.Exception.GetType().Name)
+    }
+    Start-Sleep -Seconds 3
+    $p=@(Get-CimInstance Win32_Process -Filter "Name='codexify.exe'"|Where-Object {$_.ExecutablePath -ieq $live})
   }
   if($p.Count -gt 0){
     $currentIds=@($p | Select-Object -ExpandProperty ProcessId | Sort-Object) -join ','
