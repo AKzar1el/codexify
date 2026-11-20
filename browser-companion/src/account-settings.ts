@@ -195,7 +195,39 @@ async function allowAllChoice(page:Page,signal?:AbortSignal) {
       await trigger.click({timeout:3_000,signal});
     }
   }
-  await radios.first().waitFor({state:"visible",timeout:10_000,signal});
+  try{
+    await radios.first().waitFor({state:"visible",timeout:10_000,signal});
+  }catch(error){
+    // Browser-side UI compatibility diagnostics, never account contents. This
+    // records only DOM control counts and fixed permission-option matches.
+    if(!signal?.aborted){
+      try{
+        const shape=await observeReadOnly(page.evaluate(()=>{
+          const visible=(node:Element)=>node.getClientRects().length>0;
+          const count=(selector:string)=>[...document.querySelectorAll(selector)].filter(visible).length;
+          const labels=new Set(["allow all actions","allow all tools","never ask","permitir todo","tout autoriser","consenti tutto","dovoli vsa dejanja"]);
+          const choices=[...document.querySelectorAll('button,label,span,[role="radio"],[role="option"],[role="menuitemradio"]')].filter(visible)
+            .filter(node=>node.children.length<=2&&labels.has((node.textContent??"").normalize("NFKC").replace(/\s+/g," ").trim().toLowerCase()));
+          const path=location.pathname;
+          return {
+            pageType:path.endsWith("/permissions")?"permissions":path.includes("/settings/plugins-settings/")?"plugin-settings":"other",
+            visibleRadios:count('[role="radio"],input[type="radio"]'),
+            allRadios:document.querySelectorAll('[role="radio"],input[type="radio"]').length,
+            permissionTriggers:count('[data-action="plugin-permissions"],[data-testid="plugin-permission-trigger"]'),
+            menuItemRadios:count('[role="menuitemradio"]'),
+            ariaCheckedControls:count('[aria-checked]'),
+            ariaSelectedOptions:count('[role="option"][aria-selected]'),
+            visibleDialogs:count('[role="dialog"]'),
+            visibleButtons:count('button'),
+            recognizedAllowAllLabels:choices.length,
+            recognizedAllowAllSelected:choices.filter(node=>node.getAttribute("aria-checked")==="true"||node.getAttribute("aria-selected")==="true"||node.getAttribute("data-state")==="checked").length,
+          };
+        }),signal,1_500);
+        console.warn(`[connector-permission-shape] ${JSON.stringify(shape)}`);
+      }catch{console.warn("[connector-permission-shape] observation unavailable");}
+    }
+    throw error;
+  }
   if(await observeReadOnly(radios.count(),signal)!==4)throw selectorDrift("ChatGPT permission choices changed; Allow all was not selected");
   const choice=radios.nth(3);
   const checked=()=>observeReadOnly(choice.getAttribute("aria-checked").then(value=>value==="true").then(async value=>value||await choice.isChecked().catch(()=>false)),signal);

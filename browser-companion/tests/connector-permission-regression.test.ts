@@ -15,7 +15,7 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")(
       const appId="asdk_app_fixture",name="Fixture connector";
       let mode:"allow_all"|"read_only"="allow_all";
       let permissionMetadata:string|null=null,selectedLabel="Allow all actions";
-      let permissionVisits=0,permissionChanges=0,deleteRequests=0;
+      let permissionVisits=0,permissionChanges=0,deleteRequests=0,omitControls=false;
 
       await page.context().route("https://chatgpt.com/**",async route=>{
         const path=new URL(route.request().url()).pathname;
@@ -29,6 +29,8 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")(
         if(path==="/delete"){deleteRequests++;return route.fulfill({json:{ok:true}});}
         if(path.endsWith("/permissions")){
           permissionVisits++;
+          if(omitControls)return route.fulfill({contentType:"text/html; charset=utf-8",
+            body:'<h2>Permissions</h2><p>Private example description that must never be logged</p>'});
           const options=["Ask every time","Read only","Low risk","Allow all actions"].map((label,index)=>
             '<div role="radio" aria-checked="'+String(index===(mode==="allow_all"?3:1))+'" tabindex="0">'+label+'</div>',
           ).join("");
@@ -85,6 +87,20 @@ test.skipIf(process.env.CODEXIFY_TEST_BROWSER_COMPANION_CHROME!=="1")(
       expect(verified?.allowAll).toBe(true);
       expect(deleteRequests).toBe(0);
       expect(page.context().pages()).toEqual([page]);
+      // Unknown permission markup remains fail-closed and reports only a
+      // bounded structural shape, never arbitrary private page content.
+      omitControls=true;
+      const warnings:string[]=[];
+      const originalWarn=console.warn;
+      console.warn=(...items:unknown[])=>{warnings.push(items.map(String).join(" "));};
+      try{
+        await expect(setConnectorAllowAll(page,appId,account)).rejects.toThrow("Timeout");
+      }finally{console.warn=originalWarn;}
+      const diagnostic=warnings.find(line=>line.startsWith("[connector-permission-shape]"));
+      expect(diagnostic).toBeDefined();
+      expect(diagnostic).toContain('"pageType":"permissions"');
+      expect(diagnostic).toContain('"visibleRadios":0');
+      expect(diagnostic).not.toContain("Private example description");
     } finally {
       await browser.close();
     }
