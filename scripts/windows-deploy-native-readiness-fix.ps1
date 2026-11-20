@@ -195,8 +195,15 @@ function Stop-VerifiedUnresponsiveNativePair {
       throw 'Native process identity changed before stop'
     }
   }
-  Stop-Process -Id $supervisor.ProcessId -Force -ErrorAction Stop
-  Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
+  foreach($verified in @($supervisor,$listener)){
+    $current=Get-CimInstance Win32_Process -Filter ('ProcessId='+[int]$verified.ProcessId)
+    if(-not $current){continue} # Supervisor exit can close the listener too.
+    if($current.ExecutablePath -ine $live -or
+       $current.CreationDate -ne $verified.CreationDate){
+      throw 'Native process identity changed during stop; refusing unrelated process'
+    }
+    Stop-Process -Id $verified.ProcessId -Force -ErrorAction Stop
+  }
   Write-Output 'VERIFIED_STALE_NATIVE_PAIR_STOPPED=true'
 }
 $stopped=$false
