@@ -292,6 +292,22 @@ export class SingleWindowCoordinator {
       || this.actionCleanupPending || this.observationCleanupPending;
   }
 
+  /** Private, browser-free evidence for diagnosing a stuck lease. No page or account data. */
+  readinessSnapshot() {
+    return {
+      busy:this.busy,
+      retired:this.retired,
+      activeAction:this.activeActionId !== null,
+      pendingAction:this.pendingActionId !== null,
+      windowOperationActive:this.windowOperationActive,
+      observationCleanupPending:this.observationCleanupPending,
+      actionCleanupPending:this.actionCleanupPending,
+      connectorRefreshPending:this.connectorRefreshPending,
+      driverClosed:this.driverClosed,
+      closing:this.closing,
+    };
+  }
+
   // An admitted action owns its page before its asynchronous preflight starts.
   get ownedActionId():string | null { return this.activeActionId ?? this.pendingActionId; }
   get retiredWindow():boolean {return this.retired;}

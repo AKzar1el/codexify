@@ -13,7 +13,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { SingleWindowCoordinator } from "./browser-window";
-type BrowserCoordinator = Pick<SingleWindowCoordinator,"build"|"liveness"|"presentation"|"setPresentationStyle"|"health"|"readyHealth"|"login"|"capabilities"|"accountPlan"|"turnHandoffComplete"|"approvePendingConversation"|"refreshConnector"|"newChatCapabilities"|"reveal"|"execute"|"cancel"|"action"|"events"|"close"|"navigationAvailability"|"releasePairingWindow"|"refreshPairingWindow">;
+type BrowserCoordinator = Pick<SingleWindowCoordinator,"build"|"liveness"|"presentation"|"setPresentationStyle"|"health"|"readyHealth"|"login"|"capabilities"|"accountPlan"|"turnHandoffComplete"|"approvePendingConversation"|"refreshConnector"|"newChatCapabilities"|"reveal"|"execute"|"cancel"|"action"|"events"|"close"|"navigationAvailability"|"releasePairingWindow"|"refreshPairingWindow"> & {readinessSnapshot:()=>unknown};
 import {validateNewChatProjectUrl} from "./new-chat";
 import { asCompanionError,type BrowserStage,type BrowserFailureCode } from "./errors";
 import {
@@ -172,6 +172,9 @@ async function route(
   if(request.method === "GET" && url.pathname === "/v1/liveness") {
     json(response,200,await coordinator.liveness());return;
   }
+  if(request.method === "GET" && url.pathname === "/v1/diagnostics/readiness") {
+    json(response,200,coordinator.readinessSnapshot());return;
+  }
   if(request.method === "GET" && url.pathname === "/v1/diagnostics/presentation") {
     const screenshot=z.enum(["0","1"]).parse(url.searchParams.get("screenshot")??"0")==="1";
     json(response,200,await coordinator.presentation(operation.signal,screenshot));return;
@@ -205,7 +208,8 @@ async function route(
   }
   if(request.method === "POST" && url.pathname === "/v1/turns/handoff") {
     const body=z.strictObject({url:chatGptUrlSchema,expectedAccountFingerprint:opaqueIdSchema,handoffId:z.string().regex(/^renew-[a-f0-9]{64}$/)}).parse(await readJson(request));
-    json(response,200,await coordinator.turnHandoffComplete(body.url,body.expectedAccountFingerprint,body.handoffId,operation.signal));return;
+    try {json(response,200,await coordinator.turnHandoffComplete(body.url,body.expectedAccountFingerprint,body.handoffId,operation.signal));}
+    catch(error){if(error instanceof Error&&error.message.toLowerCase().includes("busy"))throw new ClientError(423,"Handoff inspection deferred while the shared browser is busy");throw error;}return;
   }
   if(request.method === "POST" && url.pathname === "/v1/approvals/conversation") {
     const body=conversationApprovalRequestSchema.parse(await readJson(request));

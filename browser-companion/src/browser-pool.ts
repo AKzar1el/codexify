@@ -5,7 +5,7 @@ import {canonicalChatGptConversationUrl,executeActionRequestSchema,cancelActionR
   COMPANION_KIND,PROTOCOL_VERSION,type CompanionHealth,type ActionSnapshot,type ExecuteActionRequest} from "./protocol";
 
 type Coordinator = SingleWindowCoordinator;
-type Lane = {coordinator:Coordinator;reserved:boolean;lastUsed:number};
+type Lane = {coordinator:Coordinator;reserved:boolean;reservationPurpose:"approval"|"handoff"|"action"|null;lastUsed:number};
 type OwnedAction = {lane:Lane;digest:string;key:string;conversation:string};
 
 /** Fixed pages share one private profile, while action state and DOM ownership
@@ -20,13 +20,17 @@ export class PooledWindowCoordinator {
   private dispatchTail:Promise<void>=Promise.resolve();
   private maintenance=false;
   private closed=false;
+  private nextHandoffEligibleAt=0;
 
-  constructor(coordinators:readonly Coordinator[],readonly build:string,private readonly closeContext?:()=>Promise<void>) {
+  constructor(coordinators:readonly Coordinator[],readonly build:string,private readonly closeContext?:()=>Promise<void>,private readonly handoffGapMs=8_000) {
     if(coordinators.length<1||coordinators.length>4)throw new Error("Browser action pages must be between one and four");
-    this.lanes=coordinators.map(coordinator=>({coordinator,reserved:false,lastUsed:0}));
+    if(!Number.isInteger(handoffGapMs)||handoffGapMs<0||handoffGapMs>30_000)throw new Error("Invalid browser handoff inspection gap");
+    this.lanes=coordinators.map(coordinator=>({coordinator,reserved:false,reservationPurpose:null,lastUsed:0}));
   }
 
   private free(lane:Lane):boolean {return !lane.reserved&&!lane.coordinator.busy;}
+  /** Keep passive approval monitoring out of an already owned browser lane. */
+  get busy():boolean {return this.closed||this.maintenance||this.lanes.some(l=>!this.free(l));}
   private capacity(health:CompanionHealth,available:number):CompanionHealth {
     const activeActionIds=this.lanes.map(l=>l.coordinator.ownedActionId).filter((id):id is string=>id!==null);
     return {...health,actionCapacity:this.lanes.length,availableActionSlots:available,activeActionIds,
@@ -49,6 +53,12 @@ export class PooledWindowCoordinator {
   }
   health=()=>this.observe(false);
   readyHealth=()=>this.observe(true);
+  /** Authenticated local diagnostic; never read a page or expose account details. */
+  readinessSnapshot() {
+    return {maintenance:this.maintenance,closed:this.closed,
+      handoffCooldownRemainingMs:Math.max(0,this.nextHandoffEligibleAt-Date.now()),
+      lanes:this.lanes.map(l=>({reserved:l.reserved,reservationPurpose:l.reservationPurpose,...l.coordinator.readinessSnapshot()}))};
+  }
   async liveness() {
     const results=await Promise.all(this.lanes.map(l=>l.coordinator.liveness()));
     return {protocolVersion:PROTOCOL_VERSION,build:this.build,available:!this.closed&&results.some(r=>r.available)};
@@ -67,7 +77,11 @@ export class PooledWindowCoordinator {
     const entry=[...this.actions.values()].reverse().find(a=>a.conversation===key);
     return entry?.lane;
   }
-  private async onConversation<T>(url:string,operation:(coordinator:Coordinator)=>Promise<T>):Promise<T> {
+  private async onConversation<T>(url:string,operation:(coordinator:Coordinator)=>Promise<T>,purpose:"approval"|"handoff"):Promise<T> {
+    // Repeated unfinished handoff probes can otherwise monopolize the one
+    // shared browser tab. Deferral is an error, never a fake negative proof.
+    if(purpose==="handoff"&&Date.now()<this.nextHandoffEligibleAt)
+      throw new BrowserCompanionError("Browser companion is busy; handoff inspection deferred");
     const preferred=this.laneFor(url);
     const key=canonicalChatGptConversationUrl(url);
     if(this.observations.has(key))throw new BrowserCompanionError("This ChatGPT conversation is being inspected");
@@ -75,9 +89,12 @@ export class PooledWindowCoordinator {
       throw new BrowserCompanionError("This ChatGPT conversation already owns an action");
     const lane=preferred&&this.free(preferred)?preferred:this.lanes.find(l=>this.free(l));
     if(this.closed||this.maintenance||!lane)throw new BrowserCompanionError("Browser companion action pages are busy");
-    lane.reserved=true;
+    lane.reserved=true;lane.reservationPurpose=purpose;
     this.observations.add(key);
-    try {return await operation(lane.coordinator);}finally{this.observations.delete(key);lane.reserved=false;}
+    try {return await operation(lane.coordinator);}finally{
+      if(purpose==="handoff")this.nextHandoffEligibleAt=Date.now()+this.handoffGapMs;
+      this.observations.delete(key);lane.reserved=false;lane.reservationPurpose=null;
+    }
   }
   login:Coordinator["login"]=signal=>this.exclusive(c=>c.login(signal));
   capabilities:Coordinator["capabilities"]=signal=>this.exclusive(c=>c.capabilities(signal));
@@ -87,8 +104,8 @@ export class PooledWindowCoordinator {
   setPresentationStyle:Coordinator["setPresentationStyle"]=(css,signal)=>this.exclusive(c=>c.setPresentationStyle(css,signal));
   presentation:Coordinator["presentation"]=(signal,screenshot)=>this.exclusive(c=>c.presentation(signal,screenshot));
   reveal:Coordinator["reveal"]=(url,signal)=>this.exclusive(c=>c.reveal(url,signal));
-  turnHandoffComplete:Coordinator["turnHandoffComplete"]=(url,account,id,signal)=>this.onConversation(url,c=>c.turnHandoffComplete(url,account,id,signal));
-  approvePendingConversation:Coordinator["approvePendingConversation"]=(request,signal,navigate,once)=>this.onConversation(request.url,c=>c.approvePendingConversation(request,signal,navigate,once));
+  turnHandoffComplete:Coordinator["turnHandoffComplete"]=(url,account,id,signal)=>this.onConversation(url,c=>c.turnHandoffComplete(url,account,id,signal),"handoff");
+  approvePendingConversation:Coordinator["approvePendingConversation"]=(request,signal,navigate,once)=>this.onConversation(request.url,c=>c.approvePendingConversation(request,signal,navigate,once),"approval");
   // Navigation budgets are shared by every page in the profile.
   navigationAvailability:Coordinator["navigationAvailability"]=url=>(this.laneFor(url)??this.lanes[0]!).coordinator.navigationAvailability(url);
   // A retained pairing window belongs to the page that created the chat.
@@ -138,7 +155,7 @@ export class PooledWindowCoordinator {
         }
         if(this.actions.size>=this.lanes.length*1100)throw new Error("Browser action history is full");
       }
-      lane.reserved=true;lane.lastUsed=Date.now();
+      lane.reserved=true;lane.reservationPurpose="action";lane.lastUsed=Date.now();
       // Persist pool ownership before any asynchronous page preflight. Failed
       // preflight can be retried only if the single-page coordinator recorded it.
       const owned={lane,digest,key:request.idempotencyKey,conversation};
@@ -149,7 +166,7 @@ export class PooledWindowCoordinator {
           this.actions.delete(request.actionId);this.keys.delete(request.idempotencyKey);
         }
         throw error;
-      } finally {lane.reserved=false;}
+      } finally {lane.reserved=false;lane.reservationPurpose=null;}
     } finally {release();}
   }
   private async owner(actionId:string):Promise<Coordinator | undefined> {

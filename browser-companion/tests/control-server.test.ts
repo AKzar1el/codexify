@@ -5,6 +5,7 @@ import { mkdtemp } from "node:fs/promises";
 import { expect, test } from "bun:test";
 import type { CapabilityCatalog, ConversationApprovalRequest, ExecuteActionRequest } from "../src/protocol";
 import { SingleWindowCoordinator, type BrowserDriver, type DriverExecution } from "../src/browser-window";
+import {PooledWindowCoordinator} from "../src/browser-pool";
 import { startControlServer } from "../src/control-server";
 import { protocolBuild } from "../src/protocol";
 import { BrowserCompanionError } from "../src/errors";
@@ -74,6 +75,98 @@ class BlockingDriver extends ImmediateDriver {
     });
   }
 }
+
+test("private readiness diagnostic identifies maintenance without an action or account data",async()=>{
+  let entered!:()=>void,release!:()=>void;
+  const enteredPromise=new Promise<void>(resolve=>entered=resolve);
+  const gate=new Promise<void>(resolve=>release=resolve);
+  class MaintenanceDriver extends ImmediateDriver {
+    override async capabilities():Promise<CapabilityCatalog> {
+      entered();
+      await gate;
+      return super.capabilities();
+    }
+  }
+  const root=await mkdtemp(join(tmpdir(),"browser-readiness-"));
+  const coordinator=new PooledWindowCoordinator([new SingleWindowCoordinator(new MaintenanceDriver(),TEST_BUILD)],TEST_BUILD);
+  const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+  try {
+    const url=server.endpoint+"/v1/diagnostics/readiness";
+    expect((await fetch(url)).status).toBe(401);
+    const headers={Authorization:"Bearer "+server.token};
+    expect(await(await fetch(url,{headers})).json()).toMatchObject({
+      maintenance:false,closed:false,lanes:[{reserved:false,busy:false,windowOperationActive:false}],
+    });
+    const task=coordinator.capabilities();
+    await enteredPromise;
+    const blocked=await(await fetch(url,{headers})).json();
+    expect(blocked).toMatchObject({
+      maintenance:true,lanes:[{busy:true,windowOperationActive:true,activeAction:false,pendingAction:false}],
+    });
+    expect(JSON.stringify(blocked)).not.toContain("account-test");
+    expect(JSON.stringify(blocked)).not.toContain("chatgpt.com");
+    release();
+    await task;
+    expect(await(await fetch(url,{headers})).json()).toMatchObject({
+      maintenance:false,lanes:[{busy:false,windowOperationActive:false}],
+    });
+  }finally{release();await server.close();}
+});
+
+test("readiness identifies a handoff reservation without revealing conversation identifiers",async()=>{
+  let entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>entered=resolve);
+  const gate=new Promise<void>(resolve=>release=resolve);
+  class HandoffDriver extends ImmediateDriver {
+    async turnHandoffComplete(){
+      entered();
+      await gate;
+      return false;
+    }
+  }
+  const root=await mkdtemp(join(tmpdir(),"browser-handoff-readiness-"));
+  const coordinator=new PooledWindowCoordinator([new SingleWindowCoordinator(new HandoffDriver(),TEST_BUILD)],TEST_BUILD);
+  const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+  const url="https://chatgpt.com/c/private-handoff";
+  try {
+    const pending=coordinator.turnHandoffComplete(url,"account-test","renew-"+ "f".repeat(64));
+    await started;
+    const state=await(await fetch(server.endpoint+"/v1/diagnostics/readiness",{headers:{Authorization:"Bearer "+server.token}})).json();
+    expect(coordinator.busy).toBe(true);
+    expect(state).toMatchObject({maintenance:false,lanes:[{
+      reserved:true,reservationPurpose:"handoff",activeAction:false,pendingAction:false,windowOperationActive:true,
+    }]});
+    expect(JSON.stringify(state)).not.toContain("private-handoff");
+    release();
+    await pending;
+    expect(coordinator.busy).toBe(false);
+  }finally{release();await server.close();}
+});
+
+test("handoff probes defer with HTTP 423 instead of manufacturing a negative receipt",async()=>{
+  let reads=0;
+  class HandoffDriver extends ImmediateDriver {
+    async turnHandoffComplete(){reads++;return false;}
+  }
+  const root=await mkdtemp(join(tmpdir(),"browser-handoff-gap-"));
+  const coordinator=new PooledWindowCoordinator([new SingleWindowCoordinator(new HandoffDriver(),TEST_BUILD)],TEST_BUILD,undefined,45);
+  const server=await startControlServer(coordinator,join(root,"descriptor.json"));
+  const headers={Authorization:"Bearer "+server.token,"Content-Type":"application/json"};
+  const body=JSON.stringify({url:"https://chatgpt.com/c/handoff-gap",expectedAccountFingerprint:"account-test",handoffId:"renew-"+"f".repeat(64)});
+  const request=()=>fetch(server.endpoint+"/v1/turns/handoff",{method:"POST",headers,body});
+  try {
+    expect((await request()).status).toBe(200);
+    const deferred=await request();
+    expect(deferred.status).toBe(423);
+    expect(reads).toBe(1);
+    expect((await coordinator.readinessSnapshot()).handoffCooldownRemainingMs).toBeGreaterThan(0);
+    // Delaying a handoff must leave exclusive maintenance and refresh free to run.
+    expect((await coordinator.capabilities()).models).toHaveLength(1);
+    await Bun.sleep(65);
+    expect((await request()).status).toBe(200);
+    expect(reads).toBe(2);
+  }finally{await server.close();}
+});
 
 test("pairing lease renewal is authenticated and preserves the held page",async()=>{
   class PairDriver extends ImmediateDriver {
