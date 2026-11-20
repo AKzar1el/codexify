@@ -1,7 +1,7 @@
 import {observeReadOnly,RendererProbeGate} from "./observation";
 import type { Frame, Locator, Page } from "patchright";
 import {completedHandoff,createCompletedHandoffVerifier} from "./turn-renewal";
-import {classifyPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,setConnectorAllowAll,verifyConnectorAllowAll,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
+import {classifyPlan,identifyConnectorApp,observedConnectorApp,inspectConnectorSettings,beginConnectorToolRefresh,type ConnectorRefreshObservation,type AccountPlan} from "./account-settings";
 import {ConnectorAppCache} from "./connector-cache";
 import {DraftRecoveryJournal} from './draft-recovery';
 import {approveConversationCard,latestConversationApprovalCards,throwIfConversationApproval} from "./conversation-approval";
@@ -631,23 +631,20 @@ export class ChatGptBrowserDriver implements BrowserDriver {
     });
     void interrupted.catch(()=>{}); // Cancellation during preparation is handled by its bounded phase.
     try {
-      const before=await phase("Inspect connector settings",(page,account,operationSignal)=>inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal));
-      // A cached label is only a hint for diagnostics, never an authorization
-      // proof. Require a fresh, unambiguous permission state on this account.
-      const needsVerification=before?.allowAll!==true;
-      let permissionChanged=false;
-      if(needsVerification)permissionChanged=await phase("Verify connector permission",(page,account,operationSignal)=>setConnectorAllowAll(page,appId,account.fingerprint,operationSignal));
+      await phase("Inspect connector settings",(page,account,operationSignal)=>inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal));
+      // Refreshing the tool schema is not a request to elevate app permissions.
+      // Permissions may be on a separate connected-account UI or enforced by
+      // workspace policy, and the legacy /permissions radio page is optional.
+      // Never change a user's grant just to refresh tool metadata.
       observation=await phase("Start connector refresh",async(page,account,operationSignal)=>{
-        if(needsVerification)await verifyConnectorAllowAll(page,appId,account.fingerprint,operationSignal);
         const current=await inspectConnectorSettings(page,appId,name,account.fingerprint,operationSignal);
-        if(current?.allowAll!==true)throw new BrowserCompanionError("Connector permission could not be positively verified before refresh","external_interference");
-        if(current.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
+        if(current?.allowAll===true&&current.summary)this.connectorApps.rememberAllowAllSummary(account.fingerprint,name,current.summary);
         return beginConnectorToolRefresh(page,appId,name,account.fingerprint,operationSignal);
       });
       // The coordinator retains the shared window through confirmation and the
       // restoration below; other operations must not navigate away mid-refresh.
       const refreshObserved=await Promise.race([observation.wait(waitSignal),interrupted]);
-      return {appId,permissionChanged,refreshObserved,schemaVerified:false as const};
+      return {appId,permissionChanged:false,refreshObserved,schemaVerified:false as const};
     }catch(error){refreshFailure=error;throw error;}
     finally {
       waitSignal.removeEventListener("abort",onAbort);

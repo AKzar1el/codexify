@@ -450,19 +450,12 @@ export async function prepareConnectorRefresh(page:Page,name:string,expectedAcco
   const account=expectedAccountFingerprint??(await readChatGptAccount(page,signal)).fingerprint;
   const appId=knownAppId??await identifyConnectorApp(page,name,account,signal);
   const before=await inspectConnectorSettings(page,appId,name,account,signal);
-  let permissionChanged=false;
-  if(!before?.allowAll&&(!witness?.summary||before?.summary!==witness.summary)) {
-    traceRefresh("permission needs selection");
-    permissionChanged=await setConnectorAllowAll(page,appId,account,signal);
-    await connectorPage(page,appId,account,false,signal);
-    await page.getByText(name,{exact:true}).and(page.locator(':visible')).first().waitFor({state:"visible",timeout:5_000,signal});
-    await markRefreshButton(page);
-  }
-  const verified=await connectorPermissionSummary(page);
-  if(verified?.summary)witness?.remember(verified.summary);
-  traceRefresh("permission allows all");
+  // Tool refresh must not change the permission grant. The current UI may
+  // manage app/account permissions elsewhere or restrict them by policy.
+  if(before?.allowAll===true&&before.summary)witness?.remember(before.summary);
+  traceRefresh("refresh tools without changing ChatGPT-managed permissions");
   const observation=await beginConnectorToolRefresh(page,appId,name,account,signal);
-  return {appId,permissionChanged,observation};
+  return {appId,permissionChanged:false,observation};
 }
 
 export async function refreshConnectorTools(page:Page,name:string,expectedAccountFingerprint?:string,signal?:AbortSignal,knownAppId?:string,witness?:PermissionWitness):Promise<{appId:string;refreshObserved:boolean;permissionChanged:boolean;schemaVerified:false}> {
