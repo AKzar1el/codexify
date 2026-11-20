@@ -121,7 +121,8 @@ function Stop-VerifiedUnresponsiveNativePair {
   # verified *before* invoking service stop, and only if no work is active.
   if(-not(Idle)){throw 'Native/browser work became active; refusing forced native stop'}
   $task=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
-  if(-not $task.Settings.Enabled -or $task.Principal.LogonType -ne 'Interactive' -or
+  if((-not $task.Settings.Enabled -and -not $script:taskTemporarilyDisabled) -or
+     $task.Principal.LogonType -ne 'Interactive' -or
      $task.Principal.RunLevel -ne 'Limited' -or
      [IO.Path]::GetFullPath([string]$task.Actions[0].WorkingDirectory) -ine [IO.Path]::GetFullPath($root) -or
      [IO.Path]::GetFullPath([string]$task.Actions[0].Execute) -ine (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')){
@@ -158,6 +159,15 @@ function Stop-VerifiedUnresponsiveNativePair {
 }
 $stopped=$false
 $replaced=$false
+$script:taskTemporarilyDisabled=$false
+function Restore-TaskEnablement {
+  if(-not $script:taskTemporarilyDisabled){return}
+  Enable-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop | Out-Null
+  $task=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
+  if(-not $task.Settings.Enabled){throw 'Existing Codexify task could not be re-enabled'}
+  $script:taskTemporarilyDisabled=$false
+  Write-Output 'ORIGINAL_CODEXIFY_TASK_REENABLED=true'
+}
 try {
   Write-Output 'STAGE_VERIFIED=true'
   if($InterruptNativeCommands){Write-Output 'AUTHORIZED_NATIVE_COMMAND_INTERRUPTION=true'}
@@ -165,6 +175,19 @@ try {
   while(-not(Idle) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Seconds 3}
   if(-not(Idle)){throw 'Native or browser activity remained busy; original service preserved'}
   Write-Output 'IDLE_WINDOW_VERIFIED=true'
+  # Disable the existing task *temporarily* to prevent its one-minute failure
+  # recovery policy from racing the binary swap. Preserve task definition.
+  $existingTask=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
+  if(-not $existingTask.Settings.Enabled -or $existingTask.Principal.LogonType -ne 'Interactive' -or
+     $existingTask.Principal.RunLevel -ne 'Limited' -or
+     [IO.Path]::GetFullPath([string]$existingTask.Actions[0].WorkingDirectory) -ine [IO.Path]::GetFullPath($root)){
+    throw 'Existing Codexify task identity or enabled state is unexpected'
+  }
+  Disable-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop | Out-Null
+  $script:taskTemporarilyDisabled=$true
+  $verifiedTask=Get-ScheduledTask -TaskName 'Codexify' -TaskPath '\' -ErrorAction Stop
+  if($verifiedTask.Settings.Enabled){throw 'Native task did not disable; aborting before shutdown'}
+  Write-Output 'NATIVE_TASK_TEMPORARILY_DISABLED=true'
   $originalNative=@(Get-CimInstance Win32_Process -Filter "Name='codexify.exe'"|
     Where-Object {$_.ExecutablePath -ieq $live})
   $stopped=$true
@@ -193,6 +216,18 @@ try {
   if($p.Count -gt 0){
     $currentIds=@($p | Select-Object -ExpandProperty ProcessId | Sort-Object) -join ','
     $originalIds=@($originalNative | Select-Object -ExpandProperty ProcessId | Sort-Object) -join ','
+    # A scheduled-task stop can race a short-lived CLI helper. Wait for that
+    # helper to finish, but never terminate an unrecognized native process.
+    $helperDeadline=[DateTime]::UtcNow.AddSeconds(8)
+    while($currentIds -ne $originalIds -and [DateTime]::UtcNow -lt $helperDeadline){
+      Start-Sleep -Milliseconds 400
+      $p=@(Get-CimInstance Win32_Process -Filter "Name='codexify.exe'"|Where-Object {$_.ExecutablePath -ieq $live})
+      if($p.Count -eq 0){break}
+      $currentIds=@($p | Select-Object -ExpandProperty ProcessId | Sort-Object) -join ','
+    }
+    if($p.Count -eq 0){Write-Output 'NATIVE_PROCESSES_EXITED_DURING_HELPER_GRACE=true'}
+  }
+  if($p.Count -gt 0){
     if($currentIds -ne $originalIds){
       throw 'A new native process started during service stop; binary untouched'
     }
@@ -211,6 +246,7 @@ try {
   [IO.File]::Replace($stage,$live,(Join-Path $backup 'codexify.original-slot.exe'),$true)
   $replaced=$true
   if((Hash $live) -ne $newHash){throw 'Installed executable hash mismatch'}
+  Restore-TaskEnablement
   RunCli $live @('service','start')
   $deadline=[DateTime]::UtcNow.AddSeconds(80)
   while(-not(Ready) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Seconds 2}
@@ -250,6 +286,7 @@ try {
       if((Hash $restore) -ne $oldHash){throw 'Rollback stage hash mismatch'}
       [IO.File]::Replace($restore,$live,$failed,$true)
       if((Hash $live) -ne $oldHash){throw 'Rollback verification failed'}
+      Restore-TaskEnablement
       RunCli $live @('service','start')
       Write-Output 'ROLLBACK_BINARY_VERIFIED=true'
       $oldReceipt.phase='rolled_back'
@@ -258,10 +295,14 @@ try {
       Write-Output ('ROLLBACK_REQUIRES_ATTENTION='+$_.Exception.Message)
     }
   }elseif($stopped){
+    try {Restore-TaskEnablement}catch {Write-Output ('TASK_REENABLE_FAILED='+$_.Exception.Message)}
     try {RunCli $live @('service','start')}catch {Write-Output ('SERVICE_RESTART_FAILED='+$_.Exception.Message)}
   }
   $oldReceipt|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $backup 'receipt.json')
   throw
 } finally{
+  if($script:taskTemporarilyDisabled){
+    try {Restore-TaskEnablement}catch {Write-Output ('TASK_RESTORE_REQUIRES_ATTENTION='+$_.Exception.Message)}
+  }
   if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue}
 }
