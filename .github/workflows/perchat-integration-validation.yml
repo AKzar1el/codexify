@@ -37,6 +37,8 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Per-task browser session tests
-        run: cargo test --locked --lib playwright_sessions:: -- --test-threads=1
+        run: |
+          cargo test --locked --lib playwright_sessions:: -- --test-threads=1
       - name: Hot reload and real two-owner stdio tests
-        run: cargo test --locked --lib bridge::hot_reload_tests:: -- --test-threads=1
+        run: |
+          cargo test --locked --lib bridge::hot_reload_tests:: -- --test-threads=1
