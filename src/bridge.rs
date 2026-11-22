@@ -729,16 +729,49 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let resources = Arc::new(BridgedResourceStore::new(config.artifact_egress.clone()));
     let mut sources = HashMap::new();
     let mut report = Vec::new();
-    let mut names: Vec<_> = config.mcp_servers.keys().collect();
+    // Preserve the scoped branch's bounded concurrent cold-start behavior;
+    // hot-reload registry construction only happens after each result is
+    // received, in deterministic source-name order.
+    const MAX_PARALLEL_UPSTREAM_STARTS: usize = 3;
+    let mut names: Vec<String> = config.mcp_servers.keys().cloned().collect();
     names.sort();
-
-    for name in names {
-        let spec = &config.mcp_servers[name];
+    let source_config = Arc::new(config.clone());
+    let startup_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPSTREAM_STARTS));
+    let mut joins = tokio::task::JoinSet::new();
+    for (index, name) in names.iter().cloned().enumerate() {
+        let source_config = Arc::clone(&source_config);
+        let startup_slots = Arc::clone(&startup_slots);
+        joins.spawn(async move {
+            let spec = &source_config.mcp_servers[&name];
+            if spec.disabled {
+                return (index, Err("MCP source is disabled".to_string()));
+            }
+            let connected = match startup_slots.acquire_owned().await {
+                Ok(_permit) => connect_owned_source(&name, spec, &source_config).await,
+                Err(_) => Err("upstream startup limiter closed".to_string()),
+            };
+            (index, connected)
+        });
+    }
+    let mut results: Vec<_> = std::iter::repeat_with(|| None).take(names.len()).collect();
+    while let Some(joined) = joins.join_next().await {
+        match joined {
+            Ok((index, result)) => results[index] = Some(result),
+            Err(error) => {
+                tracing::warn!("upstream initialization task failed without a result: {error}")
+            }
+        }
+    }
+    for (index, name) in names.into_iter().enumerate() {
+        let spec = &config.mcp_servers[&name];
         if spec.disabled {
             report.push(format!("{name} -> disabled"));
             continue;
         }
-        match connect_owned_source(name, spec, config).await {
+        let result = results[index]
+            .take()
+            .unwrap_or_else(|| Err("upstream startup task failed".to_string()));
+        match result {
             Ok((service, tools, timeout, scoped)) => {
                 let count = tools.len();
                 let mode = spec.exposure();
@@ -3384,7 +3417,7 @@ mod tests {
         }
         let bridge = connect_upstreams(&config).await;
         assert_eq!(
-            bridge.services.len(),
+            bridge.runtime.snapshot().sources.len(),
             4,
             "all four MCP sources should connect"
         );
