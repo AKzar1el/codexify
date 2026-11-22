@@ -777,10 +777,10 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                 let mode = spec.exposure();
                 if mode == McpToolExposure::Gateway {
                     let functions = gateway_functions(&tools);
-                    write_gateway_skill(config, name, &sanitize(name), &functions);
+                    write_gateway_skill(config, &name, &sanitize(&name), &functions);
                 }
                 let generation = hot_reload::Generation::for_source(
-                    name,
+                    &name,
                     spec.clone(),
                     service,
                     tools,
