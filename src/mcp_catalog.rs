@@ -41,6 +41,7 @@ pub(crate) struct CatalogSourceInput {
     pub peer: Peer<RoleClient>,
     pub tool_timeout: Option<Duration>,
     pub control: Arc<crate::upstream_control::UpstreamControl>,
+    pub generation: Arc<crate::bridge::Generation>,
 }
 
 struct CatalogTool {
@@ -60,6 +61,7 @@ struct CatalogSource {
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
     control: Arc<crate::upstream_control::UpstreamControl>,
+    generation: Arc<crate::bridge::Generation>,
 }
 
 struct SearchDocument {
@@ -129,6 +131,7 @@ impl Catalog {
                 peer: input.peer,
                 tool_timeout: input.tool_timeout,
                 control: input.control,
+                generation: input.generation,
             });
         }
 
@@ -1038,6 +1041,7 @@ impl McpCallToolTool {
             Err(error) => return ToolResult::error(error),
         };
 
+        let _lease = source.generation.begin_call();
         let mut params = CallToolRequestParams::new(tool.raw.name.to_string());
         match args.get("arguments") {
             None | Some(Value::Null) => {}
