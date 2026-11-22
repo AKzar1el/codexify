@@ -4,10 +4,15 @@ on:
   push:
     branches:
       - feat/per-mcp-hot-reload-20261119
+      - fix/per-chat-playwright-hotreload-20261122
     paths:
       - .github/workflows/preview-hot-reload-windows.yml
       - src/markdown_chat/mod.rs
       - src/agent_automation/install.rs
+      - src/bridge.rs
+      - src/bridge/**
+      - src/mcp_catalog.rs
+      - src/playwright_sessions.rs
 
 permissions:
   contents: read
@@ -39,10 +44,10 @@ jobs:
           $hash = (Get-FileHash -LiteralPath (Join-Path $out 'codexify.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Value ("$hash  codexify.exe") -Encoding ascii
           Set-Content -LiteralPath (Join-Path $out 'SOURCE_COMMIT.txt') -Value "${{ github.sha }}" -Encoding ascii
-          Set-Content -LiteralPath (Join-Path $out 'PREVIEW_NOTICE.txt') -Value 'EXPERIMENTAL binary from feature branch PR #11. Not an official release. Activate only after backing up the existing executable; coordinate with other Codexify workers.' -Encoding ascii
+          Set-Content -LiteralPath (Join-Path $out 'PREVIEW_NOTICE.txt') -Value 'EXPERIMENTAL binary from integration branch PR #12. Not an official release. Activate only after backing up the existing executable; coordinate with other Codexify workers.' -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
-          name: codexify-pr11-windows-preview
+          name: codexify-pr12-perchat-hotreload-windows-preview
           path: ${{ runner.temp }}/codexify-hot-reload-preview/*
           if-no-files-found: error
           retention-days: 7
