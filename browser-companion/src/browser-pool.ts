@@ -20,6 +20,7 @@ export class PooledWindowCoordinator {
   private dispatchTail:Promise<void>=Promise.resolve();
   private maintenance=false;
   private closed=false;
+  private closePromise?:Promise<void>;
 
   constructor(coordinators:readonly Coordinator[],readonly build:string,private readonly closeContext?:()=>Promise<void>) {
     if(coordinators.length<1||coordinators.length>4)throw new Error("Browser action pages must be between one and four");
@@ -171,8 +172,15 @@ export class PooledWindowCoordinator {
     const coordinator=await this.owner(args[0]);if(!coordinator)throw new Error("Browser action was not found");
     yield* coordinator.events(...args);
   }
-  async close():Promise<void> {
-    if(this.closed)return;this.closed=true;
+  close():Promise<void> {
+    if(!this.closePromise){
+      this.closed=true;
+      this.closePromise=this.finishClose();
+    }
+    return this.closePromise;
+  }
+
+  private async finishClose():Promise<void> {
     await this.dispatchTail;
     // Child pages settle first; only the primary closes the shared profile.
     try {
