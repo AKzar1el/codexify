@@ -222,3 +222,20 @@ test("pool shutdown closes each action page before the shared context callback e
   expect(contextCloses).toBe(1);
   expect(await pool.health()).toMatchObject({status:"unavailable",authenticated:false,availableActionSlots:0});
 });
+
+test("concurrent pool shutdown callers share the full cleanup result",async()=>{
+  const drivers=[new LaneDriver(),new LaneDriver()];
+  const entered=deferred(),release=deferred();
+  const pool=new PooledWindowCoordinator(drivers.map(driver=>new SingleWindowCoordinator(driver,BUILD)),BUILD,async()=>{
+    entered.resolve();await release.promise;
+  });
+  const first=pool.close();
+  await entered.promise;
+  const second=pool.close();
+  try {
+    expect(second).toBe(first);
+    expect(await pool.health()).toMatchObject({status:"unavailable",availableActionSlots:0});
+  } finally {release.resolve();await Promise.all([first,second]);}
+  expect(drivers.map(driver=>driver.closeCalls)).toEqual([1,1]);
+  expect(pool.close()).toBe(first);
+});
