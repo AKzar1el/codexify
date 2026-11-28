@@ -39,17 +39,6 @@ impl Drop for CallLease<'_> {
 }
 
 impl Generation {
-    #[cfg(test)]
-    pub(super) fn new(
-        spec: crate::types::McpServerSpec,
-        service: RunningService<RoleClient, ()>,
-        tools: Vec<rmcp::model::Tool>,
-        timeout: Option<Duration>,
-        number: u64,
-    ) -> Arc<Self> {
-        Self::for_source("", spec, service, tools, timeout, None, number)
-    }
-
     pub(super) fn for_source(
         name: &str,
         spec: crate::types::McpServerSpec,
