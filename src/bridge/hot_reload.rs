@@ -39,6 +39,7 @@ impl Drop for CallLease<'_> {
 }
 
 impl Generation {
+    #[cfg(test)]
     pub(super) fn new(
         spec: crate::types::McpServerSpec,
         service: RunningService<RoleClient, ()>,
@@ -46,10 +47,24 @@ impl Generation {
         timeout: Option<Duration>,
         number: u64,
     ) -> Arc<Self> {
+        Self::for_source("", spec, service, tools, timeout, None, number)
+    }
+
+    pub(super) fn for_source(
+        name: &str,
+        spec: crate::types::McpServerSpec,
+        service: RunningService<RoleClient, ()>,
+        tools: Vec<rmcp::model::Tool>,
+        timeout: Option<Duration>,
+        scoped: Option<Arc<crate::playwright_sessions::ScopedPlaywrightPool>>,
+        number: u64,
+    ) -> Arc<Self> {
         let peer = service.peer().clone();
-        let control = Arc::new(crate::upstream_control::UpstreamControl::new(
-            spec.request_limits.clone(),
-        ));
+        let control = Arc::new(
+            crate::upstream_control::UpstreamControl::new(spec.request_limits.clone())
+                .for_server(name, &spec)
+                .with_scoped_playwright(scoped),
+        );
         let monitor = monitor_upstream(peer.clone(), control.clone());
         Arc::new(Self {
             spec,
@@ -195,6 +210,8 @@ impl HotReloadRuntime {
                     exposed.push(Box::new(tool) as Box<dyn Tool>);
                 }
                 McpToolExposure::Direct => {
+                    let server_bound_upstream_auth = source.spec.bearer_token_env_var.is_some()
+                        || configures_authorization_header(&source.spec);
                     let mut used = HashSet::new();
                     for tool in &source.tools {
                         let raw_name = tool.name.to_string();
@@ -221,11 +238,15 @@ impl HotReloadRuntime {
                                 .map(|schema| Value::Object((**schema).clone())),
                             annotations: tool.annotations.clone(),
                             icons: tool.icons.clone(),
-                            meta: tool.meta.clone(),
+                            meta: forward_server_bound_tool_metadata(
+                                tool.meta.clone(),
+                                server_bound_upstream_auth,
+                            ),
                             peer: source.peer.clone(),
                             tool_timeout: source.timeout,
                             control: source.control.clone(),
                             resources: self.resources.clone(),
+                            server_bound_upstream_auth,
                             generation: source.clone(),
                         }) as Box<dyn Tool>);
                     }
@@ -332,8 +353,17 @@ impl HotReloadRuntime {
         let started = std::time::Instant::now();
         let previous = self.snapshot().sources.get(name).cloned();
         let old_generation = previous.as_ref().map_or(0, |source| source.number);
-        let future = connect_one(name, &spec, &self.config);
-        let (service, tools, timeout) = if let Some(token) = cancellation {
+        // Reloading a per-task browser source would retire idle agent sessions
+        // when the old generation drops. Never steal or close active browser tabs.
+        if spec.session_scope == McpSessionScope::PerChat
+            || previous
+                .as_ref()
+                .is_some_and(|source| source.spec.session_scope == McpSessionScope::PerChat)
+        {
+            return Err("SCOPED_BROWSER_RELOAD_REQUIRES_QUIESCENCE");
+        }
+        let future = connect_owned_source(name, &spec, &self.config);
+        let (service, tools, timeout, scoped) = if let Some(token) = cancellation {
             tokio::select! {
                 _ = token.cancelled() => return Err("CANCELLED"),
                 result = future => result.map_err(|_| "INITIALIZE_FAILED")?,
@@ -399,7 +429,15 @@ impl HotReloadRuntime {
                 .count();
         }
         let initialization_ms = started.elapsed().as_millis() as u64;
-        let new = Generation::new(spec, service, tools, timeout, old_generation + 1);
+        let new = Generation::for_source(
+            name,
+            spec,
+            service,
+            tools,
+            timeout,
+            scoped,
+            old_generation + 1,
+        );
         let new_version = new.version();
         // Connection preparation and view construction are outside the write
         // lock. Compare-and-rebuild prevents concurrent distinct-source reloads

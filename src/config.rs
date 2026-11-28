@@ -23,7 +23,7 @@ use crate::project_catalog::{ProjectCatalog, discover_project_catalog_at};
 use crate::types::{
     AppConfig, ArtifactEgressConfig, ArtifactIngressConfig, AuditConfig, CodexProjectCatalogConfig,
     CommandConfig, ConversationAuthToken, DiffConfig, ExecConfig, ExperimentalConfig,
-    FilesystemConfig, IgnoreConfig, McpServerSpec, McpToolExposure, MemoryConfig,
+    FilesystemConfig, IgnoreConfig, McpServerSpec, McpSessionScope, McpToolExposure, MemoryConfig,
     OpenAiTunnelConfig, OutputConfig, ProjectCatalogConfig, ProjectCatalogEntryConfig,
     ProjectDocConfig, SkillsConfig, ToolLogLevel, ToolLogMode, ToolLoggingConfig, TreeConfig,
     WorktreeConfig, WorktreeMode, WorktreeUpstreamRefreshMode,
@@ -615,6 +615,9 @@ struct PartialMcpServerSpec {
     tools: Option<Vec<String>>,
     disabled_tools: Option<Vec<String>>,
     mode: Option<McpToolExposure>,
+    // Dropping this explicit field silently downgrades per-chat browser
+    // ownership and its token-file authorization to a shared global client.
+    session_scope: Option<McpSessionScope>,
 }
 
 impl PartialMcpServerSpec {
@@ -636,6 +639,7 @@ impl PartialMcpServerSpec {
             tools,
             disabled_tools,
             mode,
+            session_scope,
         } = self;
         let sets_command = command.is_some();
         let sets_args = args.is_some();
@@ -694,6 +698,9 @@ impl PartialMcpServerSpec {
         }
         if let Some(mode) = mode {
             base.mode = Some(mode);
+        }
+        if let Some(scope) = session_scope {
+            base.session_scope = scope;
         }
 
         // Naming a different transport replaces the imported transport rather
@@ -2006,6 +2013,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             disabled_tools: Some(vec!["write".to_string()]),
             mode: None,
+            session_scope: Default::default(),
             provenance: crate::types::McpServerProvenance::CodexConfig,
             request_limits: crate::types::McpRequestLimits::default(),
         }
@@ -3151,6 +3159,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explicit_playwright_session_scope_survives_json_overlay() {
+        let partial: PartialMcpServerSpec = serde_json::from_value(serde_json::json!({
+            "command": "node",
+            "args": ["@playwright/mcp", "--extension"],
+            "sessionScope": "per-chat",
+            "env": {
+                "PLAYWRIGHT_MCP_PROFILE_DIR_NAME": "Profile 3",
+                "PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE": "C:/private/extension-token"
+            }
+        }))
+        .unwrap();
+        let (servers, _) = merge_mcp_servers(
+            HashMap::new(),
+            HashMap::from([("playwright-extension".to_string(), partial)]),
+        );
+        let spec = &servers["playwright-extension"];
+        assert_eq!(spec.session_scope, McpSessionScope::PerChat);
+        assert_eq!(spec.exposure(), McpToolExposure::Direct);
+        assert_eq!(
+            spec.env
+                .get("PLAYWRIGHT_MCP_PROFILE_DIR_NAME")
+                .map(String::as_str),
+            Some("Profile 3")
+        );
+        assert!(spec.env.contains_key("PLAYWRIGHT_MCP_EXTENSION_TOKEN_FILE"));
+    }
+
+    #[test]
+    fn explicit_scope_overlay_preserves_or_overrides_imported_scope() {
+        let mut imported = imported_server();
+        imported.session_scope = McpSessionScope::PerChat;
+        let untouched = PartialMcpServerSpec {
+            disabled: Some(false),
+            ..Default::default()
+        };
+        let (servers, _) = merge_mcp_servers(
+            HashMap::from([("demo".to_string(), imported.clone())]),
+            HashMap::from([("demo".to_string(), untouched)]),
+        );
+        assert_eq!(servers["demo"].session_scope, McpSessionScope::PerChat);
+
+        let explicit: PartialMcpServerSpec =
+            serde_json::from_value(serde_json::json!({"sessionScope": "global"})).unwrap();
+        let (servers, _) = merge_mcp_servers(
+            HashMap::from([("demo".to_string(), imported)]),
+            HashMap::from([("demo".to_string(), explicit)]),
+        );
+        assert_eq!(servers["demo"].session_scope, McpSessionScope::Global);
+        assert!(
+            serde_json::from_value::<PartialMcpServerSpec>(
+                serde_json::json!({"sessionScope": "shared"})
+            )
+            .is_err()
+        );
     }
 
     #[test]
