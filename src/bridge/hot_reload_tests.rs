@@ -938,6 +938,262 @@ async fn named_profile_manager_routes_launch_reconnect_and_inventory_through_rea
     drop(source);
 }
 
+// Only opt in with an explicitly pinned Playwright MCP CLI. The browser uses
+// disposable managed profiles, headless Chrome and a loopback synthetic page.
+#[tokio::test]
+#[ignore = "requires a pinned Playwright MCP CLI and installed Chrome"]
+async fn named_profiles_real_chrome_canary() {
+    let entry = std::env::var("CODEXIFY_TEST_PLAYWRIGHT_MCP_ENTRY")
+        .expect("provide the pinned Playwright MCP CLI entry");
+    assert!(std::path::Path::new(&entry).is_file());
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::config::default_config(temp.path().to_path_buf());
+    let spec = crate::types::McpServerSpec {
+        command: Some("node".into()),
+        args: vec![entry, "--headless".into(), "--browser=chrome".into()],
+        session_scope: McpSessionScope::PerChat,
+        startup_timeout_sec: Some(45.0),
+        tool_timeout_sec: Some(45.0),
+        env: HashMap::from([(
+            "CODEXIFY_SHARED_PLAYWRIGHT_PROFILES".into(),
+            "shared-canary".into(),
+        )]),
+        ..Default::default()
+    };
+    let server = "playwright-disposable-chrome-canary";
+    let (service, tools, timeout, mut pool) =
+        connect_owned_source(server, &spec, &config).await.unwrap();
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+    );
+    Arc::get_mut(pool.as_mut().unwrap())
+        .unwrap()
+        .set_test_root(temp.path().join("profiles"));
+    let source = hot_reload::Generation::for_source(server, spec, service, tools, timeout, pool, 1);
+    let resources = BridgedResourceStore::new(config.artifact_egress.clone());
+    let a = ConversationIdentity::from_openai_session("real-chrome-canary-a").unwrap();
+    let b = ConversationIdentity::from_openai_session("real-chrome-canary-b").unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = Router::new().route("/", axum::routing::get(|| async {
+        axum::response::Html("<html><title>Codexify local canary</title><body>Local synthetic test</body></html>")
+    }));
+    let http = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let manager = crate::playwright_sessions::PROFILE_TOOL;
+
+    async fn call(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: &ConversationIdentity,
+        name: &'static str,
+        args: Value,
+    ) -> ToolResult {
+        forward_tool_call(
+            &source.peer,
+            CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+            "playwright-disposable-chrome-canary",
+            name,
+            source.timeout,
+            None,
+            UpstreamCallContext {
+                resources,
+                control: &source.control,
+                conversation: Some(owner),
+            },
+        )
+        .await
+    }
+    async fn ok(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: &ConversationIdentity,
+        name: &'static str,
+        args: Value,
+    ) -> String {
+        let result = call(source, resources, owner, name, args).await;
+        assert!(!result.is_error, "{name}: {}", result.joined_text());
+        result.joined_text()
+    }
+    let initial = ok(&source, &resources, &a, manager, json!({"action":"list"})).await;
+    assert!(!temp.path().join("profiles").exists());
+    assert!(initial.contains("default"));
+    for owner in [&a, &b] {
+        ok(
+            &source,
+            &resources,
+            owner,
+            manager,
+            json!({"action":"launch","profile":"private-canary"}),
+        )
+        .await;
+        ok(
+            &source,
+            &resources,
+            owner,
+            "browser_navigate",
+            json!({"url":url}),
+        )
+        .await;
+    }
+    let read = json!({"function":"() => localStorage.getItem('codexify-canary')"});
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_evaluate",
+        json!({"function":"() => localStorage.setItem('codexify-canary', 'isolated-a-marker')"}),
+    )
+    .await;
+    assert!(
+        ok(&source, &resources, &a, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    assert!(
+        !ok(&source, &resources, &b, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_tabs",
+        json!({"action":"new","url":url}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_tabs",
+        json!({"action":"list"}),
+    )
+    .await;
+    let inventory: Value =
+        serde_json::from_str(&ok(&source, &resources, &a, manager, json!({"action":"list"})).await)
+            .unwrap();
+    let tabs = inventory["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["profile"] == "private-canary")
+        .unwrap()["last_observed_tabs"]["tabs"]
+        .as_array()
+        .unwrap();
+    assert!(
+        tabs.len() >= 2,
+        "real Playwright tab inventory: {inventory}"
+    );
+    // The other task must retain its original profile and current page.
+    assert!(
+        !ok(&source, &resources, &b, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    ok(&source, &resources, &a, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"select","profile":"shared-canary"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_navigate",
+        json!({"url":url}),
+    )
+    .await;
+    ok(&source, &resources, &a, "browser_evaluate", json!({"function":"() => localStorage.setItem('codexify-canary', 'shared-persistence-marker')"})).await;
+    assert!(
+        call(
+            &source,
+            &resources,
+            &b,
+            manager,
+            json!({"action":"select","profile":"shared-canary"})
+        )
+        .await
+        .is_error
+    );
+    ok(&source, &resources, &a, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"reconnect","profile":"shared-canary"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        "browser_navigate",
+        json!({"url":url}),
+    )
+    .await;
+    assert!(
+        ok(&source, &resources, &b, "browser_evaluate", read)
+            .await
+            .contains("shared-persistence-marker")
+    );
+    ok(&source, &resources, &b, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"reconnect","profile":"private-canary"}),
+    )
+    .await;
+    ok(&source, &resources, &b, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    http.abort();
+    drop(source);
+}
+
 #[tokio::test]
 async fn service_isolated_real_stdio_process_reload_preserves_unrelated_sources() {
     // This fixture actually spawns three independent OS processes through the

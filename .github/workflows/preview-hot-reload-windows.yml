@@ -5,6 +5,7 @@ on:
     branches:
       - feat/per-mcp-hot-reload-20261119
       - fix/per-chat-playwright-hotreload-20261122
+      - feat/browser-profile-manager-20261128
     paths:
       - .github/workflows/preview-hot-reload-windows.yml
       - src/markdown_chat/mod.rs
@@ -21,13 +22,30 @@ jobs:
   preview-windows:
     name: Package pinned Windows feature binary
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        if: github.ref_name == 'feat/browser-profile-manager-20261128'
+        with:
+          node-version: '22'
+      - name: Real headless Chrome profile isolation and handoff
+        if: github.ref_name == 'feat/browser-profile-manager-20261128'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = Join-Path $env:RUNNER_TEMP 'codexify-pinned-playwright'
+          npm install --prefix $fixture --ignore-scripts --no-audit --no-fund '@playwright/mcp@0.0.86'
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Playwright MCP install failed' }
+          $entry = Join-Path $fixture 'node_modules/@playwright/mcp/cli.js'
+          if (!(Test-Path -LiteralPath $entry -PathType Leaf)) { throw 'Pinned MCP entry missing' }
+          $env:CODEXIFY_TEST_PLAYWRIGHT_MCP_ENTRY = $entry
+          cargo test --release --locked --lib named_profiles_real_chrome_canary -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Real Chrome canary failed' }
       - name: Build from exact branch commit
         shell: pwsh
         run: |
@@ -44,10 +62,10 @@ jobs:
           $hash = (Get-FileHash -LiteralPath (Join-Path $out 'codexify.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Value ("$hash  codexify.exe") -Encoding ascii
           Set-Content -LiteralPath (Join-Path $out 'SOURCE_COMMIT.txt') -Value "${{ github.sha }}" -Encoding ascii
-          Set-Content -LiteralPath (Join-Path $out 'PREVIEW_NOTICE.txt') -Value 'EXPERIMENTAL binary from integration branch PR #12. Not an official release. Activate only after backing up the existing executable; coordinate with other Codexify workers.' -Encoding ascii
+          Set-Content -LiteralPath (Join-Path $out 'PREVIEW_NOTICE.txt') -Value 'EXPERIMENTAL binary from an isolated integration branch. Not an official release. Do not replace the running service or existing browser profiles; coordinate a separately authorized rollout.' -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
-          name: codexify-pr12-perchat-hotreload-windows-preview
+          name: ${{ github.ref_name == 'feat/browser-profile-manager-20261128' && 'codexify-pr14-profile-manager-windows-preview' || 'codexify-pr12-perchat-hotreload-windows-preview' }}
           path: ${{ runner.temp }}/codexify-hot-reload-preview/*
           if-no-files-found: error
           retention-days: 7
