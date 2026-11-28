@@ -31,9 +31,16 @@ for await (const line of input) {
   } else if (method === 'tools/list') {
     const tools = [tool('probe', 'Version probe ' + version), tool('slow', 'Slow probe ' + version)];
     if (version === 'new') tools.push(tool('new_tool', 'New tool in replacement generation'));
+    if (version === 'profile-manager') tools.push({
+      name: 'browser_tabs',
+      description: 'Synthetic tab list; never starts a browser',
+      inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['list', 'new'] } }, required: ['action'], additionalProperties: false },
+    });
     respond(id, { tools });
   } else if (method === 'tools/call') {
-    if (request.params?.name === 'slow') {
+    if (request.params?.name === 'browser_tabs' && version === 'profile-manager') {
+      respond(id, { content: [{ type: 'text', text: '### Open tabs\n- 0: (current) [Synthetic fixture](https://example.invalid/private?secret=synthetic)\n### Page\n' + version + ':' + pid }], isError: false });
+    } else if (request.params?.name === 'slow') {
       if (process.env.HOT_RELOAD_SLOW_MARKER_FILE) {
         writeFileSync(process.env.HOT_RELOAD_SLOW_MARKER_FILE, String(pid));
       }

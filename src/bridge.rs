@@ -32,7 +32,9 @@ use crate::bridged_resources::BridgedResourceStore;
 use crate::exec_sessions::SessionState;
 use crate::mcp_catalog::{CatalogSourceInput, build_catalog_tools};
 use crate::process_env::scrub_untrusted_child_env;
+use crate::project_bindings::ConversationIdentity;
 use crate::tool::{Tool, ToolBehavior, ToolCallIdentity, ToolRequestContext};
+use crate::types::McpSessionScope;
 use crate::types::{AppConfig, McpToolExposure, ToolContent, ToolResult};
 
 mod hot_reload;
@@ -115,6 +117,7 @@ struct BridgedTool {
     annotations: Option<ToolAnnotations>,
     icons: Option<Vec<Icon>>,
     meta: Option<MetaObject>,
+    server_bound_upstream_auth: bool,
     peer: Peer<RoleClient>,
     tool_timeout: Option<Duration>,
     control: Arc<crate::upstream_control::UpstreamControl>,
@@ -122,8 +125,103 @@ struct BridgedTool {
     generation: Arc<hot_reload::Generation>,
 }
 
+/// Cloudflare and other remote MCPs can advertise their *own* OAuth requirements,
+/// even when Codexify already authenticates upstream using a configured bearer token.
+/// Forwarding those schemes as God v5 tool metadata causes ChatGPT to request OAuth
+/// for the wrong application (which has no upstream-browser setup URL).
+/// Keep other upstream metadata and do not alter tools without bound credentials.
+fn forward_server_bound_tool_metadata(
+    meta: Option<MetaObject>,
+    server_bound_auth: bool,
+) -> Option<MetaObject> {
+    let mut meta = meta?;
+    if server_bound_auth {
+        // These belong to the upstream MCP's identity, not the Codexify app.
+        // A bridged Cloudflare profile tool is not the God v5 profile tool.
+        meta.0.remove("securitySchemes");
+        meta.0.remove("openai/profile");
+    }
+    (!meta.0.is_empty()).then_some(meta)
+}
+
+/// Only display literal, bounded scope identifiers from an upstream challenge.
+/// Never forward resource_metadata URLs or raw WWW-Authenticate values.
+fn safe_declared_scope(challenge: &Value) -> Option<String> {
+    let headers: Vec<&str> = match challenge {
+        Value::String(header) => vec![header],
+        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    headers.into_iter().find_map(|header| {
+        let (_, remainder) = header.split_once("scope=\"")?;
+        let (scope, _) = remainder.split_once('"')?;
+        (!scope.is_empty()
+            && scope.len() <= 128
+            && scope.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.' | '/' | ' ')
+            }))
+        .then(|| scope.to_owned())
+    })
+}
+
+/// An upstream OAuth challenge is not a valid OAuth challenge for Codexify's
+/// already-authorized downstream MCP connection. Fail closed with a sanitized,
+/// structured upstream diagnostic rather than a broken ChatGPT relink action.
+fn sanitize_server_bound_auth_result(
+    mut result: ToolResult,
+    server_bound_auth: bool,
+) -> ToolResult {
+    if !server_bound_auth {
+        return result;
+    }
+    let challenge = result
+        .meta
+        .as_mut()
+        .and_then(|meta| meta.0.remove("mcp/www_authenticate"));
+    let Some(challenge) = challenge else {
+        return result;
+    };
+
+    let challenge_code = challenge.to_string().to_ascii_lowercase();
+    let code = if challenge_code.contains("insufficient_scope") {
+        "insufficient_scope"
+    } else if challenge_code.contains("invalid_token") {
+        "invalid_token"
+    } else {
+        "authorization_required"
+    };
+    let required_scope = safe_declared_scope(&challenge);
+    let scope_note = required_scope
+        .as_ref()
+        .map(|scope| format!(" Required scope: {scope}."))
+        .unwrap_or_default();
+
+    result.is_error = true;
+    result.structured_content = None;
+    result.content = vec![ToolContent::Text(format!(
+        "Upstream MCP authorization failed ({code}). Codexify already manages the \
+         upstream credential; verify the existing server-side token and its read \
+         permissions instead of using ChatGPT Connect.{scope_note}"
+    ))];
+    let meta = result.meta.get_or_insert_with(MetaObject::new);
+    meta.0.insert(
+        "io.github.devnoname120/codexify/upstream_auth_error".into(),
+        json!({
+            "code": code,
+            "credential_source": "server_bound",
+            "required_scope": required_scope
+        }),
+    );
+    result
+}
+
 impl BridgedTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        cancellation: Option<&CancellationToken>,
+        conversation: Option<&ConversationIdentity>,
+    ) -> ToolResult {
         let _lease = self.generation.begin_call();
         let mut params = CallToolRequestParams::new(self.original_name.clone());
         if let Some(obj) = args.as_object()
@@ -132,7 +230,7 @@ impl BridgedTool {
             params = params.with_arguments(obj.clone());
         }
 
-        forward_tool_call(
+        let result = forward_tool_call(
             &self.peer,
             params,
             &self.server,
@@ -142,9 +240,11 @@ impl BridgedTool {
             UpstreamCallContext {
                 resources: &self.resources,
                 control: &self.control,
+                conversation,
             },
         )
-        .await
+        .await;
+        sanitize_server_bound_auth_result(result, self.server_bound_upstream_auth)
     }
 }
 
@@ -246,7 +346,7 @@ impl Tool for BridgedTool {
     }
 
     async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+        self.run(args, None, None).await
     }
 
     async fn call_with_context(
@@ -256,25 +356,105 @@ impl Tool for BridgedTool {
         _session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(
+            args,
+            Some(&context.cancellation),
+            context
+                .task_conversation
+                .as_ref()
+                .or(context.conversation.as_ref()),
+        )
+        .await
     }
 }
 
 pub(crate) struct UpstreamCallContext<'a> {
     pub(crate) resources: &'a BridgedResourceStore,
     pub(crate) control: &'a crate::upstream_control::UpstreamControl,
+    pub(crate) conversation: Option<&'a ConversationIdentity>,
 }
 
 pub(crate) async fn forward_tool_call(
     peer: &Peer<RoleClient>,
-    params: CallToolRequestParams,
+    mut params: CallToolRequestParams,
     server: &str,
-    tool: &str,
+    mut tool: &str,
     tool_timeout: Option<Duration>,
     cancellation: Option<&CancellationToken>,
     context: UpstreamCallContext<'_>,
 ) -> ToolResult {
-    let UpstreamCallContext { resources, control } = context;
+    let UpstreamCallContext {
+        resources,
+        control,
+        conversation,
+    } = context;
+    let mut launch_profile = None;
+    if tool == crate::playwright_sessions::PROFILE_TOOL
+        && let Some(pool) = &control.scoped_playwright
+        && pool.supports_profiles()
+    {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return ToolResult::error("browser profile request cancelled before dispatch");
+        }
+        match pool.manage(conversation, params.arguments.as_ref()).await {
+            Ok(crate::playwright_sessions::ProfileAction::Local(value)) => {
+                return ToolResult::text(value.to_string());
+            }
+            Ok(crate::playwright_sessions::ProfileAction::Launch(name)) => {
+                // Dispatch one explicit blank-tab action through normal owner,
+                // cancellation, rate and timeout checks. Never replay it.
+                launch_profile = Some(name);
+                tool = "browser_tabs";
+                params = CallToolRequestParams::new("browser_tabs")
+                    .with_arguments(json!({"action": "new"}).as_object().unwrap().clone());
+            }
+            Err(error) => return ToolResult::error(error),
+        }
+    }
+    // This preflight is shared by direct, gateway and catalog MCP exposure.
+    // Never send an isolation request to a browser extension as a fallback.
+    if let Err(error) = control.check_browser_context_request(tool, &params) {
+        return ToolResult::error(format!("Upstream MCP server '{server}': {error}"));
+    }
+    let isolated_requested = control.isolated_tab_requested(tool, &params);
+    // A scoped Playwright source never falls back to the global peer when the
+    // downstream caller lacks an authoritative task identity.
+    let scoped_connection = match &control.scoped_playwright {
+        Some(pool) => {
+            let scoped_call = tokio::time::timeout(Duration::from_secs(90), async {
+                match launch_profile.as_deref() {
+                    Some(profile) => pool.acquire_for(conversation, Some(profile)).await,
+                    None => pool.acquire(conversation).await,
+                }
+            });
+            let cancelled = cancellation.cloned().unwrap_or_default();
+            let response = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => {
+                    return ToolResult::error(format!(
+                        "Upstream MCP server '{server}': owner request cancelled before browser dispatch"
+                    ));
+                }
+                response = scoped_call => response,
+            };
+            match response {
+                Ok(Ok(connection)) => Some(connection),
+                Ok(Err(error)) => {
+                    return ToolResult::error(format!("Upstream MCP server '{server}': {error}"));
+                }
+                Err(_) => {
+                    return ToolResult::error(format!(
+                        "Upstream MCP server '{server}': per-chat browser startup timed out; no browser tool call dispatched"
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    let (peer, control) = match &scoped_connection {
+        Some(connection) => (&connection.peer, connection.control.as_ref()),
+        None => (peer, control),
+    };
     let timeout = tool_timeout.unwrap_or(Duration::from_secs(60));
     let deadline = tokio::time::Instant::now() + timeout;
     let token = cancellation.cloned().unwrap_or_default();
@@ -306,12 +486,39 @@ pub(crate) async fn forward_tool_call(
         Err(UpstreamError::Remote(_)) => "response_received",
         Err(UpstreamError::Transport(_)) => "transport_failed",
     });
+    if let Some(connection) = &scoped_connection {
+        connection.observe_tabs(result.as_ref().ok(), tool);
+    }
 
     match result {
-        Ok(result) => map_call_result(result, peer, server, tool_timeout, resources),
-        Err(error) => ToolResult::error(format!(
-            "Upstream MCP server '{server}' failed to run '{tool}': {error}"
-        )),
+        Ok(result) => {
+            if isolated_requested && result.is_error == Some(true) {
+                let message = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(error) = control.browser_context_refusal(isolated_requested, &message) {
+                    return ToolResult::error(format!(
+                        "Upstream MCP server '{server}' failed to run '{tool}': {error}"
+                    ));
+                }
+            }
+            map_call_result(result, peer, server, tool_timeout, resources)
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let detail = control
+                .browser_context_refusal(isolated_requested, &detail)
+                .unwrap_or(detail);
+            ToolResult::error(format!(
+                "Upstream MCP server '{server}' failed to run '{tool}': {detail}"
+            ))
+        }
     }
 }
 
@@ -518,29 +725,116 @@ fn unique_name(base: String, used: &std::collections::HashSet<String>) -> String
 /// Connect to every configured upstream MCP server, discover its tools, and
 /// materialize its effective exposure mode. A server that fails to launch or
 /// answer is logged and skipped — it never blocks startup.
+// Per-task Playwright sessions must be discovered with a separate transport
+// and routed by the verified task owner on EVERY browser tool call.
+async fn connect_owned_source(
+    server: &str,
+    spec: &crate::types::McpServerSpec,
+    config: &AppConfig,
+) -> Result<
+    (
+        RunningService<RoleClient, ()>,
+        Vec<rmcp::model::Tool>,
+        Option<Duration>,
+        Option<Arc<crate::playwright_sessions::ScopedPlaywrightPool>>,
+    ),
+    String,
+> {
+    let scoped = if spec.session_scope == McpSessionScope::PerChat {
+        Some(Arc::new(
+            crate::playwright_sessions::ScopedPlaywrightPool::new(server, spec, config)?,
+        ))
+    } else {
+        None
+    };
+    let discovery = match &scoped {
+        Some(pool) => pool.discovery_spec()?,
+        None => spec.clone(),
+    };
+    let (service, mut tools, timeout) = connect_one(server, &discovery, config).await?;
+    if scoped.as_ref().is_some_and(|pool| pool.supports_profiles()) {
+        if tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+        {
+            return Err(
+                "upstream tool name conflicts with Codexify's browser profile manager".into(),
+            );
+        }
+        if tool_is_enabled(spec, crate::playwright_sessions::PROFILE_TOOL)
+            && tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == "browser_tabs")
+        {
+            tools.push(crate::playwright_sessions::profile_tool());
+        }
+    }
+    Ok((service, tools, timeout, scoped))
+}
+
 pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let resources = Arc::new(BridgedResourceStore::new(config.artifact_egress.clone()));
     let mut sources = HashMap::new();
     let mut report = Vec::new();
-    let mut names: Vec<_> = config.mcp_servers.keys().collect();
+    // Preserve the scoped branch's bounded concurrent cold-start behavior;
+    // hot-reload registry construction only happens after each result is
+    // received, in deterministic source-name order.
+    const MAX_PARALLEL_UPSTREAM_STARTS: usize = 3;
+    let mut names: Vec<String> = config.mcp_servers.keys().cloned().collect();
     names.sort();
-
-    for name in names {
-        let spec = &config.mcp_servers[name];
+    let source_config = Arc::new(config.clone());
+    let startup_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPSTREAM_STARTS));
+    let mut joins = tokio::task::JoinSet::new();
+    for (index, name) in names.iter().cloned().enumerate() {
+        let source_config = Arc::clone(&source_config);
+        let startup_slots = Arc::clone(&startup_slots);
+        joins.spawn(async move {
+            let spec = &source_config.mcp_servers[&name];
+            if spec.disabled {
+                return (index, Err("MCP source is disabled".to_string()));
+            }
+            let connected = match startup_slots.acquire_owned().await {
+                Ok(_permit) => connect_owned_source(&name, spec, &source_config).await,
+                Err(_) => Err("upstream startup limiter closed".to_string()),
+            };
+            (index, connected)
+        });
+    }
+    let mut results: Vec<_> = std::iter::repeat_with(|| None).take(names.len()).collect();
+    while let Some(joined) = joins.join_next().await {
+        match joined {
+            Ok((index, result)) => results[index] = Some(result),
+            Err(error) => {
+                tracing::warn!("upstream initialization task failed without a result: {error}")
+            }
+        }
+    }
+    for (index, name) in names.into_iter().enumerate() {
+        let spec = &config.mcp_servers[&name];
         if spec.disabled {
             report.push(format!("{name} -> disabled"));
             continue;
         }
-        match connect_one(name, spec, config).await {
-            Ok((service, tools, timeout)) => {
+        let result = results[index]
+            .take()
+            .unwrap_or_else(|| Err("upstream startup task failed".to_string()));
+        match result {
+            Ok((service, tools, timeout, scoped)) => {
                 let count = tools.len();
                 let mode = spec.exposure();
                 if mode == McpToolExposure::Gateway {
                     let functions = gateway_functions(&tools);
-                    write_gateway_skill(config, name, &sanitize(name), &functions);
+                    write_gateway_skill(config, &name, &sanitize(&name), &functions);
                 }
-                let generation =
-                    hot_reload::Generation::new(spec.clone(), service, tools, timeout, 1);
+                let generation = hot_reload::Generation::for_source(
+                    &name,
+                    spec.clone(),
+                    service,
+                    tools,
+                    timeout,
+                    scoped,
+                    1,
+                );
                 sources.insert(name.clone(), generation);
                 let visibility = if mode == McpToolExposure::Catalog {
                     " private"
@@ -705,7 +999,12 @@ struct GatewayTool {
 }
 
 impl GatewayTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        cancellation: Option<&CancellationToken>,
+        conversation: Option<&ConversationIdentity>,
+    ) -> ToolResult {
         let _lease = self.generation.begin_call();
         let Some(function) = args.get("function").and_then(|v| v.as_str()) else {
             return ToolResult::error("`function` is required (the name of the function to call)");
@@ -742,6 +1041,7 @@ impl GatewayTool {
             UpstreamCallContext {
                 resources: &self.resources,
                 control: &self.control,
+                conversation,
             },
         )
         .await
@@ -810,7 +1110,7 @@ impl Tool for GatewayTool {
     }
 
     async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+        self.run(args, None, None).await
     }
 
     async fn call_with_context(
@@ -820,12 +1120,20 @@ impl Tool for GatewayTool {
         _session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(
+            args,
+            Some(&context.cancellation),
+            context
+                .task_conversation
+                .as_ref()
+                .or(context.conversation.as_ref()),
+        )
+        .await
     }
 }
 
 /// Launch and initialise one upstream, returning its running service and tools.
-async fn connect_one(
+pub(crate) async fn connect_one(
     server_name: &str,
     spec: &crate::types::McpServerSpec,
     config: &AppConfig,
@@ -1048,7 +1356,7 @@ async fn connect_one_with_env(
     server_name: &str,
     spec: &crate::types::McpServerSpec,
     config: &AppConfig,
-    env_lookup: &(dyn Fn(&str) -> Option<String> + Sync),
+    env_lookup: &(dyn Fn(&str) -> Option<String> + Send + Sync),
 ) -> Result<
     (
         RunningService<RoleClient, ()>,
@@ -1073,6 +1381,25 @@ async fn connect_one_with_env(
             command.args(&spec.args);
             for (key, value) in &spec.env {
                 command.env(key, value);
+            }
+            if spec.session_scope == McpSessionScope::PerChat {
+                // Ambient Playwright options must not redirect a scoped
+                // stdio child to a shared/remote browser or HTTP listener.
+                for key in crate::playwright_sessions::OWNED_BROWSER_ENV {
+                    command.env_remove(key);
+                }
+                for key in [
+                    "PLAYWRIGHT_MCP_EXTENSION",
+                    "PLAYWRIGHT_MCP_PROFILE_DIR_NAME",
+                    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+                    "PLAYWRIGHT_MCP_SESSION_NAME",
+                    "PLAYWRIGHT_MCP_NO_TAB_GROUP",
+                    "PLAYWRIGHT_MCP_BACKGROUND",
+                ] {
+                    if !spec.env.contains_key(key) {
+                        command.env_remove(key);
+                    }
+                }
             }
             if let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
                 command.current_dir(cwd);
@@ -1259,6 +1586,12 @@ mod tests {
             if request.name.as_ref() == "slow" {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+            if request.name.as_ref() == "browser_tabs" && text == "cdp_refused" {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    r#"Protocol error (Target.createBrowserContext): {"code":-32000,"message":"Not allowed"}"#,
+                )])
+                .into());
+            }
             Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
         }
     }
@@ -1287,6 +1620,139 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/mcp"), task)
+    }
+
+    #[tokio::test]
+    async fn playwright_capability_is_enforced_at_real_mcp_forwarding_boundary() {
+        // The test server echoes a marker for any browser_tabs request. If an
+        // extension-only isolated request reaches it, the test will fail.
+        let (url, server_task) = spawn_http_upstream().await;
+        let mut spec = McpServerSpec {
+            url: Some(url),
+            transport: Some("http".into()),
+            ..Default::default()
+        };
+        spec.http_headers
+            .insert("authorization".into(), "Bearer remote-token".into());
+        spec.http_headers
+            .insert("x-static".into(), "static-value".into());
+        spec.http_headers.insert("x-env".into(), "env-value".into());
+        let config = crate::config::default_config(std::env::temp_dir());
+        let (service, _, _) = connect_one_with_env("playwright-test", &spec, &config, &|_| None)
+            .await
+            .unwrap();
+        let resources = BridgedResourceStore::new(config.artifact_egress.clone());
+
+        let extension_spec = McpServerSpec {
+            command: Some("node".into()),
+            args: vec!["@playwright/mcp".into(), "--extension".into()],
+            ..Default::default()
+        };
+        let full_spec = McpServerSpec {
+            command: Some("node".into()),
+            args: vec!["@playwright/mcp".into()],
+            ..Default::default()
+        };
+        let cdp_spec = McpServerSpec {
+            command: Some("node".into()),
+            args: vec!["@playwright/mcp".into(), "--cdp-endpoint=chrome".into()],
+            ..Default::default()
+        };
+        let extension_control = crate::upstream_control::UpstreamControl::default()
+            .for_server("playwright-extension", &extension_spec);
+        let full_control = crate::upstream_control::UpstreamControl::default()
+            .for_server("playwright", &full_spec);
+        let cdp_control =
+            crate::upstream_control::UpstreamControl::default().for_server("playwright", &cdp_spec);
+        let tab_request = |name: &str, context: &str| {
+            CallToolRequestParams::new("browser_tabs").with_arguments(
+                json!({
+                    "action": "new",
+                    "isolatedContext": context,
+                    "url": "https://example.invalid/local-fixture",
+                    "text": name,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )
+        };
+
+        let blocked = forward_tool_call(
+            service.peer(),
+            tab_request("never-dispatch", "lane06_grants_funding"),
+            "playwright-extension",
+            "browser_tabs",
+            None,
+            None,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &extension_control,
+                conversation: None,
+            },
+        )
+        .await;
+        assert!(blocked.is_error);
+        assert!(blocked.joined_text().contains("No request was dispatched"));
+        assert!(!blocked.joined_text().contains("never-dispatch"));
+
+        let capable = forward_tool_call(
+            service.peer(),
+            tab_request("capable-backend-called", "lane06_grants_funding"),
+            "playwright",
+            "browser_tabs",
+            None,
+            None,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &full_control,
+                conversation: None,
+            },
+        )
+        .await;
+        assert!(!capable.is_error);
+        assert_eq!(capable.joined_text(), "capable-backend-called");
+
+        let refused = forward_tool_call(
+            service.peer(),
+            tab_request("cdp_refused", "lane07_funded_events"),
+            "playwright",
+            "browser_tabs",
+            None,
+            None,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &cdp_control,
+                conversation: None,
+            },
+        )
+        .await;
+        assert!(refused.is_error);
+        assert!(refused.joined_text().contains("CDP -32000 Not allowed"));
+        assert!(
+            refused
+                .joined_text()
+                .contains("No isolated context was confirmed")
+        );
+
+        // No isolation requested: ordinary existing-tab operation still works.
+        let nonisolated = forward_tool_call(
+            service.peer(),
+            tab_request("ordinary-tab", "default"),
+            "playwright-extension",
+            "browser_tabs",
+            None,
+            None,
+            UpstreamCallContext {
+                resources: &resources,
+                control: &extension_control,
+                conversation: None,
+            },
+        )
+        .await;
+        assert!(!nonisolated.is_error);
+        assert_eq!(nonisolated.joined_text(), "ordinary-tab");
+        server_task.abort();
     }
 
     #[derive(Clone)]
@@ -1462,6 +1928,11 @@ mod tests {
         tool_meta
             .0
             .insert("vendor".into(), Value::String("hex-rays".into()));
+        tool_meta.0.insert(
+            "securitySchemes".into(),
+            json!([{"type": "oauth2", "scopes": ["account:read"]}]),
+        );
+        tool_meta.0.insert("openai/profile".into(), json!(true));
         tools.push(
             rmcp::model::Tool::new(
                 "decompile_function",
@@ -2332,6 +2803,171 @@ mod tests {
         let _ = second_server_task.await;
     }
 
+    #[test]
+    fn server_bound_oauth_metadata_is_not_misadvertised_as_chatgpt_access() {
+        let mut upstream = MetaObject::new();
+        upstream.0.insert(
+            "securitySchemes".into(),
+            json!([{"type": "oauth2", "scopes": ["account:read"]}]),
+        );
+        upstream
+            .0
+            .insert("vendor".into(), Value::String("fixture".into()));
+        upstream.0.insert("openai/profile".into(), json!(true));
+        let existing = forward_server_bound_tool_metadata(Some(upstream.clone()), false).unwrap();
+        assert!(existing.0.contains_key("securitySchemes"));
+        assert_eq!(existing.0.get("openai/profile"), Some(&json!(true)));
+
+        let forwarded = forward_server_bound_tool_metadata(Some(upstream), true).unwrap();
+        assert!(!forwarded.0.contains_key("securitySchemes"));
+        assert!(!forwarded.0.contains_key("openai/profile"));
+        assert_eq!(forwarded.0.get("vendor"), Some(&json!("fixture")));
+    }
+
+    fn upstream_auth_fixture(challenge: &str) -> ToolResult {
+        let mut result = ToolResult::error("Upstream declined authorization");
+        let mut meta = MetaObject::new();
+        meta.0
+            .insert("mcp/www_authenticate".into(), json!([challenge]));
+        result.meta = Some(meta);
+        result.structured_content = Some(json!({"untrusted": "private-fixture"}));
+        result
+    }
+
+    #[test]
+    fn insufficient_scope_returns_specific_safe_error_without_consent_url() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture(
+                "Bearer error=\"insufficient_scope\", scope=\"Account:Read\", \
+                 resource_metadata=\"https://auth.example.invalid/secret?token=do-not-log\"",
+            ),
+            true,
+        );
+        assert!(result.is_error);
+        assert!(result.structured_content.is_none());
+        assert!(
+            !result
+                .meta
+                .as_ref()
+                .unwrap()
+                .0
+                .contains_key("mcp/www_authenticate")
+        );
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected safe text diagnostic");
+        };
+        assert!(message.contains("insufficient_scope"));
+        assert!(message.contains("Account:Read"));
+        assert!(!message.contains("auth.example.invalid"));
+        assert!(!message.contains("do-not-log"));
+        assert_eq!(
+            result.meta.as_ref().unwrap().0["io.github.devnoname120/codexify/upstream_auth_error"]
+                ["required_scope"],
+            json!("Account:Read")
+        );
+    }
+
+    #[test]
+    fn expired_upstream_grant_returns_recoverable_error_not_chatgpt_relink() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            true,
+        );
+        assert!(result.is_error);
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected error");
+        };
+        assert!(message.contains("invalid_token"));
+        assert!(message.contains("existing server-side token"));
+        assert!(!message.contains("https://"));
+    }
+
+    #[test]
+    fn malformed_upstream_consent_url_is_not_forwarded_to_downstream() {
+        let result = sanitize_server_bound_auth_result(
+            upstream_auth_fixture(
+                "Bearer error=\"invalid_token\", resource_metadata=\"javascript:alert(1)\"",
+            ),
+            true,
+        );
+        let ToolContent::Text(message) = &result.content[0] else {
+            panic!("expected error");
+        };
+        assert!(!message.contains("javascript:"));
+        assert!(!message.contains("resource_metadata"));
+        assert!(!result.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+    }
+
+    #[test]
+    fn repeated_upstream_denial_stays_stable_without_oauth_prompt() {
+        let first = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            true,
+        );
+        let second = sanitize_server_bound_auth_result(first, true);
+        assert!(second.is_error);
+        assert_eq!(second.content.len(), 1);
+        assert!(!second.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+    }
+
+    #[test]
+    fn unrelated_mcp_and_cloudflare_403_500_errors_are_not_rewritten() {
+        let unbound = sanitize_server_bound_auth_result(
+            upstream_auth_fixture("Bearer error=\"invalid_token\""),
+            false,
+        );
+        assert!(unbound.meta.unwrap().0.contains_key("mcp/www_authenticate"));
+
+        for code in [403, 500] {
+            let message = format!("Cloudflare HTTP {code} test fixture");
+            let result = sanitize_server_bound_auth_result(ToolResult::error(&message), true);
+            let ToolContent::Text(actual) = &result.content[0] else {
+                panic!("expected original provider error");
+            };
+            assert_eq!(actual, &message);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_mode_with_server_bound_auth_uses_existing_grant_without_oauth_meta() {
+        let (url, _calls, server_task) = spawn_catalog_upstream().await;
+        let mut config = crate::config::default_config(std::env::temp_dir());
+        config.mcp_servers.insert(
+            "cloudflare-api".to_string(),
+            McpServerSpec {
+                url: Some(url),
+                mode: Some(McpToolExposure::Direct),
+                http_headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer fixture-token".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let bridge = connect_upstreams(&config).await;
+        let tool = bridge
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "cloudflare_api__decompile_function")
+            .expect("Cloudflare mock tool should be exposed");
+        let meta = tool.meta().expect("unrelated upstream metadata retained");
+        assert_eq!(meta.0.get("vendor"), Some(&json!("hex-rays")));
+        assert!(!meta.0.contains_key("securitySchemes"));
+        assert!(!meta.0.contains_key("openai/profile"));
+        assert_eq!(tool.annotations().unwrap().read_only_hint, Some(true));
+
+        let response = call_bridge_tool(
+            &bridge,
+            "cloudflare_api__decompile_function",
+            json!({"location": {"virtual_address": "0x01"}}),
+        )
+        .await;
+        assert!(!response.is_error);
+        drop(bridge);
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn explicit_direct_mode_retains_per_tool_exposure_and_metadata() {
         let (url, calls, server_task) = spawn_catalog_upstream().await;
@@ -2631,6 +3267,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -2648,6 +3285,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -2674,6 +3312,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &crate::upstream_control::UpstreamControl::default(),
+                conversation: None,
             },
         )
         .await;
@@ -2760,6 +3399,7 @@ mod tests {
             UpstreamCallContext {
                 resources: &resources,
                 control: &control,
+                conversation: None,
             },
         );
         let fail = async {
@@ -2772,6 +3412,95 @@ mod tests {
         assert_eq!(control.snapshot()["state"], "unresponsive");
         drop(client);
         task.abort();
+    }
+
+    #[derive(Clone)]
+    struct DelayedCatalogMcp {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ServerHandler for DelayedCatalogMcp {
+        fn get_info(&self) -> ServerInfo {
+            InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(Implementation::new("delayed-catalog", "1.0.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, McpError> {
+            use std::sync::atomic::Ordering;
+            let count = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(count, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let schema = json!({"type":"object"}).as_object().unwrap().clone();
+            Ok(ListToolsResult::with_all_items(vec![
+                rmcp::model::Tool::new("noop", "No-op for bounded startup regression", schema),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn initializes_multiple_mcp_sources_concurrently_without_reordering_the_catalog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let upstream = DelayedCatalogMcp {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut http = StreamableHttpServerConfig::default();
+        http.json_response = true;
+        let service = StreamableHttpService::new(
+            move || Ok(upstream.clone()),
+            Arc::new(LocalSessionManager::default()),
+            http,
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, Router::new().nest_service("/mcp", service))
+                .await
+                .unwrap();
+        });
+        let mut config = crate::config::default_config(std::env::temp_dir());
+        for name in ["delta", "bravo", "alpha", "charlie"] {
+            config.mcp_servers.insert(
+                name.into(),
+                McpServerSpec {
+                    url: Some(format!("http://{address}/mcp")),
+                    transport: Some("http".into()),
+                    mode: Some(McpToolExposure::Direct),
+                    startup_timeout_sec: Some(5.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let bridge = connect_upstreams(&config).await;
+        assert_eq!(
+            bridge.runtime.snapshot().sources.len(),
+            4,
+            "all four MCP sources should connect"
+        );
+        let reported: Vec<_> = bridge
+            .report
+            .iter()
+            .map(|line| line.split_once(" ->").unwrap().0)
+            .collect();
+        assert_eq!(reported, ["alpha", "bravo", "charlie", "delta"]);
+        let maximum = peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&maximum),
+            "MCP cold-start requests must overlap without exceeding the three-slot limit: {maximum}"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        drop(bridge);
+        server_task.abort();
     }
 
     #[tokio::test]

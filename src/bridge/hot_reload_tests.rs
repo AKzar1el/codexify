@@ -133,6 +133,32 @@ async fn invoke_args(view: Arc<hot_reload::BridgeView>, name: &str, args: Value)
 }
 
 #[tokio::test]
+async fn scoped_browser_reload_fails_closed_without_retiring_live_task_sessions() {
+    let (url, _, task) = fixture("before", false, Duration::ZERO, Duration::ZERO).await;
+    let mut config = crate::config::default_config(std::env::temp_dir());
+    config
+        .mcp_servers
+        .insert("alpha".into(), spec(&url, McpToolExposure::Direct));
+    let bridge = connect_upstreams(&config).await;
+    let runtime = bridge.runtime.clone();
+    let before = runtime.snapshot();
+    let mut scoped = spec(&url, McpToolExposure::Direct);
+    scoped.session_scope = McpSessionScope::PerChat;
+    let error = runtime
+        .reload_with_spec("alpha", scoped, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error, "SCOPED_BROWSER_RELOAD_REQUIRES_QUIESCENCE");
+    let after = runtime.snapshot();
+    assert!(Arc::ptr_eq(
+        &before.sources["alpha"],
+        &after.sources["alpha"]
+    ));
+    assert_eq!(invoke(after, "alpha__probe").await.joined_text(), "before");
+    task.abort();
+}
+
+#[tokio::test]
 async fn single_source_reload_updates_tools_but_not_other_mcp() {
     let (old_url, _, old_task) = fixture("1", false, Duration::ZERO, Duration::ZERO).await;
     let (new_url, _, new_task) = fixture("2", true, Duration::ZERO, Duration::ZERO).await;
@@ -641,6 +667,588 @@ async fn stdio_process_still_alive(pid: u32) -> bool {
         .status()
         .await
         .is_ok_and(|status| status.success())
+}
+
+#[tokio::test]
+async fn distinct_task_owners_get_distinct_stdio_browser_peers_without_global_fallback() {
+    // A real MCP stdio process is spawned once for tool discovery and once
+    // for EACH owner. No user Chrome profile or network destination is used.
+    let mut config = crate::config::default_config(std::env::temp_dir());
+    let mut source_spec = isolated_stdio_spec("perchat");
+    source_spec.session_scope = McpSessionScope::PerChat;
+    config
+        .mcp_servers
+        .insert("playwright-ownership-fixture".into(), source_spec);
+    let bridge = connect_upstreams(&config).await;
+    let view = bridge.runtime.snapshot();
+    let source = view
+        .sources
+        .get("playwright-ownership-fixture")
+        .unwrap()
+        .clone();
+    assert!(source.control.scoped_playwright.is_some());
+
+    let owner_a = ConversationIdentity::from_openai_session("isolated-fixture-owner-a")
+        .expect("unique valid owner A");
+    let owner_b = ConversationIdentity::from_openai_session("isolated-fixture-owner-b")
+        .expect("unique valid owner B");
+
+    async fn probe(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: Option<&ConversationIdentity>,
+    ) -> ToolResult {
+        forward_tool_call(
+            &source.peer,
+            CallToolRequestParams::new("probe"),
+            "playwright-ownership-fixture",
+            "probe",
+            source.timeout,
+            None,
+            UpstreamCallContext {
+                resources,
+                control: &source.control,
+                conversation: owner,
+            },
+        )
+        .await
+    }
+
+    let denied = probe(&source, &bridge.resources, None).await;
+    assert!(denied.is_error);
+    assert!(
+        denied
+            .joined_text()
+            .contains("refusing the shared global browser")
+    );
+
+    let a1 = stdio_process_id(
+        probe(&source, &bridge.resources, Some(&owner_a)).await,
+        "perchat",
+    );
+    let b1 = stdio_process_id(
+        probe(&source, &bridge.resources, Some(&owner_b)).await,
+        "perchat",
+    );
+    let a2 = stdio_process_id(
+        probe(&source, &bridge.resources, Some(&owner_a)).await,
+        "perchat",
+    );
+    let b2 = stdio_process_id(
+        probe(&source, &bridge.resources, Some(&owner_b)).await,
+        "perchat",
+    );
+    assert_ne!(
+        a1, b1,
+        "two task owners must never share an MCP child process"
+    );
+    assert_eq!(a1, a2, "one task must keep its own browser connection");
+    assert_eq!(
+        b1, b2,
+        "the second task must retain its distinct connection"
+    );
+    // Removing the per-chat setting from an existing source is not a safe
+    // live migration. It must not retire either owner's browser connection.
+    let mut global = isolated_stdio_spec("replacement-global");
+    global.session_scope = McpSessionScope::Global;
+    let result = bridge
+        .runtime
+        .reload_with_spec("playwright-ownership-fixture", global, None)
+        .await;
+    assert_eq!(
+        result.unwrap_err(),
+        "SCOPED_BROWSER_RELOAD_REQUIRES_QUIESCENCE"
+    );
+    let after = bridge.runtime.snapshot();
+    assert!(Arc::ptr_eq(
+        &source,
+        &after.sources["playwright-ownership-fixture"]
+    ));
+    assert_eq!(
+        a1,
+        stdio_process_id(
+            probe(&source, &bridge.resources, Some(&owner_a)).await,
+            "perchat"
+        )
+    );
+    assert_eq!(
+        b1,
+        stdio_process_id(
+            probe(&source, &bridge.resources, Some(&owner_b)).await,
+            "perchat"
+        )
+    );
+}
+
+#[tokio::test]
+async fn named_profile_manager_routes_launch_reconnect_and_inventory_through_real_stdio() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::config::default_config(temp.path().to_path_buf());
+    let mut spec = isolated_stdio_spec("profile-manager");
+    spec.session_scope = McpSessionScope::PerChat;
+    spec.env.insert(
+        "CODEXIFY_SHARED_PLAYWRIGHT_PROFILES".into(),
+        "authority".into(),
+    );
+    let server = "playwright-profile-manager-fixture";
+    let (service, tools, timeout, mut pool) =
+        connect_owned_source(server, &spec, &config).await.unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|t| t.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+            .count(),
+        1
+    );
+    Arc::get_mut(pool.as_mut().unwrap())
+        .unwrap()
+        .set_test_root(temp.path().join("profiles"));
+    let source = hot_reload::Generation::for_source(server, spec, service, tools, timeout, pool, 1);
+    let resources = BridgedResourceStore::new(config.artifact_egress.clone());
+    let a = ConversationIdentity::from_openai_session("profile-manager-owner-a").unwrap();
+    let b = ConversationIdentity::from_openai_session("profile-manager-owner-b").unwrap();
+
+    async fn call(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: Option<&ConversationIdentity>,
+        tool: &'static str,
+        args: Value,
+    ) -> ToolResult {
+        forward_tool_call(
+            &source.peer,
+            CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone()),
+            "playwright-profile-manager-fixture",
+            tool,
+            source.timeout,
+            None,
+            UpstreamCallContext {
+                resources,
+                control: &source.control,
+                conversation: owner,
+            },
+        )
+        .await
+    }
+    let manager = crate::playwright_sessions::PROFILE_TOOL;
+    let no_owner = call(&source, &resources, None, manager, json!({"action":"list"})).await;
+    assert!(no_owner.is_error);
+    let before = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!before.is_error);
+    assert!(!temp.path().join("profiles").exists());
+    let launched = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"launch","profile":"private-a"}),
+    )
+    .await;
+    assert!(!launched.is_error, "{}", launched.joined_text());
+    let launch_text = launched.joined_text();
+    assert!(launch_text.contains("### Open tabs"));
+    let first_pid = launch_text.lines().last().unwrap();
+    let inventory = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    let inventory: Value = serde_json::from_str(&inventory.joined_text()).unwrap();
+    let owned = inventory["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["profile"] == "private-a")
+        .unwrap();
+    assert_eq!(
+        owned["last_observed_tabs"]["tabs"][0]["origin"],
+        "https://example.invalid"
+    );
+    assert!(!inventory.to_string().contains("secret=synthetic"));
+    let b_inventory = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!b_inventory.joined_text().contains("private-a"));
+    assert!(!b_inventory.joined_text().contains("example.invalid"));
+
+    let selected = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"select","profile":"authority"}),
+    )
+    .await;
+    assert!(!selected.is_error, "{}", selected.joined_text());
+    let refused = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"select","profile":"authority"}),
+    )
+    .await;
+    assert!(refused.is_error);
+    let shared_pid = stdio_process_id(
+        call(&source, &resources, Some(&a), "probe", json!({})).await,
+        "profile-manager",
+    );
+    assert_ne!(first_pid, format!("profile-manager:{shared_pid}"));
+    source
+        .control
+        .scoped_playwright
+        .as_ref()
+        .unwrap()
+        .simulate_idle_expiry()
+        .await;
+    let refused = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"select","profile":"authority"}),
+    )
+    .await;
+    assert!(
+        refused.is_error,
+        "idle pruning must not steal a connected named profile"
+    );
+    assert_eq!(
+        shared_pid,
+        stdio_process_id(
+            call(&source, &resources, Some(&a), "probe", json!({})).await,
+            "profile-manager"
+        )
+    );
+    let reconnect = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"reconnect","profile":"private-a"}),
+    )
+    .await;
+    assert!(!reconnect.is_error);
+    let reused = call(
+        &source,
+        &resources,
+        Some(&a),
+        "browser_tabs",
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!reused.is_error);
+    assert_eq!(reused.joined_text().lines().last().unwrap(), first_pid);
+    let released = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"release","profile":"authority"}),
+    )
+    .await;
+    assert!(!released.is_error);
+    let claimed = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"reconnect","profile":"authority"}),
+    )
+    .await;
+    assert!(!claimed.is_error);
+    let new_pid = stdio_process_id(
+        call(&source, &resources, Some(&b), "probe", json!({})).await,
+        "profile-manager",
+    );
+    assert_ne!(shared_pid, new_pid);
+    assert_eq!(
+        call(
+            &source,
+            &resources,
+            Some(&a),
+            "browser_tabs",
+            json!({"action":"list"})
+        )
+        .await
+        .joined_text()
+        .lines()
+        .last()
+        .unwrap(),
+        first_pid
+    );
+    drop(source);
+}
+
+// Only opt in with an explicitly pinned Playwright MCP CLI. The browser uses
+// disposable managed profiles, headless Chrome and a loopback synthetic page.
+#[tokio::test]
+#[ignore = "requires a pinned Playwright MCP CLI and installed Chrome"]
+async fn named_profiles_real_chrome_canary() {
+    let entry = std::env::var("CODEXIFY_TEST_PLAYWRIGHT_MCP_ENTRY")
+        .expect("provide the pinned Playwright MCP CLI entry");
+    assert!(std::path::Path::new(&entry).is_file());
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::config::default_config(temp.path().to_path_buf());
+    let spec = crate::types::McpServerSpec {
+        command: Some("node".into()),
+        args: vec![entry, "--headless".into(), "--browser=chrome".into()],
+        session_scope: McpSessionScope::PerChat,
+        startup_timeout_sec: Some(45.0),
+        tool_timeout_sec: Some(45.0),
+        env: HashMap::from([(
+            "CODEXIFY_SHARED_PLAYWRIGHT_PROFILES".into(),
+            "shared-canary".into(),
+        )]),
+        ..Default::default()
+    };
+    let server = "playwright-disposable-chrome-canary";
+    let (service, tools, timeout, mut pool) =
+        connect_owned_source(server, &spec, &config).await.unwrap();
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+    );
+    Arc::get_mut(pool.as_mut().unwrap())
+        .unwrap()
+        .set_test_root(temp.path().join("profiles"));
+    let source = hot_reload::Generation::for_source(server, spec, service, tools, timeout, pool, 1);
+    let resources = BridgedResourceStore::new(config.artifact_egress.clone());
+    let a = ConversationIdentity::from_openai_session("real-chrome-canary-a").unwrap();
+    let b = ConversationIdentity::from_openai_session("real-chrome-canary-b").unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = Router::new().route("/", axum::routing::get(|| async {
+        axum::response::Html("<html><title>Codexify local canary</title><body>Local synthetic test</body></html>")
+    }));
+    let http = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let manager = crate::playwright_sessions::PROFILE_TOOL;
+
+    async fn call(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: &ConversationIdentity,
+        name: &'static str,
+        args: Value,
+    ) -> ToolResult {
+        forward_tool_call(
+            &source.peer,
+            CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+            "playwright-disposable-chrome-canary",
+            name,
+            source.timeout,
+            None,
+            UpstreamCallContext {
+                resources,
+                control: &source.control,
+                conversation: Some(owner),
+            },
+        )
+        .await
+    }
+    async fn ok(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: &ConversationIdentity,
+        name: &'static str,
+        args: Value,
+    ) -> String {
+        let result = call(source, resources, owner, name, args).await;
+        assert!(!result.is_error, "{name}: {}", result.joined_text());
+        result.joined_text()
+    }
+    let initial = ok(&source, &resources, &a, manager, json!({"action":"list"})).await;
+    assert!(!temp.path().join("profiles").exists());
+    assert!(initial.contains("default"));
+    for owner in [&a, &b] {
+        ok(
+            &source,
+            &resources,
+            owner,
+            manager,
+            json!({"action":"launch","profile":"private-canary"}),
+        )
+        .await;
+        ok(
+            &source,
+            &resources,
+            owner,
+            "browser_navigate",
+            json!({"url":url}),
+        )
+        .await;
+    }
+    let read = json!({"function":"() => localStorage.getItem('codexify-canary')"});
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_evaluate",
+        json!({"function":"() => localStorage.setItem('codexify-canary', 'isolated-a-marker')"}),
+    )
+    .await;
+    assert!(
+        ok(&source, &resources, &a, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    assert!(
+        !ok(&source, &resources, &b, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_tabs",
+        json!({"action":"new","url":url}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_tabs",
+        json!({"action":"list"}),
+    )
+    .await;
+    let inventory: Value =
+        serde_json::from_str(&ok(&source, &resources, &a, manager, json!({"action":"list"})).await)
+            .unwrap();
+    let tabs = inventory["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["profile"] == "private-canary")
+        .unwrap()["last_observed_tabs"]["tabs"]
+        .as_array()
+        .unwrap();
+    assert!(
+        tabs.len() >= 2,
+        "real Playwright tab inventory: {inventory}"
+    );
+    // The other task must retain its original profile and current page.
+    assert!(
+        !ok(&source, &resources, &b, "browser_evaluate", read.clone())
+            .await
+            .contains("isolated-a-marker")
+    );
+    ok(&source, &resources, &a, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"select","profile":"shared-canary"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        "browser_navigate",
+        json!({"url":url}),
+    )
+    .await;
+    ok(&source, &resources, &a, "browser_evaluate", json!({"function":"() => localStorage.setItem('codexify-canary', 'shared-persistence-marker')"})).await;
+    assert!(
+        call(
+            &source,
+            &resources,
+            &b,
+            manager,
+            json!({"action":"select","profile":"shared-canary"})
+        )
+        .await
+        .is_error
+    );
+    ok(&source, &resources, &a, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &a,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"reconnect","profile":"shared-canary"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        "browser_navigate",
+        json!({"url":url}),
+    )
+    .await;
+    assert!(
+        ok(&source, &resources, &b, "browser_evaluate", read)
+            .await
+            .contains("shared-persistence-marker")
+    );
+    ok(&source, &resources, &b, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"reconnect","profile":"private-canary"}),
+    )
+    .await;
+    ok(&source, &resources, &b, "browser_close", json!({})).await;
+    ok(
+        &source,
+        &resources,
+        &b,
+        manager,
+        json!({"action":"release"}),
+    )
+    .await;
+    http.abort();
+    drop(source);
 }
 
 #[tokio::test]

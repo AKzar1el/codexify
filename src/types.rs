@@ -556,6 +556,14 @@ impl McpServerProvenance {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpSessionScope {
+    #[default]
+    Global,
+    PerChat,
+}
+
 /// One upstream MCP server to bridge, in the standard `mcpServers` shape. Its
 /// tools are discovered at startup and materialized according to the effective
 /// exposure mode. A `command` selects stdio; a `url` selects Codex-compatible
@@ -626,6 +634,10 @@ pub struct McpServerSpec {
     /// catalog mode.
     #[serde(default)]
     pub mode: Option<McpToolExposure>,
+    /// Explicit opt-in to a separate Playwright MCP process and browser
+    /// profile/tab group for each durable ChatGPT task.
+    #[serde(default)]
+    pub session_scope: McpSessionScope,
     /// Internal origin used only to select the backward-compatible default mode.
     #[serde(skip)]
     pub provenance: McpServerProvenance,

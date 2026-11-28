@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bridge::{UpstreamCallContext, forward_tool_call};
 use crate::bridged_resources::BridgedResourceStore;
 use crate::exec_sessions::SessionState;
+use crate::project_bindings::ConversationIdentity;
 use crate::tool::{Tool, ToolBehavior, ToolCallIdentity, ToolRequestContext};
 use crate::types::{AppConfig, McpServerProvenance, ToolResult};
 
@@ -1017,7 +1018,12 @@ struct McpCallToolTool {
 }
 
 impl McpCallToolTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        cancellation: Option<&CancellationToken>,
+        conversation: Option<&ConversationIdentity>,
+    ) -> ToolResult {
         let source_id = match required_string(&args, "source") {
             Ok(source) => source,
             Err(error) => return ToolResult::error(error),
@@ -1061,6 +1067,7 @@ impl McpCallToolTool {
             UpstreamCallContext {
                 resources: &self.resources,
                 control: &source.control,
+                conversation,
             },
         )
         .await
@@ -1138,7 +1145,7 @@ impl Tool for McpCallToolTool {
     }
 
     async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+        self.run(args, None, None).await
     }
 
     async fn call_with_context(
@@ -1148,7 +1155,15 @@ impl Tool for McpCallToolTool {
         _session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(
+            args,
+            Some(&context.cancellation),
+            context
+                .task_conversation
+                .as_ref()
+                .or(context.conversation.as_ref()),
+        )
+        .await
     }
 }
 
