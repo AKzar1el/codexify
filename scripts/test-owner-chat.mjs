@@ -690,6 +690,32 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     const page = await ownerTestPage(browser);
     page.setDefaultTimeout(5000);
     const errors = [];
+    const pendingApi = new Set();
+    page.on("request", request => {
+      if (new URL(request.url()).pathname.startsWith("/api/")) pendingApi.add(request);
+    });
+    page.on("requestfinished", request => pendingApi.delete(request));
+    page.on("requestfailed", request => pendingApi.delete(request));
+    // WebKit can report a same-origin poll started during document replacement
+    // as an access-control pageerror (Playwright #43120). Control only the
+    // timing of the hard navigations, not fetch, authorization or error checks.
+    const pausePolling = async () => {
+      await page.clock.pauseAt(await page.evaluate(() => Date.now() + 2500));
+      const deadline = Date.now() + 5000;
+      while (true) {
+        // Drain responses and their application-side continuations before
+        // replacing the document. No fixed navigation sleep or networkidle.
+        await page.evaluate(() => Promise.resolve());
+        if (!pendingApi.size) return;
+        assert(Date.now() < deadline, "owner API requests did not settle");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    };
+    const replaceDocument = async navigate => {
+      await pausePolling();
+      try { await navigate(); }
+      finally { await page.clock.resume(); }
+    };
     const copied = [];
     const markdownRequests = [];
     await page.exposeFunction("recordClipboard", text => copied.push(text));
@@ -705,6 +731,7 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     });
     page.on("pageerror", error => errors.push(error.message));
     const now = Date.now();
+    await page.clock.install({ time:now });
     const rawSource = "**Rendered**  \n\n```js\nconst x = 1;\n```";
     const wholeTranscript = `## Agent\n\nOlder server-only entry\n\n## Agent\n\n${rawSource}`;
     const chats = [
@@ -814,24 +841,28 @@ test(`${engineName}: standalone owner view restores its URL selection`, { timeou
     await page.locator("#chat-host").getByText("Please run the test suite").waitFor();
     await page.goForward();
     await page.locator("#chat-host").getByText("Please run the test suite").waitFor({ state:"hidden" });
-    await page.reload();
+    await replaceDocument(() => page.reload());
     await page.locator('.conversation[aria-current="true"] .conversation-title').getByText("Review files").waitFor();
     await page.locator("#chat-host #draft").waitFor();
     assert.equal(new URL(page.url()).searchParams.get("chat"), chats[1].id);
     assert.equal(new URL(page.url()).hash, "#test-token");
     await page.evaluate(() => sessionStorage.clear());
-    await page.goto(`http://127.0.0.1:43210/?chat=${chats[0].id}#test-token`);
+    await replaceDocument(() => page.goto(`http://127.0.0.1:43210/?chat=${chats[0].id}#test-token`));
     await page.locator("#chat-host").getByText("Please run the test suite").waitFor();
     assert.equal(new URL(page.url()).searchParams.get("chat"), chats[0].id);
     assert.equal(new URL(page.url()).hash, "#test-token");
     assert(seenRequests.length > 0 && seenRequests.every(value => value === "Bearer test-token"));
+    await pausePolling();
     const clock = Date.now();
-    await page.clock.install({ time:clock });
     chats[1].agentWaitingUntilMs = clock + 20000;
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await page.locator(".conversation-row:nth-of-type(2) .conversation .presence.waiting").waitFor();
+    const failedPoll = page.waitForResponse(response =>
+      new URL(response.url()).pathname === "/api/chats" && response.status() === 503);
     failPolling = true;
     await page.clock.fastForward(20000);
+    await failedPoll;
+    await page.locator("#error").getByText("Preview connection unavailable", { exact:true }).waitFor();
     await page.locator(".conversation-row:nth-of-type(2) .conversation .presence.away").waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
