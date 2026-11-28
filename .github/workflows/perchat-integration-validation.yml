@@ -4,11 +4,13 @@ on:
   push:
     branches:
       - fix/per-chat-playwright-hotreload-20261122
+      - feat/browser-profile-manager-20261128
     paths:
       - .github/workflows/perchat-integration-validation.yml
       - src/bridge.rs
       - src/bridge/**
       - src/playwright_sessions.rs
+      - scripts/fixtures/hot-reload-stdio-mcp.mjs
       - src/mcp_catalog.rs
       - src/upstream_control.rs
 

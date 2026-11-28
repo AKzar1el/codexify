@@ -376,9 +376,9 @@ pub(crate) struct UpstreamCallContext<'a> {
 
 pub(crate) async fn forward_tool_call(
     peer: &Peer<RoleClient>,
-    params: CallToolRequestParams,
+    mut params: CallToolRequestParams,
     server: &str,
-    tool: &str,
+    mut tool: &str,
     tool_timeout: Option<Duration>,
     cancellation: Option<&CancellationToken>,
     context: UpstreamCallContext<'_>,
@@ -388,6 +388,29 @@ pub(crate) async fn forward_tool_call(
         control,
         conversation,
     } = context;
+    let mut launch_profile = None;
+    if tool == crate::playwright_sessions::PROFILE_TOOL
+        && let Some(pool) = &control.scoped_playwright
+        && pool.supports_profiles()
+    {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return ToolResult::error("browser profile request cancelled before dispatch");
+        }
+        match pool.manage(conversation, params.arguments.as_ref()).await {
+            Ok(crate::playwright_sessions::ProfileAction::Local(value)) => {
+                return ToolResult::text(value.to_string());
+            }
+            Ok(crate::playwright_sessions::ProfileAction::Launch(name)) => {
+                // Dispatch one explicit blank-tab action through normal owner,
+                // cancellation, rate and timeout checks. Never replay it.
+                launch_profile = Some(name);
+                tool = "browser_tabs";
+                params = CallToolRequestParams::new("browser_tabs")
+                    .with_arguments(json!({"action": "new"}).as_object().unwrap().clone());
+            }
+            Err(error) => return ToolResult::error(error),
+        }
+    }
     // This preflight is shared by direct, gateway and catalog MCP exposure.
     // Never send an isolation request to a browser extension as a fallback.
     if let Err(error) = control.check_browser_context_request(tool, &params) {
@@ -398,8 +421,12 @@ pub(crate) async fn forward_tool_call(
     // downstream caller lacks an authoritative task identity.
     let scoped_connection = match &control.scoped_playwright {
         Some(pool) => {
-            let scoped_call =
-                tokio::time::timeout(Duration::from_secs(90), pool.acquire(conversation));
+            let scoped_call = tokio::time::timeout(Duration::from_secs(90), async {
+                match launch_profile.as_deref() {
+                    Some(profile) => pool.acquire_for(conversation, Some(profile)).await,
+                    None => pool.acquire(conversation).await,
+                }
+            });
             let cancelled = cancellation.cloned().unwrap_or_default();
             let response = tokio::select! {
                 biased;
@@ -459,6 +486,9 @@ pub(crate) async fn forward_tool_call(
         Err(UpstreamError::Remote(_)) => "response_received",
         Err(UpstreamError::Transport(_)) => "transport_failed",
     });
+    if let Some(connection) = &scoped_connection {
+        connection.observe_tabs(result.as_ref().ok(), tool);
+    }
 
     match result {
         Ok(result) => {
@@ -721,7 +751,24 @@ async fn connect_owned_source(
         Some(pool) => pool.discovery_spec()?,
         None => spec.clone(),
     };
-    let (service, tools, timeout) = connect_one(server, &discovery, config).await?;
+    let (service, mut tools, timeout) = connect_one(server, &discovery, config).await?;
+    if scoped.as_ref().is_some_and(|pool| pool.supports_profiles()) {
+        if tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+        {
+            return Err(
+                "upstream tool name conflicts with Codexify's browser profile manager".into(),
+            );
+        }
+        if tool_is_enabled(spec, crate::playwright_sessions::PROFILE_TOOL)
+            && tools
+                .iter()
+                .any(|tool| tool.name.as_ref() == "browser_tabs")
+        {
+            tools.push(crate::playwright_sessions::profile_tool());
+        }
+    }
     Ok((service, tools, timeout, scoped))
 }
 
@@ -1334,6 +1381,25 @@ async fn connect_one_with_env(
             command.args(&spec.args);
             for (key, value) in &spec.env {
                 command.env(key, value);
+            }
+            if spec.session_scope == McpSessionScope::PerChat {
+                // Ambient Playwright options must not redirect a scoped
+                // stdio child to a shared/remote browser or HTTP listener.
+                for key in crate::playwright_sessions::OWNED_BROWSER_ENV {
+                    command.env_remove(key);
+                }
+                for key in [
+                    "PLAYWRIGHT_MCP_EXTENSION",
+                    "PLAYWRIGHT_MCP_PROFILE_DIR_NAME",
+                    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+                    "PLAYWRIGHT_MCP_SESSION_NAME",
+                    "PLAYWRIGHT_MCP_NO_TAB_GROUP",
+                    "PLAYWRIGHT_MCP_BACKGROUND",
+                ] {
+                    if !spec.env.contains_key(key) {
+                        command.env_remove(key);
+                    }
+                }
             }
             if let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
                 command.current_dir(cwd);

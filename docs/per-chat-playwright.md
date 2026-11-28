@@ -26,6 +26,74 @@ on one machine never contend for the same task browser profile.
 This does not reuse the personal Chrome profile. Memory usage grows with
 the number of concurrently active Chrome processes.
 
+### Named persistent profiles and explicit handoff
+
+On a compatible build, the managed per-chat source exposes one additional
+function, `codexify_browser_session` (direct exposure:
+`playwright__codexify_browser_session`, or the existing gateway/catalog).
+It is only exposed when the upstream offers `browser_tabs`, and respects
+the configured tool allow/deny list. The legacy default profile is unchanged.
+
+| Action | Profile argument | Behavior |
+| --- | --- | --- |
+| list | none | Inspect saved profiles, selected profile, leases and last observed tabs; never launches, focuses, or expires a browser. |
+| create | new private name | Provision and select a persistent directory; no Chrome process until a browser action. |
+| launch | new private name | Create and select a new profile, then dispatch one blank-tab creation through normal scoped routing. |
+| select / reconnect | existing name or default | Reuse an owned live MCP peer, or lazily start from the saved directory on the next browser action. |
+| release | selected or explicit owned name | Relinquish an idle peer/lease; leave profile data on disk. Requires explicit reselection before dispatch. |
+
+Names are lowercase ASCII letters, digits, hyphens and underscores, 1-40
+characters. A private name is scoped to the durable task identity, source and
+native service port; another task using the same name gets a different profile.
+For reuse across unrelated conversations, the operator may explicitly allow
+named shared profiles on a dedicated managed source. Example (merge only the
+relevant keys into a compatible source configuration; preserve existing
+command, pinned package, mode and other settings):
+
+```json
+{
+  "sessionScope": "per-chat",
+  "env": {
+    "CODEXIFY_SHARED_PLAYWRIGHT_PROFILES": "authority-research,hackathons"
+  }
+}
+```
+
+Only configure names whose saved logins the operator explicitly authorizes
+trusted tasks on that source to reuse. This is not an authentication or
+authorization mechanism between independent human users of a shared service.
+The source strips this internal setting from the child environment. Shared
+names are reserved for that configuration; use select, not create, to prepare
+and claim one. The browser data directory is separate from personal Chrome.
+One task can hold a profile at a time. Busy claims and releases/switches during
+an in-flight call fail closed. Release or an idle lease expiry allows another
+task to explicitly claim the profile. After release or expiry of a shared
+selection, the former owner must explicitly select again; no automatic
+fallback or takeover. Chrome's own directory lock is still authoritative
+if a previous browser process is shutting down; never force-kill it.
+
+For a first login, select the allowed profile and use an ordinary browser
+navigation or new-tab action on a headed managed source. The operator logs
+in personally; the saved login remains in the directory. Later reconnect
+to the same selected profile. A live peer retains its existing tab state;
+after a peer is released or the service restarts, only persistent profile
+data is guaranteed, not the exact set of open tabs. If a live peer failed,
+release it when idle, then reconnect; never automatically replay a form.
+
+The inventory is read-only and uses the last recognized tab list returned
+by Playwright. It reports observation age, indices/current marker and
+HTTP(S) origins for owned profiles (no page titles, URL paths, query strings
+or credentials), and redacted counts/lease availability for other workers.
+Unknown or unrecognized lists are explicitly unavailable. Use the existing
+`browser_tabs {"action":"list"}` in an owned selected profile for a fresh
+list. It does not enumerate personal Chrome windows or arbitrary CDP
+endpoints, and does not query or focus another worker's browser. Extension
+mode retains its existing per-task tab group behavior; named physical
+profiles require managed browser mode.
+
+No runtime config changes, new browser launches, or production service
+restarts are required for source development or synthetic stdio tests.
+
 ## Extension mode (tab-group isolation, weaker security)
 
 Use the official Playwright Extension only on a dedicated, non-default

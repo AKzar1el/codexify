@@ -750,6 +750,195 @@ async fn distinct_task_owners_get_distinct_stdio_browser_peers_without_global_fa
 }
 
 #[tokio::test]
+async fn named_profile_manager_routes_launch_reconnect_and_inventory_through_real_stdio() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::config::default_config(temp.path().to_path_buf());
+    let mut spec = isolated_stdio_spec("profile-manager");
+    spec.session_scope = McpSessionScope::PerChat;
+    spec.env.insert(
+        "CODEXIFY_SHARED_PLAYWRIGHT_PROFILES".into(),
+        "authority".into(),
+    );
+    let server = "playwright-profile-manager-fixture";
+    let (service, tools, timeout, mut pool) =
+        connect_owned_source(server, &spec, &config).await.unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|t| t.name.as_ref() == crate::playwright_sessions::PROFILE_TOOL)
+            .count(),
+        1
+    );
+    Arc::get_mut(pool.as_mut().unwrap())
+        .unwrap()
+        .set_test_root(temp.path().join("profiles"));
+    let source = hot_reload::Generation::for_source(server, spec, service, tools, timeout, pool, 1);
+    let resources = BridgedResourceStore::new(config.artifact_egress.clone());
+    let a = ConversationIdentity::from_openai_session("profile-manager-owner-a").unwrap();
+    let b = ConversationIdentity::from_openai_session("profile-manager-owner-b").unwrap();
+
+    async fn call(
+        source: &hot_reload::Generation,
+        resources: &BridgedResourceStore,
+        owner: Option<&ConversationIdentity>,
+        tool: &'static str,
+        args: Value,
+    ) -> ToolResult {
+        forward_tool_call(
+            &source.peer,
+            CallToolRequestParams::new(tool).with_arguments(args.as_object().unwrap().clone()),
+            "playwright-profile-manager-fixture",
+            tool,
+            source.timeout,
+            None,
+            UpstreamCallContext {
+                resources,
+                control: &source.control,
+                conversation: owner,
+            },
+        )
+        .await
+    }
+    let manager = crate::playwright_sessions::PROFILE_TOOL;
+    let no_owner = call(&source, &resources, None, manager, json!({"action":"list"})).await;
+    assert!(no_owner.is_error);
+    let before = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!before.is_error);
+    assert!(!temp.path().join("profiles").exists());
+    let launched = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"launch","profile":"private-a"}),
+    )
+    .await;
+    assert!(!launched.is_error, "{}", launched.joined_text());
+    let launch_text = launched.joined_text();
+    assert!(launch_text.contains("### Open tabs"));
+    let first_pid = launch_text.lines().last().unwrap();
+    let inventory = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    let inventory: Value = serde_json::from_str(&inventory.joined_text()).unwrap();
+    let owned = inventory["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["profile"] == "private-a")
+        .unwrap();
+    assert_eq!(
+        owned["last_observed_tabs"]["tabs"][0]["origin"],
+        "https://example.invalid"
+    );
+    assert!(!inventory.to_string().contains("secret=synthetic"));
+    let b_inventory = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!b_inventory.joined_text().contains("private-a"));
+    assert!(!b_inventory.joined_text().contains("example.invalid"));
+
+    let selected = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"select","profile":"authority"}),
+    )
+    .await;
+    assert!(!selected.is_error, "{}", selected.joined_text());
+    let refused = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"select","profile":"authority"}),
+    )
+    .await;
+    assert!(refused.is_error);
+    let shared_pid = stdio_process_id(
+        call(&source, &resources, Some(&a), "probe", json!({})).await,
+        "profile-manager",
+    );
+    assert_ne!(first_pid, format!("profile-manager:{shared_pid}"));
+    let reconnect = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"reconnect","profile":"private-a"}),
+    )
+    .await;
+    assert!(!reconnect.is_error);
+    let reused = call(
+        &source,
+        &resources,
+        Some(&a),
+        "browser_tabs",
+        json!({"action":"list"}),
+    )
+    .await;
+    assert!(!reused.is_error);
+    assert_eq!(reused.joined_text().lines().last().unwrap(), first_pid);
+    let released = call(
+        &source,
+        &resources,
+        Some(&a),
+        manager,
+        json!({"action":"release","profile":"authority"}),
+    )
+    .await;
+    assert!(!released.is_error);
+    let claimed = call(
+        &source,
+        &resources,
+        Some(&b),
+        manager,
+        json!({"action":"reconnect","profile":"authority"}),
+    )
+    .await;
+    assert!(!claimed.is_error);
+    let new_pid = stdio_process_id(
+        call(&source, &resources, Some(&b), "probe", json!({})).await,
+        "profile-manager",
+    );
+    assert_ne!(shared_pid, new_pid);
+    assert_eq!(
+        call(
+            &source,
+            &resources,
+            Some(&a),
+            "browser_tabs",
+            json!({"action":"list"})
+        )
+        .await
+        .joined_text()
+        .lines()
+        .last()
+        .unwrap(),
+        first_pid
+    );
+    drop(source);
+}
+
+#[tokio::test]
 async fn service_isolated_real_stdio_process_reload_preserves_unrelated_sources() {
     // This fixture actually spawns three independent OS processes through the
     // production TokioChildProcess transport; no live Codexify is involved.
